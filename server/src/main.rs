@@ -7,8 +7,9 @@ use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
-use arrayvec::ArrayString;
 use blake3::Hash;
+use distd_core::chunk_storage::hashmap_storage::HashMapStorage;
+use distd_core::chunk_storage::ChunkStorage;
 use ring::error::KeyRejected;
 use ring::pkcs8::Document;
 use ring::signature::Ed25519KeyPair;
@@ -17,51 +18,14 @@ use ring::{
     signature::{self},
 };
 use uuid::Uuid;
-use warp::Filter;
 
-use crate::utils::url_part_utf8_string;
 use distd_core::metadata::{Item, RawChunk};
 use distd_core::version::{Version, VERSION};
 pub mod utils;
 
-// TODO define the Storage trait
-pub trait ChunkStorage {
-    fn get(self, hash: &Hash) -> Option<RawChunk>;
-    fn insert(self, chunk: RawChunk) -> Option<Hash>;
-    //fn drop(hash: Hash); // ??
-}
-
-// Dead simple in-memory global storage
-#[derive(Default)]
-struct SimpleStorage {
-    // This re-hashes the hashes, but nicely handles collisions in return
-    // TODO we may use a Hasher that just returns the first n bytes of the SHA-256?
-    data: RwLock<HashMap<Hash, RawChunk>>,
-}
-
-impl ChunkStorage for SimpleStorage {
-    fn get(self, hash: &Hash) -> Option<RawChunk> {
-        let data = match self.data.read() {
-            Ok(data) => data,
-            Err(_) => return None,
-        };
-        data.get(hash).copied()
-    }
-
-    fn insert(self, chunk: RawChunk) -> Option<Hash> {
-        let mut data = match self.data.write() {
-            Ok(data) => data,
-            Err(_) => return None,
-        };
-        let hash = blake3::hash(&chunk);
-        match data.insert(hash, chunk) {
-            Some(_) => Some(hash),
-            None => None,
-        }
-    }
-}
-
-type FeedName = ArrayString<256>;
+type UniqueName = String;
+type FeedName = UniqueName;
+type ClientName = UniqueName;
 
 #[derive(Debug)]
 struct Feed {
@@ -72,7 +36,7 @@ struct Feed {
 impl Feed {
     pub fn new(name: &str) -> Self {
         Self {
-            name: ArrayString::from_str(&name).unwrap(),
+            name: name.to_string(),
             paths: BTreeMap::new(),
         }
     }
@@ -86,6 +50,7 @@ type Metadata = String; // TODO
 /// Note that this is different from an eventual "build" signature.
 struct Server {
     key_pair: Ed25519KeyPair,  // needs server restart to be changed
+    uuid_nonce: String,        // needs server restart to be changed
     global_metadata: Metadata, // needs server restart to be changed
     feeds: RwLock<HashMap<FeedName, Feed>>,
     clients: RwLock<BTreeMap<Uuid, Client>>,
@@ -98,6 +63,7 @@ impl Default for Server {
         // Generate a key pair in PKCS#8 (v2) format.
         let rng = rand::SystemRandom::new();
         let pkcs8_bytes = signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let uuid_nonce = blake3::hash(pkcs8_bytes.as_ref()).to_string();
 
         // Normally the application would store the PKCS#8 file persistently. Later
         // it would read the PKCS#8 file from persistent storage to use it.
@@ -105,10 +71,11 @@ impl Default for Server {
 
         Self {
             key_pair,
+            uuid_nonce,
             global_metadata: "".to_string(),
             feeds: RwLock::new(HashMap::<FeedName, Feed>::new()),
             clients: RwLock::new(BTreeMap::<Uuid, Client>::new()),
-            storage: Box::new(SimpleStorage::default()),
+            storage: Box::new(HashMapStorage::default()),
             version: *VERSION,
         }
     }
@@ -126,27 +93,30 @@ impl Server {
         let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8_bytes.as_ref())?;
         Ok(Self {
             key_pair,
+            uuid_nonce: blake3::hash(pkcs8_bytes.as_ref()).to_string(),
             global_metadata,
             feeds: RwLock::new(HashMap::<FeedName, Feed>::from_iter(
-                feeds.into_iter().map(|x| (x.name, x)),
+                feeds.into_iter().map(|x| (x.name.clone(), x)),
             )),
             clients: RwLock::new(BTreeMap::<Uuid, Client>::new()), // TODO save and reload from disk
-            storage: Box::new(SimpleStorage::default()),
+            storage: Box::new(HashMapStorage::default()),
             version: *VERSION,
         })
     }
 
     pub fn register_client(
         &self,
-        name: ArrayString<256>,
+        name: ClientName,
         addr: SocketAddr,
+        version: Option<String>,
     ) -> Result<Uuid, RegisterError> {
-        let uuid = Uuid::new_v5(&Uuid::NAMESPACE_URL, name.as_bytes());
+        let nonced_name = name.clone() + &self.uuid_nonce;
+        let uuid = Uuid::new_v5(&Uuid::NAMESPACE_URL, &nonced_name.as_bytes());
         let client = Client {
             ip: addr.ip(),
             name,
             uuid,
-            version: None,
+            version,
             last_heartbeat: Instant::now(),
         };
         let clients_lock = self.clients.write();
@@ -163,8 +133,8 @@ impl Server {
         let feeds_lock = self.feeds.write();
         match feeds_lock {
             Ok(mut feeds) => {
-                let name = feed.name;
-                feeds.insert(name, feed);
+                let name = feed.name.clone();
+                feeds.insert(name.clone(), feed);
                 Ok(name)
             }
             Err(_) => Err(RegisterError),
@@ -174,11 +144,11 @@ impl Server {
 
 #[derive(Debug)]
 struct Client {
-    name: ArrayString<256>,
+    name: ClientName,
     ip: IpAddr,
     uuid: Uuid,
     //realm: Option<Arc<Realm>>,
-    version: Option<Version>,
+    version: Option<String>, // FIXME use Version instead
     last_heartbeat: Instant,
 }
 
@@ -194,125 +164,79 @@ impl PartialOrd for Client {
 }
 
 mod handlers {
-    use arrayvec::ArrayString;
+    use distd_core::version::Version;
+    use serde::{Deserialize, Serialize};
     use std::{convert::Infallible, net::SocketAddr, sync::Arc};
-    use warp::http::StatusCode;
-    use warp::reply::{json, with_status};
 
+    use axum::{
+        extract::{connect_info::IntoMakeServiceWithConnectInfo, ConnectInfo, Path, Query, State},
+        http::StatusCode,
+        response::IntoResponse,
+        routing::{get, post},
+        Json, Router,
+    };
+
+    use crate::FeedName;
     use crate::Server as RawServer;
 
     type Server = Arc<RawServer>;
 
-    pub async fn register_client(
-        addr: Option<SocketAddr>,
-        client_post_obj: crate::filters::ClientPostObj,
-        server: Server,
-    ) -> Result<impl warp::Reply, Infallible> {
-        let name = ArrayString::<256>::from(&client_post_obj.name);
-        if name.is_err() || addr.is_none() {
-            return Ok(with_status(json(&()), StatusCode::BAD_REQUEST));
-        };
-        match server.register_client(name.unwrap(), addr.unwrap()) {
-            Ok(client_uuid) => Ok(with_status(json(&client_uuid.to_string()), StatusCode::OK)),
-            Err(_) => Ok(with_status(json(&()), StatusCode::INTERNAL_SERVER_ERROR)),
-        }
+    use crate::utils::serde::empty_string_as_none;
+
+    #[derive(Deserialize, Serialize)]
+    struct ClientPostObj {
+        #[serde(default, deserialize_with = "empty_string_as_none")]
+        pub version: Option<String>,
+        pub name: String,
+        //pub realm: Option<Realm>,
     }
-}
 
-mod filters {
-    use arrayvec::ArrayString;
-    use serde::{Deserialize, Serialize};
-
-    use std::sync::Arc;
-    use warp::Filter;
-
-    use crate::{handlers, Server as RawServer};
-
-    type Server = Arc<RawServer>;
-
-    fn with_server(
-        server: Server,
-    ) -> impl Filter<Extract = (Server,), Error = std::convert::Infallible> + Clone {
-        warp::any().map(move || server.clone())
+    async fn register_client(
+        ConnectInfo(addr): ConnectInfo<SocketAddr>,
+        Query(client): Query<ClientPostObj>,
+        State(server): State<Server>,
+    ) -> Result<impl IntoResponse, StatusCode> {
+        match server.register_client(client.name, addr, client.version) {
+            Ok(client_uuid) => Ok(client_uuid.to_string()),
+            Err(_) => Err(StatusCode::FORBIDDEN),
+        }
     }
 
     // GET /version
-    pub fn version() -> impl Filter<Extract = (impl warp::Reply,), Error = warp::Rejection> + Clone
-    {
-        warp::path!("version").map(|| "distd v0.1.0")
+    async fn version() -> &'static str {
+        env!("CARGO_PKG_VERSION")
     }
 
     // GET /clients
-    pub fn get_clients(
-        server: Server,
-    ) -> impl Filter<Extract = (impl warp::Reply,), Error = warp::Rejection> + Clone {
-        warp::path!("clients")
-            .and(warp::get())
-            .and(with_server(server))
-            .map(|server: Server| format!("clients: {:?}", server.clone().clients.read().unwrap()))
-    }
-
-    #[derive(Deserialize, Serialize)]
-    pub struct ClientPostObj {
-        pub name: String,
-    }
-
-    // POST /clients
-    pub fn register_client(
-        server: Server,
-    ) -> impl Filter<Extract = (impl warp::Reply,), Error = warp::Rejection> + Clone {
-        warp::path!("clients")
-            .and(warp::post())
-            .and(warp::addr::remote())
-            .and(warp::query::<ClientPostObj>())
-            .and(with_server(server))
-            .and_then(handlers::register_client)
+    async fn get_clients(State(server): State<Server>) -> impl IntoResponse {
+        format!("clients: {:?}", server.clone().clients.read().unwrap())
     }
 
     // GET /feeds
-    pub fn get_feeds(
-        server: Server,
-    ) -> impl Filter<Extract = (impl warp::Reply,), Error = warp::Rejection> + Clone {
-        warp::path!("feeds")
-            .and(with_server(server))
-            .map(|server: Server| format!("clients: {:?}", server.clone().feeds.read().unwrap()))
+    async fn get_feeds(State(server): State<Server>) -> impl IntoResponse {
+        format!("clients: {:?}", server.clone().feeds.read().unwrap())
     }
-
-    use crate::url_part_utf8_string::UrlPartUtf8String;
 
     // GET /feeds/<feed name>
-    pub fn get_one_feed(
-        // TODO
-        server: Server,
-    ) -> impl Filter<Extract = (impl warp::Reply,), Error = warp::Rejection> + Clone {
-        warp::path!("feeds" / UrlPartUtf8String)
-            .and(with_server(server))
-            .map(|feed_name: UrlPartUtf8String, server: Server| {
-                let feed_name = feed_name.to_string();
-                let feed_name = ArrayString::<256>::from(&feed_name);
-                match feed_name {
-                    Ok(feed_name) => match server
-                        .feeds
-                        .read()
-                        .unwrap()
-                        .get::<ArrayString<256>>(&feed_name)
-                    {
-                        Some(feed) => format!("feeds: {:?}", feed),
-                        None => "{}".to_owned(),
-                    },
-                    Err(e) => format!("Cannot parse feed name: {:?}", e),
-                }
-            })
+    async fn get_one_feed(
+        Path(feed_name): Path<FeedName>,
+        State(server): State<Server>,
+    ) -> Result<impl IntoResponse, StatusCode> {
+        match server.feeds.read().unwrap().get(&feed_name) {
+            Some(feed) => Ok(format!("feeds: {:?}", feed)),
+            None => Err(StatusCode::NOT_FOUND),
+        }
     }
 
-    pub fn routes(
-        server: Server,
-    ) -> impl Filter<Extract = (impl warp::Reply,), Error = warp::Rejection> + Clone {
-        version()
-            .or(register_client(server.clone()))
-            .or(get_clients(server.clone()))
-            .or(get_feeds(server.clone()))
-            .or(get_one_feed(server.clone()))
+    pub fn make_app(server: RawServer) -> IntoMakeServiceWithConnectInfo<Router, SocketAddr> {
+        Router::new()
+            .route("/", get(version))
+            .route("/version", get(version))
+            .route("/clients", get(get_clients).post(register_client))
+            .route("/feeds", get(get_feeds))
+            .route("/feeds/one", get(get_one_feed))
+            .with_state(Arc::new(server))
+            .into_make_service_with_connect_info::<SocketAddr>()
     }
 }
 
@@ -324,9 +248,9 @@ async fn main() {
     println!("{:?}", feed.name);
     server.expose_feed(feed);
 
-    let hello = warp::path!("hello" / String).map(|name| format!("Hello, {}!", name));
+    let app = handlers::make_app(server);
 
-    warp::serve(hello.or(filters::routes(Arc::new(server))))
-        .run(([127, 0, 0, 1], 3000))
-        .await;
+    // run our app with hyper, listening globally on port 3000
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    axum::serve(listener, app).await.unwrap();
 }

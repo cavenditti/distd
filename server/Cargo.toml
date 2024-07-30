@@ -8,7 +8,7 @@ documentation.workspace = true
 
 [dependencies]
 tokio = { workspace = true }
-warp = { workspace = true }
+axum = { workspace = true }
 
 anyhow = { workspace = true }
 #thiserror = { workspace = true }

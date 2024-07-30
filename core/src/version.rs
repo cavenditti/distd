@@ -1,12 +1,14 @@
 use std::sync::LazyLock;
+use serde::{Serialize, Deserialize};
 
 /// Version struct used in client-server and peer-peer version checking
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 pub struct Version {
     major: u16,
     minor: u16,
     patch: u16,
 }
+
 pub static VERSION: LazyLock<Version> = LazyLock::new(|| Version {
     major: env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap(),
     minor: env!("CARGO_PKG_VERSION_MINOR").parse().unwrap(),
