@@ -1,0 +1,24 @@
+[package]
+name = "distd_client"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description.workspace = true
+documentation.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+
+anyhow = { workspace = true }
+
+clap = { workspace = true }
+
+rustls = { workspace = true }
+blake3 = { workspace = true }
+ 
+serde = { workspace = true }
+uuid = { workspace = true }
+percent-encoding = { workspace = true }

@@ -1,0 +1,12 @@
+[package]
+name = "distd_core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description.workspace = true
+documentation.workspace = true
+
+[dependencies]
+config = { workspace = true }
+
+blake3 = { workspace = true }

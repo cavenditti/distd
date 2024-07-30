@@ -1,0 +1,28 @@
+[package]
+name = "distd_server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description.workspace = true
+documentation.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+warp = { workspace = true }
+
+anyhow = { workspace = true }
+#thiserror = { workspace = true }
+
+clap = { workspace = true }
+config = { workspace = true }
+
+rustls = { workspace = true }
+ring = { workspace = true }
+blake3 = { workspace = true }
+
+arrayvec = { workspace = true }
+serde = { workspace = true }
+uuid = { workspace = true }
+percent-encoding = { workspace = true }
+
+distd_core = { path = "../core" }
