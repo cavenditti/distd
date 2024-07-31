@@ -9,14 +9,18 @@ distd (short for distribution daemon) is a tool for updates distribution.
 This is meant to push updates to clients optimizing bandwidth usage at all levels and reducing
 requirements on the providing server(s).
 
+## Requirements
+- Rust 1.82.0-nightly with cargo
+
 ## Architecture
-This works pretty much like a multi-swarm Bittorent client and tracker, but:
+This works pretty much like a partitioned Bittorent swarm, but:
 - It uses BLAKE3 instead of SHA1 o SHA256
 - Only uses µTP transport
+- The equivalent of torrent/metainfo files are msgpack-encoded instead of bencode-encoded
+- There are servers, clients and peers
+- The server acts both as a tracker and a peer, it may also be a client
 - It is somewhat simpler and stricter, as the scope is way reduced
-- The server acts both as a tracker and a client
-- It's layered, each server has visibility only of same level and 1-level lower clients.
-    Clients may act as servers for 1-level lower clients.
+- It's layered, forming a distribution tree basically: clients may act as servers for clients in a lower level
 - chunk/piece size is currently hardcoded
 
 ## Code organization

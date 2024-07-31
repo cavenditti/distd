@@ -20,8 +20,8 @@ rustls = { workspace = true }
 ring = { workspace = true }
 blake3 = { workspace = true }
 
-arrayvec = { workspace = true }
 serde = { workspace = true }
+rmp-serde = { workspace = true }
 uuid = { workspace = true }
 percent-encoding = { workspace = true }
 

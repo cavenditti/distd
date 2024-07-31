@@ -1,15 +1,13 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
-use std::net::IpAddr;
+use std::io::Cursor;
 use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::str::FromStr;
-use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::sync::RwLock;
+use std::time::SystemTime;
 
-use blake3::Hash;
 use distd_core::chunk_storage::hashmap_storage::HashMapStorage;
 use distd_core::chunk_storage::ChunkStorage;
+use distd_core::msgpack::MsgPackSerializable;
 use ring::error::KeyRejected;
 use ring::pkcs8::Document;
 use ring::signature::Ed25519KeyPair;
@@ -19,28 +17,10 @@ use ring::{
 };
 use uuid::Uuid;
 
-use distd_core::metadata::{Item, RawChunk};
+use distd_core::feed::{Feed, FeedName};
+use distd_core::unique_name::UniqueName;
 use distd_core::version::{Version, VERSION};
 pub mod utils;
-
-type UniqueName = String;
-type FeedName = UniqueName;
-type ClientName = UniqueName;
-
-#[derive(Debug)]
-struct Feed {
-    name: FeedName,
-    paths: BTreeMap<PathBuf, Item>,
-}
-
-impl Feed {
-    pub fn new(name: &str) -> Self {
-        Self {
-            name: name.to_string(),
-            paths: BTreeMap::new(),
-        }
-    }
-}
 
 type Metadata = String; // TODO
 
@@ -108,16 +88,16 @@ impl Server {
         &self,
         name: ClientName,
         addr: SocketAddr,
-        version: Option<String>,
+        version: Option<Version>,
     ) -> Result<Uuid, RegisterError> {
         let nonced_name = name.clone() + &self.uuid_nonce;
         let uuid = Uuid::new_v5(&Uuid::NAMESPACE_URL, &nonced_name.as_bytes());
         let client = Client {
-            ip: addr.ip(),
+            addr,
             name,
             uuid,
             version,
-            last_heartbeat: Instant::now(),
+            last_heartbeat: SystemTime::now(),
         };
         let clients_lock = self.clients.write();
         match clients_lock {
@@ -142,14 +122,16 @@ impl Server {
     }
 }
 
+type ClientName = UniqueName;
+
 #[derive(Debug)]
 struct Client {
     name: ClientName,
-    ip: IpAddr,
+    addr: SocketAddr,
     uuid: Uuid,
     //realm: Option<Arc<Realm>>,
-    version: Option<String>, // FIXME use Version instead
-    last_heartbeat: Instant,
+    version: Option<Version>, // FIXME use Version instead
+    last_heartbeat: SystemTime,
 }
 
 impl PartialEq for Client {
@@ -163,10 +145,10 @@ impl PartialOrd for Client {
     }
 }
 
-mod handlers {
+mod rest_api {
     use distd_core::version::Version;
     use serde::{Deserialize, Serialize};
-    use std::{convert::Infallible, net::SocketAddr, sync::Arc};
+    use std::{net::SocketAddr, sync::Arc};
 
     use axum::{
         extract::{connect_info::IntoMakeServiceWithConnectInfo, ConnectInfo, Path, Query, State},
@@ -186,7 +168,7 @@ mod handlers {
     #[derive(Deserialize, Serialize)]
     struct ClientPostObj {
         #[serde(default, deserialize_with = "empty_string_as_none")]
-        pub version: Option<String>,
+        pub version: Option<Version>,
         pub name: String,
         //pub realm: Option<Realm>,
     }
@@ -202,22 +184,18 @@ mod handlers {
         }
     }
 
-    // GET /version
     async fn version() -> &'static str {
         env!("CARGO_PKG_VERSION")
     }
 
-    // GET /clients
     async fn get_clients(State(server): State<Server>) -> impl IntoResponse {
         format!("clients: {:?}", server.clone().clients.read().unwrap())
     }
 
-    // GET /feeds
     async fn get_feeds(State(server): State<Server>) -> impl IntoResponse {
         format!("clients: {:?}", server.clone().feeds.read().unwrap())
     }
 
-    // GET /feeds/<feed name>
     async fn get_one_feed(
         Path(feed_name): Path<FeedName>,
         State(server): State<Server>,
@@ -245,10 +223,13 @@ async fn main() {
     println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
     let server = Server::default();
     let feed = Feed::new("A feed");
+    let buf = feed.to_msgpack().unwrap();
+    let feed = Feed::from_msgpack(buf).unwrap();
+
     println!("{:?}", feed.name);
     server.expose_feed(feed);
 
-    let app = handlers::make_app(server);
+    let app = rest_api::make_app(server);
 
     // run our app with hyper, listening globally on port 3000
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();

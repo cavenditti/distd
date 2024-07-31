@@ -25,22 +25,26 @@
 //! "signature": <build-key signature of file> ???
 //!}
 
-use std::io::Read;
 use std::fs::File;
-use std::time::Instant;
+use std::io::Read;
+use std::path::PathBuf;
+use std::time::SystemTime;
 //use ring::signature::Signature;
 
-use blake3::Hash;
+use serde::{Deserialize, Serialize};
+
+use crate::msgpack::MsgPackSerializable;
 
 pub const CHUNK_SIZE: usize = 256 * 1024;
 
 pub type RawChunk = [u8; CHUNK_SIZE];
+pub type RawHash = [u8; 32];
 
-pub type ChunksPack = Vec<Hash>; // We only keep hashes for chunks, they will then be retrieved from storage
+pub type ChunksPack = Vec<RawHash>; // We only keep hashes for chunks, they will then be retrieved from storage
 
-#[derive(Debug)]
-pub enum ItemFormat{
-    V1 = 1
+#[derive(Debug, Serialize, Deserialize)]
+pub enum ItemFormat {
+    V1 = 1,
 }
 
 /// Item representation
@@ -50,7 +54,7 @@ pub enum ItemFormat{
 ///
 /// We're assuming this is produced by a non-ill-intended trusted party, and we're not permorming many checks (e.g. on
 /// name and descprition length).
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Item {
     /// Name of the Item
     name: String,
@@ -58,12 +62,14 @@ pub struct Item {
     description: Option<String>,
     /// Incremental number of the file revision
     revision: u32,
+    /// Path of the file (it may change among revisions?)
+    path: PathBuf,
     /// Size in bytes of each chunk
     chunk_size: usize,
     /// BLAKE3 hashes of the chunks
     chunks: ChunksPack,
-    /// Creation Instant
-    created: Instant,
+    /// Creation SystemTime
+    created: SystemTime,
     /// Version used to create the Item (same as the output of env!("CARGO_PKG_VERSION") on the creator.
     created_by: String,
     /// format used
@@ -74,8 +80,9 @@ pub struct Item {
 impl Item {
     pub fn new(
         name: String,
-        description: Option<String>,
+        path: PathBuf,
         revision: u32,
+        description: Option<String>,
         file: &mut File,
     ) -> Result<Self, std::io::Error> {
         let mut chunks = ChunksPack::new();
@@ -85,7 +92,7 @@ impl Item {
             if n == 0 {
                 break;
             }
-            chunks.push(blake3::hash(&raw_chunk));
+            chunks.push(*blake3::hash(&raw_chunk).as_bytes());
             // push chunk to storage
             if n < CHUNK_SIZE {
                 break;
@@ -95,14 +102,17 @@ impl Item {
             name,
             description,
             revision,
+            path,
             chunk_size: CHUNK_SIZE,
             chunks,
-            created: Instant::now(),
+            created: SystemTime::now(),
             created_by: env!("CARGO_PKG_VERSION").to_owned(),
             format: ItemFormat::V1,
         })
     }
 }
+
+impl<'a> MsgPackSerializable<'a, Item> for Item {}
 
 #[cfg(test)]
 mod tests {
