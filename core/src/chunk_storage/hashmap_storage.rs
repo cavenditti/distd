@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use blake3::Hash;
 
@@ -7,11 +7,11 @@ use crate::metadata::RawChunk;
 use crate::chunk_storage::ChunkStorage;
 
 // Dead simple in-memory global storage
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct HashMapStorage {
     // This re-hashes the hashes, but nicely handles collisions in return
     // TODO we may use a Hasher that just returns the first n bytes of the SHA-256?
-    data: RwLock<HashMap<Hash, RawChunk>>,
+    data: Arc<RwLock<HashMap<Hash, RawChunk>>,>
 }
 
 impl ChunkStorage for HashMapStorage {

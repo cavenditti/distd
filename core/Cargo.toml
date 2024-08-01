@@ -9,5 +9,6 @@ documentation.workspace = true
 [dependencies]
 config = { workspace = true }
 serde = { workspace = true }
+bytes = { workspace = true }
 rmp-serde = { workspace = true }
 blake3 = { workspace = true }

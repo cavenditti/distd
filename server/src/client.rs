@@ -40,7 +40,7 @@ impl Serialize for Client {
         let mut state = serializer.serialize_struct("Client", 5)?;
         state.serialize_field("name", &self.name)?;
         state.serialize_field("addr", &self.addr)?;
-        state.serialize_field("uuid", &self.uuid.as_u128())?;
+        state.serialize_field("uuid", &self.uuid.to_string())?;
         state.serialize_field("version", &self.version)?;
         state.serialize_field("last_heartbeat", &self.last_heartbeat)?;
         state.end()

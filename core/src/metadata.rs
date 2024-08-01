@@ -25,20 +25,20 @@
 //! "signature": <build-key signature of file> ???
 //!}
 
-use std::fs::File;
-use std::io::Read;
+use bytes::{Buf, Bytes};
 use std::path::PathBuf;
 use std::time::SystemTime;
 //use ring::signature::Signature;
 
 use serde::{Deserialize, Serialize};
 
-use crate::msgpack::MsgPackSerializable;
+use crate::{chunk_storage::ChunkStorage, msgpack::MsgPackSerializable, unique_name::UniqueName};
 
 pub const CHUNK_SIZE: usize = 256 * 1024;
 
 pub type RawChunk = [u8; CHUNK_SIZE];
 pub type RawHash = [u8; 32];
+pub type ItemName = UniqueName;
 
 pub type ChunksPack = Vec<RawHash>; // We only keep hashes for chunks, they will then be retrieved from storage
 
@@ -57,47 +57,42 @@ pub enum ItemFormat {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Item {
     /// Name of the Item
-    name: String,
+    pub name: ItemName,
     /// Optional description, a generic String
-    description: Option<String>,
+    pub description: Option<String>,
     /// Incremental number of the file revision
-    revision: u32,
+    pub revision: u32,
     /// Path of the file (it may change among revisions?)
-    path: PathBuf,
+    pub path: PathBuf,
     /// Size in bytes of each chunk
-    chunk_size: usize,
+    pub chunk_size: usize,
     /// BLAKE3 hashes of the chunks
-    chunks: ChunksPack,
+    pub chunks: ChunksPack,
     /// Creation SystemTime
-    created: SystemTime,
+    pub created: SystemTime,
     /// Version used to create the Item (same as the output of env!("CARGO_PKG_VERSION") on the creator.
-    created_by: String,
+    pub created_by: String,
     /// format used
-    format: ItemFormat,
+    pub format: ItemFormat,
     //signature: Signature,
 }
 
 impl Item {
-    pub fn new(
-        name: String,
+    pub fn new<T: ChunkStorage + Clone> (
+        name: ItemName,
         path: PathBuf,
         revision: u32,
         description: Option<String>,
-        file: &mut File,
-    ) -> Result<Self, std::io::Error> {
+        file: Bytes,
+        storage: T,
+    ) -> Result<Self, std::io::Error>
+    {
         let mut chunks = ChunksPack::new();
-        loop {
-            let mut raw_chunk: RawChunk = [0; CHUNK_SIZE];
-            let n = file.by_ref().take(CHUNK_SIZE as u64).read(&mut raw_chunk)?;
-            if n == 0 {
-                break;
-            }
-            chunks.push(*blake3::hash(&raw_chunk).as_bytes());
-            // push chunk to storage
-            if n < CHUNK_SIZE {
-                break;
-            }
+        for chunk in file.chunks(CHUNK_SIZE) {
+            chunks.push(*blake3::hash(&chunk).as_bytes());
+            storage.clone().insert(chunk.try_into().unwrap()); // Size is fixed
         }
+
         Ok(Self {
             name,
             description,
