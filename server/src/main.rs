@@ -18,9 +18,10 @@ use ring::{
 use uuid::Uuid;
 
 use distd_core::feed::{Feed, FeedName};
-use distd_core::unique_name::UniqueName;
 use distd_core::version::{Version, VERSION};
+pub mod client;
 pub mod utils;
+use crate::client::{Client, ClientName};
 
 type Metadata = String; // TODO
 
@@ -122,33 +123,11 @@ impl Server {
     }
 }
 
-type ClientName = UniqueName;
-
-#[derive(Debug)]
-struct Client {
-    name: ClientName,
-    addr: SocketAddr,
-    uuid: Uuid,
-    //realm: Option<Arc<Realm>>,
-    version: Option<Version>, // FIXME use Version instead
-    last_heartbeat: SystemTime,
-}
-
-impl PartialEq for Client {
-    fn eq(&self, other: &Self) -> bool {
-        self.uuid == other.uuid
-    }
-}
-impl PartialOrd for Client {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.uuid.partial_cmp(&other.uuid)
-    }
-}
-
 mod rest_api {
     use distd_core::version::Version;
     use serde::{Deserialize, Serialize};
-    use std::{net::SocketAddr, sync::Arc};
+    use std::{net::SocketAddr, str::FromStr, sync::Arc};
+    use uuid::Uuid;
 
     use axum::{
         extract::{connect_info::IntoMakeServiceWithConnectInfo, ConnectInfo, Path, Query, State},
@@ -189,11 +168,43 @@ mod rest_api {
     }
 
     async fn get_clients(State(server): State<Server>) -> impl IntoResponse {
-        format!("clients: {:?}", server.clone().clients.read().unwrap())
+        Json(
+            server
+                .clients
+                .read()
+                .unwrap()
+                .values()
+                .cloned()
+                .collect::<Vec<Client>>(),
+        )
     }
 
+    use crate::Client;
+    async fn get_one_client(
+        Path(uuid): Path<String>,
+        State(server): State<Server>,
+    ) -> Result<Json<Client>, StatusCode> {
+        match Uuid::from_str(&uuid)
+            .ok()
+            .and_then(|x| server.clients.read().unwrap().get(&x).cloned())
+        {
+            Some(x) => Ok(Json(x)),
+            _ => Err(StatusCode::NOT_FOUND),
+        }
+    }
+
+    use crate::Feed;
     async fn get_feeds(State(server): State<Server>) -> impl IntoResponse {
-        format!("clients: {:?}", server.clone().feeds.read().unwrap())
+        Json(
+            server
+                .feeds
+                .read()
+                .unwrap()
+                .values()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<Feed>>(),
+        )
     }
 
     async fn get_one_feed(
@@ -201,7 +212,7 @@ mod rest_api {
         State(server): State<Server>,
     ) -> Result<impl IntoResponse, StatusCode> {
         match server.feeds.read().unwrap().get(&feed_name) {
-            Some(feed) => Ok(format!("feeds: {:?}", feed)),
+            Some(feed) => Ok(Json(feed.clone())),
             None => Err(StatusCode::NOT_FOUND),
         }
     }
@@ -211,8 +222,9 @@ mod rest_api {
             .route("/", get(version))
             .route("/version", get(version))
             .route("/clients", get(get_clients).post(register_client))
+            .route("/clients/:uuid", get(get_one_client))
             .route("/feeds", get(get_feeds))
-            .route("/feeds/one", get(get_one_feed))
+            .route("/feeds/:feed_name", get(get_one_feed))
             .with_state(Arc::new(server))
             .into_make_service_with_connect_info::<SocketAddr>()
     }
@@ -224,6 +236,7 @@ async fn main() {
     let server = Server::default();
     let feed = Feed::new("A feed");
     let buf = feed.to_msgpack().unwrap();
+    println!("Feed is {} bytes", buf.len());
     let feed = Feed::from_msgpack(buf).unwrap();
 
     println!("{:?}", feed.name);

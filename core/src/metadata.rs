@@ -42,7 +42,7 @@ pub type RawHash = [u8; 32];
 
 pub type ChunksPack = Vec<RawHash>; // We only keep hashes for chunks, they will then be retrieved from storage
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
 pub enum ItemFormat {
     V1 = 1,
 }
@@ -54,7 +54,7 @@ pub enum ItemFormat {
 ///
 /// We're assuming this is produced by a non-ill-intended trusted party, and we're not permorming many checks (e.g. on
 /// name and descprition length).
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Item {
     /// Name of the Item
     name: String,

@@ -9,7 +9,7 @@ use crate::msgpack::MsgPackSerializable;
 
 pub type FeedName = UniqueName;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Feed {
     pub name: FeedName,
     pub paths: BTreeMap<PathBuf, Item>,
