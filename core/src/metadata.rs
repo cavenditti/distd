@@ -25,27 +25,49 @@
 //! "signature": <build-key signature of file> ???
 //!}
 
-use bytes::{Buf, Bytes};
+use blake3::Hash;
+use bytes::Bytes;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::SystemTime;
 //use ring::signature::Signature;
 
 use serde::{Deserialize, Serialize};
 
+use crate::utils::serde::{
+    deserialize_hash, deserialize_hash_vec, serialize_hash, serialize_hash_vec,
+};
 use crate::{chunk_storage::ChunkStorage, msgpack::MsgPackSerializable, unique_name::UniqueName};
 
 pub const CHUNK_SIZE: usize = 256 * 1024;
 
-pub type RawChunk = [u8; CHUNK_SIZE];
+//pub type RawChunk = [u8; CHUNK_SIZE];
+pub type RawChunk = Arc<Vec<u8>>;
 pub type RawHash = [u8; 32];
 pub type ItemName = UniqueName;
 
-pub type ChunksPack = Vec<RawHash>; // We only keep hashes for chunks, they will then be retrieved from storage
+pub type ChunksPack = Vec<Hash>; // We only keep hashes for chunks, they will then be retrieved from storage
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
 pub enum ItemFormat {
     V1 = 1,
 }
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ChunkInfo {
+    // progressive unique id provided by the storage ??
+    //pub id: u64,
+    // Chunk size
+    pub size: u32,
+    // Chunk hash
+    #[serde(
+        serialize_with = "serialize_hash",
+        deserialize_with = "deserialize_hash"
+    )]
+    pub hash: Hash,
+}
+//pub type ChunksMap = BTreeMap<u64, ChunkInfo>;
 
 /// Item representation
 ///
@@ -64,10 +86,12 @@ pub struct Item {
     pub revision: u32,
     /// Path of the file (it may change among revisions?)
     pub path: PathBuf,
-    /// Size in bytes of each chunk
-    pub chunk_size: usize,
+    // /// Size in bytes of each chunk
+    //pub chunk_size: usize,
     /// BLAKE3 hashes of the chunks
-    pub chunks: ChunksPack,
+    pub chunks: Vec<ChunkInfo>,
+    // Should be something like this: allowing for content-addressable chunking
+    //pub chunks: HashMap<PathBuf, (usize, usize, Vec<Hash>)>,
     /// Creation SystemTime
     pub created: SystemTime,
     /// Version used to create the Item (same as the output of env!("CARGO_PKG_VERSION") on the creator.
@@ -78,19 +102,21 @@ pub struct Item {
 }
 
 impl Item {
-    pub fn new<T: ChunkStorage + Clone> (
+    pub fn new<T: ChunkStorage + Clone>(
         name: ItemName,
         path: PathBuf,
         revision: u32,
         description: Option<String>,
         file: Bytes,
         storage: T,
-    ) -> Result<Self, std::io::Error>
-    {
-        let mut chunks = ChunksPack::new();
+    ) -> Result<Self, std::io::Error> {
+        let mut chunks = Vec::new();
         for chunk in file.chunks(CHUNK_SIZE) {
-            chunks.push(*blake3::hash(&chunk).as_bytes());
-            storage.clone().insert(chunk.try_into().unwrap()); // Size is fixed
+            let res = storage.insert(chunk);
+            if res.is_none() {
+                return Err(std::io::Error::other("Cannot insert chunk"));
+            }
+            chunks.push(res.unwrap());
         }
 
         Ok(Self {
@@ -98,7 +124,7 @@ impl Item {
             description,
             revision,
             path,
-            chunk_size: CHUNK_SIZE,
+            //chunk_size: CHUNK_SIZE,
             chunks,
             created: SystemTime::now(),
             created_by: env!("CARGO_PKG_VERSION").to_owned(),

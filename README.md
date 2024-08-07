@@ -23,9 +23,14 @@ This works pretty much like a partitioned Bittorent swarm, but:
 - It's layered, forming a distribution tree basically: clients may act as servers for clients in a lower level
 - chunk/piece size is currently hardcoded
 
+## TODO:
+- Implement diff algorithm
+- Make sure the approach is fine tuned for EROFS images, so that they can be chunked efficiently.
+
 ## Code organization
 - distd_core contains common data structures and algorithms for p2p sharing
 - distd_server is responsible of chunking, hashing and first serving the file
 - distd_client fetches files from the server
 - distd_peer fetches and provides files and chunks to visible clients
 
+## Current state
