@@ -1,4 +1,5 @@
 #![feature(allocator_api)]
+#![feature(map_try_insert)]
 #![feature(array_chunks)]
 #![feature(test)]
 

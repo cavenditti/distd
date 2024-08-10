@@ -25,6 +25,7 @@ This works pretty much like a partitioned Bittorent swarm, but:
 
 ## TODO:
 - Implement diff algorithm
+- 
 - Make sure the approach is fine tuned for EROFS images, so that they can be chunked efficiently.
 
 ## Code organization

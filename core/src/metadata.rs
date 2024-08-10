@@ -27,7 +27,7 @@
 
 use blake3::Hash;
 use bytes::Bytes;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -40,14 +40,12 @@ use crate::utils::serde::{
 };
 use crate::{chunk_storage::ChunkStorage, msgpack::MsgPackSerializable, unique_name::UniqueName};
 
-pub const CHUNK_SIZE: usize = 256 * 1024;
+pub const CHUNK_SIZE: usize = 4 * 1024;
 
 //pub type RawChunk = [u8; CHUNK_SIZE];
 pub type RawChunk = Arc<Vec<u8>>;
 pub type RawHash = [u8; 32];
 pub type ItemName = UniqueName;
-
-pub type ChunksPack = Vec<Hash>; // We only keep hashes for chunks, they will then be retrieved from storage
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
 pub enum ItemFormat {
@@ -67,7 +65,14 @@ pub struct ChunkInfo {
     )]
     pub hash: Hash,
 }
+
+pub struct ChunksPack {
+    chunk_size: usize,
+    last_chunk_size: usize,
+    hashes: Vec<Hash>, // We only keep hashes for chunks, they will then be retrieved from storage
+}
 //pub type ChunksMap = BTreeMap<u64, ChunkInfo>;
+pub type ChunksMap = HashMap<PathBuf, ChunksPack>;
 
 /// Item representation
 ///
@@ -112,11 +117,11 @@ impl Item {
     ) -> Result<Self, std::io::Error> {
         let mut chunks = Vec::new();
         for chunk in file.chunks(CHUNK_SIZE) {
-            let res = storage.insert(chunk);
-            if res.is_none() {
+            if let Some(res) = storage.insert(chunk) {
+                chunks.push(res);
+            } else {
                 return Err(std::io::Error::other("Cannot insert chunk"));
             }
-            chunks.push(res.unwrap());
         }
 
         Ok(Self {
@@ -137,5 +142,8 @@ impl<'a> MsgPackSerializable<'a, Item> for Item {}
 
 #[cfg(test)]
 mod tests {
-    fn test_item_new() {}
+    #[test]
+    fn test_item_new() {
+        assert!(true)
+    }
 }

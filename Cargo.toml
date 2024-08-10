@@ -10,7 +10,7 @@ description = ""
 documentation = "https://example.com/bar"
 
 [workspace.dependencies]
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.39.2", features = ["full"] }
 axum = { version = "0.7.5", features = ["json", "multipart"] }
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }

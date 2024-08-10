@@ -21,14 +21,15 @@ impl ChunkStorage for HashMapStorage {
 
     fn insert(&self, chunk: &[u8]) -> Option<ChunkInfo> {
         if let Ok(mut data) = self.data.write() {
+            //println!("Chunk: {:?}", &chunk);
             let size: u32 = chunk.len().try_into().unwrap(); // FIXME unwrap
             let hash = blake3::hash(&chunk);
+            println!("Hash: {}, size: {}", hash, size);
             if let Some(_raw_chunk) = data.get(&hash.clone()) {
                 return Some(ChunkInfo { size, hash });
             }
             let chunk_info = ChunkInfo { size, hash };
-            data.insert(hash, Arc::new(Vec::from(chunk)))
-                .and(Some(chunk_info))
+            data.try_insert(hash, Arc::new(Vec::from(chunk))).ok().map(|_| chunk_info)
         } else {
             None
         }

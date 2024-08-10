@@ -11,6 +11,7 @@ use crate::server::Server;
 pub mod client;
 pub mod server;
 pub mod rest_api;
+pub mod error;
 
 #[tokio::main]
 async fn main() {

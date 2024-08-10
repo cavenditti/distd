@@ -12,6 +12,8 @@ use thiserror::Error;
 pub enum StorageError {
     #[error("Unknown storage size")]
     UnknownSize,
+    #[error("Cannot insert chunk in data store")]
+    UnknownChunkInsertError(#[from] std::io::Error),
 }
 
 /// Defines a backend used to store hashes and chunks ad key-value pairs

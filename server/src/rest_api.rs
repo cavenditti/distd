@@ -1,3 +1,4 @@
+use blake3::Hash;
 use distd_core::utils::serde::empty_string_as_none;
 use distd_core::{metadata::ItemName, version::Version};
 use serde::{Deserialize, Serialize};
@@ -88,17 +89,12 @@ where
     )
 }
 
-async fn get_chunks_size<T>(State(server): State<Server<T>>) -> impl IntoResponse
+async fn get_chunks_size_sum<T>(State(server): State<Server<T>>) -> impl IntoResponse
 where
     T: ChunkStorage + Sync + Send + Clone + Default,
 {
-    Json(
-        server
-            .storage
-            .size()
-    )
+    Json(server.storage.size())
 }
-
 
 use crate::Feed;
 async fn get_feeds<T>(State(server): State<Server<T>>) -> impl IntoResponse
@@ -172,16 +168,23 @@ where
         if field.name().unwrap() != "item" {
             continue;
         }
-        return server
+        println!("Found `item` field");
+        let res = server
             .publish_item(
                 name,
                 item_data.path,
                 0,
                 item_data.description,
                 field.bytes().await.map_err(|_| StatusCode::BAD_REQUEST)?,
-            )
+            );
+        let res = res.or_else(|e| {
+            println!("ERROR: {}", e.to_string());
+            Err(e)
+        });
+        println!("RESULT: {:?}", res);
+        return res
             .map(|item| Json(item))
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+            .map_err(|e| StatusCode::INTERNAL_SERVER_ERROR);
     }
     Err(StatusCode::BAD_REQUEST)
 }
@@ -202,6 +205,17 @@ where
         .ok_or_else(|| StatusCode::NOT_FOUND)
 }
 
+async fn get_chunk<T>(
+    Path(hash): Path<String>,
+    State(server): State<Server<T>>,
+) -> Result<impl IntoResponse, StatusCode>
+where
+    T: ChunkStorage + Sync + Send + Clone + Default,
+{
+    let hash = Hash::from_str(hash.as_str()).map_err(|_| StatusCode::BAD_REQUEST)?;
+    Ok(Json(server.storage.get(&hash).map(|x| x.to_vec())))
+}
+
 pub fn make_app<T>(server: RawServer<T>) -> IntoMakeServiceWithConnectInfo<Router, SocketAddr>
 where
     T: ChunkStorage + Sync + Send + Clone + Default + 'static,
@@ -211,12 +225,13 @@ where
         .route("/version", get(version))
         .route("/clients", get(get_clients).post(register_client))
         .route("/clients/:uuid", get(get_one_client))
-        .route("/chunks", get(get_chunks))
         .route("/items", get(get_items))
         .route("/items/:name", get(get_one_item).post(publish_item))
+        .route("/chunks", get(get_chunks))
+        .route("/chunks/size-sum", get(get_chunks_size_sum))
+        .route("/chunks/get/:hash", get(get_chunk))
         .route("/feeds", get(get_feeds))
         .route("/feeds/:feed_name", get(get_one_feed))
-        .route("/chunks_size", get(get_chunks_size))
         .with_state(Arc::new(server))
         .into_make_service_with_connect_info::<SocketAddr>()
 }

@@ -17,6 +17,7 @@ use ring::{
 use uuid::Uuid;
 
 use crate::client::{Client, ClientName};
+use crate::error::ServerError;
 use distd_core::feed::{Feed, FeedName};
 use distd_core::version::{Version, VERSION};
 
@@ -140,7 +141,7 @@ where
         revision: u32,
         description: Option<String>,
         file: Bytes,
-    ) -> Result<Item, RegisterError> {
+    ) -> Result<Item, ServerError> {
         Item::new(
             name,
             path,
@@ -149,13 +150,14 @@ where
             file,
             self.storage.clone(),
         )
-        .map_err(|_| RegisterError)
+        .map_err(|e| ServerError::ChunkInsertError(e))
         .and_then(|i| {
             self.item_map
                 .write()
-                .map_err(|_| RegisterError)?
-                .insert(i.name.clone(), i)
-                .ok_or(RegisterError)
+                .map_err(|_e| ServerError::LockError)?
+                .try_insert(i.name.clone(), i)
+                .map(|item| item.to_owned())
+                .map_err(|e| ServerError::ItemInsertionError(e.entry.key().clone()))
         })
     }
 }
