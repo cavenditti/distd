@@ -5,6 +5,7 @@
 
 
 pub mod version;
+pub mod hash;
 pub mod metadata;
 pub mod chunk_storage;
 pub mod unique_name;

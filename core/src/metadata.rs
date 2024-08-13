@@ -64,6 +64,7 @@ pub struct ChunkInfo {
         deserialize_with = "deserialize_hash"
     )]
     pub hash: Hash,
+    //pub children: Option<(Hash, Hash)>,
 }
 
 pub struct ChunksPack {

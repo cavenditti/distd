@@ -8,7 +8,6 @@ documentation.workspace = true
 
 [dependencies]
 tokio = { workspace = true }
-utp = { workspace = true }
 
 config = { workspace = true }
 anyhow = { workspace = true }

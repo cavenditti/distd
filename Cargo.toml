@@ -1,5 +1,5 @@
 [workspace]
-members = ["core", "server", "client"]
+members = ["core", "server", "client", "ppspp-rs"]
 resolver = "2"
 
 [workspace.package]
@@ -15,7 +15,6 @@ axum = { version = "0.7.5", features = ["json", "multipart"] }
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
 http-body-util = "0.1"
-utp = "0.7.0"
 
 anyhow = { version = "1.0", default-features = false }
 thiserror = "1.0"
