@@ -96,6 +96,8 @@ pub struct Item {
     //pub chunk_size: usize,
     /// BLAKE3 hashes of the chunks
     pub chunks: Vec<ChunkInfo>,
+    /// BLAKE3 root hash of the file
+    pub root: ChunkInfo,
     // Should be something like this: allowing for content-addressable chunking
     //pub chunks: HashMap<PathBuf, (usize, usize, Vec<Hash>)>,
     /// Creation SystemTime
@@ -116,14 +118,7 @@ impl Item {
         file: Bytes,
         storage: T,
     ) -> Result<Self, std::io::Error> {
-        let mut chunks = Vec::new();
-        for chunk in file.chunks(CHUNK_SIZE) {
-            if let Some(res) = storage.insert(chunk) {
-                chunks.push(res);
-            } else {
-                return Err(std::io::Error::other("Cannot insert chunk"));
-            }
-        }
+        let hash_tree = storage.insert(file).unwrap();
 
         Ok(Self {
             name,
@@ -131,7 +126,8 @@ impl Item {
             revision,
             path,
             //chunk_size: CHUNK_SIZE,
-            chunks,
+            chunks: hash_tree.flatten_with_sizes(),
+            root: hash_tree.get_chunk_info(),
             created: SystemTime::now(),
             created_by: env!("CARGO_PKG_VERSION").to_owned(),
             format: ItemFormat::V1,

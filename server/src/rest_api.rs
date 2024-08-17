@@ -169,14 +169,13 @@ where
             continue;
         }
         println!("Found `item` field");
-        let res = server
-            .publish_item(
-                name,
-                item_data.path,
-                0,
-                item_data.description,
-                field.bytes().await.map_err(|_| StatusCode::BAD_REQUEST)?,
-            );
+        let res = server.publish_item(
+            name,
+            item_data.path,
+            0,
+            item_data.description,
+            field.bytes().await.map_err(|_| StatusCode::BAD_REQUEST)?,
+        );
         let res = res.or_else(|e| {
             println!("ERROR: {}", e.to_string());
             Err(e)
@@ -184,7 +183,7 @@ where
         println!("RESULT: {:?}", res);
         return res
             .map(|item| Json(item))
-            .map_err(|e| StatusCode::INTERNAL_SERVER_ERROR);
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
     }
     Err(StatusCode::BAD_REQUEST)
 }
@@ -213,7 +212,7 @@ where
     T: ChunkStorage + Sync + Send + Clone + Default,
 {
     let hash = Hash::from_str(hash.as_str()).map_err(|_| StatusCode::BAD_REQUEST)?;
-    Ok(Json(server.storage.get(&hash).map(|x| x.to_vec())))
+    Ok(Json(server.storage.get(&hash)))
 }
 
 pub fn make_app<T>(server: RawServer<T>) -> IntoMakeServiceWithConnectInfo<Router, SocketAddr>

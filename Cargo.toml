@@ -1,5 +1,6 @@
 [workspace]
-members = ["core", "server", "client", "ppspp-rs"]
+members = ["core", "server", "client"]
+#members = ["core", "server", "client", "ppspp-rs"]
 resolver = "2"
 
 [workspace.package]
