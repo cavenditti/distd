@@ -27,7 +27,8 @@ See also zsync, casync
 
 ## TODO:
 - ~~Implement merkle-tree computing~~
-- Give each Item its own tree of hashes insteas of Vec
+- Give each Item its own tree of hashes insteas of Vec (kinda done)
+- Make order between ChunkInfo and StoredChunkRef
 - Implement diff algorithm comparing merkle-trees
 
 ### P2P (TODO)

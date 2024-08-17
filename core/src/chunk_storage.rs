@@ -37,24 +37,48 @@ impl Serialize for StoredChunkRef {
     where
         S: serde::Serializer,
     {
-        match self {
-            Self::Parent {
-                hash: _,
-                left,
-                right,
-            } => {
-                let mut state =
-                    serializer.serialize_struct_variant("StoredChunkRef", 0, "Parent", 2)?;
-                state.serialize_field("left", &left.get_hash().as_bytes())?;
-                state.serialize_field("right", &right.get_hash().as_bytes())?;
-                state.end()
+        if serializer.is_human_readable() {
+            match self {
+                Self::Parent {
+                    hash: _,
+                    left,
+                    right,
+                } => {
+                    let mut state =
+                        serializer.serialize_struct_variant("StoredChunkRef", 0, "Parent", 2)?;
+                    state.serialize_field("left", &left.get_hash().to_string())?;
+                    state.serialize_field("right", &right.get_hash().to_string())?;
+                    state.end()
+                }
+                Self::Stored { hash, data } => {
+                    let mut state =
+                        serializer.serialize_struct_variant("StoredChunkRef", 0, "Stored", 2)?;
+                    state.serialize_field("hash", &hash.to_string())?;
+                    state.serialize_field("data", &*data)?; // TODO do base64 encoding maybe?
+                    state.end()
+                }
             }
-            Self::Stored { hash, data } => {
-                let mut state =
-                    serializer.serialize_struct_variant("StoredChunkRef", 0, "Stored", 2)?;
-                state.serialize_field("hash", &hash.as_bytes())?;
-                state.serialize_field("data", &*data.clone())?;
-                state.end()
+        } else {
+            match self {
+                Self::Parent {
+                    hash,
+                    left,
+                    right,
+                } => {
+                    let mut state =
+                        serializer.serialize_struct_variant("StoredChunkRef", 0, "Parent", 3)?;
+                    state.serialize_field("hash", &hash.as_bytes())?;
+                    state.serialize_field("left", &left)?;
+                    state.serialize_field("right", &right)?;
+                    state.end()
+                }
+                Self::Stored { hash, data } => {
+                    let mut state =
+                        serializer.serialize_struct_variant("StoredChunkRef", 0, "Stored", 2)?;
+                    state.serialize_field("hash", &hash.as_bytes())?;
+                    state.serialize_field("data", &*data.clone())?;
+                    state.end()
+                }
             }
         }
         // 3 is the number of fields in the struct.
