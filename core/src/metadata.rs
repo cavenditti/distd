@@ -41,6 +41,8 @@ use crate::utils::serde::{
 use crate::{chunk_storage::ChunkStorage, msgpack::MsgPackSerializable, unique_name::UniqueName};
 
 pub const CHUNK_SIZE: usize = 4 * 1024;
+// Some tests assume a chunk length of 4096 as of now, should change in the future
+//pub const CHUNK_SIZE: usize = blake3::guts::CHUNK_LEN;
 
 //pub type RawChunk = [u8; CHUNK_SIZE];
 pub type RawChunk = Arc<Vec<u8>>;

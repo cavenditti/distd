@@ -1,5 +1,5 @@
 use core::slice::SlicePattern;
-use std::{borrow::Cow, io, slice::Chunks, sync::Arc};
+use std::{borrow::Cow, collections::HashSet, io, slice::Chunks, sync::Arc};
 
 use blake3::Hash;
 use bytes::Bytes;
@@ -121,13 +121,59 @@ impl StoredChunkRef {
     }
 
     /// Get contained data, returns None if is not Stored
-    pub fn get_data(&self) -> Option<RawChunk> {
+    pub fn _get_stored_data(&self) -> Option<RawChunk> {
         match self {
             Self::Stored { hash: _, data } => Some(data.clone()),
             _ => None,
         }
     }
 
+    /// Get contained data, returns None if is not Parent
+    pub fn _get_children(&self) -> Option<(&Arc<StoredChunkRef>, &Arc<StoredChunkRef>)> {
+        match self {
+            Self::Parent {
+                hash: _,
+                left,
+                right,
+            } => Some((left, right)),
+            _ => None,
+        }
+    }
+
+    /// Get a view on contained data, recursing across all children
+    pub fn get_data(&self) -> Option<Vec<RawChunk>> {
+        match self {
+            Self::Stored { hash: _, data } => Some(vec![data.clone()]),
+            Self::Parent {
+                hash: _,
+                left,
+                right,
+            } => {
+                let mut left_vec = left.get_data()?;
+                left_vec.extend(right.get_data()?);
+                Some(left_vec)
+            }
+        }
+    }
+
+    /// Get contained data, recursing across all children
+    /// This method may be slow and produce (copying) a large result, pay attention when using it
+    pub fn clone_data(&self) -> Option<Vec<u8>> {
+        match self {
+            Self::Stored { hash: _, data } => Some((*data.clone()).to_owned()),
+            Self::Parent {
+                hash: _,
+                left,
+                right,
+            } => {
+                let mut left_vec = left.clone_data()?;
+                left_vec.extend(right.clone_data()?);
+                Some(left_vec)
+            }
+        }
+    }
+
+    /// Get flatten representation, eventually repeating hashes
     pub fn flatten(&self) -> Vec<Hash> {
         match self {
             Self::Stored { hash, data: _ } => {
@@ -145,6 +191,22 @@ impl StoredChunkRef {
         }
     }
 
+    /// Get all unique Stored hashes referenced by the (sub-)tree
+    pub fn hashes(&self) -> HashSet<Hash> {
+        match self {
+            Self::Stored { hash, data: _ } => HashSet::from([*hash]),
+            Self::Parent {
+                hash: _,
+                left,
+                right,
+            } => {
+                let left_vec = left.hashes();
+                left_vec.union(&right.hashes()).map(|x| *x).collect()
+            }
+        }
+    }
+
+    /// Get flatten representation with sizes, eventually repeating hashes
     pub fn flatten_with_sizes(&self) -> Vec<ChunkInfo> {
         match self {
             Self::Stored { hash, data: _ } => {
@@ -182,12 +244,12 @@ impl TreeItem for StoredChunkRef {
                 size_style.foreground = Some(Color::Red);
 
                 write!(
-                f,
-                "{} <{}>",
-                leaf_style.paint(self.get_hash()),
-                size_style.paint(self.get_size()),
-            )
-            },
+                    f,
+                    "{} <{}>",
+                    leaf_style.paint(self.get_hash()),
+                    size_style.paint(self.get_size()),
+                )
+            }
         }
         //write!(f, "{}", style.paint(self.get_hash()))
     }
@@ -241,10 +303,14 @@ pub trait ChunkStorage {
                 left.iter().map(|x| x.len()).collect::<Vec<usize>>(),
                 right.iter().map(|x| x.len()).collect::<Vec<usize>>()
             );
-            match (left.len(), right.len()) {
+            let x = match (left.len(), right.len()) {
                 (0, 0) => None,
                 (1, 0) => storage.insert_chunk(left[0]),
                 (0, 1) => storage.insert_chunk(right[0]),
+                (1, 1) => storage.link(
+                    partial_tree(storage, left, &[])?,
+                    partial_tree(storage, &[], right)?,
+                ),
                 (_, 1) => storage.link(
                     partial_tree(storage, &left[..left.len() / 2], &left[left.len() / 2..])?,
                     partial_tree(storage, &[], right)?,
@@ -254,10 +320,11 @@ pub trait ChunkStorage {
                     partial_tree(
                         storage,
                         &right[..right.len() / 2],
-                        &right[..right.len() / 2],
+                        &right[right.len() / 2..],
                     )?,
                 ),
-            }
+            };
+            x
         }
 
         let (chunks, remainder) = data.as_chunks::<CHUNK_SIZE>();
