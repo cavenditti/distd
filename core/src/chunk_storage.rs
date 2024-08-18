@@ -1,8 +1,9 @@
 use core::slice::SlicePattern;
-use std::{slice::Chunks, sync::Arc};
+use std::{borrow::Cow, io, slice::Chunks, sync::Arc};
 
 use blake3::Hash;
 use bytes::Bytes;
+use ptree::{Color, Style, TreeItem};
 use serde::ser::{Serialize, SerializeStructVariant};
 
 use crate::metadata::{ChunkInfo, RawChunk, CHUNK_SIZE};
@@ -37,6 +38,7 @@ impl Serialize for StoredChunkRef {
     where
         S: serde::Serializer,
     {
+        use base64::prelude::*;
         if serializer.is_human_readable() {
             match self {
                 Self::Parent {
@@ -54,17 +56,13 @@ impl Serialize for StoredChunkRef {
                     let mut state =
                         serializer.serialize_struct_variant("StoredChunkRef", 0, "Stored", 2)?;
                     state.serialize_field("hash", &hash.to_string())?;
-                    state.serialize_field("data", &*data)?; // TODO do base64 encoding maybe?
+                    state.serialize_field("data", &BASE64_STANDARD.encode(&*data.as_ref()))?; // TODO do base64 encoding maybe?
                     state.end()
                 }
             }
         } else {
             match self {
-                Self::Parent {
-                    hash,
-                    left,
-                    right,
-                } => {
+                Self::Parent { hash, left, right } => {
                     let mut state =
                         serializer.serialize_struct_variant("StoredChunkRef", 0, "Parent", 3)?;
                     state.serialize_field("hash", &hash.as_bytes())?;
@@ -168,6 +166,46 @@ impl StoredChunkRef {
     }
 }
 
+impl TreeItem for StoredChunkRef {
+    type Child = Self;
+    fn write_self<W: io::Write>(&self, f: &mut W, style: &Style) -> io::Result<()> {
+        match self {
+            Self::Parent { .. } => write!(f, "{}", style.paint(self.get_hash())),
+            Self::Stored { .. } => {
+                let mut leaf_style = Style::default();
+                leaf_style.bold = true;
+                leaf_style.background = Some(Color::White);
+                leaf_style.foreground = Some(Color::Black);
+
+                let mut size_style = Style::default();
+                size_style.bold = true;
+                size_style.foreground = Some(Color::Red);
+
+                write!(
+                f,
+                "{} <{}>",
+                leaf_style.paint(self.get_hash()),
+                size_style.paint(self.get_size()),
+            )
+            },
+        }
+        //write!(f, "{}", style.paint(self.get_hash()))
+    }
+    fn children(&self) -> Cow<[Self::Child]> {
+        match self {
+            Self::Stored { hash: _, data: _ } => Cow::from(vec![]),
+            Self::Parent {
+                hash: _,
+                left,
+                right,
+            } => Cow::from(vec![
+                (*left.to_owned()).clone(),
+                (*right.to_owned()).clone(),
+            ]),
+        }
+    }
+}
+
 /// Defines a backend used to store hashes and chunks ad key-value pairs
 pub trait ChunkStorage {
     fn get(&self, hash: &Hash) -> Option<Arc<StoredChunkRef>>;
@@ -193,15 +231,26 @@ pub trait ChunkStorage {
             left: &[&[u8]],
             right: &[&[u8]],
         ) -> Option<Arc<StoredChunkRef>> {
+            println!(
+                "[StorageCnkLen] LEFT: {} RIGHT: {}",
+                left.len(),
+                right.len()
+            );
+            println!(
+                "[StorageChunks] LEFT: {:?} RIGHT: {:?}",
+                left.iter().map(|x| x.len()).collect::<Vec<usize>>(),
+                right.iter().map(|x| x.len()).collect::<Vec<usize>>()
+            );
             match (left.len(), right.len()) {
+                (0, 0) => None,
                 (1, 0) => storage.insert_chunk(left[0]),
                 (0, 1) => storage.insert_chunk(right[0]),
                 (_, 1) => storage.link(
-                    partial_tree(storage, &left[..left.len() / 2], &left[..left.len() / 2])?,
+                    partial_tree(storage, &left[..left.len() / 2], &left[left.len() / 2..])?,
                     partial_tree(storage, &[], right)?,
                 ),
                 (_, _) => storage.link(
-                    partial_tree(storage, &left[..left.len() / 2], &left[..left.len() / 2])?,
+                    partial_tree(storage, &left[..left.len() / 2], &left[left.len() / 2..])?,
                     partial_tree(
                         storage,
                         &right[..right.len() / 2],
@@ -216,7 +265,7 @@ pub trait ChunkStorage {
             self,
             chunks
                 .iter()
-                .map(|x| x.as_slice())
+                .map(|x| x.as_ref())
                 .collect::<Vec<&[u8]>>() // FIXME is this zero copy?
                 .as_slice(),
             &[remainder],
