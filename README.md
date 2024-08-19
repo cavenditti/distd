@@ -40,8 +40,9 @@ the (eventually private storage repo) and keep all items deduplicated.
 - Tests for everything
 - Implement FsStorage, to store items directly in the filesystem without deduplication (will be used by client)
 - Minimal client
-- Evaluate whether to and assign a 64-bit uid to each hash to reduce network overhead or not.
+- Evaluate whether to and assign a 64-bit uid to each hash to reduce network overhead or not
 - Add TLS, or use QUIC everywhere
+- Replace ptree with something unintrusive when running tests
 
 ### Long term TODO:
 - Implement (a subset of) PPSPP in Rust, see [PyPPSPP](https://github.com/justas-/PyPPSPP) as reference
