@@ -85,7 +85,7 @@ impl ChunkStorage for HashMapStorage {
 
 #[cfg(test)]
 mod tests {
-    use crate::metadata::CHUNK_SIZE;
+    use crate::{hash::hash, metadata::CHUNK_SIZE};
 
     use super::*;
     use bytes::Bytes;
@@ -108,7 +108,7 @@ mod tests {
         let len = data.len();
         let root = s.insert(data).unwrap();
         println!("\nOriginal lenght: {}, stored length: {}", len, s.size());
-        print_tree(&*root.to_owned()).unwrap();
+        //print_tree(&*root.to_owned()).unwrap();
         println!();
         assert!(len >= s.size());
     }
@@ -125,65 +125,28 @@ mod tests {
         //print_tree(&*root.to_owned()).unwrap();
         assert_eq!(CHUNK_SIZE, s.size());
 
-        // TODO make these indipendent of CHUNK_SIZE, just needs to recompute hashes per-chunk and check them
-        let root_hash = "e78e8d3d053116365a3a98cf8580254cb6173cbb473d9f2f132fb7b7862e5665";
-        assert_eq!(root.get_hash().to_string(), root_hash);
+        let root_hash = hash(&[0u8; SIZE]);
+        assert_eq!(root.get_hash(), &root_hash);
 
+        let zeros_chunk_hash = hash(&[0u8; CHUNK_SIZE]);
         let root_children = (
-            "5d0b31ce6fa4b67269bc42019bde6dfbc5eefd8d13871ba10d972fd3fe559693",
-            "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+            zeros_chunk_hash,
+            hash(&[0u8; CHUNK_SIZE * 2]),
         );
-        assert_eq!(root.get_hash().to_string(), root_hash);
-        assert_eq!(
-            root._get_children().unwrap().0.get_hash().to_string(),
-            root_children.0
-        );
-        assert_eq!(
-            root._get_children().unwrap().1.get_hash().to_string(),
-            root_children.1
-        );
-
-        let zero_chunk = "b6fb73fc46938c981e2b0b4b1ef282adcfc89854d01bfe3972fdc4785b41b2c7";
-        let root_children_left_children = (
-            zero_chunk,
-            "a622c121567e4c936e0210532383b3eaef8486854aa65a188e152187a8b080b8",
-        );
-        assert_eq!(
-            root._get_children()
-                .unwrap()
-                .0
-                ._get_children()
-                .unwrap()
-                .0
-                .get_hash()
-                .to_string(),
-            zero_chunk
-        );
-        assert_eq!(
-            root._get_children()
-                .unwrap()
-                .0
-                ._get_children()
-                .unwrap()
-                .1
-                .get_hash()
-                .to_string(),
-            root_children_left_children.1
-        );
+        assert_eq!(root._get_children().unwrap().0.get_hash(), &root_children.0);
+        assert_eq!(root._get_children().unwrap().1.get_hash(), &root_children.1);
 
         let hash_vec = root.flatten();
-        assert_eq!(hash_vec.len(), 4);
-        assert_eq!(hash_vec[0].to_string(), zero_chunk);
-        assert_eq!(hash_vec[1].to_string(), zero_chunk);
-        assert_eq!(hash_vec[2].to_string(), zero_chunk);
-        // This is the last (empty) chunk.
-        assert_eq!(
-            hash_vec[3].to_string(),
-            "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
-        );
+        assert_eq!(hash_vec.len(), 3);
+        assert_eq!(hash_vec[0], zeros_chunk_hash);
+        assert_eq!(hash_vec[1], zeros_chunk_hash);
+        assert_eq!(hash_vec[2], zeros_chunk_hash);
 
         let hash_set = root.hashes();
-        assert_eq!(hash_set.len(), 2);
+        assert_eq!(hash_set.len(), 1);
+        for i in hash_set {
+            assert_eq!(i, zeros_chunk_hash);
+        }
 
         let cloned = root.clone_data().unwrap();
         assert_eq!(cloned.len(), SIZE);
@@ -195,7 +158,7 @@ mod tests {
     #[test]
     fn test_hms_2mb() {
         let s = HashMapStorage::default();
-        let data = Bytes::from_static(include_bytes!("../../../1.MOV"));
+        let data = Bytes::from_static(include_bytes!("../../../2mb.random"));
         let len = data.len();
         let root = s.insert(data.clone()).unwrap();
         //print_tree(&*root.to_owned()).unwrap();

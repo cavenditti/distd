@@ -290,37 +290,27 @@ pub trait ChunkStorage {
     {
         fn partial_tree(
             storage: &dyn ChunkStorage,
-            left: &[&[u8]],
-            right: &[&[u8]],
+            slices: &[&[u8]],
         ) -> Option<Arc<StoredChunkRef>> {
             println!(
-                "[StorageCnkLen] LEFT: {} RIGHT: {}",
-                left.len(),
-                right.len()
+                "[StorageChunks] {} {:?}",
+                slices.len(),
+                slices.iter().map(|x| x.len()).collect::<Vec<usize>>()
             );
-            println!(
-                "[StorageChunks] LEFT: {:?} RIGHT: {:?}",
-                left.iter().map(|x| x.len()).collect::<Vec<usize>>(),
-                right.iter().map(|x| x.len()).collect::<Vec<usize>>()
-            );
-            let x = match (left.len(), right.len()) {
-                (0, 0) => None,
-                (1, 0) => storage.insert_chunk(left[0]),
-                (0, 1) => storage.insert_chunk(right[0]),
-                (1, 1) => storage.link(
-                    partial_tree(storage, left, &[])?,
-                    partial_tree(storage, &[], right)?,
+            let x = match slices.len() {
+                 0 => None,
+                 1 => storage.insert_chunk(slices[0]),
+                /*
+                 _ => storage.link(
+                    partial_tree(storage, slices, &[])?,
+                    partial_tree(storage, &[], slices)?,
                 ),
-                (_, 1) => storage.link(
-                    partial_tree(storage, &left[..left.len() / 2], &left[left.len() / 2..])?,
-                    partial_tree(storage, &[], right)?,
-                ),
-                (_, _) => storage.link(
-                    partial_tree(storage, &left[..left.len() / 2], &left[left.len() / 2..])?,
+*/
+                _ => storage.link(
+                    partial_tree(storage, &slices[..slices.len() / 2])?,
                     partial_tree(
                         storage,
-                        &right[..right.len() / 2],
-                        &right[right.len() / 2..],
+                        &slices[slices.len() / 2..],
                     )?,
                 ),
             };
@@ -328,14 +318,10 @@ pub trait ChunkStorage {
         }
 
         let (chunks, remainder) = data.as_chunks::<CHUNK_SIZE>();
-        partial_tree(
-            self,
-            chunks
-                .iter()
-                .map(|x| x.as_ref())
-                .collect::<Vec<&[u8]>>() // FIXME is this zero copy?
-                .as_slice(),
-            &[remainder],
-        )
+        let mut slices = chunks.iter().map(|x| x.as_ref()).collect::<Vec<&[u8]>>(); // FIXME is this zero copy?
+        if remainder.len() != 0 {
+            slices.push(remainder);
+        }
+        partial_tree(self, slices.as_slice())
     }
 }
