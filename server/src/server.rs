@@ -6,7 +6,8 @@ use std::time::SystemTime;
 
 use axum::body::Bytes;
 use distd_core::chunk_storage::ChunkStorage;
-use distd_core::metadata::{Item, ItemName};
+use distd_core::item::{Item, ItemName};
+use distd_core::metadata::ServerMetadata;
 use ring::error::KeyRejected;
 use ring::pkcs8::Document;
 use ring::signature::Ed25519KeyPair;
@@ -21,8 +22,6 @@ use crate::error::ServerError;
 use distd_core::feed::{Feed, FeedName};
 use distd_core::version::{Version, VERSION};
 
-type Metadata = String; // TODO
-
 /// distd Server
 ///
 /// Server signature is used to check replicated data among clients when shared p2p,
@@ -34,14 +33,13 @@ where
     key_pair: Ed25519KeyPair, // needs server restart to be changed
     uuid_nonce: String,       // needs server restart to be changed
     // global server metadata
-    pub global_metadata: Metadata, // needs server restart to be changed
+    pub global_metadata: RwLock<ServerMetadata>,
     // Feed map
     pub feeds: RwLock<HashMap<FeedName, Feed>>,
     // Client map
     pub clients: RwLock<BTreeMap<Uuid, Client>>,
     // A storage implementing ChunkStorage, basically a key-value database of some sort
     pub storage: T,
-    //TODO chunkmap to ref count chunks
     // Map associating each item name with its metadata (including chunk hashes)
     pub item_map: RwLock<HashMap<ItemName, Item>>,
     // server version
@@ -65,7 +63,7 @@ where
         Self {
             key_pair,
             uuid_nonce,
-            global_metadata: "".to_string(),
+            global_metadata: RwLock::new(ServerMetadata::default()),
             feeds: RwLock::new(HashMap::<FeedName, Feed>::new()),
             clients: RwLock::new(BTreeMap::<Uuid, Client>::new()),
             storage: T::default(),
@@ -84,14 +82,14 @@ where
 {
     pub fn new(
         pkcs8_bytes: Document,
-        global_metadata: Metadata,
+        global_metadata: ServerMetadata,
         feeds: Vec<Feed>,
     ) -> Result<Self, KeyRejected> {
         let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8_bytes.as_ref())?;
         Ok(Self {
             key_pair,
             uuid_nonce: blake3::hash(pkcs8_bytes.as_ref()).to_string(),
-            global_metadata,
+            global_metadata: RwLock::new(global_metadata),
             feeds: RwLock::new(HashMap::<FeedName, Feed>::from_iter(
                 feeds.into_iter().map(|x| (x.name.clone(), x)),
             )),

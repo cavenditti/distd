@@ -76,7 +76,7 @@ impl ChunkStorage for HashMapStorage {
             .unwrap()
             .values()
             .map(|x| match &**x {
-                StoredChunkRef::Stored { hash: _, data } => data.len(),
+                StoredChunkRef::Stored { data, .. } => data.len(),
                 _ => 0,
             })
             .sum()
@@ -129,10 +129,7 @@ mod tests {
         assert_eq!(root.get_hash(), &root_hash);
 
         let zeros_chunk_hash = hash(&[0u8; CHUNK_SIZE]);
-        let root_children = (
-            zeros_chunk_hash,
-            hash(&[0u8; CHUNK_SIZE * 2]),
-        );
+        let root_children = (zeros_chunk_hash, hash(&[0u8; CHUNK_SIZE * 2]));
         assert_eq!(root._get_children().unwrap().0.get_hash(), &root_children.0);
         assert_eq!(root._get_children().unwrap().1.get_hash(), &root_children.1);
 

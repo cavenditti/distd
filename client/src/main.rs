@@ -9,6 +9,8 @@ use tokio::io::{self, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 use hyper_util::rt::TokioIo;
 
+pub mod client;
+pub mod server;
 
 // A simple type alias so as to DRY.
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::metadata::Item;
+use crate::item::Item;
 use crate::unique_name::UniqueName;
 use crate::msgpack::MsgPackSerializable;
 

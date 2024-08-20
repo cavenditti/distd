@@ -3,7 +3,7 @@ use core::panic;
 use blake3::{Hash, Hasher};
 use bytes::Bytes;
 
-use crate::metadata::CHUNK_SIZE;
+use crate::chunks::CHUNK_SIZE;
 
 pub fn merge_hashes(left: &Hash, right: &Hash) -> Hash {
     let mut combined_hashes = left.as_bytes().to_vec();

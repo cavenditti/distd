@@ -1,6 +1,8 @@
+use axum::body::Body;
 use blake3::Hash;
+use distd_core::chunks::OwnedHashTreeNode;
 use distd_core::utils::serde::empty_string_as_none;
-use distd_core::{metadata::ItemName, version::Version};
+use distd_core::{item::ItemName, version::Version};
 use serde::{Deserialize, Serialize};
 use std::{net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc};
 use uuid::Uuid;
@@ -215,6 +217,31 @@ where
     Ok(Json(server.storage.get(&hash)))
 }
 
+use bitcode;
+
+/// Download data associated with an hash-tree from its root
+async fn get_transfer<T>(
+    Path(hash): Path<String>,
+    State(server): State<Server<T>>,
+) -> Result<impl IntoResponse, StatusCode>
+where
+    T: ChunkStorage + Sync + Send + Clone + Default,
+{
+    let hash = Hash::from_str(hash.as_str()).map_err(|_| StatusCode::BAD_REQUEST)?;
+    server
+        .storage
+        .get(&hash)
+        .ok_or_else(|| StatusCode::NOT_FOUND)
+        .and_then(|stored_chunk_ref| {
+            Some(OwnedHashTreeNode::from((*stored_chunk_ref).clone()))
+                .ok_or_else(|| StatusCode::INTERNAL_SERVER_ERROR)
+        })
+        .and_then(|packed| {
+            bitcode::serialize(&packed).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        })
+        .and_then(|x| Ok(Body::from(x)))
+}
+
 pub fn make_app<T>(server: RawServer<T>) -> IntoMakeServiceWithConnectInfo<Router, SocketAddr>
 where
     T: ChunkStorage + Sync + Send + Clone + Default + 'static,
@@ -229,6 +256,7 @@ where
         .route("/chunks", get(get_chunks))
         .route("/chunks/size-sum", get(get_chunks_size_sum))
         .route("/chunks/get/:hash", get(get_chunk))
+        .route("/transfer/:hash", get(get_transfer))
         .route("/feeds", get(get_feeds))
         .route("/feeds/:feed_name", get(get_one_feed))
         .with_state(Arc::new(server))

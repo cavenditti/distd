@@ -22,6 +22,7 @@ blake3 = { workspace = true }
 
 serde = { workspace = true }
 rmp-serde = { workspace = true }
+bitcode = { workspace = true }
 uuid = { workspace = true }
 percent-encoding = { workspace = true }
 

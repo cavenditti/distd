@@ -11,14 +11,19 @@ tokio = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 http-body-util = { workspace = true }
+hyper-rustls = { version = "0.27.2" }
 
 anyhow = { workspace = true }
 
 clap = { workspace = true }
 
 rustls = { workspace = true }
+ring = { workspace = true }
 blake3 = { workspace = true }
- 
+
 serde = { workspace = true }
 uuid = { workspace = true }
 percent-encoding = { workspace = true }
+bitcode = { workspace = true }
+
+distd_core = { path = "../core" }

@@ -39,7 +39,8 @@ impl std::str::FromStr for Version {
     type Err = ParseVersionError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let v: Result<Vec<u16>, ParseVersionError> = s.strip_prefix("distd ")
+        let v: Result<Vec<u16>, ParseVersionError> = s
+            .strip_prefix("distd ")
             .ok_or(ParseVersionError)?
             .split('.')
             .map(|frag| u16::from_str(frag).map_err(|_| ParseVersionError))
@@ -47,13 +48,19 @@ impl std::str::FromStr for Version {
         let v = v?;
         if v.len() != 3 {
             Err(ParseVersionError)
-        }  else {
+        } else {
             Ok(Version {
-                major:v[0],
-                minor:v[1],
-                patch:v[2],
+                major: v[0],
+                minor: v[1],
+                patch: v[2],
             })
         }
+    }
+}
+
+impl Default for Version {
+    fn default() -> Self {
+        *VERSION
     }
 }
 

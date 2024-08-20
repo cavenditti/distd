@@ -8,7 +8,7 @@
 
 pub mod version;
 pub mod hash;
-pub mod metadata;
+pub mod chunks;
 pub mod chunk_storage;
 pub mod unique_name;
 pub mod feed;
@@ -16,5 +16,7 @@ pub mod net;
 pub mod msgpack;
 pub mod peer;
 pub mod utils;
+pub mod metadata;
+pub mod item;
 
 pub mod benchmarks;
