@@ -1,15 +1,14 @@
-#![deny(warnings)]
+//#![deny(warnings)]
 #![warn(rust_2018_idioms)]
 use std::env;
 
-use hyper::body::Bytes;
 use http_body_util::{BodyExt, Empty};
+use hyper::body::Bytes;
 use hyper::Request;
 use tokio::io::{self, AsyncWriteExt as _};
-use tokio::net::TcpStream;
-use hyper_util::rt::TokioIo;
 
 pub mod client;
+pub mod connection;
 pub mod server;
 
 // A simple type alias so as to DRY.
@@ -46,29 +45,11 @@ async fn main() -> Result<()> {
 }
 
 async fn fetch_url(url: hyper::Uri, method: String) -> Result<()> {
-    let host = url.host().expect("uri has no host");
-    let port = url.port_u16().unwrap_or(80);
-    let addr = format!("{}:{}", host, port);
-    let stream = TcpStream::connect(addr).await?;
-    let io = TokioIo::new(stream);
-
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
-    tokio::task::spawn(async move {
-        if let Err(err) = conn.await {
-            println!("Connection failed: {:?}", err);
-        }
-    });
-
-    let authority = url.authority().unwrap().clone();
+    let mut client = client::Client::new(url.clone(), &[0u8; 32]).await;
+    println!("{:?}", client.server.metadata);
 
     let path = url.path();
-    let req = Request::builder()
-        .method(method.as_str())
-        .uri(path)
-        .header(hyper::header::HOST, authority.as_str())
-        .body(Empty::<Bytes>::new())?;
-
-    let mut res = sender.send_request(req).await?;
+    let mut res = client.server.send_request(&method, path).await.unwrap();
 
     println!("Response: {}", res.status());
     println!("Headers: {:#?}\n", res.headers());
@@ -78,7 +59,7 @@ async fn fetch_url(url: hyper::Uri, method: String) -> Result<()> {
     while let Some(next) = res.frame().await {
         let frame = next?;
         if let Some(chunk) = frame.data_ref() {
-            io::stdout().write_all(&chunk).await?;
+            io::stdout().write_all(chunk).await?;
         }
     }
 

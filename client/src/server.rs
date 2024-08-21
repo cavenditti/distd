@@ -1,16 +1,19 @@
 //use std::{net::SocketAddr
 use std::{sync::RwLock, time::Instant};
+use anyhow::Error;
 
 use http_body_util::{BodyExt, Empty};
 use hyper::{
     body::{Buf, Bytes, Incoming},
-    client::conn::http2::SendRequest,
+    client::conn::http1::SendRequest,
     Request, Response,
 };
 
-use ring::agreement::PublicKey;
+//use ring::agreement::PublicKey;
 
 use distd_core::metadata::ServerMetadata;
+
+use crate::connection;
 
 /// Server representation used by clients
 pub struct Server {
@@ -18,70 +21,117 @@ pub struct Server {
 
     // server address
     //pub addr: SocketAddr,
-    // server url
-    pub addr: hyper::Uri,
-    // server Ed25519 public key
+    /// server url
+    pub url: hyper::Uri,
+
+    /// server Ed25519 public key
     pub pub_key: [u8; 32], // TODO Check this
-    // global server metadata
+
+    /// global server metadata
     pub metadata: RwLock<ServerMetadata>,
-    // last time metadata was fetched from server
+
+    /// last time metadata was fetched from server
     pub last_update: Instant,
+
+    /// sender for REST requests to server
+    pub sender: SendRequest<Empty<Bytes>>,
 }
 
 impl Server {
-    async fn send_request(
-        addr: hyper::Uri,
-        mut sender: SendRequest<Empty<Bytes>>,
-    ) -> Result<impl Buf, anyhow::Error> {
+    async fn _send_request(
+        url: hyper::Uri,
+        sender: &mut SendRequest<Empty<Bytes>>,
+        method: &str,
+    ) -> Result<Response<Incoming>, Error> {
         // Prepare request
         let req = Request::builder()
-            .uri(addr.clone())
-            .header(hyper::header::HOST, addr.authority().unwrap().as_str())
+            .uri(url.clone())
+            .method(method)
+            .header(hyper::header::HOST, url.authority().unwrap().as_str())
             .body(Empty::<Bytes>::new())
-            .map_err(|_| anyhow::Error::msg("Cannot build request body"))?;
+            .map_err(|_| Error::msg("Cannot build request body"))?;
 
         // Fetch from url
         let res = sender
             .send_request(req)
             .await
-            .map_err(|_| anyhow::Error::msg("Cannot complete request"))?;
+            .map_err(|_| Error::msg("Cannot complete request"))?;
+
+        Ok(res)
+    }
+
+    async fn _send_and_collect_request(
+        url: hyper::Uri,
+        sender: &mut SendRequest<Empty<Bytes>>,
+        method: &str,
+    ) -> Result<impl Buf, Error> {
+        // make request
+        let res = Self::_send_request(url, sender, method).await?;
 
         // asynchronously aggregate the chunks of the body
         let body = res
             .collect()
             .await
-            .map_err(|_| anyhow::Error::msg("Cannot collect response"))?
+            .map_err(|_| Error::msg("Cannot collect response"))?
             .aggregate();
 
-        // try to deserialize ServerMetadata from body
         Ok(body)
     }
 
-    async fn fetch(&self, sender: SendRequest<Empty<Bytes>>) -> Result<(), anyhow::Error> {
+    fn make_uri(&self, path_and_query: &str) -> Result<hyper::Uri, Error> {
+        hyper::Uri::builder()
+            .scheme(self.url.scheme().unwrap().clone())
+            .authority(self.url.authority().unwrap().clone())
+            .path_and_query(path_and_query)
+            .build()
+            .map_err(Error::msg)
+    }
+
+    pub async fn send_request(
+        &mut self,
+        method: &str,
+        path: &str,
+    ) -> Result<Response<Incoming>, Error> {
+        Self::_send_request(self.make_uri(path)?, &mut self.sender, method).await
+    }
+
+    async fn fetch(&mut self) -> Result<(), Error> {
         let mut metadata = self.metadata.write().unwrap(); //FIXME
 
-        let body = Self::send_request(self.addr.clone(), sender).await?;
+        let body = Self::_send_and_collect_request(
+            self.make_uri("/transfer/metadata")?,
+            &mut self.sender,
+            "GET",
+        )
+        .await?;
         let buf = body.chunk();
 
         // try to deserialize ServerMetadata from body
-        let new_metadata = bitcode::deserialize(buf).map_err(|e| anyhow::Error::msg(e))?;
+        let new_metadata = bitcode::deserialize(buf).map_err(Error::msg)?;
 
         *metadata = new_metadata;
         Ok(())
     }
 
     pub async fn new(
-        addr: hyper::Uri,
-        sender: SendRequest<Empty<Bytes>>,
-        pub_key: &PublicKey,
-    ) -> Result<Self, anyhow::Error> {
-        let server = Self {
+        url: hyper::Uri,
+        //pub_key: &PublicKey,
+        pub_key: &[u8; 32],
+    ) -> Result<Self, Error> {
+        // Uri values are not going to change so we'll check them now and then just unwrap
+        assert!(url.scheme().is_some());
+        assert!(url.authority().is_some());
+
+        let sender = connection::make_connection(url.clone()).await?;
+
+        let mut server = Self {
             pub_key: pub_key.as_ref().try_into().unwrap(), // FIXME
-            addr,
+            url,
             metadata: RwLock::new(ServerMetadata::default()),
+            sender,
             last_update: Instant::now(),
         };
-        server.fetch(sender).await?;
+        server.fetch().await?;
         Ok(server)
     }
 }
