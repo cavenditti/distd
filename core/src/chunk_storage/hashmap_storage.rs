@@ -25,7 +25,7 @@ impl ChunkStorage for HashMapStorage {
         if let Ok(mut data) = self.data.write() {
             //println!("Chunk: {:?}", &chunk);
             let size: u32 = chunk.len().try_into().unwrap(); // FIXME unwrap
-            let hash = blake3::hash(&chunk);
+            let hash = blake3::hash(chunk);
             println!("[StorageInsert] Hash: {}, size: {}", hash, size);
             if let Some(raw_chunk) = data.get(&hash.clone()) {
                 return Some(raw_chunk.clone());
@@ -85,7 +85,7 @@ impl ChunkStorage for HashMapStorage {
 
 #[cfg(test)]
 mod tests {
-    use crate::{hash::hash, metadata::CHUNK_SIZE};
+    use crate::{hash::hash, chunks::CHUNK_SIZE};
 
     use super::*;
     use bytes::Bytes;

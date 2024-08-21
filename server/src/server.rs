@@ -20,7 +20,7 @@ use uuid::Uuid;
 use crate::client::{Client, ClientName};
 use crate::error::ServerError;
 use distd_core::feed::{Feed, FeedName};
-use distd_core::version::{Version, VERSION};
+use distd_core::version::Version;
 
 /// distd Server
 ///
@@ -34,16 +34,14 @@ where
     uuid_nonce: String,       // needs server restart to be changed
     // global server metadata
     pub global_metadata: RwLock<ServerMetadata>,
+    // A storage implementing ChunkStorage, basically a key-value database of some sort
+    pub storage: T,
     // Feed map
     pub feeds: RwLock<HashMap<FeedName, Feed>>,
     // Client map
     pub clients: RwLock<BTreeMap<Uuid, Client>>,
-    // A storage implementing ChunkStorage, basically a key-value database of some sort
-    pub storage: T,
     // Map associating each item name with its metadata (including chunk hashes)
     pub item_map: RwLock<HashMap<ItemName, Item>>,
-    // server version
-    pub version: Version,
 }
 
 impl<T> Default for Server<T>
@@ -68,7 +66,6 @@ where
             clients: RwLock::new(BTreeMap::<Uuid, Client>::new()),
             storage: T::default(),
             item_map: RwLock::new(HashMap::<ItemName, Item>::new()),
-            version: *VERSION,
         }
     }
 }
@@ -96,7 +93,6 @@ where
             clients: RwLock::new(BTreeMap::<Uuid, Client>::new()), // TODO save and reload from disk
             storage: T::default(),
             item_map: RwLock::new(HashMap::<ItemName, Item>::new()),
-            version: *VERSION,
         })
     }
 
@@ -107,7 +103,7 @@ where
         version: Option<Version>,
     ) -> Result<Uuid, RegisterError> {
         let nonced_name = name.clone() + &self.uuid_nonce;
-        let uuid = Uuid::new_v5(&Uuid::NAMESPACE_URL, &nonced_name.as_bytes());
+        let uuid = Uuid::new_v5(&Uuid::NAMESPACE_URL, nonced_name.as_bytes());
         let client = Client {
             addr,
             name,
@@ -148,7 +144,7 @@ where
             file,
             self.storage.clone(),
         )
-        .map_err(|e| ServerError::ChunkInsertError(e))
+        .map_err(ServerError::ChunkInsertError)
         .and_then(|i| {
             self.item_map
                 .write()

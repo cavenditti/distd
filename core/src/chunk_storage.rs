@@ -60,7 +60,7 @@ impl Serialize for StoredChunkRef {
                     let mut state =
                         serializer.serialize_struct_variant("StoredChunkRef", 0, "Stored", 2)?;
                     state.serialize_field("hash", &hash.to_string())?;
-                    state.serialize_field("data", &BASE64_STANDARD.encode(&*data.as_ref()))?;
+                    state.serialize_field("data", &BASE64_STANDARD.encode(data.as_ref()))?;
                     state.end()
                 }
             }
@@ -108,7 +108,7 @@ impl From<StoredChunkRef> for OwnedHashTreeNode {
 impl StoredChunkRef {
     pub fn get_hash(&self) -> &Hash {
         match self {
-            Self::Stored { hash, .. } => &hash,
+            Self::Stored { hash, .. } => hash,
             Self::Parent { hash, .. } => hash,
         }
     }
@@ -195,7 +195,7 @@ impl StoredChunkRef {
             Self::Stored { hash, .. } => HashSet::from([*hash]),
             Self::Parent { left, right, .. } => {
                 let left_vec = left.hashes();
-                left_vec.union(&right.hashes()).map(|x| *x).collect()
+                left_vec.union(&right.hashes()).copied().collect()
             }
         }
     }
@@ -207,7 +207,7 @@ impl StoredChunkRef {
             Self::Parent { hash, left, right } => {
                 let mut left_vec = left.all_hashes();
                 left_vec.insert(*hash);
-                left_vec.union(&right.all_hashes()).map(|x| *x).collect()
+                left_vec.union(&right.all_hashes()).copied().collect()
             }
         }
     }
@@ -223,7 +223,7 @@ impl StoredChunkRef {
                 let left_vec = left.hashes_with_sizes();
                 left_vec
                     .union(&right.hashes_with_sizes())
-                    .map(|x| *x)
+                    .copied()
                     .collect()
             }
         }
@@ -244,7 +244,7 @@ impl StoredChunkRef {
                 });
                 left_vec
                     .union(&right.hashes_with_sizes())
-                    .map(|x| *x)
+                    .copied()
                     .collect()
             }
         }
@@ -333,7 +333,7 @@ pub trait ChunkStorage {
                 slices.len(),
                 slices.iter().map(|x| x.len()).collect::<Vec<usize>>()
             );
-            let x = match slices.len() {
+            match slices.len() {
                 0 => None,
                 1 => storage.insert_chunk(slices[0]),
                 /*
@@ -346,13 +346,12 @@ pub trait ChunkStorage {
                     partial_tree(storage, &slices[..slices.len() / 2])?,
                     partial_tree(storage, &slices[slices.len() / 2..])?,
                 ),
-            };
-            x
+            }
         }
 
         let (chunks, remainder) = data.as_chunks::<CHUNK_SIZE>();
         let mut slices = chunks.iter().map(|x| x.as_ref()).collect::<Vec<&[u8]>>(); // FIXME is this zero copy?
-        if remainder.len() != 0 {
+        if !remainder.is_empty() {
             slices.push(remainder);
         }
         partial_tree(self, slices.as_slice())

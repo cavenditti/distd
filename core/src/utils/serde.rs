@@ -44,17 +44,17 @@ pub mod hashes {
         }
     }
 
-    pub fn serialize_hash_vec<S>(v: &Vec<Hash>, serializer: S) -> Result<S::Ok, S::Error>
+    pub fn serialize_hash_vec<S>(v: &[Hash], serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
         if serializer.is_human_readable() {
-            v.into_iter()
+            v.iter()
                 .map(|e| e.to_string())
                 .collect::<Vec<String>>()
                 .serialize(serializer)
         } else {
-            v.into_iter()
+            v.iter()
                 .map(|e| *e.as_bytes())
                 .collect::<Vec<[u8; 32]>>()
                 .serialize(serializer)
@@ -68,13 +68,12 @@ pub mod hashes {
         if deserializer.is_human_readable() {
             let s: Vec<String> = Deserialize::deserialize(deserializer)?;
             Ok(s.into_iter()
-                .map(|e| blake3::Hash::from_str(&e))
-                .flatten()
+                .flat_map(|e| blake3::Hash::from_str(&e))
                 .collect::<Vec<Hash>>())
         } else {
             let s: Vec<[u8; 32]> = Deserialize::deserialize(deserializer)?;
             Ok(s.into_iter()
-                .map(|e| blake3::Hash::from_bytes(e))
+                .map(blake3::Hash::from_bytes)
                 .collect::<Vec<Hash>>())
         }
     }
@@ -128,7 +127,7 @@ pub mod opt_hash_struct {
                 })
                 .transpose()
         } else {
-            Option::<[u8; 32]>::deserialize(deserializer).map(|x| x.map(|x| Hash::from_bytes(x)))
+            Option::<[u8; 32]>::deserialize(deserializer).map(|x| x.map(Hash::from_bytes))
         }
     }
 

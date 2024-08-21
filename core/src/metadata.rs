@@ -1,4 +1,5 @@
-///! Common metadata exchanged between server and client
+//! Common metadata exchanged between server and client
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 

@@ -74,7 +74,7 @@ pub fn hash(data: &[u8]) -> Hash {
 
     let (chunks, remainder) = data.as_chunks::<CHUNK_SIZE>();
     let mut slices = chunks.iter().map(|x| x.as_ref()).collect::<Vec<&[u8]>>(); // FIXME is this zero copy?
-    if remainder.len() != 0 {
+    if !remainder.is_empty() {
         slices.push(remainder);
     }
     partial_tree(slices.as_slice())

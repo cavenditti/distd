@@ -1,19 +1,22 @@
-use axum::body::Body;
-use blake3::Hash;
-use distd_core::chunks::OwnedHashTreeNode;
-use distd_core::utils::serde::empty_string_as_none;
-use distd_core::{item::ItemName, version::Version};
-use serde::{Deserialize, Serialize};
 use std::{net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc};
+
+use bitcode;
+use blake3::Hash;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use axum::{
+    body::Body,
     extract::{connect_info::IntoMakeServiceWithConnectInfo, ConnectInfo, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
+
+use distd_core::chunks::OwnedHashTreeNode;
+use distd_core::utils::serde::empty_string_as_none;
+use distd_core::{item::ItemName, version::Version};
 
 use crate::FeedName;
 use crate::Server as RawServer;
@@ -73,8 +76,8 @@ where
     Uuid::from_str(&uuid)
         .ok()
         .and_then(|uuid| server.clients.read().unwrap().get(&uuid).cloned())
-        .ok_or_else(|| StatusCode::NOT_FOUND)
-        .map(|client| Json(client))
+        .ok_or(StatusCode::NOT_FOUND)
+        .map(Json)
 }
 
 async fn get_chunks<T>(State(server): State<Server<T>>) -> impl IntoResponse
@@ -109,7 +112,6 @@ where
             .read()
             .unwrap()
             .values()
-            .into_iter()
             .cloned()
             .collect::<Vec<Feed>>(),
     )
@@ -140,7 +142,7 @@ where
         .unwrap()
         .get(&name)
         .cloned()
-        .map(|x| Json(x))
+        .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
 }
 
@@ -178,14 +180,9 @@ where
             item_data.description,
             field.bytes().await.map_err(|_| StatusCode::BAD_REQUEST)?,
         );
-        let res = res.or_else(|e| {
-            println!("ERROR: {}", e.to_string());
-            Err(e)
-        });
+        let res = res.inspect_err(|e| println!("ERROR: {}", e));
         println!("RESULT: {:?}", res);
-        return res
-            .map(|item| Json(item))
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+        return res.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
     }
     Err(StatusCode::BAD_REQUEST)
 }
@@ -203,7 +200,7 @@ where
         .unwrap()
         .get(&feed_name)
         .map(|feed| Json(feed.clone()))
-        .ok_or_else(|| StatusCode::NOT_FOUND)
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 async fn get_chunk<T>(
@@ -217,8 +214,6 @@ where
     Ok(Json(server.storage.get(&hash)))
 }
 
-use bitcode;
-
 /// Download data associated with an hash-tree from its root
 async fn get_transfer<T>(
     Path(hash): Path<String>,
@@ -231,15 +226,26 @@ where
     server
         .storage
         .get(&hash)
-        .ok_or_else(|| StatusCode::NOT_FOUND)
+        .ok_or(StatusCode::NOT_FOUND)
         .and_then(|stored_chunk_ref| {
             Some(OwnedHashTreeNode::from((*stored_chunk_ref).clone()))
-                .ok_or_else(|| StatusCode::INTERNAL_SERVER_ERROR)
+                .ok_or(StatusCode::INTERNAL_SERVER_ERROR)
         })
         .and_then(|packed| {
             bitcode::serialize(&packed).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
         })
-        .and_then(|x| Ok(Body::from(x)))
+        .map(Body::from)
+}
+
+/// Download data associated with an hash-tree from its root
+async fn get_metadata<T>(State(server): State<Server<T>>) -> Result<impl IntoResponse, StatusCode>
+where
+    T: ChunkStorage + Sync + Send + Clone + Default,
+{
+    let metadata = (*server.global_metadata.read().unwrap()).clone();
+    bitcode::serialize(&metadata)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map(Body::from)
 }
 
 pub fn make_app<T>(server: RawServer<T>) -> IntoMakeServiceWithConnectInfo<Router, SocketAddr>
@@ -256,9 +262,11 @@ where
         .route("/chunks", get(get_chunks))
         .route("/chunks/size-sum", get(get_chunks_size_sum))
         .route("/chunks/get/:hash", get(get_chunk))
-        .route("/transfer/:hash", get(get_transfer))
         .route("/feeds", get(get_feeds))
         .route("/feeds/:feed_name", get(get_one_feed))
+        // 'transfer' routes return binary bitcode serialized bodies
+        .route("/transfer/metadata", get(get_metadata))
+        .route("/transfer/:hash", get(get_transfer))
         .with_state(Arc::new(server))
         .into_make_service_with_connect_info::<SocketAddr>()
 }
