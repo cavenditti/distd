@@ -338,7 +338,7 @@ pub trait ChunkStorage {
                 slices.iter().map(|x| x.len()).collect::<Vec<usize>>()
             );
             match slices.len() {
-                0 => None,
+                0 => storage.insert_chunk(b""), // Transparently andle empty files too
                 1 => storage.insert_chunk(slices[0]),
                 /*
                                  _ => storage.link(
