@@ -274,14 +274,18 @@ impl TreeItem for StoredChunkRef {
         match self {
             Self::Parent { .. } => write!(f, "{}", style.paint(self.get_hash())),
             Self::Stored { .. } => {
-                let mut leaf_style = Style::default();
-                leaf_style.bold = true;
-                leaf_style.background = Some(Color::White);
-                leaf_style.foreground = Some(Color::Black);
+                let leaf_style = Style {
+                    bold: true,
+                    background: Some(Color::White),
+                    foreground: Some(Color::Black),
+                    ..Default::default()
+                };
 
-                let mut size_style = Style::default();
-                size_style.bold = true;
-                size_style.foreground = Some(Color::Red);
+                let size_style = Style {
+                    bold: true,
+                    foreground: Some(Color::Red),
+                    ..Default::default()
+                };
 
                 write!(
                     f,
