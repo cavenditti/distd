@@ -10,16 +10,19 @@ use axum::{
     extract::{connect_info::IntoMakeServiceWithConnectInfo, ConnectInfo, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, post},
-    Json, Router,
+    routing::get, //, post},
+    Json,
+    Router,
 };
 
-use distd_core::chunks::OwnedHashTreeNode;
 use distd_core::utils::serde::empty_string_as_none;
+use distd_core::{
+    chunks::OwnedHashTreeNode, metadata::ServerMetadata, utils::serde::bitcode::BitcodeSerializable,
+};
 use distd_core::{item::ItemName, version::Version};
 
-use crate::FeedName;
 use crate::Server as RawServer;
+use crate::{error::ServerError, FeedName};
 
 type Server<T> = Arc<RawServer<T>>;
 
@@ -102,19 +105,16 @@ where
 }
 
 use crate::Feed;
-async fn get_feeds<T>(State(server): State<Server<T>>) -> impl IntoResponse
+async fn get_feeds<T>(State(server): State<Server<T>>) -> Result<impl IntoResponse, StatusCode>
 where
     T: ChunkStorage + Sync + Send + Clone + Default,
 {
-    Json(
-        server
-            .feeds
-            .read()
-            .unwrap()
-            .values()
-            .cloned()
-            .collect::<Vec<Feed>>(),
-    )
+    server
+        .metadata
+        .read()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map(|metadata| metadata.feeds.values().cloned().collect::<Vec<Feed>>())
+        .map(Json)
 }
 
 async fn get_items<T>(State(server): State<Server<T>>) -> Result<impl IntoResponse, StatusCode>
@@ -122,11 +122,10 @@ where
     T: ChunkStorage + Sync + Send + Clone + Default,
 {
     server
-        .item_map
+        .metadata
         .read()
-        .map(|x| Json(x.keys().cloned().collect::<Vec<String>>()))
-        .ok()
-        .ok_or(StatusCode::NOT_FOUND)
+        .map(|x| Json(x.items.keys().cloned().collect::<Vec<String>>()))
+        .map_err(|_| StatusCode::NOT_FOUND)
 }
 
 async fn get_one_item<T>(
@@ -137,13 +136,11 @@ where
     T: ChunkStorage + Sync + Send + Clone + Default,
 {
     server
-        .item_map
+        .metadata
         .read()
-        .unwrap()
-        .get(&name)
-        .cloned()
+        .map(|metadata| metadata.items.get(&name).cloned())
         .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 #[derive(Deserialize, Serialize)]
@@ -180,27 +177,29 @@ where
             item_data.description,
             field.bytes().await.map_err(|_| StatusCode::BAD_REQUEST)?,
         );
-        let res = res.inspect_err(|e| println!("ERROR: {}", e));
-        println!("RESULT: {:?}", res);
-        return res.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+        let res = res.map(|x| x.metadata);
+        println!("RESULT: ERR {:?}", res);
+        return res.map(Json).map_err(|e| match e {
+            ServerError::ItemInsertionError(..) => StatusCode::NOT_IMPLEMENTED,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        });
     }
     Err(StatusCode::BAD_REQUEST)
 }
 
 async fn get_one_feed<T>(
-    Path(feed_name): Path<FeedName>,
+    Path(name): Path<FeedName>,
     State(server): State<Server<T>>,
 ) -> Result<impl IntoResponse, StatusCode>
 where
     T: ChunkStorage + Sync + Send + Clone + Default,
 {
     server
-        .feeds
+        .metadata
         .read()
-        .unwrap()
-        .get(&feed_name)
-        .map(|feed| Json(feed.clone()))
-        .ok_or(StatusCode::NOT_FOUND)
+        .map(|metadata| metadata.feeds.get(&name).cloned())
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 async fn get_chunk<T>(
@@ -242,8 +241,9 @@ async fn get_metadata<T>(State(server): State<Server<T>>) -> Result<impl IntoRes
 where
     T: ChunkStorage + Sync + Send + Clone + Default,
 {
-    let metadata = (*server.global_metadata.read().unwrap()).clone();
-    bitcode::serialize(&metadata)
+    let metadata = (*server.metadata.read().unwrap()).clone();
+    ServerMetadata::from(metadata)
+        .to_bitcode()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
         .map(Body::from)
 }

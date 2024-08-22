@@ -36,7 +36,7 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 
 use crate::chunks::ChunkInfo;
-use crate::utils::serde::bitcode::BitcodeSerializable;
+use crate::metadata::ItemMetadata;
 use crate::{chunk_storage::ChunkStorage, unique_name::UniqueName};
 
 pub type ItemName = UniqueName;
@@ -55,31 +55,12 @@ pub enum ItemFormat {
 /// name and descprition length).
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct Item {
-    /// Name of the Item
-    pub name: ItemName,
-    /// Optional description, a generic String
-    pub description: Option<String>,
-    /// Incremental number of the file revision
-    pub revision: u32,
-    /// Path of the file (it may change among revisions?)
-    pub path: PathBuf,
-    // /// Size in bytes of each chunk
-    //pub chunk_size: usize,
+    /// General metadata of the Item
+    pub metadata: ItemMetadata,
     /// BLAKE3 hashes of the chunks
     pub chunks: Vec<ChunkInfo>,
     /// BLAKE3 hashes of any hash subtree
     pub hashes: HashSet<ChunkInfo>,
-    /// BLAKE3 root hash of the file
-    pub root: ChunkInfo,
-    // Should be something like this: allowing for content-addressable chunking
-    //pub chunks: HashMap<PathBuf, (usize, usize, Vec<Hash>)>,
-    /// Creation SystemTime
-    pub created: SystemTime,
-    /// Version used to create the Item (same as the output of env!("CARGO_PKG_VERSION") on the creator.
-    pub created_by: String,
-    /// format used
-    pub format: ItemFormat,
-    //signature: Signature,
 }
 
 impl Item {
@@ -93,18 +74,21 @@ impl Item {
     ) -> Result<Self, std::io::Error> {
         let hash_tree = storage.insert(file).unwrap();
 
+        let now = SystemTime::now();
         Ok(Self {
-            name,
-            description,
-            revision,
-            path,
-            //chunk_size: CHUNK_SIZE,
+            metadata: ItemMetadata {
+                name,
+                description,
+                revision,
+                path,
+                root: hash_tree.get_chunk_info(),
+                created: now,
+                updated: now,
+                created_by: env!("CARGO_PKG_VERSION").to_owned(),
+                format: ItemFormat::V1,
+            },
             chunks: hash_tree.flatten_with_sizes(),
-            root: hash_tree.get_chunk_info(),
             hashes: hash_tree.all_hashes_with_sizes(),
-            created: SystemTime::now(),
-            created_by: env!("CARGO_PKG_VERSION").to_owned(),
-            format: ItemFormat::V1,
         })
     }
 
@@ -115,34 +99,57 @@ impl Item {
     }
 }
 
-impl<'a> BitcodeSerializable<'a, Item> for Item {}
-
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
     use std::mem;
+    use std::str::FromStr;
 
     use crate::chunk_storage::hashmap_storage::HashMapStorage;
+    use crate::utils::serde::bitcode::BitcodeSerializable;
 
     use super::*;
 
     #[test]
     fn test_item_size() {
-        let storage = HashMapStorage::default();
-        let item = Item::new(
-            "name".to_string(),
-            PathBuf::from_str("/some/path").unwrap(),
-            0,
-            None,
-            Bytes::from_static(b""),
-            storage,
-        ).unwrap();
-        println!("In-memory size of item:       {}", mem::size_of::<Item>());
+        println!("In-memory size of Item:         {}", mem::size_of::<Item>());
+        println!("In-memory size of ItemMetadata: {}", mem::size_of::<ItemMetadata>());
+        {
+            let storage = HashMapStorage::default();
+            let item = Item::new(
+                "name".to_string(),
+                PathBuf::from_str("/some/path").unwrap(),
+                0,
+                None,
+                Bytes::from_static(b""),
+                storage,
+            )
+            .unwrap();
 
-        let serialized = item.clone().to_bitcode().unwrap();
-        println!("Serialized size of bare item: {}", serialized.len());
+            let serialized = item.clone().metadata.to_bitcode().unwrap();
+            println!("Small Item serialized size: {}", serialized.len());
 
-        let new_item = Item::from_bitcode(&serialized).unwrap();
-        assert_eq!(item, new_item);
+            let new_metadata = ItemMetadata::from_bitcode(&serialized).unwrap();
+            assert_eq!(item.metadata, new_metadata);
+        }
+
+        {
+            // Same as above but with a larger one
+            let storage = HashMapStorage::default();
+            let item = Item::new(
+                "name".to_string(),
+                PathBuf::from_str("/some/path").unwrap(),
+                0,
+                Some("Some description for the larger item".to_string()),
+                Bytes::from_static(&[0u8; 100_000_000]),
+                storage,
+            )
+            .unwrap();
+
+            let serialized = item.clone().metadata.to_bitcode().unwrap();
+            println!("Small Item serialized size: {}", serialized.len());
+
+            let new_metadata = ItemMetadata::from_bitcode(&serialized).unwrap();
+            assert_eq!(item.metadata, new_metadata);
+        }
     }
 }

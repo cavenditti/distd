@@ -54,12 +54,14 @@ pub fn hash(input_data: &[u8]) -> Hash {
 /// Hashing function. Uses BLAKE3 but without Subtree-freeness
 pub fn hash(data: &[u8]) -> Hash {
     fn partial_tree(slices: &[&[u8]]) -> Hash {
+        /*
         println!(
             "[HASH-NE] {}, {:?}",
             slices.len(),
             slices.iter().map(|x| x.len()).collect::<Vec<usize>>()
         );
-        let x = match slices.len() {
+        */
+        match slices.len() {
             //0 => panic!("Requested hash of empty slice: Should never happen"),
             0 => blake3::hash(b""), // Why it's needed?
             1 => blake3::hash(slices[0]),
@@ -67,9 +69,8 @@ pub fn hash(data: &[u8]) -> Hash {
                 &partial_tree(&slices[..slices.len() / 2]),
                 &partial_tree(&slices[slices.len() / 2..]),
             ),
-        };
-        println!("[HASH-NE] HASH: {}", x);
-        x
+        }
+        //println!("[HASH-NE] HASH: {}", x);
     }
 
     let (chunks, remainder) = data.as_chunks::<CHUNK_SIZE>();

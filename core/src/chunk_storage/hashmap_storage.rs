@@ -24,9 +24,9 @@ impl ChunkStorage for HashMapStorage {
     fn insert_chunk(&self, chunk: &[u8]) -> Option<Arc<StoredChunkRef>> {
         if let Ok(mut data) = self.data.write() {
             //println!("Chunk: {:?}", &chunk);
-            let size: u32 = chunk.len().try_into().unwrap(); // FIXME unwrap
+            //let size: u32 = chunk.len().try_into().unwrap(); // FIXME unwrap
             let hash = blake3::hash(chunk);
-            println!("[StorageInsert] Hash: {}, size: {}", hash, size);
+            //println!("[StorageInsert] Hash: {}, size: {}", hash, size);
             if let Some(raw_chunk) = data.get(&hash.clone()) {
                 return Some(raw_chunk.clone());
             }
@@ -50,12 +50,14 @@ impl ChunkStorage for HashMapStorage {
         right: Arc<StoredChunkRef>,
     ) -> Option<Arc<StoredChunkRef>> {
         let hash = merge_hashes(left.get_hash(), right.get_hash());
+        /*
         println!(
             "[Storage Link ]: {}: {} + {}",
             hash,
             left.get_hash(),
             right.get_hash()
         );
+        */
         if let Ok(mut data) = self.data.write() {
             data.get(&hash).cloned().or(data
                 .try_insert(hash, Arc::new(StoredChunkRef::Parent { hash, left, right }))
@@ -89,7 +91,7 @@ mod tests {
 
     use super::*;
     use bytes::Bytes;
-    use ptree::print_tree;
+    //use ptree::print_tree;
 
     #[test]
     fn test_hms_single_chunk_insertion() {
@@ -106,7 +108,7 @@ mod tests {
         let s = HashMapStorage::default();
         let data = Bytes::from_static(include_bytes!("../../../Cargo.lock"));
         let len = data.len();
-        let root = s.insert(data).unwrap();
+        //let root = s.insert(data).unwrap();
         println!("\nOriginal lenght: {}, stored length: {}", len, s.size());
         //print_tree(&*root.to_owned()).unwrap();
         println!();

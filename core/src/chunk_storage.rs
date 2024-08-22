@@ -332,11 +332,13 @@ pub trait ChunkStorage {
             storage: &dyn ChunkStorage,
             slices: &[&[u8]],
         ) -> Option<Arc<StoredChunkRef>> {
+            /*
             println!(
                 "[StorageChunks] {} {:?}",
                 slices.len(),
                 slices.iter().map(|x| x.len()).collect::<Vec<usize>>()
             );
+            */
             match slices.len() {
                 0 => storage.insert_chunk(b""), // Transparently andle empty files too
                 1 => storage.insert_chunk(slices[0]),

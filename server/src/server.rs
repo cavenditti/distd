@@ -22,6 +22,33 @@ use crate::error::ServerError;
 use distd_core::feed::{Feed, FeedName};
 use distd_core::version::Version;
 
+/// Data structure used internally by server, may be converted to ServerMetadata
+#[derive(Debug, Clone, Default)]
+pub struct ServerInternalMetadata {
+    // TODO
+    // server version
+    pub version: Version,
+    // Feed map
+    pub feeds: HashMap<FeedName, Feed>,
+    // Item map
+    pub items: HashMap<ItemName, Item>,
+}
+
+impl From<ServerInternalMetadata> for ServerMetadata {
+    fn from(value: ServerInternalMetadata) -> Self {
+        Self {
+            version: value.version,
+            feeds: value.feeds,
+            items: HashMap::from_iter(
+                value
+                    .items
+                    .iter()
+                    .map(|x| (x.0.clone(), x.1.metadata.clone())),
+            ),
+        }
+    }
+}
+
 /// distd Server
 ///
 /// Server signature is used to check replicated data among clients when shared p2p,
@@ -33,15 +60,11 @@ where
     key_pair: Ed25519KeyPair, // needs server restart to be changed
     uuid_nonce: String,       // needs server restart to be changed
     // global server metadata
-    pub global_metadata: RwLock<ServerMetadata>,
+    pub metadata: RwLock<ServerInternalMetadata>,
     // A storage implementing ChunkStorage, basically a key-value database of some sort
     pub storage: T,
-    // Feed map
-    pub feeds: RwLock<HashMap<FeedName, Feed>>,
     // Client map
     pub clients: RwLock<BTreeMap<Uuid, Client>>,
-    // Map associating each item name with its metadata (including chunk hashes)
-    pub item_map: RwLock<HashMap<ItemName, Item>>,
 }
 
 impl<T> Default for Server<T>
@@ -61,11 +84,9 @@ where
         Self {
             key_pair,
             uuid_nonce,
-            global_metadata: RwLock::new(ServerMetadata::default()),
-            feeds: RwLock::new(HashMap::<FeedName, Feed>::new()),
+            metadata: RwLock::new(ServerInternalMetadata::default()),
             clients: RwLock::new(BTreeMap::<Uuid, Client>::new()),
             storage: T::default(),
-            item_map: RwLock::new(HashMap::<ItemName, Item>::new()),
         }
     }
 }
@@ -79,20 +100,15 @@ where
 {
     pub fn new(
         pkcs8_bytes: Document,
-        global_metadata: ServerMetadata,
-        feeds: Vec<Feed>,
+        metadata: ServerInternalMetadata,
     ) -> Result<Self, KeyRejected> {
         let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8_bytes.as_ref())?;
         Ok(Self {
             key_pair,
             uuid_nonce: blake3::hash(pkcs8_bytes.as_ref()).to_string(),
-            global_metadata: RwLock::new(global_metadata),
-            feeds: RwLock::new(HashMap::<FeedName, Feed>::from_iter(
-                feeds.into_iter().map(|x| (x.name.clone(), x)),
-            )),
+            metadata: RwLock::new(metadata),
             clients: RwLock::new(BTreeMap::<Uuid, Client>::new()), // TODO save and reload from disk
             storage: T::default(),
-            item_map: RwLock::new(HashMap::<ItemName, Item>::new()),
         })
     }
 
@@ -120,10 +136,16 @@ where
     }
 
     pub fn expose_feed(&self, feed: Feed) -> Result<FeedName, RegisterError> {
-        self.feeds
+        self.metadata
             .write()
             .ok()
-            .and_then(|mut feeds| feeds.try_insert(feed.name.clone(), feed).ok().cloned())
+            .and_then(|mut metadata| {
+                metadata
+                    .feeds
+                    .try_insert(feed.name.clone(), feed)
+                    .ok()
+                    .cloned()
+            })
             .map(|feed| feed.name.clone())
             .ok_or(RegisterError)
     }
@@ -146,10 +168,11 @@ where
         )
         .map_err(ServerError::ChunkInsertError)
         .and_then(|i| {
-            self.item_map
+            self.metadata
                 .write()
                 .map_err(|_e| ServerError::LockError)?
-                .try_insert(i.name.clone(), i)
+                .items
+                .try_insert(i.metadata.name.clone(), i)
                 .map(|item| item.to_owned())
                 .map_err(|e| ServerError::ItemInsertionError(e.entry.key().clone()))
         })
