@@ -45,8 +45,8 @@ async fn main() -> Result<()> {
 }
 
 async fn fetch_url(url: hyper::Uri, method: String) -> Result<()> {
-    let mut client = client::Client::new(url.clone(), &[0u8; 32]).await;
-    println!("{:?}", client.server.metadata);
+    let client = client::Client::new(url.clone(), &[0u8; 32]).await;
+    println!("{:?}", client.server.get_metadata().await);
 
     let path = url.path();
     let mut res = client.server.send_request(&method, path).await.unwrap();
@@ -64,6 +64,14 @@ async fn fetch_url(url: hyper::Uri, method: String) -> Result<()> {
     }
 
     println!("\n\nDone!");
+
+
+    /*
+    tokio::task::spawn(async move {
+        client.server.fetch_loop().await;
+    });
+    */
+    client.server.fetch_loop().await;
 
     Ok(())
 }

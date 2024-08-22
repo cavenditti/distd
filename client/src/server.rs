@@ -1,6 +1,6 @@
 //use std::{net::SocketAddr
 use anyhow::Error;
-use std::time::Instant;
+use std::time::Duration;
 
 use http_body_util::{BodyExt, Empty};
 use hyper::{
@@ -8,13 +8,26 @@ use hyper::{
     client::conn::http1::SendRequest,
     Request, Response,
 };
-use tokio::sync::RwLock;
+use tokio::{sync::RwLock, time::Instant};
 
 //use ring::agreement::PublicKey;
 
 use distd_core::metadata::ServerMetadata;
 
 use crate::connection;
+
+/// Shared server-related data to be kept behind an async lock
+#[derive(Debug)]
+struct SharedServer {
+    /// global server metadata
+    pub metadata: ServerMetadata,
+
+    /// last time metadata was fetched from server
+    pub last_update: Instant,
+
+    /// sender for REST requests to server
+    pub sender: SendRequest<Empty<Bytes>>,
+}
 
 /// Server representation used by clients
 pub struct Server {
@@ -28,14 +41,11 @@ pub struct Server {
     /// server Ed25519 public key
     pub pub_key: [u8; 32], // TODO Check this
 
-    /// global server metadata
-    pub metadata: RwLock<ServerMetadata>,
+    /// Shared data
+    shared: RwLock<SharedServer>,
 
-    /// last time metadata was fetched from server
-    pub last_update: Instant,
-
-    /// sender for REST requests to server
-    pub sender: SendRequest<Empty<Bytes>>,
+    /// Elapsed time between server fetches
+    timeout: Duration,
 }
 
 impl Server {
@@ -88,20 +98,33 @@ impl Server {
             .map_err(Error::msg)
     }
 
+    pub async fn get_metadata(&self) -> ServerMetadata {
+        self.shared.read().await.metadata.clone()
+    }
+
+    pub async fn get_last_update(&self) -> Instant {
+        self.shared.read().await.last_update
+    }
+
     pub async fn send_request(
-        &mut self,
+        &self,
         method: &str,
         path: &str,
     ) -> Result<Response<Incoming>, Error> {
-        Self::_send_request(self.make_uri(path)?, &mut self.sender, method).await
+        Self::_send_request(
+            self.make_uri(path)?,
+            &mut self.shared.write().await.sender,
+            method,
+        )
+        .await
     }
 
-    async fn fetch(&mut self) -> Result<(), Error> {
-        let mut metadata = self.metadata.write().await;
+    async fn fetch(&self) -> Result<(), Error> {
+        let mut shared = self.shared.write().await;
 
         let body = Self::_send_and_collect_request(
             self.make_uri("/transfer/metadata")?,
-            &mut self.sender,
+            &mut shared.sender,
             "GET",
         )
         .await?;
@@ -109,9 +132,25 @@ impl Server {
 
         // try to deserialize ServerMetadata from body
         let new_metadata = bitcode::deserialize(buf).map_err(Error::msg)?;
+        shared.last_update = Instant::now();
 
-        *metadata = new_metadata;
+        if shared.metadata != new_metadata {
+            println!("Metadata changed!");
+            shared.metadata = new_metadata;
+        } else {
+            println!("Metadata didn't change.");
+        }
         Ok(())
+    }
+
+    pub async fn fetch_loop(&self) {
+        loop {
+            tokio::time::sleep(self.timeout).await;
+            if self.fetch().await.is_err() {
+                break;
+            }
+        }
+        panic!("fetch loop failed") // FIXME
     }
 
     pub async fn new(
@@ -124,15 +163,20 @@ impl Server {
         assert!(url.authority().is_some());
 
         let sender = connection::make_connection(url.clone()).await?;
+        let timeout = Duration::new(5, 0); // TODO make this configurable
 
-        let mut server = Self {
+        let server = Self {
             pub_key: pub_key.as_ref().try_into().unwrap(), // FIXME
             url,
-            metadata: RwLock::new(ServerMetadata::default()),
-            sender,
-            last_update: Instant::now(),
+            shared: RwLock::new(SharedServer {
+                metadata: ServerMetadata::default(),
+                sender,
+                last_update: Instant::now(),
+            }),
+            timeout,
         };
         server.fetch().await?;
+
         Ok(server)
     }
 }

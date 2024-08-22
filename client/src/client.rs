@@ -4,6 +4,7 @@ use crate::server::Server;
 pub struct RegisterError;
 
 pub struct Client {
+    /// Associated server
     pub server: Server,
 }
 
