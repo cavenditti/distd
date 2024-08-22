@@ -3,6 +3,9 @@ use blake3::Hash;
 use serde::{de, Deserialize, Deserializer, Serialize};
 use std::{fmt, str::FromStr};
 
+//pub mod msgpack;
+pub mod bitcode;
+
 /// Serde deserialization decorator to map empty Strings to None,
 pub fn empty_string_as_none<'de, D, T>(de: D) -> Result<Option<T>, D::Error>
 where

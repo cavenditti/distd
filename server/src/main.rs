@@ -2,7 +2,6 @@
 
 use distd_core::chunk_storage::hashmap_storage::HashMapStorage;
 use distd_core::chunk_storage::ChunkStorage;
-use distd_core::msgpack::MsgPackSerializable;
 use distd_core::feed::{Feed, FeedName};
 
 use crate::client::Client;
@@ -18,11 +17,6 @@ async fn main() {
     println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
     let server: Server<HashMapStorage> = Server::default();
     let feed = Feed::new("A feed");
-    let buf = feed.to_msgpack().unwrap();
-    println!("Feed is {} bytes", buf.len());
-    let feed = Feed::from_msgpack(buf).unwrap();
-
-    println!("{:?}", feed.name);
     server.expose_feed(feed);
 
     let app = rest_api::make_app(server);

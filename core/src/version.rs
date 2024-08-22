@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 
 /// Version struct used in client-server and peer-peer version checking
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Version {
     major: u16,
     minor: u16,

@@ -36,11 +36,12 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 
 use crate::chunks::ChunkInfo;
-use crate::{chunk_storage::ChunkStorage, msgpack::MsgPackSerializable, unique_name::UniqueName};
+use crate::utils::serde::bitcode::BitcodeSerializable;
+use crate::{chunk_storage::ChunkStorage, unique_name::UniqueName};
 
 pub type ItemName = UniqueName;
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 pub enum ItemFormat {
     V1 = 1,
 }
@@ -52,7 +53,7 @@ pub enum ItemFormat {
 ///
 /// We're assuming this is produced by a non-ill-intended trusted party, and we're not permorming many checks (e.g. on
 /// name and descprition length).
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct Item {
     /// Name of the Item
     pub name: ItemName,
@@ -114,12 +115,34 @@ impl Item {
     }
 }
 
-impl<'a> MsgPackSerializable<'a, Item> for Item {}
+impl<'a> BitcodeSerializable<'a, Item> for Item {}
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+    use std::mem;
+
+    use crate::chunk_storage::hashmap_storage::HashMapStorage;
+
+    use super::*;
+
     #[test]
-    fn test_item_new() {
-        assert!(true)
+    fn test_item_size() {
+        let storage = HashMapStorage::default();
+        let item = Item::new(
+            "name".to_string(),
+            PathBuf::from_str("/some/path").unwrap(),
+            0,
+            None,
+            Bytes::from_static(b""),
+            storage,
+        ).unwrap();
+        println!("In-memory size of item:       {}", mem::size_of::<Item>());
+
+        let serialized = item.clone().to_bitcode().unwrap();
+        println!("Serialized size of bare item: {}", serialized.len());
+
+        let new_item = Item::from_bitcode(&serialized).unwrap();
+        assert_eq!(item, new_item);
     }
 }

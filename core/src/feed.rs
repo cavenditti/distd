@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::item::Item;
 use crate::unique_name::UniqueName;
-use crate::msgpack::MsgPackSerializable;
 
 pub type FeedName = UniqueName;
 
@@ -24,4 +23,26 @@ impl Feed {
     }
 }
 
-impl<'a> MsgPackSerializable<'a, Feed> for Feed {}
+impl PartialEq for Feed {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.paths.len() == other.paths.len()
+            && self
+                .paths
+                .iter()
+                .zip(other.paths.iter())
+                .all(|((x_path, x_item), (y_path, y_item))| x_path == y_path && x_item == y_item)
+    }
+}
+impl Eq for Feed {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_feed() {
+        let feed = Feed::new("A feed");
+        assert_eq!("A feed", feed.name);
+    }
+}
