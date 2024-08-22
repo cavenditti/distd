@@ -1,6 +1,6 @@
 //use std::{net::SocketAddr
-use std::{sync::RwLock, time::Instant};
 use anyhow::Error;
+use std::time::Instant;
 
 use http_body_util::{BodyExt, Empty};
 use hyper::{
@@ -8,6 +8,7 @@ use hyper::{
     client::conn::http1::SendRequest,
     Request, Response,
 };
+use tokio::sync::RwLock;
 
 //use ring::agreement::PublicKey;
 
@@ -96,7 +97,7 @@ impl Server {
     }
 
     async fn fetch(&mut self) -> Result<(), Error> {
-        let mut metadata = self.metadata.write().unwrap(); //FIXME
+        let mut metadata = self.metadata.write().await;
 
         let body = Self::_send_and_collect_request(
             self.make_uri("/transfer/metadata")?,
