@@ -17,7 +17,7 @@ async fn main() {
     println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
     let server: Server<HashMapStorage> = Server::default();
     let feed = Feed::new("A feed");
-    server.expose_feed(feed);
+    server.expose_feed(feed).unwrap();
 
     let app = rest_api::make_app(server);
 

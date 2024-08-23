@@ -11,10 +11,9 @@ pub struct Client {
 impl Client {
     pub async fn new(
         server_addr: hyper::Uri,
-        //pub_key: &PublicKey,
-        server_pub_key: &[u8; 32],
+        server_public_key: &[u8; 32],
     ) -> Self {
-        let server = Server::new(server_addr, server_pub_key).await.unwrap();
+        let server = Server::new(server_addr, server_public_key).await.unwrap();
         Self { server }
     }
 }

@@ -1,3 +1,5 @@
+//! network addresses data structure, not used atm
+
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 
 #[derive(Debug, Clone, Copy)]

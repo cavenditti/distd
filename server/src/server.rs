@@ -10,7 +10,7 @@ use distd_core::item::{Item, ItemName};
 use distd_core::metadata::ServerMetadata;
 use ring::error::KeyRejected;
 use ring::pkcs8::Document;
-use ring::signature::Ed25519KeyPair;
+use ring::signature::{Ed25519KeyPair, KeyPair};
 use ring::{
     rand,
     signature::{self},
@@ -176,5 +176,9 @@ where
                 .map(|item| item.to_owned())
                 .map_err(|e| ServerError::ItemInsertionError(e.entry.key().clone()))
         })
+    }
+
+    pub fn get_public_key(&self) -> &[u8] {
+        self.key_pair.public_key().as_ref()
     }
 }

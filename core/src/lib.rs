@@ -12,7 +12,6 @@ pub mod chunks;
 pub mod chunk_storage;
 pub mod unique_name;
 pub mod feed;
-pub mod net;
 pub mod peer;
 pub mod utils;
 pub mod metadata;

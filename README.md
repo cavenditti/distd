@@ -41,6 +41,7 @@ the (eventually private storage repo) and keep all items deduplicated.
 - Replace some Option with Result to have better visibility on errors (in progress)
 - Overall code clean up
 - Tests for everything
+- **Make storage agnostic about hash computation, it's not its business**
 - **Implement FsStorage, to store items directly in the filesystem without deduplication (will be used by client)**
 - Minimal client
 - Evaluate whether to and assign a 64-bit uid to each hash to reduce network overhead or not

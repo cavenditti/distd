@@ -1,10 +1,7 @@
 //! common chunks and hash-tree data structs
 
 use blake3::Hash;
-use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
-//use ring::signature::Signature;
 
 use serde::{Deserialize, Serialize};
 
@@ -98,27 +95,12 @@ pub struct ChunkInfo {
         deserialize_with = "deserialize_hash"
     )]
     pub hash: Hash,
-    /*
-    #[serde(
-        serialize_with = "serialize_opt_2tuple_hash",
-        deserialize_with = "deserialize_opt_2tuple_hash"
-    )]
-    pub children: Option<(Hash, Hash)>,
-    */
 }
 
 impl ChunkInfo {
+    #[allow(dead_code)] // TODO check if it's needed
     fn is_leaf(&self) -> bool {
         //self.children.is_none()
         self.size == CHUNK_SIZE as u32
     }
 }
-
-pub struct ChunksPack {
-    chunk_size: usize,
-    last_chunk_size: usize,
-    hashes: Vec<Hash>, // We only keep hashes for chunks, they will then be retrieved from storage
-}
-
-//pub type ChunksMap = BTreeMap<u64, ChunkInfo>;
-pub type ChunksMap = HashMap<PathBuf, ChunksPack>;
