@@ -1,6 +1,6 @@
 use blake3::guts::{parent_cv, ChunkState, CHUNK_LEN};
 
-use blake3::{Hash, Hasher};
+use blake3::Hasher;
 
 #[test]
 fn test_parents() {
@@ -21,26 +21,4 @@ fn test_parents() {
     let parent = parent_cv(&chunk0_cv, &chunk1_cv, false);
     let root = parent_cv(&parent, &chunk2_cv, true);
     assert_eq!(hasher.finalize(), root);
-}
-
-#[test]
-fn test_blake3() {
-    // Define the input data.
-    let buf = [0u8; CHUNK_LEN * 2 + 42];
-    let chunks_hashes: Vec<Hash> = vec![];
-    let mut hasher = Hasher::new();
-
-    buf.chunks(CHUNK_LEN).enumerate().map(|(i, x)| {
-        hasher.update(x);
-        ChunkState::new(i as u64).update(x).finalize(false)
-    });
-
-    let final_hash = hasher.finalize();
-
-    for i in chunks_hashes.iter().skip(1) {
-        //let parent_node = parent_cv(&one, &i, false);
-    }
-
-    //println!("Parent Hash: {}", parent_node);
-    //let parent_node = parent_cv(&hash1, &hash2, true);
 }

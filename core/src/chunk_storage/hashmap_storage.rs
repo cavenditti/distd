@@ -21,11 +21,8 @@ impl ChunkStorage for HashMapStorage {
         self.data.read().unwrap().get(hash).cloned()
     }
 
-    fn insert_chunk(&self, chunk: &[u8]) -> Option<Arc<StoredChunkRef>> {
+    fn _insert_chunk(&self, hash: Hash, chunk: &[u8]) -> Option<Arc<StoredChunkRef>> {
         if let Ok(mut data) = self.data.write() {
-            //println!("Chunk: {:?}", &chunk);
-            //let size: u32 = chunk.len().try_into().unwrap(); // FIXME unwrap
-            let hash = blake3::hash(chunk);
             //println!("[StorageInsert] Hash: {}, size: {}", hash, size);
             if let Some(raw_chunk) = data.get(&hash.clone()) {
                 return Some(raw_chunk.clone());
@@ -44,12 +41,12 @@ impl ChunkStorage for HashMapStorage {
         }
     }
 
-    fn link(
+    fn _link(
         &self,
+        hash: Hash,
         left: Arc<StoredChunkRef>,
         right: Arc<StoredChunkRef>,
     ) -> Option<Arc<StoredChunkRef>> {
-        let hash = merge_hashes(left.get_hash(), right.get_hash());
         /*
         println!(
             "[Storage Link ]: {}: {} + {}",

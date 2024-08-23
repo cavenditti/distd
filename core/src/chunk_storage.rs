@@ -1,16 +1,14 @@
-use std::{
-    borrow::Cow,
-    collections::HashSet,
-    io,
-    sync::Arc,
-};
+use std::{borrow::Cow, collections::HashSet, io, sync::Arc};
 
 use blake3::Hash;
 use bytes::Bytes;
 use ptree::{Color, Style, TreeItem};
 use serde::ser::{Serialize, SerializeStructVariant};
 
-use crate::chunks::{ChunkInfo, OwnedHashTreeNode, RawChunk, CHUNK_SIZE};
+use crate::{
+    chunks::{ChunkInfo, OwnedHashTreeNode, RawChunk, CHUNK_SIZE},
+    hash::merge_hashes,
+};
 
 pub mod hashmap_storage;
 
@@ -308,13 +306,30 @@ impl TreeItem for StoredChunkRef {
 
 /// Defines a backend used to store hashes and chunks ad key-value pairs
 pub trait ChunkStorage {
+    fn _insert_chunk(&self, hash: Hash, chunk: &[u8]) -> Option<Arc<StoredChunkRef>>;
+    fn _link(
+        &self,
+        hash: Hash,
+        left: Arc<StoredChunkRef>,
+        right: Arc<StoredChunkRef>,
+    ) -> Option<Arc<StoredChunkRef>>;
+
     fn get(&self, hash: &Hash) -> Option<Arc<StoredChunkRef>>;
-    fn insert_chunk(&self, chunk: &[u8]) -> Option<Arc<StoredChunkRef>>;
+    fn insert_chunk(&self, chunk: &[u8]) -> Option<Arc<StoredChunkRef>> {
+        let hash = blake3::hash(chunk);
+        self._insert_chunk(hash, chunk)
+            .inspect(|x| assert!(*x.get_hash() == hash))
+    }
     fn link(
         &self,
         left: Arc<StoredChunkRef>,
         right: Arc<StoredChunkRef>,
-    ) -> Option<Arc<StoredChunkRef>>;
+    ) -> Option<Arc<StoredChunkRef>> {
+        let hash = merge_hashes(left.get_hash(), right.get_hash());
+        self._link(hash, left, right)
+            .inspect(|x| assert!(*x.get_hash() == hash))
+    }
+
     fn chunks(&self) -> Vec<Hash>;
     /// Allocated size for all chunks, in bytes
     /// This only counts actual chunks size, excluding any auxiliary structure used by storage backend/adapter
