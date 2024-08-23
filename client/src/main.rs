@@ -46,31 +46,11 @@ async fn main() -> Result<()> {
 
 async fn fetch_url(url: hyper::Uri, method: String) -> Result<()> {
     let client = client::Client::new(url.clone(), &[0u8; 32]).await;
-    println!("{:?}", client.server.get_metadata().await);
+    client
+        .server
+        .send_request(&method, url.path_and_query().unwrap().clone())
+        .await.unwrap(); //FIXME remove this
 
-    let path = url.path();
-    let mut res = client.server.send_request(&method, path).await.unwrap();
-
-    println!("Response: {}", res.status());
-    println!("Headers: {:#?}\n", res.headers());
-
-    // Stream the body, writing each chunk to stdout as we get it
-    // (instead of buffering and printing at the end).
-    while let Some(next) = res.frame().await {
-        let frame = next?;
-        if let Some(chunk) = frame.data_ref() {
-            io::stdout().write_all(chunk).await?;
-        }
-    }
-
-    println!("\n\nDone!");
-
-
-    /*
-    tokio::task::spawn(async move {
-        client.server.fetch_loop().await;
-    });
-    */
     client.server.fetch_loop().await;
 
     Ok(())

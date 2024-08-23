@@ -6,6 +6,7 @@ use http_body_util::{BodyExt, Empty};
 use hyper::{
     body::{Buf, Bytes, Incoming},
     client::conn::http1::SendRequest,
+    http::uri::PathAndQuery,
     Request, Response,
 };
 use tokio::{sync::RwLock, time::Instant};
@@ -89,7 +90,10 @@ impl Server {
         Ok(body)
     }
 
-    fn make_uri(&self, path_and_query: &str) -> Result<hyper::Uri, Error> {
+    fn make_uri<T>(&self, path_and_query: T) -> Result<hyper::Uri, Error>
+    where
+        T: Into<PathAndQuery>,
+    {
         hyper::Uri::builder()
             .scheme(self.url.scheme().unwrap().clone())
             .authority(self.url.authority().unwrap().clone())
@@ -106,11 +110,10 @@ impl Server {
         self.shared.read().await.last_update
     }
 
-    pub async fn send_request(
-        &self,
-        method: &str,
-        path: &str,
-    ) -> Result<Response<Incoming>, Error> {
+    pub async fn send_request<T>(&self, method: &str, path: T) -> Result<Response<Incoming>, Error>
+    where
+        T: Into<PathAndQuery>,
+    {
         Self::_send_request(
             self.make_uri(path)?,
             &mut self.shared.write().await.sender,
@@ -123,7 +126,7 @@ impl Server {
         let mut shared = self.shared.write().await;
 
         let body = Self::_send_and_collect_request(
-            self.make_uri("/transfer/metadata")?,
+            self.make_uri(PathAndQuery::from_static("/transfer/metadata"))?,
             &mut shared.sender,
             "GET",
         )
@@ -135,8 +138,8 @@ impl Server {
         shared.last_update = Instant::now();
 
         if shared.metadata != new_metadata {
-            println!("Metadata changed!");
             shared.metadata = new_metadata;
+            println!("New metadata: {:?}", shared.metadata);
         } else {
             println!("Metadata didn't change.");
         }
@@ -150,7 +153,7 @@ impl Server {
                 break;
             }
         }
-        panic!("fetch loop failed") // FIXME
+        panic!("Cannot fetch from server") // FIXME
     }
 
     pub async fn new(
