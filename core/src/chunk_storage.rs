@@ -1,9 +1,8 @@
 use core::slice::SlicePattern;
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     io,
-    slice::Chunks,
     sync::Arc,
 };
 

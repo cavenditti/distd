@@ -86,8 +86,6 @@ impl HashTreeNode for OwnedHashTreeNode {
     }
 }
 
-trait ClonableHashTreeNode: HashTreeNode + Into<OwnedHashTreeNode> {} // Useful?
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, std::hash::Hash, PartialEq, Eq)]
 pub struct ChunkInfo {
     // progressive unique id provided by the storage ??

@@ -1,5 +1,4 @@
 use thiserror::Error;
-use distd_core::chunk_storage::StorageError;
 
 #[derive(Error, Debug)]
 pub enum ServerError {

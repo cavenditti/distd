@@ -2,10 +2,6 @@
 #![warn(rust_2018_idioms)]
 use std::env;
 
-use http_body_util::{BodyExt, Empty};
-use hyper::body::Bytes;
-use hyper::Request;
-use tokio::io::{self, AsyncWriteExt as _};
 
 pub mod client;
 pub mod connection;

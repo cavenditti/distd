@@ -1,7 +1,5 @@
-use core::panic;
 
-use blake3::{Hash, Hasher};
-use bytes::Bytes;
+use blake3::Hash;
 
 use crate::chunks::CHUNK_SIZE;
 

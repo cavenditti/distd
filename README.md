@@ -35,18 +35,21 @@ the (eventually private storage repo) and keep all items deduplicated.
     while keeping the list of all the leaf hashes)
 - Make order between ChunkInfo and StoredChunkRef (even just renaming them may be enough)
 - Implement diff algorithm comparing merkle-trees
-- Replace some Option with Result to have better visibility on errors
+    - We may get away with this, as we have all leaf hashes and their differences. Shouldn't really be needed unless
+        there is the need to compute rolling hashes or doing something more fancy (in that case the approach would be
+        different anyway)
+- Replace some Option with Result to have better visibility on errors (in progress)
 - Overall code clean up
 - Tests for everything
-- Implement FsStorage, to store items directly in the filesystem without deduplication (will be used by client)
+- **Implement FsStorage, to store items directly in the filesystem without deduplication (will be used by client)**
 - Minimal client
 - Evaluate whether to and assign a 64-bit uid to each hash to reduce network overhead or not
-- Add TLS, or use QUIC everywhere
-- Replace ptree with something unintrusive when running tests
 
 ### Long term TODO:
 - Implement (a subset of) PPSPP in Rust, see [PyPPSPP](https://github.com/justas-/PyPPSPP) as reference
+- Add TLS, or use QUIC everywhere
 - Make sure the approach is fine tuned for EROFS images, so that they can be chunked efficiently.
+- Replace ptree with something unintrusive when running tests
 
 #### P2P (TODO)
 This works pretty much like a partitioned Bittorent swarm, but:
