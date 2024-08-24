@@ -34,12 +34,12 @@ the (eventually private storage repo) and keep all items deduplicated.
 - [x] ~~Give each Item its own tree of hashes instead of Vec~~ (kinda done, we have the Arc to the root StorageChunkRef
     while keeping the list of all the leaf hashes)
 - [x] ~~Make order between ChunkInfo and StoredChunkRef (even just renaming them may be enough)~~
-- [ ] Implement diff algorithm comparing merkle-trees
+- [x] ~~Implement diff algorithm comparing merkle-trees~~ won't do it
     > [!NOTE]
     > We may get away with this, as we have all leaf hashes and their differences. Shouldn't really be needed unless
     > there is the need to compute rolling hashes or doing something more fancy (in that case the approach would be
     > different anyway)
-- [ ] Replace some Option with Result to have better visibility on errors (in progress)
+- [ ] Replace some Option with Result to have better visibility on errors (in progress), mostly in chunk storage
 - [ ] Overall code clean up
 - [ ] Tests for everything
 - [x] ~~Make storage agnostic about hash computation, it's not its business~~
@@ -63,9 +63,8 @@ This works pretty much like a partitioned Bittorent swarm, but:
 
 
 ## Code organization
-- distd_core contains common data structures and algorithms for p2p sharing
+- distd_core contains common data structures and algorithms
 - distd_server is responsible of chunking, hashing and first serving the file
 - distd_client fetches files from the server
-- distd_peer fetches and provides files and chunks to visible clients
 
 ## Current state

@@ -306,6 +306,7 @@ impl TreeItem for StoredChunkRef {
 
 /// Defines a backend used to store hashes and chunks ad key-value pairs
 pub trait ChunkStorage {
+    fn get(&self, hash: &Hash) -> Option<Arc<StoredChunkRef>>;
     fn _insert_chunk(&self, hash: Hash, chunk: &[u8]) -> Option<Arc<StoredChunkRef>>;
     fn _link(
         &self,
@@ -314,12 +315,20 @@ pub trait ChunkStorage {
         right: Arc<StoredChunkRef>,
     ) -> Option<Arc<StoredChunkRef>>;
 
-    fn get(&self, hash: &Hash) -> Option<Arc<StoredChunkRef>>;
+    fn chunks(&self) -> Vec<Hash>;
+
+    /// Allocated size for all chunks, in bytes
+    /// This only counts actual chunks size, excluding any auxiliary structure used by storage backend/adapter
+    fn size(&self) -> usize;
+
+    //fn drop(hash: Hash); // TODO
+
     fn insert_chunk(&self, chunk: &[u8]) -> Option<Arc<StoredChunkRef>> {
         let hash = blake3::hash(chunk);
         self._insert_chunk(hash, chunk)
             .inspect(|x| assert!(*x.get_hash() == hash))
     }
+
     fn link(
         &self,
         left: Arc<StoredChunkRef>,
@@ -329,12 +338,6 @@ pub trait ChunkStorage {
         self._link(hash, left, right)
             .inspect(|x| assert!(*x.get_hash() == hash))
     }
-
-    fn chunks(&self) -> Vec<Hash>;
-    /// Allocated size for all chunks, in bytes
-    /// This only counts actual chunks size, excluding any auxiliary structure used by storage backend/adapter
-    fn size(&self) -> usize;
-    //fn drop(hash: Hash); // ??
 
     /// Insert bytes into the storage returning the associated hash tree
     fn insert(&self, data: Bytes) -> Option<Arc<StoredChunkRef>>

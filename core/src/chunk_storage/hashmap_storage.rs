@@ -4,7 +4,6 @@ use std::sync::{Arc, RwLock};
 use blake3::Hash;
 
 use crate::chunk_storage::ChunkStorage;
-use crate::hash::merge_hashes;
 
 use super::StoredChunkRef;
 
