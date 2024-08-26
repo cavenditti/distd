@@ -44,7 +44,8 @@ the (eventually private storage repo) and keep all items deduplicated.
 - [ ] Doc comments
 - [ ] Tests for everything
 - [x] ~~Make storage agnostic about hash computation, it's not its business~~
-- [ ] **Implement FsStorage, to store items directly in the filesystem without deduplication (will be used by client)**
+- [x] ~~Implement FsStorage, to store items directly in the filesystem without deduplication (will be used by client)~~
+        **needs extensive testing**
 - [ ] Minimal client
 - [ ] Evaluate whether to and assign a 64-bit uid to each hash to reduce network overhead or not
 
@@ -60,14 +61,14 @@ the (eventually private storage repo) and keep all items deduplicated.
 This works pretty much like a partitioned Bittorent swarm, but:
 - It uses BLAKE3 instead of SHA1 o SHA256
 - Only uses ~~µTP~~ kind-of-PPSPP over UDP transport [see at RFC7574 on ietf.org](https://datatracker.ietf.org/doc/rfc7574/)
-- The equivalent of torrent/metainfo files are msgpack-encoded instead of bencode-encoded
+- The equivalent of torrent/metainfo files are msgpack(?)-encoded instead of bencode-encoded
 - Every node is a peer in one or more swarm(s).
-- chunk/piece size is currently hardcoded
+- ~~chunk/piece size is currently hardcoded~~
 
 
-## Code organization
+## Current state
+### Code organization
 - distd_core contains common data structures and algorithms
 - distd_server is responsible of chunking, hashing and first serving the file
 - distd_client fetches files from the server
 
-## Current state

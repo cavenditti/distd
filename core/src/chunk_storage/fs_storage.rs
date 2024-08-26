@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    fs::{remove_file, File},
+    fs::{create_dir_all, remove_file, File},
     io::{BufReader, Read, Seek},
     os::unix::fs::FileExt,
     path::PathBuf,
@@ -126,7 +126,15 @@ impl InnerFsStorage {
 impl InnerFsStorage {
     /// Returns the (eventual) stored path of the item provided
     fn path(&self, item: &Item) -> PathBuf {
-        self.root.join(&item.metadata.path)
+        let p = self.root.join(
+            &item
+                .metadata
+                .path
+                .strip_prefix("/")
+                .unwrap_or(&item.metadata.path),
+        );
+        create_dir_all(&p.parent().unwrap_or(&p)).unwrap(); // FIXME
+        p
     }
 
     pub fn get(&self, hash: &Hash) -> Option<Arc<StoredChunkRef>> {
@@ -231,13 +239,22 @@ pub struct FsStorage {
 }
 
 impl FsStorage {
-    pub fn new(root: PathBuf) -> Self {
-        Self {
+    pub fn new(root: PathBuf) -> Result<Self, std::io::Error> {
+        create_dir_all(&root)?;
+        Ok(Self {
             data: Arc::new(RwLock::new(InnerFsStorage::new(root))),
-        }
+        })
     }
 
     //pub fn load() {}
+
+    pub fn get_root(&self) -> Option<PathBuf> {
+        self.data.read().ok().map(|x| x.root.clone())
+    }
+
+    pub fn get_items(&self) -> Option<HashSet<Item>> {
+        self.data.read().ok().map(|x| x.items.clone())
+    }
 
     /// Wrapper around InnerFsStorage::pre_allocate
     pub fn pre_allocate(&self, item: Item) -> Result<(), Error> {
@@ -298,5 +315,44 @@ impl ChunkStorage for FsStorage {
 
     fn chunks(&self) -> Vec<Hash> {
         self.data.read().unwrap().chunks()
+    }
+
+    /*
+    fn insert(&self, data: bytes::Bytes) -> Option<Arc<StoredChunkRef>>
+        where
+            Self: Sized, {
+
+    }
+    */
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::item::tests::make_zeros_item;
+    use std::str::FromStr;
+
+    use super::*;
+
+    fn print_fsstorage(storage: &FsStorage) {
+        println!(
+            "root: {:?} \n\
+            chunks: {:?} \n\
+            items: {:?}",
+            storage.get_root(),
+            storage.chunks(),
+            storage.get_items(),
+        )
+    }
+
+    #[test]
+    fn test_fs_storage() {
+        let storage = FsStorage::default();
+        print_fsstorage(&storage);
+        let storage = FsStorage::new(PathBuf::from_str("somewhere_here").unwrap()).unwrap();
+        let item = make_zeros_item();
+        storage.pre_allocate(item).unwrap();
+        print_fsstorage(&storage);
+        // TODO read file and check its content are correct
+        // TODO do the same with an item with multiple chunks
     }
 }

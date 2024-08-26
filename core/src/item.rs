@@ -65,6 +65,8 @@ pub struct Item {
 }
 
 impl Item {
+    /// Create a new Item from its metadata and Bytes
+    /// This is the preferred way to create a new Item
     pub fn new<T: ChunkStorage + Clone>(
         name: ItemName,
         path: PathBuf,
@@ -93,9 +95,38 @@ impl Item {
         })
     }
 
+    /// Make a new Item without adding it to a storage
+    pub fn make(
+        name: ItemName,
+        path: PathBuf,
+        revision: u32,
+        description: Option<String>,
+        root: ChunkInfo,
+        chunks: Vec<ChunkInfo>,
+        hashes: HashSet<ChunkInfo>,
+    ) -> Result<Self, std::io::Error> {
+        let now = SystemTime::now();
+        Ok(Self {
+            metadata: ItemMetadata {
+                name,
+                description,
+                revision,
+                path,
+                root,
+                created: now,
+                updated: now,
+                created_by: env!("CARGO_PKG_VERSION").to_owned(),
+                format: ItemFormat::V1,
+            },
+            chunks,
+            hashes,
+        })
+    }
+
     /// Recompute total size of the item
     /// Computed as the sum of the sizes of the chunks
-    pub fn recompute_size(&self) -> u32 { // useful?
+    pub fn recompute_size(&self) -> u32 {
+        // useful?
         self.chunks.iter().map(|x| x.size).sum()
     }
 
@@ -118,14 +149,69 @@ impl std::hash::Hash for Item {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use std::mem;
     use std::str::FromStr;
 
     use crate::chunk_storage::hashmap_storage::HashMapStorage;
+    use crate::chunks::CHUNK_SIZE;
+    use crate::hash::hash;
     use crate::utils::serde::bitcode::BitcodeSerializable;
 
     use super::*;
+
+    pub fn new_empty_item<T>(storage: T) -> Item
+    where
+        T: ChunkStorage + Clone,
+    {
+        Item::new(
+            "name".to_string(),
+            PathBuf::from_str("/some/path").unwrap(),
+            0,
+            None,
+            Bytes::from_static(b""),
+            storage,
+        )
+        .unwrap()
+    }
+
+    pub fn new_zeros_item<T>(storage: T) -> Item
+    where
+        T: ChunkStorage + Clone,
+    {
+        Item::new(
+            "name".to_string(),
+            PathBuf::from_str("some/path").unwrap(),
+            0,
+            Some("Some description for the larger item".to_string()),
+            Bytes::from_static(&[0u8; 100_000_000]),
+            storage,
+        )
+        .unwrap()
+    }
+
+    pub fn make_zeros_item() -> Item {
+        let data = Bytes::from_static(&[0u8; CHUNK_SIZE]);
+        let chunk = ChunkInfo {
+            hash: hash(&data),
+            size: CHUNK_SIZE as u32,
+        };
+        Item::make(
+            "name".to_string(),
+            PathBuf::from_str("/some/path").unwrap(),
+            0,
+            Some("Some description for the larger item".to_string()),
+            chunk,
+            vec![chunk],
+            HashSet::from_iter(vec![chunk]),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_make_item() {
+        make_zeros_item();
+    }
 
     #[test]
     fn test_item_size() {
@@ -136,16 +222,7 @@ mod tests {
         );
         {
             let storage = HashMapStorage::default();
-            let item = Item::new(
-                "name".to_string(),
-                PathBuf::from_str("/some/path").unwrap(),
-                0,
-                None,
-                Bytes::from_static(b""),
-                storage,
-            )
-            .unwrap();
-
+            let item = new_empty_item(storage);
             let serialized = item.clone().metadata.to_bitcode().unwrap();
             println!("Small Item serialized size: {}", serialized.len());
 
@@ -156,16 +233,7 @@ mod tests {
         {
             // Same as above but with a larger one
             let storage = HashMapStorage::default();
-            let item = Item::new(
-                "name".to_string(),
-                PathBuf::from_str("/some/path").unwrap(),
-                0,
-                Some("Some description for the larger item".to_string()),
-                Bytes::from_static(&[0u8; 100_000_000]),
-                storage,
-            )
-            .unwrap();
-
+            let item = new_zeros_item(storage);
             let serialized = item.clone().metadata.to_bitcode().unwrap();
             println!("Small Item serialized size: {}", serialized.len());
 
