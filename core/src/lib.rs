@@ -4,6 +4,7 @@
 #![feature(slice_as_chunks)]
 #![feature(slice_pattern)]
 #![feature(extract_if)]
+#![feature(hash_extract_if)]
 #![feature(test)]
 
 

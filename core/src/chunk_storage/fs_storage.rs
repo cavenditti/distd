@@ -14,12 +14,18 @@ use crate::{chunks::ChunkInfo, item::Item};
 
 use super::{ChunkStorage, StoredChunkRef};
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct InFileChunkPaths {
+    pub path: PathBuf,
+    pub offset: u64,
+}
+
+/// Chunk stored in multiple files
+/// Basically ref-counting on items paths
 #[derive(Debug, Clone)]
 struct InFileChunk {
     pub info: ChunkInfo,
-
-    pub path: PathBuf,
-    pub offset: u64,
+    pub paths: HashSet<InFileChunkPaths>,
     pub populated: Arc<AtomicBool>,
     buf_reader: Arc<Mutex<Option<BufReader<File>>>>,
 }
@@ -35,14 +41,16 @@ impl TryFrom<InFileChunk> for StoredChunkRef {
             .buf_reader
             .lock()
             .map_err(|_| Error::msg("Cannot acquire lock"))?;
+
+        let first_path = value.paths.iter().next().ok_or(Error::msg("empty"))?;
         if buf_reader.is_none() {
-            let file = File::open(value.path).map_err(Error::msg)?;
+            let file = File::open(&first_path.path).map_err(Error::msg)?;
             let reader = BufReader::new(file);
             *buf_reader = Some(reader);
         }
         let reader = buf_reader.as_mut().unwrap();
         reader
-            .seek(std::io::SeekFrom::Start(value.offset))
+            .seek(std::io::SeekFrom::Start(first_path.offset))
             .map_err(Error::msg)?;
         let mut buf = Vec::with_capacity(value.info.size as usize);
         reader.read_exact(&mut buf).map_err(Error::msg)?;
@@ -60,18 +68,35 @@ impl TryFrom<&Arc<InFileChunk>> for StoredChunkRef {
     }
 }
 
+impl TryFrom<&InFileChunk> for StoredChunkRef {
+    type Error = Error;
+    fn try_from(value: &InFileChunk) -> Result<Self, Self::Error> {
+        Self::try_from(value.clone())
+    }
+}
+
+impl TryFrom<&mut InFileChunk> for StoredChunkRef {
+    type Error = Error;
+    fn try_from(value: &mut InFileChunk) -> Result<Self, Self::Error> {
+        Self::try_from(value.clone())
+    }
+}
+
 impl InFileChunk {
     pub fn write(&self, hash: &Hash, chunk: &[u8]) -> Result<(), Error> {
         assert_eq!(&self.info.hash, hash);
 
-        let buffer = File::create("foo.txt").map_err(Error::msg)?;
-        match buffer.write_at(chunk, self.offset) {
-            Ok(size) if size as u32 == self.info.size => Ok(()),
-            _ => Err(Error::msg("Cannot write to file")),
-        }
-        .map(|_| {
-            self.populated
-                .swap(true, std::sync::atomic::Ordering::Relaxed);
+        // write chunk to all associated files (and offsets)
+        self.paths.iter().try_for_each(|p| {
+            let buffer = File::create(&p.path).map_err(Error::msg)?;
+            match buffer.write_at(chunk, p.offset) {
+                Ok(size) if size as u32 == self.info.size => Ok(()),
+                _ => Err(Error::msg("Cannot write to file")),
+            }
+            .map(|_| {
+                self.populated
+                    .swap(true, std::sync::atomic::Ordering::Relaxed);
+            })
         })
     }
 }
@@ -86,7 +111,7 @@ struct InnerFsStorage {
     pub root: PathBuf,
 
     pub items: HashSet<Item>,
-    pub data: HashMap<Hash, Vec<Arc<InFileChunk>>>,
+    pub data: HashMap<Hash, InFileChunk>,
 }
 
 impl InnerFsStorage {
@@ -107,7 +132,7 @@ impl InnerFsStorage {
     pub fn get(&self, hash: &Hash) -> Option<Arc<StoredChunkRef>> {
         self.data
             .get(hash)
-            .and_then(|x| StoredChunkRef::try_from(x.first()?).ok())
+            .and_then(|x| StoredChunkRef::try_from(x).ok())
             .map(Arc::new)
     }
 
@@ -134,18 +159,23 @@ impl InnerFsStorage {
 
         // Prepare all InFileChunk and add them to self.data
         for chunk in &item.chunks {
-            let infile_chunk = InFileChunk {
-                info: *chunk,
+            let paths = InFileChunkPaths {
                 path: path.clone(),
                 offset,
-                populated: Arc::default(),
-                buf_reader: Arc::default(),
             };
             offset += chunk.size as u64;
-            if let Some(v) = self.data.get_mut(&chunk.hash) {
-                v.append(infile_chunk);
+            if let Some(infile_chunk) = self.data.get_mut(&chunk.hash) {
+                infile_chunk.paths.insert(paths);
             } else {
-                self.data.insert(&chunk.hash, infile_chunk)
+                self.data.insert(
+                    chunk.hash,
+                    InFileChunk {
+                        info: *chunk,
+                        paths: HashSet::from_iter([paths]),
+                        populated: Arc::default(),
+                        buf_reader: Arc::default(),
+                    },
+                );
             }
         }
         self.items.insert(item);
@@ -165,11 +195,11 @@ impl InnerFsStorage {
         for chunk in &item.chunks {
             // We may have duplicated hashes in chunks, so we need to check first if it's there and otherwise
             // do nothing (may not be there, or we may have already removed it). HashMap::get/get_mut do it for us.
-            if let Some(v) = self.data.get_mut(&chunk.hash) {
+            if let Some(infile_chunk) = self.data.get_mut(&chunk.hash) {
                 // Remove any chunk referencing the item's path
-                let _ = v.extract_if(|infile| infile.path == path);
+                let _ = infile_chunk.paths.extract_if(|infile| infile.path == path);
                 // If there are not references left, outright remove the entry
-                if v.is_empty() {
+                if infile_chunk.paths.is_empty() {
                     self.data.remove(&chunk.hash);
                 }
             }
@@ -248,10 +278,12 @@ impl ChunkStorage for FsStorage {
     /// May only add chunks by adding items. Dummy implementation always returning None
     fn _insert_chunk(&self, hash: Hash, chunk: &[u8]) -> Option<Arc<StoredChunkRef>> {
         let mut inner = self.data.write().ok()?;
-        if let Some(v) = inner.data.get_mut(&hash) {
-            v.iter_mut().map(|x| x.write(&hash, chunk));
+        if let Some(infile_chunk) = inner.data.get_mut(&hash) {
+            infile_chunk.write(&hash, chunk).ok()?;
+            StoredChunkRef::try_from(infile_chunk).map(Arc::new).ok()
+        } else {
+            None
         }
-        None
     }
 
     /// May only link chunks by adding items. Dummy implementation always returning None
