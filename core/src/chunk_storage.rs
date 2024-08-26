@@ -11,6 +11,7 @@ use crate::{
 };
 
 pub mod hashmap_storage;
+pub mod fs_storage;
 
 use thiserror::Error;
 

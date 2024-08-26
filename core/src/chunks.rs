@@ -11,10 +11,9 @@ use crate::utils::serde::hashes::{deserialize_hash, serialize_hash};
 //pub const CHUNK_SIZE: usize = 4 * 1024;
 pub const CHUNK_SIZE: usize = blake3::guts::CHUNK_LEN;
 
-//pub type RawChunk = [u8; CHUNK_SIZE];
 pub type RawChunk = Arc<Vec<u8>>;
 pub type OwnedChunk = Vec<u8>;
-pub type RawHash = [u8; 32];
+//pub type Size = u64;
 
 pub trait HashTreeNode {
     /// Get hash of node

@@ -40,7 +40,8 @@ the (eventually private storage repo) and keep all items deduplicated.
     > there is the need to compute rolling hashes or doing something more fancy (in that case the approach would be
     > different anyway)
 - [ ] Replace some Option with Result to have better visibility on errors (in progress), mostly in chunk storage
-- [ ] Overall code clean up
+- [x] ~~Overall code clean up~~ kinda
+- [ ] Doc comments
 - [ ] Tests for everything
 - [x] ~~Make storage agnostic about hash computation, it's not its business~~
 - [ ] **Implement FsStorage, to store items directly in the filesystem without deduplication (will be used by client)**
@@ -48,10 +49,12 @@ the (eventually private storage repo) and keep all items deduplicated.
 - [ ] Evaluate whether to and assign a 64-bit uid to each hash to reduce network overhead or not
 
 ### Long term TODO:
-- Implement (a subset of) PPSPP in Rust, see [PyPPSPP](https://github.com/justas-/PyPPSPP) as reference
-- Add TLS, or use QUIC everywhere
-- Make sure the approach is fine tuned for EROFS images, so that they can be chunked efficiently.
-- Replace ptree with something unintrusive when running tests
+- [ ] Implement (a subset of) PPSPP in Rust, see [PyPPSPP](https://github.com/justas-/PyPPSPP) as reference
+- [ ] Add TLS, or use QUIC everywhere
+- [ ] Make sure the approach is fine tuned for EROFS images, so that they can be chunked efficiently.
+- [ ] Replace ptree with something unintrusive when running tests
+- [ ] no-std variant for client
+- [ ] Cross-compilation for arm
 
 #### P2P (TODO)
 This works pretty much like a partitioned Bittorent swarm, but:

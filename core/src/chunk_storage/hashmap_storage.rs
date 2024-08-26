@@ -7,11 +7,9 @@ use crate::chunk_storage::ChunkStorage;
 
 use super::StoredChunkRef;
 
-// Dead simple in-memory global storage
+/// Dead simple in-memory global storage
 #[derive(Default, Clone)]
 pub struct HashMapStorage {
-    // This re-hashes the hashes, but nicely handles collisions in return
-    // TODO we may use a Hasher that just returns the first n bytes of the SHA-256?
     data: Arc<RwLock<HashMap<Hash, Arc<StoredChunkRef>>>>,
 }
 
@@ -83,7 +81,7 @@ impl ChunkStorage for HashMapStorage {
 
 #[cfg(test)]
 mod tests {
-    use crate::{hash::hash, chunks::CHUNK_SIZE};
+    use crate::{chunks::CHUNK_SIZE, hash::hash};
 
     use super::*;
     use bytes::Bytes;

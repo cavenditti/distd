@@ -45,6 +45,21 @@ pub struct ItemMetadata {
     //signature: Signature,
 }
 
+impl std::hash::Hash for ItemMetadata {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.root.hash.hash(state);
+        self.name.hash(state);
+        self.path.hash(state);
+        self.format.hash(state);
+    }
+}
+
+impl ItemMetadata {
+    pub fn get_size(&self) -> u32 {
+        self.root.size
+    }
+}
+
 impl<'a> BitcodeSerializable<'a, ItemMetadata> for ItemMetadata {}
 
 //Will be used in future to handle server-side tracking of clients for p2p distribution

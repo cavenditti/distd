@@ -3,6 +3,7 @@
 #![feature(array_chunks)]
 #![feature(slice_as_chunks)]
 #![feature(slice_pattern)]
+#![feature(extract_if)]
 #![feature(test)]
 
 

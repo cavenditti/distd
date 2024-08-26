@@ -29,6 +29,7 @@
 
 use bytes::Bytes;
 use std::collections::HashSet;
+use std::hash::Hash;
 use std::path::PathBuf;
 use std::time::SystemTime;
 //use ring::signature::Signature;
@@ -41,7 +42,7 @@ use crate::{chunk_storage::ChunkStorage, unique_name::UniqueName};
 
 pub type ItemName = UniqueName;
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ItemFormat {
     V1 = 1,
 }
@@ -57,7 +58,7 @@ pub enum ItemFormat {
 pub struct Item {
     /// General metadata of the Item
     pub metadata: ItemMetadata,
-    /// BLAKE3 hashes of the chunks
+    /// BLAKE3 hashes of the chunks that make the item
     pub chunks: Vec<ChunkInfo>,
     /// BLAKE3 hashes of any hash subtree
     pub hashes: HashSet<ChunkInfo>,
@@ -92,10 +93,27 @@ impl Item {
         })
     }
 
+    /// Recompute total size of the item
+    /// Computed as the sum of the sizes of the chunks
+    pub fn recompute_size(&self) -> u32 { // useful?
+        self.chunks.iter().map(|x| x.size).sum()
+    }
+
+    /// Total size of the item
+    pub fn get_size(&self) -> u32 {
+        self.metadata.get_size()
+    }
+
     /// `Stored` chunks diff of two items
     /// Chunks in self and not in other
     pub fn diff(&self, other: &Self) -> HashSet<ChunkInfo> {
         self.hashes.difference(&other.hashes).cloned().collect()
+    }
+}
+
+impl std::hash::Hash for Item {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.metadata.hash(state);
     }
 }
 
@@ -112,7 +130,10 @@ mod tests {
     #[test]
     fn test_item_size() {
         println!("In-memory size of Item:         {}", mem::size_of::<Item>());
-        println!("In-memory size of ItemMetadata: {}", mem::size_of::<ItemMetadata>());
+        println!(
+            "In-memory size of ItemMetadata: {}",
+            mem::size_of::<ItemMetadata>()
+        );
         {
             let storage = HashMapStorage::default();
             let item = Item::new(
