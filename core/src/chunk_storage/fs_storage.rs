@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::{create_dir_all, remove_file, File},
-    io::{BufReader, Read, Seek},
+    io::{BufReader, Read, Seek, Write},
     os::unix::fs::FileExt,
     path::PathBuf,
     sync::{atomic::AtomicBool, Arc, Mutex, RwLock},
@@ -37,10 +37,7 @@ impl TryFrom<InFileChunk> for StoredChunkRef {
         if !value.populated.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(Error::msg("missing data"));
         }
-        let mut buf_reader = value
-            .buf_reader
-            .lock()
-            .map_err(|_| Error::msg("Cannot acquire lock"))?;
+        let mut buf_reader = value.buf_reader.lock().expect("Poisoned Lock");
 
         let first_path = value.paths.iter().next().ok_or(Error::msg("empty"))?;
         if buf_reader.is_none() {
@@ -48,7 +45,9 @@ impl TryFrom<InFileChunk> for StoredChunkRef {
             let reader = BufReader::new(file);
             *buf_reader = Some(reader);
         }
-        let reader = buf_reader.as_mut().unwrap();
+        let reader = buf_reader
+            .as_mut()
+            .ok_or(Error::msg("Cannot open buffer"))?;
         reader
             .seek(std::io::SeekFrom::Start(first_path.offset))
             .map_err(Error::msg)?;
@@ -96,6 +95,7 @@ impl InFileChunk {
             .map(|_| {
                 self.populated
                     .swap(true, std::sync::atomic::Ordering::Relaxed);
+                // buffer.sync_all().unwrap();
             })
         })
     }
@@ -136,18 +136,7 @@ impl InnerFsStorage {
         Ok(full_path)
     }
 
-    pub fn get(&self, hash: &Hash) -> Option<Arc<StoredChunkRef>> {
-        self.data
-            .get(hash)
-            .and_then(|x| StoredChunkRef::try_from(x).ok())
-            .map(Arc::new)
-    }
-
-    pub fn chunks(&self) -> Vec<Hash> {
-        self.data.keys().cloned().collect()
-    }
-
-    pub fn pre_allocate(&mut self, item: Item) -> Result<(), Error> {
+    pub fn pre_allocate(&mut self, item: &Item) -> Result<(), Error> {
         let path = self.path(&item)?;
         if self.items.contains(&item) {
             return Ok(());
@@ -189,7 +178,7 @@ impl InnerFsStorage {
                 );
             }
         }
-        self.items.insert(item);
+        self.items.insert(item.clone());
         Ok(())
     }
 
@@ -251,44 +240,41 @@ impl FsStorage {
 
     //pub fn load() {}
 
-    pub fn get_root(&self) -> Option<PathBuf> {
-        self.data.read().ok().map(|x| x.root.clone())
+    pub fn get_root(&self) -> PathBuf {
+        self.data.read().expect("Poisoned Lock").root.clone()
     }
 
-    pub fn get_items(&self) -> Option<HashSet<Item>> {
-        self.data.read().ok().map(|x| x.items.clone())
+    pub fn get_items(&self) -> HashSet<Item> {
+        self.data.read().expect("Poisoned Lock").items.clone()
     }
 
     /// Wrapper around InnerFsStorage::pre_allocate
-    pub fn pre_allocate(&self, item: Item) -> Result<(), Error> {
-        self.data
-            .write()
-            .map_err(|_| Error::msg("cannot acquire lock"))?
-            .pre_allocate(item)
+    pub fn pre_allocate(&self, item: &Item) -> Result<(), Error> {
+        self.data.write().expect("Poisoned Lock").pre_allocate(item)
     }
 
     /// Remove references to file from FsStorage, doesn't actually delete the file from filesystem
     /// Wrapper around InnerFsStorage::remove
     pub fn remove(&self, item: Item) -> Result<(), Error> {
-        self.data
-            .write()
-            .map_err(|_| Error::msg("cannot acquire lock"))?
-            .remove(item)
+        self.data.write().expect("Poisoned Lock").remove(item)
     }
 
     /// Remove references to file from FsStorage and deletes the file from filesystem
     /// Wrapper around InnerFsStorage::delete
     pub fn delete(&self, item: Item) -> Result<(), Error> {
-        self.data
-            .write()
-            .map_err(|_| Error::msg("cannot acquire lock"))?
-            .delete(item)
+        self.data.write().expect("Poisoned Lock").delete(item)
     }
 }
 
 impl ChunkStorage for FsStorage {
     fn get(&self, hash: &Hash) -> Option<Arc<StoredChunkRef>> {
-        self.data.read().ok()?.get(hash)
+        self.data
+            .read()
+            .expect("Poisoned Lock")
+            .data
+            .get(hash)
+            .and_then(|x| StoredChunkRef::try_from(x).ok())
+            .map(Arc::new)
     }
 
     fn size(&self) -> usize {
@@ -297,13 +283,11 @@ impl ChunkStorage for FsStorage {
 
     /// May only add chunks by adding items. Dummy implementation always returning None
     fn _insert_chunk(&self, hash: Hash, chunk: &[u8]) -> Option<Arc<StoredChunkRef>> {
-        let mut inner = self.data.write().ok()?;
-        if let Some(infile_chunk) = inner.data.get_mut(&hash) {
+        let mut inner = self.data.write().expect("Poisoned Lock");
+        inner.data.get_mut(&hash).and_then(|infile_chunk| {
             infile_chunk.write(&hash, chunk).ok()?;
             StoredChunkRef::try_from(infile_chunk).map(Arc::new).ok()
-        } else {
-            None
-        }
+        })
     }
 
     /// May only link chunks by adding items. Dummy implementation always returning None
@@ -317,7 +301,13 @@ impl ChunkStorage for FsStorage {
     }
 
     fn chunks(&self) -> Vec<Hash> {
-        self.data.read().unwrap().chunks()
+        self.data
+            .read()
+            .expect("Poisoned Lock")
+            .data
+            .keys()
+            .cloned()
+            .collect()
     }
 
     /*
@@ -331,7 +321,7 @@ impl ChunkStorage for FsStorage {
 
 #[cfg(test)]
 mod tests {
-    use crate::item::tests::make_zeros_item;
+    use crate::{chunks::CHUNK_SIZE, hash::hash, item::tests::make_ones_item};
     use std::str::FromStr;
 
     use super::*;
@@ -340,23 +330,60 @@ mod tests {
         println!(
             "root: {:?} \n\
             chunks: {:?} \n\
+            file chunks: {:?} \n\
             items: {:?}",
             storage.get_root(),
             storage.chunks(),
+            storage.data.read().unwrap().data.values(),
             storage.get_items(),
         )
     }
 
     #[test]
     fn test_fs_storage() {
+        // check default doesn't panics, just in case
         let storage = FsStorage::default();
         print_fsstorage(&storage);
+
+        // create storage in a temporary directory
         let tempdir = std::env::temp_dir().join(PathBuf::from_str("in_a_temp_dir").unwrap());
         let storage = FsStorage::new(tempdir).unwrap();
-        let item = make_zeros_item();
-        storage.pre_allocate(item).unwrap();
+
+        // make an item with a know content, a single chunk of all zeros
+        let item = make_ones_item();
+        storage.pre_allocate(&item).unwrap();
+
+        // Actually store the item chunk
+        storage.insert_chunk(&[1u8; CHUNK_SIZE]).unwrap();
+
         print_fsstorage(&storage);
+
         // TODO read file and check its content are correct
+        let path = storage.data.read().unwrap().path(&item).unwrap();
+        let mut f = File::open(&path).unwrap();
+        let mut buffer = Vec::with_capacity(item.get_size() as usize);
+
+        println!("{:?}", path);
+
+        // read from file
+        let n = f.read(&mut buffer[..]).unwrap();
+
+        assert_eq!(n, (&item).get_size() as usize);
+        assert_eq!(hash(&buffer), item.metadata.root.hash);
+
+        // retrieve chunk from storage
+        assert_eq!(
+            hash(
+                storage
+                    .get(&item.metadata.root.hash)
+                    .unwrap()
+                    ._get_stored_data()
+                    .unwrap()
+                    .as_ref()
+            ),
+            item.metadata.root.hash
+        );
+
         // TODO do the same with an item with multiple chunks
     }
 }

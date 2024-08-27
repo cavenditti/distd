@@ -198,8 +198,8 @@ pub mod tests {
             .unwrap()
     }
 
-    pub fn make_zeros_item() -> Item {
-        let data = Bytes::from_static(&[0u8; CHUNK_SIZE]);
+    pub fn make_repeated_item(value: u8) -> Item {
+        let data = Bytes::from_iter([value; CHUNK_SIZE]);
         let chunk = ChunkInfo {
             hash: hash(&data),
             size: CHUNK_SIZE as u32,
@@ -214,6 +214,14 @@ pub mod tests {
             HashSet::from_iter(vec![chunk]),
         )
         .unwrap()
+    }
+
+    pub fn make_zeros_item() -> Item {
+        make_repeated_item(0)
+    }
+
+    pub fn make_ones_item() -> Item {
+        make_repeated_item(1)
     }
 
     #[test]

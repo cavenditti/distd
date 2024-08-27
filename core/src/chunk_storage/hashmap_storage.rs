@@ -15,27 +15,25 @@ pub struct HashMapStorage {
 
 impl ChunkStorage for HashMapStorage {
     fn get(&self, hash: &Hash) -> Option<Arc<StoredChunkRef>> {
-        self.data.read().unwrap().get(hash).cloned()
+        self.data.read().expect("Poisoned Lock").get(hash).cloned()
     }
 
     fn _insert_chunk(&self, hash: Hash, chunk: &[u8]) -> Option<Arc<StoredChunkRef>> {
-        if let Ok(mut data) = self.data.write() {
-            //println!("[StorageInsert] Hash: {}, size: {}", hash, size);
-            if let Some(raw_chunk) = data.get(&hash.clone()) {
-                return Some(raw_chunk.clone());
-            }
-            data.try_insert(
-                hash,
-                Arc::new(StoredChunkRef::Stored {
-                    hash,
-                    data: Arc::new(Vec::from(chunk)),
-                }),
-            )
-            .ok()
-            .map(|x| x.clone())
-        } else {
-            None
+        let mut data = self.data.write().expect("Poisoned Lock");
+
+        //println!("[StorageInsert] Hash: {}, size: {}", hash, size);
+        if let Some(raw_chunk) = data.get(&hash.clone()) {
+            return Some(raw_chunk.clone());
         }
+        data.try_insert(
+            hash,
+            Arc::new(StoredChunkRef::Stored {
+                hash,
+                data: Arc::new(Vec::from(chunk)),
+            }),
+        )
+        .ok()
+        .map(|x| x.clone())
     }
 
     fn _link(
@@ -52,24 +50,26 @@ impl ChunkStorage for HashMapStorage {
             right.get_hash()
         );
         */
-        if let Ok(mut data) = self.data.write() {
-            data.get(&hash).cloned().or(data
-                .try_insert(hash, Arc::new(StoredChunkRef::Parent { hash, left, right }))
-                .ok()
-                .map(|x| x.clone()))
-        } else {
-            None
-        }
+        let mut data = self.data.write().expect("Poisoned Lock");
+        data.get(&hash).cloned().or(data
+            .try_insert(hash, Arc::new(StoredChunkRef::Parent { hash, left, right }))
+            .ok()
+            .map(|x| x.clone()))
     }
 
     fn chunks(&self) -> Vec<Hash> {
-        self.data.read().unwrap().keys().cloned().collect()
+        self.data
+            .read()
+            .expect("Poisoned Lock")
+            .keys()
+            .cloned()
+            .collect()
     }
 
     fn size(&self) -> usize {
         self.data
             .read()
-            .unwrap()
+            .expect("Poisoned Lock")
             .values()
             .map(|x| match &**x {
                 StoredChunkRef::Stored { data, .. } => data.len(),

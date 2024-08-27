@@ -61,7 +61,7 @@ where
         server
             .clients
             .read()
-            .unwrap()
+            .expect("Poisoned Lock")
             .values()
             .cloned()
             .collect::<Vec<Client>>(),
@@ -78,7 +78,14 @@ where
 {
     Uuid::from_str(&uuid)
         .ok()
-        .and_then(|uuid| server.clients.read().unwrap().get(&uuid).cloned())
+        .and_then(|uuid| {
+            server
+                .clients
+                .read()
+                .expect("Poisoned Lock")
+                .get(&uuid)
+                .cloned()
+        })
         .ok_or(StatusCode::NOT_FOUND)
         .map(Json)
 }
@@ -105,42 +112,54 @@ where
 }
 
 use crate::Feed;
-async fn get_feeds<T>(State(server): State<Server<T>>) -> Result<impl IntoResponse, StatusCode>
+async fn get_feeds<T>(State(server): State<Server<T>>) -> impl IntoResponse
 where
     T: ChunkStorage + Sync + Send + Clone + Default,
 {
-    server
-        .metadata
-        .read()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
-        .map(|metadata| metadata.feeds.values().cloned().collect::<Vec<Feed>>())
-        .map(Json)
+    Json(
+        server
+            .metadata
+            .read()
+            .expect("Poisoned Lock")
+            .feeds
+            .values()
+            .cloned()
+            .collect::<Vec<Feed>>(),
+    )
 }
 
-async fn get_items<T>(State(server): State<Server<T>>) -> Result<impl IntoResponse, StatusCode>
+async fn get_items<T>(State(server): State<Server<T>>) -> impl IntoResponse
 where
     T: ChunkStorage + Sync + Send + Clone + Default,
 {
-    server
-        .metadata
-        .read()
-        .map(|x| Json(x.items.keys().cloned().collect::<Vec<String>>()))
-        .map_err(|_| StatusCode::NOT_FOUND)
+    Json(
+        server
+            .metadata
+            .read()
+            .expect("Poisoned Lock")
+            .items
+            .keys()
+            .cloned()
+            .collect::<Vec<String>>(),
+    )
 }
 
 async fn get_one_item<T>(
     Path(name): Path<ItemName>,
     State(server): State<Server<T>>,
-) -> Result<impl IntoResponse, StatusCode>
+) -> impl IntoResponse
 where
     T: ChunkStorage + Sync + Send + Clone + Default,
 {
-    server
-        .metadata
-        .read()
-        .map(|metadata| metadata.items.get(&name).cloned())
-        .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    Json(
+        server
+            .metadata
+            .read()
+            .expect("Poisoned Lock")
+            .items
+            .get(&name)
+            .cloned(),
+    )
 }
 
 #[derive(Deserialize, Serialize)]
@@ -190,16 +209,19 @@ where
 async fn get_one_feed<T>(
     Path(name): Path<FeedName>,
     State(server): State<Server<T>>,
-) -> Result<impl IntoResponse, StatusCode>
+) -> impl IntoResponse
 where
     T: ChunkStorage + Sync + Send + Clone + Default,
 {
-    server
-        .metadata
-        .read()
-        .map(|metadata| metadata.feeds.get(&name).cloned())
-        .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    Json(
+        server
+            .metadata
+            .read()
+            .expect("Poisoned Lock")
+            .feeds
+            .get(&name)
+            .cloned(),
+    )
 }
 
 async fn get_chunk<T>(
@@ -241,7 +263,7 @@ async fn get_metadata<T>(State(server): State<Server<T>>) -> Result<impl IntoRes
 where
     T: ChunkStorage + Sync + Send + Clone + Default,
 {
-    let metadata = (*server.metadata.read().unwrap()).clone();
+    let metadata = (*server.metadata.read().expect("Poisoned Lock")).clone();
     ServerMetadata::from(metadata)
         .to_bitcode()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)

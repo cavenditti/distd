@@ -129,8 +129,10 @@ where
         };
         self.clients
             .write()
+            .expect("Poisoned Lock")
+            .try_insert(client.uuid, client)
+            .cloned()
             .ok()
-            .and_then(|mut clients| clients.try_insert(client.uuid, client).cloned().ok())
             .map(|client| client.uuid)
             .ok_or(RegisterError)
     }
@@ -138,14 +140,11 @@ where
     pub fn expose_feed(&self, feed: Feed) -> Result<FeedName, RegisterError> {
         self.metadata
             .write()
+            .expect("Poisoned Lock")
+            .feeds
+            .try_insert(feed.name.clone(), feed)
             .ok()
-            .and_then(|mut metadata| {
-                metadata
-                    .feeds
-                    .try_insert(feed.name.clone(), feed)
-                    .ok()
-                    .cloned()
-            })
+            .cloned()
             .map(|feed| feed.name.clone())
             .ok_or(RegisterError)
     }
@@ -158,12 +157,13 @@ where
         description: Option<String>,
         file: Bytes,
     ) -> Result<Item, ServerError> {
-        self.storage.create_item(name, path, revision, description, file)
+        self.storage
+            .create_item(name, path, revision, description, file)
             .ok_or(ServerError::ChunkInsertError)
             .and_then(|i| {
                 self.metadata
                     .write()
-                    .map_err(|_| ServerError::LockError)?
+                    .expect("Poisoned Lock")
                     .items
                     .try_insert(i.metadata.name.clone(), i)
                     .map(|item| item.to_owned())
