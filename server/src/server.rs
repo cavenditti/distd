@@ -158,24 +158,17 @@ where
         description: Option<String>,
         file: Bytes,
     ) -> Result<Item, ServerError> {
-        Item::new(
-            name,
-            path,
-            revision,
-            description,
-            file,
-            self.storage.clone(),
-        )
-        .map_err(ServerError::ChunkInsertError)
-        .and_then(|i| {
-            self.metadata
-                .write()
-                .map_err(|_e| ServerError::LockError)?
-                .items
-                .try_insert(i.metadata.name.clone(), i)
-                .map(|item| item.to_owned())
-                .map_err(|e| ServerError::ItemInsertionError(e.entry.key().clone()))
-        })
+        self.storage.create_item(name, path, revision, description, file)
+            .ok_or(ServerError::ChunkInsertError)
+            .and_then(|i| {
+                self.metadata
+                    .write()
+                    .map_err(|_| ServerError::LockError)?
+                    .items
+                    .try_insert(i.metadata.name.clone(), i)
+                    .map(|item| item.to_owned())
+                    .map_err(|e| ServerError::ItemInsertionError(e.entry.key().clone()))
+            })
     }
 
     pub fn get_public_key(&self) -> &[u8] {

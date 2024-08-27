@@ -1,4 +1,4 @@
-use std::{borrow::Cow, collections::HashSet, io, sync::Arc};
+use std::{borrow::Cow, collections::HashSet, io, path::PathBuf, sync::Arc};
 
 use blake3::Hash;
 use bytes::Bytes;
@@ -8,10 +8,11 @@ use serde::ser::{Serialize, SerializeStructVariant};
 use crate::{
     chunks::{ChunkInfo, OwnedHashTreeNode, RawChunk, CHUNK_SIZE},
     hash::merge_hashes,
+    item::{Item, ItemName},
 };
 
-pub mod hashmap_storage;
 pub mod fs_storage;
+pub mod hashmap_storage;
 
 use thiserror::Error;
 
@@ -378,5 +379,22 @@ pub trait ChunkStorage {
             slices.push(remainder);
         }
         partial_tree(self, slices.as_slice())
+    }
+
+    /// Create a new Item from its metadata and Bytes
+    /// This is the preferred way to create a new Item
+    fn create_item(
+        &self,
+        name: ItemName,
+        path: PathBuf,
+        revision: u32,
+        description: Option<String>,
+        file: Bytes,
+    ) -> Option<Item>
+    where
+        Self: Sized,
+    {
+        let hash_tree = self.insert(file)?;
+        Some(Item::new(name, path, revision, description, hash_tree))
     }
 }

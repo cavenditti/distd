@@ -125,16 +125,15 @@ impl InnerFsStorage {
 
 impl InnerFsStorage {
     /// Returns the (eventual) stored path of the item provided
-    fn path(&self, item: &Item) -> PathBuf {
-        let p = self.root.join(
-            &item
-                .metadata
+    fn path(&self, item: &Item) -> Result<PathBuf, Error> {
+        let full_path = self.root.join(
+            item.metadata
                 .path
                 .strip_prefix("/")
                 .unwrap_or(&item.metadata.path),
         );
-        create_dir_all(&p.parent().unwrap_or(&p)).unwrap(); // FIXME
-        p
+        create_dir_all(full_path.parent().unwrap_or(&full_path)).map_err(Error::msg)?;
+        Ok(full_path)
     }
 
     pub fn get(&self, hash: &Hash) -> Option<Arc<StoredChunkRef>> {
@@ -149,11 +148,15 @@ impl InnerFsStorage {
     }
 
     pub fn pre_allocate(&mut self, item: Item) -> Result<(), Error> {
-        let path = self.path(&item);
+        let path = self.path(&item)?;
         if self.items.contains(&item) {
             return Ok(());
         };
-        if self.items.iter().any(|it| *self.path(it) == path) {
+        if self
+            .items
+            .iter()
+            .any(|it| self.path(it).is_ok_and(|p| p == path))
+        {
             return Err(Error::msg(format!(
                 "Conflict found: path {} already present in filesystem",
                 path.to_string_lossy()
@@ -192,7 +195,7 @@ impl InnerFsStorage {
 
     /// Remove references to file from FsStorage, doesn't actually delete the file from filesystem
     pub fn remove(&mut self, item: Item) -> Result<(), Error> {
-        let path = self.path(&item);
+        let path = self.path(&item)?;
         // First check wheter the item is actually present, if not return Err
         let item = self
             .items
@@ -218,7 +221,7 @@ impl InnerFsStorage {
 
     /// Remove references to file from FsStorage and deletes the file from filesystem
     fn delete(&mut self, item: Item) -> Result<(), Error> {
-        let path = self.path(&item);
+        let path = self.path(&item)?;
         self.remove(item)
             .and_then(|_| remove_file(path).map_err(Error::msg))
     }
@@ -348,7 +351,8 @@ mod tests {
     fn test_fs_storage() {
         let storage = FsStorage::default();
         print_fsstorage(&storage);
-        let storage = FsStorage::new(PathBuf::from_str("somewhere_here").unwrap()).unwrap();
+        let tempdir = std::env::temp_dir().join(PathBuf::from_str("in_a_temp_dir").unwrap());
+        let storage = FsStorage::new(tempdir).unwrap();
         let item = make_zeros_item();
         storage.pre_allocate(item).unwrap();
         print_fsstorage(&storage);

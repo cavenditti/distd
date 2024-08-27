@@ -27,18 +27,19 @@
 //!}
 //!```
 
-use bytes::Bytes;
 use std::collections::HashSet;
 use std::hash::Hash;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::SystemTime;
 //use ring::signature::Signature;
 
 use serde::{Deserialize, Serialize};
 
+use crate::chunk_storage::StoredChunkRef;
 use crate::chunks::ChunkInfo;
 use crate::metadata::ItemMetadata;
-use crate::{chunk_storage::ChunkStorage, unique_name::UniqueName};
+use crate::unique_name::UniqueName;
 
 pub type ItemName = UniqueName;
 
@@ -65,20 +66,19 @@ pub struct Item {
 }
 
 impl Item {
-    /// Create a new Item from its metadata and Bytes
-    /// This is the preferred way to create a new Item
-    pub fn new<T: ChunkStorage + Clone>(
+    /// Create a new Item from its metadata and ChunkStorage
+    ///
+    /// Calling `create_item` on a ChunkStorage object encapsulates this and its the recommended way to create
+    /// an Item unless there is an explicit reason not to do so.
+    pub fn new(
         name: ItemName,
         path: PathBuf,
         revision: u32,
         description: Option<String>,
-        file: Bytes,
-        storage: T,
-    ) -> Result<Self, std::io::Error> {
-        let hash_tree = storage.insert(file).unwrap();
-
+        hash_tree: Arc<StoredChunkRef>,
+    ) -> Self {
         let now = SystemTime::now();
-        Ok(Self {
+        Self {
             metadata: ItemMetadata {
                 name,
                 description,
@@ -92,7 +92,7 @@ impl Item {
             },
             chunks: hash_tree.flatten_with_sizes(),
             hashes: hash_tree.all_hashes_with_sizes(),
-        })
+        }
     }
 
     /// Make a new Item without adding it to a storage
@@ -153,41 +153,49 @@ pub mod tests {
     use std::mem;
     use std::str::FromStr;
 
+    use bytes::Bytes;
+
     use crate::chunk_storage::hashmap_storage::HashMapStorage;
+    use crate::chunk_storage::ChunkStorage;
     use crate::chunks::CHUNK_SIZE;
     use crate::hash::hash;
     use crate::utils::serde::bitcode::BitcodeSerializable;
 
     use super::*;
 
+    /*
+     * Most of these tests are bad. I wasn't sure about Item interfaces at first and their spaghettified
+     * and messed up
+     */
+
     pub fn new_empty_item<T>(storage: T) -> Item
     where
         T: ChunkStorage + Clone,
     {
-        Item::new(
-            "name".to_string(),
-            PathBuf::from_str("/some/path").unwrap(),
-            0,
-            None,
-            Bytes::from_static(b""),
-            storage,
-        )
-        .unwrap()
+        storage
+            .create_item(
+                "name".to_string(),
+                PathBuf::from_str("/some/path").unwrap(),
+                0,
+                None,
+                Bytes::from_static(b""),
+            )
+            .unwrap()
     }
 
     pub fn new_zeros_item<T>(storage: T) -> Item
     where
         T: ChunkStorage + Clone,
     {
-        Item::new(
-            "name".to_string(),
-            PathBuf::from_str("some/path").unwrap(),
-            0,
-            Some("Some description for the larger item".to_string()),
-            Bytes::from_static(&[0u8; 100_000_000]),
-            storage,
-        )
-        .unwrap()
+        storage
+            .create_item(
+                "name".to_string(),
+                PathBuf::from_str("some/path").unwrap(),
+                0,
+                Some("Some description for the larger item".to_string()),
+                Bytes::from_static(&[0u8; 100_000_000]),
+            )
+            .unwrap()
     }
 
     pub fn make_zeros_item() -> Item {
