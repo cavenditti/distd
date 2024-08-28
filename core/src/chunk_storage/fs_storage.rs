@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::{create_dir_all, remove_file, File},
-    io::{BufReader, Read, Seek, Write},
+    io::{BufReader, Read, Seek},
     os::unix::fs::FileExt,
     path::PathBuf,
     sync::{atomic::AtomicBool, Arc, Mutex, RwLock},
@@ -51,7 +51,10 @@ impl TryFrom<InFileChunk> for StoredChunkRef {
         reader
             .seek(std::io::SeekFrom::Start(first_path.offset))
             .map_err(Error::msg)?;
+
         let mut buf = Vec::with_capacity(value.info.size as usize);
+        buf.resize(value.info.size as usize, 0);
+
         reader.read_exact(&mut buf).map_err(Error::msg)?;
         Ok(StoredChunkRef::Stored {
             hash: value.info.hash,
@@ -95,7 +98,10 @@ impl InFileChunk {
             .map(|_| {
                 self.populated
                     .swap(true, std::sync::atomic::Ordering::Relaxed);
-                // buffer.sync_all().unwrap();
+                // TODO investigate:
+                // I noticed while testing that even calling sync_all doesn't ensure the write actually happens
+                // right away. I'm not sure why this is the case.
+                buffer.sync_all().unwrap();
             })
         })
     }
@@ -321,8 +327,8 @@ impl ChunkStorage for FsStorage {
 
 #[cfg(test)]
 mod tests {
-    use crate::{chunks::CHUNK_SIZE, hash::hash, item::tests::make_ones_item};
-    use std::str::FromStr;
+    use crate::{chunks::CHUNK_SIZE, hash::hash as do_hash, item::tests::make_ones_item};
+    use std::{str::FromStr, thread::sleep, time::Duration};
 
     use super::*;
 
@@ -337,6 +343,86 @@ mod tests {
             storage.data.read().unwrap().data.values(),
             storage.get_items(),
         )
+    }
+
+    fn make_infile_chunk() -> ([u8; CHUNK_SIZE], Hash, InFileChunk) {
+        // Create infile_chunk with some data
+        let data = [1u8; CHUNK_SIZE];
+        let hash = do_hash(&data);
+        let infile_chunk = InFileChunk {
+            info: ChunkInfo {
+                hash,
+                size: CHUNK_SIZE as u32,
+            },
+            paths: HashSet::default(),
+            populated: Arc::default(),
+            buf_reader: Arc::default(),
+        };
+        (data, hash, infile_chunk)
+    }
+
+    fn write_data_to_infile_chunk(
+        data: &[u8],
+        hash: Hash,
+        infile_chunk: &mut InFileChunk,
+    ) -> PathBuf {
+        //  Add a temporary path
+        let path = std::env::temp_dir().join(PathBuf::from_str("tempfile").unwrap());
+        infile_chunk.paths.insert(InFileChunkPaths {
+            path: path.clone(),
+            offset: 0,
+        });
+
+        // write to temp path
+        infile_chunk.write(&hash, &data).unwrap();
+
+        // wait for the file to do actually written. We're calling `sync_all` inside InFileChunk::write,
+        // maybe I'm missing something.
+        sleep(Duration::from_secs(2));
+
+        path
+    }
+
+    fn is_populated(infile_chunk: &InFileChunk) -> bool {
+        infile_chunk
+            .populated
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[test]
+    fn test_infile_chunk() {
+        let (data, hash, mut infile_chunk) = make_infile_chunk();
+        assert!(!is_populated(&infile_chunk));
+
+        let path = write_data_to_infile_chunk(&data, hash, &mut infile_chunk);
+        assert!(is_populated(&infile_chunk));
+
+        // Check written data
+        let mut f = File::open(&path).unwrap();
+        let mut buffer = [0u8; CHUNK_SIZE];
+        let n = f.read(&mut buffer[..]).unwrap();
+        assert_eq!(n, CHUNK_SIZE);
+        assert_eq!(do_hash(&buffer), hash);
+    }
+
+    #[test]
+    fn test_infile_chunk_conversion() {
+        let (data, hash, mut infile_chunk) = make_infile_chunk();
+        let _path = write_data_to_infile_chunk(&data, hash, &mut infile_chunk);
+
+        assert!(is_populated(&infile_chunk));
+
+        let chunk = StoredChunkRef::try_from(infile_chunk.clone()).unwrap();
+        assert_eq!(
+            do_hash(&**chunk._get_stored_data().unwrap()),
+            do_hash(&data)
+        );
+        assert_eq!(chunk.get_hash(), &hash);
+        assert_eq!(do_hash(&data), hash);
+
+        // Check idempotence
+        let chunk2 = StoredChunkRef::try_from(infile_chunk).unwrap();
+        assert_eq!(chunk, chunk2);
     }
 
     #[test]
@@ -361,19 +447,19 @@ mod tests {
         // TODO read file and check its content are correct
         let path = storage.data.read().unwrap().path(&item).unwrap();
         let mut f = File::open(&path).unwrap();
-        let mut buffer = Vec::with_capacity(item.get_size() as usize);
+        let mut buffer = vec![0u8; item.get_size() as usize];
 
-        println!("{:?}", path);
+        println!("Stored data path {:?}", path);
 
         // read from file
         let n = f.read(&mut buffer[..]).unwrap();
 
         assert_eq!(n, (&item).get_size() as usize);
-        assert_eq!(hash(&buffer), item.metadata.root.hash);
+        assert_eq!(do_hash(&buffer), item.metadata.root.hash);
 
         // retrieve chunk from storage
         assert_eq!(
-            hash(
+            do_hash(
                 storage
                     .get(&item.metadata.root.hash)
                     .unwrap()

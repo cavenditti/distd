@@ -47,7 +47,9 @@ the (eventually private storage repo) and keep all items deduplicated.
 - [x] ~~Implement FsStorage, to store items directly in the filesystem without deduplication (will be used by client)~~
         **needs extensive testing**
 - [ ] Minimal client
-- [ ] Evaluate whether to and assign a 64-bit uid to each hash to reduce network overhead or not
+- [ ] Config
+- [ ] Basic authentication and keys management
+- [ ] Evaluate whether to assign a 64-bit uid to each hash to reduce network overhead or not
 
 ### Long term TODO:
 - [ ] Implement (a subset of) PPSPP in Rust, see [PyPPSPP](https://github.com/justas-/PyPPSPP) as reference
@@ -56,6 +58,7 @@ the (eventually private storage repo) and keep all items deduplicated.
 - [ ] Replace ptree with something unintrusive when running tests
 - [ ] no-std variant for client
 - [ ] Cross-compilation for arm
+- [ ] Compression?
 
 #### P2P (TODO)
 This works pretty much like a partitioned Bittorent swarm, but:
