@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc};
+use std::{fmt::Debug, net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc};
 
 use bitcode;
 use blake3::Hash;
@@ -13,6 +13,10 @@ use axum::{
     routing::get, //, post},
     Json,
     Router,
+};
+use tower_http::{
+    trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer},
+    LatencyUnit,
 };
 
 use distd_core::utils::serde::empty_string_as_none;
@@ -41,7 +45,7 @@ async fn register_client<T>(
     State(server): State<Server<T>>,
 ) -> Result<impl IntoResponse, StatusCode>
 where
-    T: ChunkStorage + Sync + Send + Clone + Default,
+    T: ChunkStorage + Sync + Send + Clone + Default + Debug,
 {
     server
         .register_client(client.name, addr, client.version)
@@ -178,7 +182,7 @@ async fn publish_item<T>(
     mut multipart: Multipart,
 ) -> Result<impl IntoResponse, StatusCode>
 where
-    T: ChunkStorage + Sync + Send + Clone + Default,
+    T: ChunkStorage + Sync + Send + Clone + Default + Debug,
 {
     while let Some(field) = multipart
         .next_field()
@@ -188,7 +192,6 @@ where
         if field.name().unwrap() != "item" {
             continue;
         }
-        println!("Found `item` field");
         let res = server.publish_item(
             name,
             item_data.path,
@@ -197,7 +200,7 @@ where
             field.bytes().await.map_err(|_| StatusCode::BAD_REQUEST)?,
         );
         let res = res.map(|x| x.metadata);
-        println!("RESULT: ERR {:?}", res);
+        tracing::debug!("{:?}", res);
         return res.map(Json).map_err(|e| match e {
             ServerError::ItemInsertionError(..) => StatusCode::NOT_IMPLEMENTED,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -272,7 +275,7 @@ where
 
 pub fn make_app<T>(server: RawServer<T>) -> IntoMakeServiceWithConnectInfo<Router, SocketAddr>
 where
-    T: ChunkStorage + Sync + Send + Clone + Default + 'static,
+    T: ChunkStorage + Sync + Send + Clone + Default + Debug + 'static,
 {
     Router::new()
         .route("/", get(version))
@@ -290,5 +293,15 @@ where
         .route("/transfer/metadata", get(get_metadata))
         .route("/transfer/:hash", get(get_transfer))
         .with_state(Arc::new(server))
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(DefaultMakeSpan::new().include_headers(true))
+                .on_request(DefaultOnRequest::new().level(tracing::Level::TRACE))
+                .on_response(
+                    DefaultOnResponse::new()
+                        .level(tracing::Level::INFO)
+                        .latency_unit(LatencyUnit::Micros),
+                ),
+        )
         .into_make_service_with_connect_info::<SocketAddr>()
 }

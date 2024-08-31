@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::sync::LazyLock;
+use std::{fmt::Display, sync::LazyLock};
 
 /// Version struct used in client-server and peer-peer version checking
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -40,8 +40,6 @@ impl std::str::FromStr for Version {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let v: Result<Vec<u16>, ParseVersionError> = s
-            .strip_prefix("distd ")
-            .ok_or(ParseVersionError)?
             .split('.')
             .map(|frag| u16::from_str(frag).map_err(|_| ParseVersionError))
             .collect();
@@ -64,6 +62,12 @@ impl Default for Version {
     }
 }
 
+impl Display for Version {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("{}.{}.{}", self.major, self.minor, self.patch))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
@@ -72,7 +76,7 @@ mod tests {
 
     #[test]
     fn test_from_str() {
-        let v = Version::from_str("distd 1.2.3").unwrap();
+        let v = Version::from_str("1.2.3").unwrap();
         assert_eq!(v.major, 1);
         assert_eq!(v.minor, 2);
         assert_eq!(v.patch, 3);
@@ -80,6 +84,6 @@ mod tests {
 
     #[test]
     fn test_from_str_invalid() {
-        assert!(Version::from_str("distd 1.2invalid.3").is_err())
+        assert!(Version::from_str("1.2invalid.3").is_err())
     }
 }

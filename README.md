@@ -39,15 +39,17 @@ the (eventually private storage repo) and keep all items deduplicated.
     > We may get away with this, as we have all leaf hashes and their differences. Shouldn't really be needed unless
     > there is the need to compute rolling hashes or doing something more fancy (in that case the approach would be
     > different anyway)
-- [ ] Replace some Option with Result to have better visibility on errors (in progress), mostly in chunk storage
 - [x] ~~Overall code clean up~~ kinda
-- [ ] Doc comments
-- [ ] Tests for everything
 - [x] ~~Make storage agnostic about hash computation, it's not its business~~
 - [x] ~~Implement FsStorage, to store items directly in the filesystem without deduplication (will be used by client)~~
         **needs extensive testing**
 - [ ] Minimal client
+- [ ] Doc comments
+- [ ] Tests for everything
+- [ ] Replace some Option with Result to have better visibility on errors (in progress), mostly in chunk storage
+- [ ] Server sessions
 - [ ] Config
+- [ ] Logging
 - [ ] Basic authentication and keys management
 - [ ] Evaluate whether to assign a 64-bit uid to each hash to reduce network overhead or not
 

@@ -9,10 +9,13 @@ documentation.workspace = true
 [dependencies]
 tokio = { workspace = true }
 axum = { workspace = true }
+tower-http = { workspace = true }
 
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 
+tracing = { workspace = true }
+tracing-subscriber = "0.3.16"
 clap = { workspace = true }
 config = { workspace = true }
 

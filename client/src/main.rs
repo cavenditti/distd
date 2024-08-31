@@ -1,7 +1,8 @@
 //#![deny(warnings)]
 #![warn(rust_2018_idioms)]
-use std::env;
+use std::{env, path::PathBuf, str::FromStr, thread::sleep, time::Duration};
 
+use distd_core::chunk_storage::fs_storage::FsStorage;
 
 pub mod client;
 pub mod connection;
@@ -20,7 +21,6 @@ async fn main() -> Result<()> {
             return Ok(());
         }
     };
-    println!("{}", method);
     let url = match env::args().nth(2) {
         Some(url) => url,
         None => {
@@ -41,11 +41,24 @@ async fn main() -> Result<()> {
 }
 
 async fn fetch_url(url: hyper::Uri, method: String) -> Result<()> {
-    let client = client::Client::new(url.clone(), &[0u8; 32]).await;
+    println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+
+    let storage = FsStorage::new(PathBuf::from_str("here").unwrap()).unwrap();
+    let client = loop {
+        match client::Client::new(url.clone(), &[0u8; 32], storage.clone()).await {
+            Ok(client) => break client,
+            Err(e) => {
+                const T: u64 = 5;
+                println!("Error: '{}', retrying in {} seconds", e, T);
+                sleep(Duration::from_secs(T))
+            }
+        }
+    };
     client
         .server
         .send_request(&method, url.path_and_query().unwrap().clone())
-        .await.unwrap(); //FIXME remove this
+        .await
+        .unwrap(); //FIXME remove this
 
     client.server.fetch_loop().await;
 

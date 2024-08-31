@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::RwLock;
@@ -15,6 +16,7 @@ use ring::{
     rand,
     signature::{self},
 };
+use tracing::span;
 use uuid::Uuid;
 
 use crate::client::{Client, ClientName};
@@ -53,6 +55,7 @@ impl From<ServerInternalMetadata> for ServerMetadata {
 ///
 /// Server signature is used to check replicated data among clients when shared p2p,
 /// Note that this is different from an eventual "build" signature.
+#[derive(Debug)]
 pub struct Server<T>
 where
     T: ChunkStorage + Sync + Send + Clone + Default,
@@ -96,7 +99,7 @@ pub struct RegisterError;
 
 impl<T> Server<T>
 where
-    T: ChunkStorage + Sync + Send + Clone + Default,
+    T: ChunkStorage + Sync + Send + Clone + Default + Debug,
 {
     pub fn new(
         pkcs8_bytes: Document,
@@ -118,8 +121,15 @@ where
         addr: SocketAddr,
         version: Option<Version>,
     ) -> Result<Uuid, RegisterError> {
-        let nonced_name = name.clone() + &self.uuid_nonce;
+        // tracing span
+        let span = span!(tracing::Level::INFO, "register_client");
+        let _entered = span.enter();
+
+        tracing::info!("Got new client: '{}' ver:{:?}, @{}", name, version, addr);
+        let nonced_name = name.clone() + &self.uuid_nonce + &addr.to_string();
+        tracing::debug!("Client nonced name: '{}'", nonced_name);
         let uuid = Uuid::new_v5(&Uuid::NAMESPACE_URL, nonced_name.as_bytes());
+        tracing::debug!("client uuid: '{}'", uuid.to_string());
         let client = Client {
             addr,
             name,
@@ -131,6 +141,7 @@ where
             .write()
             .expect("Poisoned Lock")
             .try_insert(client.uuid, client)
+            .inspect_err(|e| tracing::warn!("{}", e))
             .cloned()
             .ok()
             .map(|client| client.uuid)

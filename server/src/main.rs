@@ -8,13 +8,20 @@ use crate::client::Client;
 use crate::server::Server;
 
 pub mod client;
-pub mod server;
-pub mod rest_api;
 pub mod error;
+pub mod rest_api;
+pub mod server;
 
 #[tokio::main]
 async fn main() {
-    println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .compact()
+        .with_max_level(tracing::Level::DEBUG)
+        .init();
+
+    tracing::info!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+
     let server: Server<HashMapStorage> = Server::default();
     let feed = Feed::new("A feed");
     server.expose_feed(feed).unwrap();
@@ -22,6 +29,10 @@ async fn main() {
     let app = rest_api::make_app(server);
 
     // run our app with hyper, listening globally on port 3000
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    let addr = "0.0.0.0:3000";
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+
+    tracing::info!("listening on {}", addr);
+
     axum::serve(listener, app).await.unwrap();
 }

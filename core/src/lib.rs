@@ -7,16 +7,15 @@
 #![feature(hash_extract_if)]
 #![feature(test)]
 
-
-pub mod version;
-pub mod hash;
-pub mod chunks;
 pub mod chunk_storage;
-pub mod unique_name;
+pub mod chunks;
 pub mod feed;
-pub mod peer;
-pub mod utils;
-pub mod metadata;
+pub mod hash;
 pub mod item;
+pub mod metadata;
+pub mod peer;
+pub mod unique_name;
+pub mod utils;
+pub mod version;
 
 pub mod benchmarks;

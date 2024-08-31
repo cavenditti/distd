@@ -8,7 +8,7 @@ use crate::chunk_storage::ChunkStorage;
 use super::StoredChunkRef;
 
 /// Dead simple in-memory global storage
-#[derive(Default, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct HashMapStorage {
     data: Arc<RwLock<HashMap<Hash, Arc<StoredChunkRef>>>>,
 }
