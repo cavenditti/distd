@@ -560,6 +560,7 @@ dependencies = [
  "bitcode",
  "blake3",
  "clap",
+ "config",
  "distd_core",
  "http-body-util",
  "hyper",

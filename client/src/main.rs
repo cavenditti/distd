@@ -1,33 +1,82 @@
 //#![deny(warnings)]
+#![feature(iter_advance_by)]
 #![warn(rust_2018_idioms)]
 use std::{env, path::PathBuf, str::FromStr, thread::sleep, time::Duration};
 
+use config::Config;
+
 use distd_core::chunk_storage::fs_storage::FsStorage;
+use http_body_util::BodyExt;
+use hyper::body::Buf;
+
+use crate::client::Client;
 
 pub mod client;
 pub mod connection;
 pub mod server;
 
-// A simple type alias so as to DRY.
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
-
 #[tokio::main]
-async fn main() -> Result<()> {
-    // Some simple CLI args requirements...
-    let method = match env::args().nth(1) {
-        Some(method) => method,
-        None => {
-            println!("Usage: client <HTTP method> <url>");
-            return Ok(());
+async fn main() -> Result<(), i32> {
+    println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+
+    let cmd = std::env::args().nth(1).expect("no cmd given");
+    let mut i = std::env::args();
+    i.advance_by(2).expect("Invalid arguments");
+    let cmd_args = i.collect::<Vec<String>>();
+    println!("CMD: {} {:?}", cmd, cmd_args);
+
+    let settings = Config::builder()
+        // Add in `./Settings.toml`
+        .add_source(config::File::with_name("ClientSettings"))
+        // Add in settings from the environment (with a prefix of APP)
+        // Eg.. `APP_DEBUG=1 ./target/app` would set the `debug` key
+        .add_source(config::Environment::with_prefix("DISTD"))
+        .build()
+        .expect("Missing configuration file");
+
+    println!("Config: {:?}", settings);
+
+    let url = settings
+        .get_string("server_url")
+        .expect("Missing server url in configuration");
+    let uri = url.parse::<hyper::Uri>().unwrap();
+
+    let storage = FsStorage::new(PathBuf::from_str("here").unwrap()).unwrap();
+    let client = loop {
+        match client::Client::new(uri.clone(), &[0u8; 32], storage.clone()).await {
+            Ok(client) => break client,
+            Err(e) => {
+                const T: u64 = 5;
+                println!("Error: '{}', retrying in {} seconds", e, T);
+                sleep(Duration::from_secs(T))
+            }
         }
     };
-    let url = match env::args().nth(2) {
-        Some(url) => url,
-        None => {
-            println!("Usage: client <url>");
-            return Ok(());
+
+    println!("Feeds: {:?}", client.server.get_metadata().await.feeds);
+    println!("Items: {:?}", client.server.get_metadata().await.items);
+
+    match cmd.as_str() {
+        "fetch" => fetch(client, cmd_args).await,
+        "loop" => client_loop(client).await,
+        _ => {
+            println!("Invalid command specified");
+            return Err(-3);
         }
-    };
+    }
+}
+
+async fn client_loop(client: Client<FsStorage>) -> Result<(), i32> {
+    Ok(client.server.fetch_loop().await)
+}
+
+async fn fetch(client: Client<FsStorage>, args: Vec<String>) -> Result<(), i32> {
+    let (url, method) = args
+        .iter()
+        .nth(1)
+        .zip(env::args().nth(2))
+        .expect("Invalid args");
+    println!("Fetch {} {}", method, url);
 
     // HTTPS requires picking a TLS implementation, so give a better
     // warning if the user tries to request an 'https' URL.
@@ -37,30 +86,28 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    fetch_url(url, method).await
-}
-
-async fn fetch_url(url: hyper::Uri, method: String) -> Result<()> {
-    println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-
-    let storage = FsStorage::new(PathBuf::from_str("here").unwrap()).unwrap();
-    let client = loop {
-        match client::Client::new(url.clone(), &[0u8; 32], storage.clone()).await {
-            Ok(client) => break client,
-            Err(e) => {
-                const T: u64 = 5;
-                println!("Error: '{}', retrying in {} seconds", e, T);
-                sleep(Duration::from_secs(T))
-            }
-        }
-    };
-    client
+    let mut response = client
         .server
         .send_request(&method, url.path_and_query().unwrap().clone())
         .await
-        .unwrap(); //FIXME remove this
+        .inspect(|r| println!("Got {:?}", &r))
+        .or_else(|e| {
+            println!("{}", e);
+            Err(-7)
+        })?;
 
-    client.server.fetch_loop().await;
-
+    // send help plz
+    let body = String::from_utf8(
+        response
+            .body_mut()
+            .collect()
+            .await
+            .unwrap()
+            .aggregate()
+            .chunk()
+            .to_vec(),
+    )
+    .unwrap();
+    println!("Body: `{}`", body);
     Ok(())
 }
