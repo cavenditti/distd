@@ -97,17 +97,16 @@ async fn fetch(client: Client<FsStorage>, args: Vec<String>) -> Result<(), i32> 
         })?;
 
     // send help plz
-    let body = String::from_utf8(
-        response
-            .body_mut()
-            .collect()
-            .await
-            .unwrap()
-            .aggregate()
-            .chunk()
-            .to_vec(),
-    )
-    .unwrap();
-    println!("Body: `{}`", body);
+    let body = response
+        .body_mut()
+        .collect()
+        .await
+        .unwrap()
+        .aggregate()
+        .chunk()
+        .to_vec();
+    let body_str = String::from_utf8(body.clone())
+        .unwrap_or(body.iter().map(|x| format!("{:x?}", x)).collect());
+    println!("Body: `{}`", body_str);
     Ok(())
 }

@@ -19,7 +19,7 @@ use tower_http::{
     LatencyUnit,
 };
 
-use distd_core::utils::serde::empty_string_as_none;
+use distd_core::{chunk_storage::StoredChunkRef, utils::serde::empty_string_as_none};
 use distd_core::{
     chunks::OwnedHashTreeNode, metadata::ServerMetadata, utils::serde::bitcode::BitcodeSerializable,
 };
@@ -240,25 +240,35 @@ where
 
 /// Download data associated with an hash-tree from its root
 async fn get_transfer<T>(
-    Path(hash): Path<String>,
+    Path(hashes): Path<String>,
     State(server): State<Server<T>>,
 ) -> Result<impl IntoResponse, StatusCode>
 where
     T: ChunkStorage + Sync + Send + Clone + Default,
 {
-    let hash = Hash::from_str(hash.as_str()).map_err(|_| StatusCode::BAD_REQUEST)?;
-    server
-        .storage
-        .get(&hash)
-        .ok_or(StatusCode::NOT_FOUND)
-        .and_then(|stored_chunk_ref| {
-            Some(OwnedHashTreeNode::from((*stored_chunk_ref).clone()))
-                .ok_or(StatusCode::INTERNAL_SERVER_ERROR)
-        })
-        .and_then(|packed| {
-            bitcode::serialize(&packed).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
-        })
-        .map(Body::from)
+    // Manually splitting at ',' is actually enough for this case
+    let hashes: Result<Vec<Hash>, blake3::HexError> =
+        hashes.split(',').map(|x| Hash::from_str(x)).collect();
+
+    let hashes: Result<Vec<Arc<StoredChunkRef>>, StatusCode> = hashes
+        .inspect_err(|e| tracing::error!("Cannot decode hash {}", e))
+        .map_err(|_| StatusCode::BAD_REQUEST)?
+        .iter()
+        .map(|hash| server.storage.get(&hash)
+            .ok_or(StatusCode::NOT_FOUND))
+        .collect();
+
+    let chunks: Vec<OwnedHashTreeNode> = hashes?
+        .iter()
+        .map(|x| OwnedHashTreeNode::from((**x).clone()))
+        .collect();
+
+    let serialized: Result<Vec<u8>, StatusCode> =
+        bitcode::serialize(&chunks)
+        .inspect_err(|e| tracing::error!("Cannot serialize chunk {}", e))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+
+    serialized.map(Body::from)
 }
 
 /// Download data associated with an hash-tree from its root
@@ -291,7 +301,7 @@ where
         .route("/feeds/:feed_name", get(get_one_feed))
         // 'transfer' routes return binary bitcode serialized bodies
         .route("/transfer/metadata", get(get_metadata))
-        .route("/transfer/:hash", get(get_transfer))
+        .route("/transfer/:hashes", get(get_transfer))
         .with_state(Arc::new(server))
         .layer(
             TraceLayer::new_for_http()
