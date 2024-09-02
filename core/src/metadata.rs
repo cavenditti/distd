@@ -55,7 +55,7 @@ impl std::hash::Hash for ItemMetadata {
 }
 
 impl ItemMetadata {
-    pub fn get_size(&self) -> u32 {
+    pub fn size(&self) -> u32 {
         self.root.size
     }
 }

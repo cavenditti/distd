@@ -248,14 +248,13 @@ where
 {
     // Manually splitting at ',' is actually enough for this case
     let hashes: Result<Vec<Hash>, blake3::HexError> =
-        hashes.split(',').map(|x| Hash::from_str(x)).collect();
+        hashes.split(',').map(Hash::from_str).collect();
 
     let hashes: Result<Vec<Arc<StoredChunkRef>>, StatusCode> = hashes
         .inspect_err(|e| tracing::error!("Cannot decode hash {}", e))
         .map_err(|_| StatusCode::BAD_REQUEST)?
         .iter()
-        .map(|hash| server.storage.get(&hash)
-            .ok_or(StatusCode::NOT_FOUND))
+        .map(|hash| server.storage.get(hash).ok_or(StatusCode::NOT_FOUND))
         .collect();
 
     let chunks: Vec<OwnedHashTreeNode> = hashes?
@@ -263,8 +262,7 @@ where
         .map(|x| OwnedHashTreeNode::from((**x).clone()))
         .collect();
 
-    let serialized: Result<Vec<u8>, StatusCode> =
-        bitcode::serialize(&chunks)
+    let serialized: Result<Vec<u8>, StatusCode> = bitcode::serialize(&chunks)
         .inspect_err(|e| tracing::error!("Cannot serialize chunk {}", e))
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
 

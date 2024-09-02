@@ -182,7 +182,7 @@ where
             })
     }
 
-    pub fn get_public_key(&self) -> &[u8] {
+    pub fn public_key(&self) -> &[u8] {
         self.key_pair.public_key().as_ref()
     }
 }

@@ -57,7 +57,7 @@ the (eventually private storage repo) and keep all items deduplicated.
 - [ ] Implement (a subset of) PPSPP in Rust, see [PyPPSPP](https://github.com/justas-/PyPPSPP) as reference
 - [ ] Add TLS, or use QUIC everywhere
 - [ ] Make sure the approach is fine tuned for EROFS images, so that they can be chunked efficiently.
-- [ ] Replace ptree with something unintrusive when running tests
+- [x] ~~Replace ptree with something unintrusive when running tests~~ Just ditched it for now, trees are going to be too big anyway.
 - [ ] no-std variant for client
 - [ ] Cross-compilation for arm
 - [ ] Compression?

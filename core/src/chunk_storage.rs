@@ -46,7 +46,7 @@ pub trait ChunkStorage {
     fn insert_chunk(&self, chunk: &[u8]) -> Option<Arc<StoredChunkRef>> {
         let hash = blake3::hash(chunk);
         self._insert_chunk(hash, chunk)
-            .inspect(|x| assert!(*x.get_hash() == hash))
+            .inspect(|x| assert!(*x.hash() == hash))
     }
 
     fn link(
@@ -54,9 +54,9 @@ pub trait ChunkStorage {
         left: Arc<StoredChunkRef>,
         right: Arc<StoredChunkRef>,
     ) -> Option<Arc<StoredChunkRef>> {
-        let hash = merge_hashes(left.get_hash(), right.get_hash());
+        let hash = merge_hashes(left.hash(), right.hash());
         self._link(hash, left, right)
-            .inspect(|x| assert!(*x.get_hash() == hash))
+            .inspect(|x| assert!(*x.hash() == hash))
     }
 
     /// Insert bytes into the storage returning the associated hash tree

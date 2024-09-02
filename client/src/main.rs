@@ -1,7 +1,7 @@
 //#![deny(warnings)]
 #![feature(iter_advance_by)]
 #![warn(rust_2018_idioms)]
-use std::{env, path::PathBuf, str::FromStr, thread::sleep, time::Duration};
+use std::{env, fmt::Write, path::PathBuf, str::FromStr, thread::sleep, time::Duration};
 
 use config::Config;
 
@@ -53,8 +53,8 @@ async fn main() -> Result<(), i32> {
         }
     };
 
-    println!("Feeds: {:?}", client.server.get_metadata().await.feeds);
-    println!("Items: {:?}", client.server.get_metadata().await.items);
+    println!("Feeds: {:?}", client.server.metadata().await.feeds);
+    println!("Items: {:?}", client.server.metadata().await.items);
 
     match cmd.as_str() {
         "fetch" => fetch(client, cmd_args).await,
@@ -67,15 +67,12 @@ async fn main() -> Result<(), i32> {
 }
 
 async fn client_loop(client: Client<FsStorage>) -> Result<(), i32> {
-    Ok(client.server.fetch_loop().await)
+    client.server.fetch_loop().await;
+    Ok(())
 }
 
 async fn fetch(client: Client<FsStorage>, args: Vec<String>) -> Result<(), i32> {
-    let (url, method) = args
-        .iter()
-        .nth(1)
-        .zip(env::args().nth(2))
-        .expect("Invalid args");
+    let (url, method) = args.get(1).zip(args.get(2)).expect("Invalid args");
     println!("Fetch {} {}", method, url);
 
     // HTTPS requires picking a TLS implementation, so give a better
@@ -88,13 +85,11 @@ async fn fetch(client: Client<FsStorage>, args: Vec<String>) -> Result<(), i32> 
 
     let mut response = client
         .server
-        .send_request(&method, url.path_and_query().unwrap().clone())
+        .send_request(method, url.path_and_query().unwrap().clone())
         .await
         .inspect(|r| println!("Got {:?}", &r))
-        .or_else(|e| {
-            println!("{}", e);
-            Err(-7)
-        })?;
+        .inspect_err(|e| println!("{}", e))
+        .map_err(|_| -7)?;
 
     // send help plz
     let body = response
@@ -105,8 +100,12 @@ async fn fetch(client: Client<FsStorage>, args: Vec<String>) -> Result<(), i32> 
         .aggregate()
         .chunk()
         .to_vec();
-    let body_str = String::from_utf8(body.clone())
-        .unwrap_or(body.iter().map(|x| format!("{:x?}", x)).collect());
+    let body_str =
+        String::from_utf8(body.clone()).unwrap_or(body.iter().fold(String::new(), |mut s, x| {
+            let _ = write!(s, "{x:x?}");
+            s
+        }));
+    //.unwrap_or(body.iter().map(|x| format!("{:x?}", x)).collect());
     println!("Body: `{}`", body_str);
     Ok(())
 }

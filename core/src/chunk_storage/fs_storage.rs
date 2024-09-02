@@ -52,8 +52,7 @@ impl TryFrom<InFileChunk> for StoredChunkRef {
             .seek(std::io::SeekFrom::Start(first_path.offset))
             .map_err(Error::msg)?;
 
-        let mut buf = Vec::with_capacity(value.info.size as usize);
-        buf.resize(value.info.size as usize, 0);
+        let mut buf = vec![0u8; value.info.size as usize];
 
         reader.read_exact(&mut buf).map_err(Error::msg)?;
         Ok(StoredChunkRef::Stored {
@@ -143,8 +142,8 @@ impl InnerFsStorage {
     }
 
     pub fn pre_allocate(&mut self, item: &Item) -> Result<(), Error> {
-        let path = self.path(&item)?;
-        if self.items.contains(&item) {
+        let path = self.path(item)?;
+        if self.items.contains(item) {
             return Ok(());
         };
         if self
@@ -158,7 +157,7 @@ impl InnerFsStorage {
             )));
         }
         File::create(&path)
-            .and_then(|x| x.set_len(item.get_size() as u64))
+            .and_then(|x| x.set_len(item.size() as u64))
             .map_err(Error::msg)?;
 
         let mut offset = 0;
@@ -246,37 +245,45 @@ impl FsStorage {
 
     //pub fn load() {}
 
-    pub fn get_root(&self) -> PathBuf {
-        self.data.read().expect("Poisoned Lock").root.clone()
+    /// Call read() on self.data lock and unwrap it
+    fn read(&self) -> std::sync::RwLockReadGuard<InnerFsStorage> {
+        self.data.read().expect("Poisoned Lock")
     }
 
-    pub fn get_items(&self) -> HashSet<Item> {
-        self.data.read().expect("Poisoned Lock").items.clone()
+    /// Call write() on self.data lock and unwrap it
+    fn write(&self) -> std::sync::RwLockWriteGuard<InnerFsStorage> {
+        self.data.write().expect("Poisoned Lock")
+    }
+
+    pub fn root(&self) -> PathBuf {
+        self.read().root.clone()
+    }
+
+    pub fn items(&self) -> HashSet<Item> {
+        self.read().items.clone()
     }
 
     /// Wrapper around InnerFsStorage::pre_allocate
     pub fn pre_allocate(&self, item: &Item) -> Result<(), Error> {
-        self.data.write().expect("Poisoned Lock").pre_allocate(item)
+        self.write().pre_allocate(item)
     }
 
     /// Remove references to file from FsStorage, doesn't actually delete the file from filesystem
     /// Wrapper around InnerFsStorage::remove
     pub fn remove(&self, item: Item) -> Result<(), Error> {
-        self.data.write().expect("Poisoned Lock").remove(item)
+        self.write().remove(item)
     }
 
     /// Remove references to file from FsStorage and deletes the file from filesystem
     /// Wrapper around InnerFsStorage::delete
     pub fn delete(&self, item: Item) -> Result<(), Error> {
-        self.data.write().expect("Poisoned Lock").delete(item)
+        self.write().delete(item)
     }
 }
 
 impl ChunkStorage for FsStorage {
     fn get(&self, hash: &Hash) -> Option<Arc<StoredChunkRef>> {
-        self.data
-            .read()
-            .expect("Poisoned Lock")
+        self.read()
             .data
             .get(hash)
             .and_then(|x| StoredChunkRef::try_from(x).ok())
@@ -289,8 +296,7 @@ impl ChunkStorage for FsStorage {
 
     /// May only add chunks by adding items. Dummy implementation always returning None
     fn _insert_chunk(&self, hash: Hash, chunk: &[u8]) -> Option<Arc<StoredChunkRef>> {
-        let mut inner = self.data.write().expect("Poisoned Lock");
-        inner.data.get_mut(&hash).and_then(|infile_chunk| {
+        self.write().data.get_mut(&hash).and_then(|infile_chunk| {
             infile_chunk.write(&hash, chunk).ok()?;
             StoredChunkRef::try_from(infile_chunk).map(Arc::new).ok()
         })
@@ -307,9 +313,7 @@ impl ChunkStorage for FsStorage {
     }
 
     fn chunks(&self) -> Vec<Hash> {
-        self.data
-            .read()
-            .expect("Poisoned Lock")
+        self.read()
             .data
             .keys()
             .cloned()
@@ -338,10 +342,10 @@ mod tests {
             chunks: {:?} \n\
             file chunks: {:?} \n\
             items: {:?}",
-            storage.get_root(),
+            storage.root(),
             storage.chunks(),
             storage.data.read().unwrap().data.values(),
-            storage.get_items(),
+            storage.items(),
         )
     }
 
@@ -413,11 +417,8 @@ mod tests {
         assert!(is_populated(&infile_chunk));
 
         let chunk = StoredChunkRef::try_from(infile_chunk.clone()).unwrap();
-        assert_eq!(
-            do_hash(&**chunk._get_stored_data().unwrap()),
-            do_hash(&data)
-        );
-        assert_eq!(chunk.get_hash(), &hash);
+        assert_eq!(do_hash(&**chunk.stored_data().unwrap()), do_hash(&data));
+        assert_eq!(chunk.hash(), &hash);
         assert_eq!(do_hash(&data), hash);
 
         // Check idempotence
@@ -447,14 +448,14 @@ mod tests {
         // TODO read file and check its content are correct
         let path = storage.data.read().unwrap().path(&item).unwrap();
         let mut f = File::open(&path).unwrap();
-        let mut buffer = vec![0u8; item.get_size() as usize];
+        let mut buffer = vec![0u8; item.size() as usize];
 
         println!("Stored data path {:?}", path);
 
         // read from file
         let n = f.read(&mut buffer[..]).unwrap();
 
-        assert_eq!(n, (&item).get_size() as usize);
+        assert_eq!(n, (&item).size() as usize);
         assert_eq!(do_hash(&buffer), item.metadata.root.hash);
 
         // retrieve chunk from storage
@@ -463,7 +464,7 @@ mod tests {
                 storage
                     .get(&item.metadata.root.hash)
                     .unwrap()
-                    ._get_stored_data()
+                    .stored_data()
                     .unwrap()
                     .as_ref()
             ),

@@ -84,7 +84,7 @@ impl Item {
                 description,
                 revision,
                 path,
-                root: hash_tree.get_chunk_info(),
+                root: hash_tree.chunk_info(),
                 created: now,
                 updated: now,
                 created_by: env!("CARGO_PKG_VERSION").to_owned(),
@@ -131,8 +131,8 @@ impl Item {
     }
 
     /// Total size of the item
-    pub fn get_size(&self) -> u32 {
-        self.metadata.get_size()
+    pub fn size(&self) -> u32 {
+        self.metadata.size()
     }
 
     /// `Stored` chunks diff of two items

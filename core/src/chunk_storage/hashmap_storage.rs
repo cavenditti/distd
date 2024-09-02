@@ -46,8 +46,8 @@ impl ChunkStorage for HashMapStorage {
         println!(
             "[Storage Link ]: {}: {} + {}",
             hash,
-            left.get_hash(),
-            right.get_hash()
+            left.hash(),
+            right.hash()
         );
         */
         let mut data = self.data.write().expect("Poisoned Lock");
@@ -85,8 +85,6 @@ mod tests {
 
     use super::*;
     use bytes::Bytes;
-    //use ptree::print_tree;
-
     #[test]
     fn test_hms_single_chunk_insertion() {
         let s = HashMapStorage::default();
@@ -122,12 +120,12 @@ mod tests {
         assert_eq!(CHUNK_SIZE, s.size());
 
         let root_hash = hash(&[0u8; SIZE]);
-        assert_eq!(root.get_hash(), &root_hash);
+        assert_eq!(root.hash(), &root_hash);
 
         let zeros_chunk_hash = hash(&[0u8; CHUNK_SIZE]);
         let root_children = (zeros_chunk_hash, hash(&[0u8; CHUNK_SIZE * 2]));
-        assert_eq!(root._get_children().unwrap().0.get_hash(), &root_children.0);
-        assert_eq!(root._get_children().unwrap().1.get_hash(), &root_children.1);
+        assert_eq!(root.children().unwrap().0.hash(), &root_children.0);
+        assert_eq!(root.children().unwrap().1.hash(), &root_children.1);
 
         let hash_vec = root.flatten();
         assert_eq!(hash_vec.len(), 3);

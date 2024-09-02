@@ -111,11 +111,11 @@ impl Server {
             .map_err(Error::msg)
     }
 
-    pub async fn get_metadata(&self) -> ServerMetadata {
+    pub async fn metadata(&self) -> ServerMetadata {
         self.shared.read().await.metadata.clone()
     }
 
-    pub async fn get_last_update(&self) -> Instant {
+    pub async fn last_update(&self) -> Instant {
         self.shared.read().await.last_update
     }
 
@@ -218,7 +218,7 @@ impl Server {
                 PathAndQuery::try_from(format!(
                     "/clients?name={}&version={}",
                     utf8_percent_encode(client_name, NON_ALPHANUMERIC),
-                    VERSION.to_string(),
+                    *VERSION,
                 ))
                 .unwrap(),
             )
