@@ -62,7 +62,7 @@ impl ChunkStorage for HashMapStorage {
             .read()
             .expect("Poisoned Lock")
             .keys()
-            .cloned()
+            .copied()
             .collect()
     }
 
@@ -95,7 +95,7 @@ mod tests {
     }
 
     #[test]
-    /// Multiple chunks, not aligned with CHUNK_SIZE
+    /// Multiple chunks, not aligned with `CHUNK_SIZE`
     fn test_hms_insertion() {
         let s = HashMapStorage::default();
         let data = Bytes::from_static(include_bytes!("../../../Cargo.lock"));

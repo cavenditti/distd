@@ -8,14 +8,20 @@ use crate::unique_name::UniqueName;
 
 pub type FeedName = UniqueName;
 
+/// A `Feed` is a collection of items
+///
+/// It is identified by a unique name
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Feed {
+    /// Name of the feed
     pub name: FeedName,
+
+    /// Paths of items in the feed
     pub paths: BTreeMap<PathBuf, Item>,
 }
 
 impl Feed {
-    pub fn new(name: &str) -> Self {
+    #[must_use] pub fn new(name: &str) -> Self {
         Self {
             name: name.to_string(),
             paths: BTreeMap::new(),

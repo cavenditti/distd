@@ -92,7 +92,7 @@ pub trait ChunkStorage {
         }
 
         let (chunks, remainder) = data.as_chunks::<CHUNK_SIZE>();
-        let mut slices = chunks.iter().map(|x| x.as_ref()).collect::<Vec<&[u8]>>(); // FIXME is this zero copy?
+        let mut slices = chunks.iter().map(std::convert::AsRef::as_ref).collect::<Vec<&[u8]>>(); // FIXME is this zero copy?
         if !remainder.is_empty() {
             slices.push(remainder);
         }

@@ -84,6 +84,6 @@ mod tests {
 
     #[test]
     fn test_from_str_invalid() {
-        assert!(Version::from_str("1.2invalid.3").is_err())
+        assert!(Version::from_str("1.2invalid.3").is_err());
     }
 }

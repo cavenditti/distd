@@ -10,13 +10,24 @@ use distd_core::version::Version;
 
 pub type ClientName = UniqueName;
 
+/// Server-side client representation
 #[derive(Debug, Clone)]
 pub struct Client {
+    /// Client advertised name
     pub name: ClientName,
+
+    /// Client address
     pub addr: SocketAddr,
+
+    /// Client UUID, assigned by server
     pub uuid: Uuid,
+
     //realm: Option<Arc<Realm>>,
+
+    /// Client version, optional
     pub version: Option<Version>,
+
+    /// Last heartbeat time
     pub last_heartbeat: SystemTime,
 }
 

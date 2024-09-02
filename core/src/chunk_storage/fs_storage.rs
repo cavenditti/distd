@@ -15,6 +15,7 @@ use crate::{chunks::ChunkInfo, item::Item};
 use super::{ChunkStorage, StoredChunkRef};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Path and offset of a chunk in a file
 struct InFileChunkPaths {
     pub path: PathBuf,
     pub offset: u64,
@@ -33,6 +34,10 @@ struct InFileChunk {
 impl TryFrom<InFileChunk> for StoredChunkRef {
     type Error = Error;
 
+
+    /// Try to read the chunk from the file at first path
+    ///
+    /// If the chunk is not populated, it will return an error
     fn try_from(value: InFileChunk) -> Result<Self, Self::Error> {
         if !value.populated.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(Error::msg("missing data"));
@@ -84,6 +89,7 @@ impl TryFrom<&mut InFileChunk> for StoredChunkRef {
 }
 
 impl InFileChunk {
+    /// Write a chunk to the file at all the registered paths for that chunk
     pub fn write(&self, hash: &Hash, chunk: &[u8]) -> Result<(), Error> {
         assert_eq!(&self.info.hash, hash);
 
@@ -94,7 +100,7 @@ impl InFileChunk {
                 Ok(size) if size as u32 == self.info.size => Ok(()),
                 _ => Err(Error::msg("Cannot write to file")),
             }
-            .map(|_| {
+            .map(|()| {
                 self.populated
                     .swap(true, std::sync::atomic::Ordering::Relaxed);
                 // TODO investigate:
@@ -106,8 +112,8 @@ impl InFileChunk {
     }
 }
 
-/// Shared state pointed to by FsStorage
-/// This does Chunks ref-counting on Items to manage chunks availability trought FsStorage ChunkStorage interfaces.
+/// Shared state pointed to by `FsStorage`
+/// This does Chunks ref-counting on Items to manage chunks availability trought `FsStorage` `ChunkStorage` interfaces.
 /// Removing files may actually be slow.
 #[derive(Default)]
 struct InnerFsStorage {
@@ -115,7 +121,10 @@ struct InnerFsStorage {
     /// Keeping track of all items'paths is important, as we cannot store different items in the same path
     pub root: PathBuf,
 
+    /// Items, used to get the paths where to store chunks
     pub items: HashSet<Item>,
+
+    /// Data, used to store `InFileChunks`
     pub data: HashMap<Hash, InFileChunk>,
 }
 
@@ -141,6 +150,7 @@ impl InnerFsStorage {
         Ok(full_path)
     }
 
+    /// Pre-allocate space for an item in the filesystem
     pub fn pre_allocate(&mut self, item: &Item) -> Result<(), Error> {
         let path = self.path(item)?;
         if self.items.contains(item) {
@@ -157,7 +167,7 @@ impl InnerFsStorage {
             )));
         }
         File::create(&path)
-            .and_then(|x| x.set_len(item.size() as u64))
+            .and_then(|x| x.set_len(u64::from(item.size())))
             .map_err(Error::msg)?;
 
         let mut offset = 0;
@@ -168,7 +178,7 @@ impl InnerFsStorage {
                 path: path.clone(),
                 offset,
             };
-            offset += chunk.size as u64;
+            offset += u64::from(chunk.size);
             if let Some(infile_chunk) = self.data.get_mut(&chunk.hash) {
                 infile_chunk.paths.insert(paths);
             } else {
@@ -187,7 +197,7 @@ impl InnerFsStorage {
         Ok(())
     }
 
-    /// Remove references to file from FsStorage, doesn't actually delete the file from filesystem
+    /// Remove references to file from `FsStorage`, doesn't actually delete the file from filesystem
     pub fn remove(&mut self, item: Item) -> Result<(), Error> {
         let path = self.path(&item)?;
         // First check wheter the item is actually present, if not return Err
@@ -213,11 +223,11 @@ impl InnerFsStorage {
         Ok(())
     }
 
-    /// Remove references to file from FsStorage and deletes the file from filesystem
+    /// Remove references to file from `FsStorage` and deletes the file from filesystem
     fn delete(&mut self, item: Item) -> Result<(), Error> {
         let path = self.path(&item)?;
         self.remove(item)
-            .and_then(|_| remove_file(path).map_err(Error::msg))
+            .and_then(|()| remove_file(path).map_err(Error::msg))
     }
 }
 
@@ -225,7 +235,7 @@ impl InnerFsStorage {
 ///
 /// It is useful to actually install files in the filesystem if the root is set to `/`
 ///
-/// While it implements ChunkStorage, most methods will fail without special care, in particular by providing
+/// While it implements `ChunkStorage`, most methods will fail without special care, in particular by providing
 /// relevant items to get their paths.
 ///
 /// Most logic is implemented in `InnerFsStorage`, this is mostly a wrapper to provide interior mutability
@@ -245,43 +255,45 @@ impl FsStorage {
 
     //pub fn load() {}
 
-    /// Call read() on self.data lock and unwrap it
+    /// Call `read()` on self.data lock and unwrap it
     fn read(&self) -> std::sync::RwLockReadGuard<InnerFsStorage> {
         self.data.read().expect("Poisoned Lock")
     }
 
-    /// Call write() on self.data lock and unwrap it
+    /// Call `write()` on self.data lock and unwrap it
     fn write(&self) -> std::sync::RwLockWriteGuard<InnerFsStorage> {
         self.data.write().expect("Poisoned Lock")
     }
 
-    pub fn root(&self) -> PathBuf {
+    /// Root path for the `FsStorage`
+    #[must_use] pub fn root(&self) -> PathBuf {
         self.read().root.clone()
     }
 
-    pub fn items(&self) -> HashSet<Item> {
+    #[must_use] pub fn items(&self) -> HashSet<Item> {
         self.read().items.clone()
     }
 
-    /// Wrapper around InnerFsStorage::pre_allocate
+    /// Wrapper around `InnerFsStorage::pre_allocate`
     pub fn pre_allocate(&self, item: &Item) -> Result<(), Error> {
         self.write().pre_allocate(item)
     }
 
-    /// Remove references to file from FsStorage, doesn't actually delete the file from filesystem
-    /// Wrapper around InnerFsStorage::remove
+    /// Remove references to file from `FsStorage`, doesn't actually delete the file from filesystem
+    /// Wrapper around `InnerFsStorage::remove`
     pub fn remove(&self, item: Item) -> Result<(), Error> {
         self.write().remove(item)
     }
 
-    /// Remove references to file from FsStorage and deletes the file from filesystem
-    /// Wrapper around InnerFsStorage::delete
+    /// Remove references to file from `FsStorage` and deletes the file from filesystem
+    /// Wrapper around `InnerFsStorage::delete`
     pub fn delete(&self, item: Item) -> Result<(), Error> {
         self.write().delete(item)
     }
 }
 
 impl ChunkStorage for FsStorage {
+    /// Get a `StoredChunkRef` chunk from storage
     fn get(&self, hash: &Hash) -> Option<Arc<StoredChunkRef>> {
         self.read()
             .data
@@ -312,11 +324,12 @@ impl ChunkStorage for FsStorage {
         None
     }
 
+    /// Get a Vec of all chunks' hashes in storage
     fn chunks(&self) -> Vec<Hash> {
         self.read()
             .data
             .keys()
-            .cloned()
+            .copied()
             .collect()
     }
 
@@ -346,7 +359,7 @@ mod tests {
             storage.chunks(),
             storage.data.read().unwrap().data.values(),
             storage.items(),
-        )
+        );
     }
 
     fn make_infile_chunk() -> ([u8; CHUNK_SIZE], Hash, InFileChunk) {
@@ -378,7 +391,7 @@ mod tests {
         });
 
         // write to temp path
-        infile_chunk.write(&hash, &data).unwrap();
+        infile_chunk.write(&hash, data).unwrap();
 
         // wait for the file to do actually written. We're calling `sync_all` inside InFileChunk::write,
         // maybe I'm missing something.
@@ -417,7 +430,7 @@ mod tests {
         assert!(is_populated(&infile_chunk));
 
         let chunk = StoredChunkRef::try_from(infile_chunk.clone()).unwrap();
-        assert_eq!(do_hash(&**chunk.stored_data().unwrap()), do_hash(&data));
+        assert_eq!(do_hash(&chunk.stored_data().unwrap()), do_hash(&data));
         assert_eq!(chunk.hash(), &hash);
         assert_eq!(do_hash(&data), hash);
 
@@ -450,12 +463,12 @@ mod tests {
         let mut f = File::open(&path).unwrap();
         let mut buffer = vec![0u8; item.size() as usize];
 
-        println!("Stored data path {:?}", path);
+        println!("Stored data path {path:?}");
 
         // read from file
         let n = f.read(&mut buffer[..]).unwrap();
 
-        assert_eq!(n, (&item).size() as usize);
+        assert_eq!(n, item.size() as usize);
         assert_eq!(do_hash(&buffer), item.metadata.root.hash);
 
         // retrieve chunk from storage

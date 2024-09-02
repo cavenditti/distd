@@ -7,14 +7,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::utils::serde::hashes::{deserialize_hash, serialize_hash};
 
-// It may useful to increase this in order to print hash tree when debugging
-//pub const CHUNK_SIZE: usize = 4 * 1024;
+/// Chunk size in bytes
+/// It may useful to increase this in order to print hash tree when debugging
 pub const CHUNK_SIZE: usize = blake3::guts::CHUNK_LEN;
+//pub const CHUNK_SIZE: usize = 4 * 1024;
 
+/// Raw chunk reference
 pub type RawChunk = Arc<Vec<u8>>;
+
+/// Owned chunk
 pub type OwnedChunk = Vec<u8>;
+
 //pub type Size = u64;
 
+/// Node in an hash-tree
+/// It may be a parent node with two children or a leaf node with owned data
 pub trait HashTreeNode {
     /// Get hash of node
     fn hash(&self) -> &Hash;
@@ -32,6 +39,7 @@ pub trait HashTreeNode {
 /// Seralizable view of the hash tree, fully owns stored chunks and subtrees
 #[derive(Debug, Clone, Serialize, Deserialize, std::hash::Hash, PartialEq, Eq)]
 pub enum OwnedHashTreeNode {
+    /// Parent node with two children
     Parent {
         size: u32,
         #[serde(
@@ -42,6 +50,8 @@ pub enum OwnedHashTreeNode {
         left: Box<OwnedHashTreeNode>,
         right: Box<OwnedHashTreeNode>,
     },
+
+    /// Leaf node with owned stored data
     Stored {
         #[serde(
             serialize_with = "serialize_hash",
@@ -53,12 +63,14 @@ pub enum OwnedHashTreeNode {
 }
 
 impl HashTreeNode for OwnedHashTreeNode {
+    /// Get hash of node
     fn hash(&self) -> &Hash {
         match self {
             Self::Parent { hash, .. } | Self::Stored { hash, .. } => hash,
         }
     }
 
+    /// Compute sum size in bytes of all descending chunks
     fn size(&self) -> u32 {
         match self {
             Self::Parent { size, .. } => *size,
@@ -66,6 +78,7 @@ impl HashTreeNode for OwnedHashTreeNode {
         }
     }
 
+    /// Get children, return None if is `Stored`
     fn children(&self) -> Option<(&Self, &Self)> {
         match self {
             Self::Parent { left, right, .. } => Some((left, right)),
@@ -73,6 +86,7 @@ impl HashTreeNode for OwnedHashTreeNode {
         }
     }
 
+    /// Get contained data, returns None if is not `Stored`
     fn stored_data(&self) -> Option<&OwnedChunk> {
         match self {
             Self::Parent { .. } => None,
@@ -81,6 +95,7 @@ impl HashTreeNode for OwnedHashTreeNode {
     }
 }
 
+/// Seralizable view of an hash tree node, only contains size and hash
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, std::hash::Hash, PartialEq, Eq)]
 pub struct ChunkInfo {
     // progressive unique id provided by the storage ??

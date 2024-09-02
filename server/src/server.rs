@@ -24,7 +24,7 @@ use crate::error::ServerError;
 use distd_core::feed::{Feed, FeedName};
 use distd_core::version::Version;
 
-/// Data structure used internally by server, may be converted to ServerMetadata
+/// Data structure used internally by server, may be converted to `ServerMetadata`
 #[derive(Debug, Clone, Default)]
 pub struct ServerInternalMetadata {
     // TODO
@@ -101,6 +101,7 @@ impl<T> Server<T>
 where
     T: ChunkStorage + Sync + Send + Clone + Default + Debug,
 {
+    /// Create a new server instance, with a specific key pair and metadata
     pub fn new(
         pkcs8_bytes: Document,
         metadata: ServerInternalMetadata,
@@ -160,6 +161,7 @@ where
             .ok_or(RegisterError)
     }
 
+    /// Publish a new item to the server
     pub fn publish_item(
         &self,
         name: ItemName,
@@ -182,6 +184,7 @@ where
             })
     }
 
+    /// Get the public key of the server
     pub fn public_key(&self) -> &[u8] {
         self.key_pair.public_key().as_ref()
     }

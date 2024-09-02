@@ -5,7 +5,7 @@
 //! - 1. We're ignoring everything tracker related, as we already know the server and it does most of what of tracker
 //!         shoud do
 //! - 2. Uses BLAKE3 instead of SHA1 or SHA25
-//! - 3. No info_hash, no encoding. We'll use a binary format and the server will sign it
+//! - 3. No `info_hash`, no encoding. We'll use a binary format and the server will sign it
 //! - 4. We're calling them "chunks" instead of "pieces", because I like it more this way
 //! - 5. An item contains a single file. Msgpack serialization is cheap. Just use tar if you need to :)
 //!
@@ -66,11 +66,11 @@ pub struct Item {
 }
 
 impl Item {
-    /// Create a new Item from its metadata and ChunkStorage
+    /// Create a new Item from its metadata and `ChunkStorage`
     ///
-    /// Calling `create_item` on a ChunkStorage object encapsulates this and its the recommended way to create
+    /// Calling `create_item` on a `ChunkStorage` object encapsulates this and its the recommended way to create
     /// an Item unless there is an explicit reason not to do so.
-    pub fn new(
+    #[must_use] pub fn new(
         name: ItemName,
         path: PathBuf,
         revision: u32,
@@ -125,20 +125,20 @@ impl Item {
 
     /// Recompute total size of the item
     /// Computed as the sum of the sizes of the chunks
-    pub fn recompute_size(&self) -> u32 {
+    #[must_use] pub fn recompute_size(&self) -> u32 {
         // useful?
         self.chunks.iter().map(|x| x.size).sum()
     }
 
     /// Total size of the item
-    pub fn size(&self) -> u32 {
+    #[must_use] pub fn size(&self) -> u32 {
         self.metadata.size()
     }
 
     /// `Stored` chunks diff of two items
     /// Chunks in self and not in other
-    pub fn diff(&self, other: &Self) -> HashSet<ChunkInfo> {
-        self.hashes.difference(&other.hashes).cloned().collect()
+    #[must_use] pub fn diff(&self, other: &Self) -> HashSet<ChunkInfo> {
+        self.hashes.difference(&other.hashes).copied().collect()
     }
 }
 
@@ -198,7 +198,7 @@ pub mod tests {
             .unwrap()
     }
 
-    pub fn make_repeated_item(value: u8) -> Item {
+    #[must_use] pub fn make_repeated_item(value: u8) -> Item {
         let data = Bytes::from_iter([value; CHUNK_SIZE]);
         let chunk = ChunkInfo {
             hash: hash(&data),
@@ -216,17 +216,17 @@ pub mod tests {
         .unwrap()
     }
 
-    pub fn make_zeros_item() -> Item {
+    #[must_use] pub fn make_zeros_item() -> Item {
         make_repeated_item(0)
     }
 
-    pub fn make_ones_item() -> Item {
+    #[must_use] pub fn make_ones_item() -> Item {
         make_repeated_item(1)
     }
 
     #[test]
     fn test_make_item() {
-        make_zeros_item();
+        let _ = make_zeros_item();
     }
 
     #[test]

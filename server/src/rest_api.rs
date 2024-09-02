@@ -7,7 +7,9 @@ use uuid::Uuid;
 
 use axum::{
     body::Body,
-    extract::{connect_info::IntoMakeServiceWithConnectInfo, ConnectInfo, Path, Query, State},
+    extract::{
+        connect_info::IntoMakeServiceWithConnectInfo, ConnectInfo, Multipart, Path, Query, State,
+    },
     http::StatusCode,
     response::IntoResponse,
     routing::get, //, post},
@@ -25,8 +27,11 @@ use distd_core::{
 };
 use distd_core::{item::ItemName, version::Version};
 
+use crate::Client;
+use crate::Feed;
 use crate::Server as RawServer;
 use crate::{error::ServerError, FeedName};
+use crate::ChunkStorage;
 
 type Server<T> = Arc<RawServer<T>>;
 
@@ -38,7 +43,17 @@ struct ClientPostObj {
     //pub realm: Option<Realm>,
 }
 
-use crate::ChunkStorage;
+/// Register a client
+///
+/// This endpoint is used by clients to register themselves to the server
+/// The client should  provide a name and a version, the server will return
+/// a UUID that the client should use to identify itself in future requests.
+///
+/// The version is optional and can be used to identify the client version
+/// The name is mandatory and should be unique
+///
+/// # Errors
+/// If the name is already in use, the server will return a 409 status code
 async fn register_client<T>(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Query(client): Query<ClientPostObj>,
@@ -53,10 +68,12 @@ where
         .map_err(|_| StatusCode::CONFLICT)
 }
 
+/// Get version
 async fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// Get all clients
 async fn get_clients<T>(State(server): State<Server<T>>) -> impl IntoResponse
 where
     T: ChunkStorage + Sync + Send + Clone + Default,
@@ -72,7 +89,7 @@ where
     )
 }
 
-use crate::Client;
+/// Get one client
 async fn get_one_client<T>(
     Path(uuid): Path<String>,
     State(server): State<Server<T>>,
@@ -94,6 +111,7 @@ where
         .map(Json)
 }
 
+/// Get all chunks
 async fn get_chunks<T>(State(server): State<Server<T>>) -> impl IntoResponse
 where
     T: ChunkStorage + Sync + Send + Clone + Default,
@@ -108,6 +126,7 @@ where
     )
 }
 
+/// Get sum of all chunks sizes
 async fn get_chunks_size_sum<T>(State(server): State<Server<T>>) -> impl IntoResponse
 where
     T: ChunkStorage + Sync + Send + Clone + Default,
@@ -115,7 +134,7 @@ where
     Json(server.storage.size())
 }
 
-use crate::Feed;
+/// Get all feeds
 async fn get_feeds<T>(State(server): State<Server<T>>) -> impl IntoResponse
 where
     T: ChunkStorage + Sync + Send + Clone + Default,
@@ -132,6 +151,7 @@ where
     )
 }
 
+/// Get all items
 async fn get_items<T>(State(server): State<Server<T>>) -> impl IntoResponse
 where
     T: ChunkStorage + Sync + Send + Clone + Default,
@@ -148,6 +168,7 @@ where
     )
 }
 
+/// Get one item
 async fn get_one_item<T>(
     Path(name): Path<ItemName>,
     State(server): State<Server<T>>,
@@ -174,7 +195,7 @@ struct ItemPostObj {
     pub path: PathBuf,
 }
 
-use axum::extract::Multipart;
+/// Publish an item
 async fn publish_item<T>(
     Path(name): Path<ItemName>,
     Query(item_data): Query<ItemPostObj>,
@@ -209,6 +230,7 @@ where
     Err(StatusCode::BAD_REQUEST)
 }
 
+/// Get one feed
 async fn get_one_feed<T>(
     Path(name): Path<FeedName>,
     State(server): State<Server<T>>,
@@ -227,6 +249,12 @@ where
     )
 }
 
+/// Download data associated with an hash
+/// This is a simple wrapper around `ChunkStorage::get`
+///
+/// # Errors
+/// Returns `StatusCode::BAD_REQUEST` if the hash is not a valid `blake3::Hash`
+/// Returns `StatusCode::NOT_FOUND` if the hash is not found in the storage
 async fn get_chunk<T>(
     Path(hash): Path<String>,
     State(server): State<Server<T>>,
@@ -235,7 +263,11 @@ where
     T: ChunkStorage + Sync + Send + Clone + Default,
 {
     let hash = Hash::from_str(hash.as_str()).map_err(|_| StatusCode::BAD_REQUEST)?;
-    Ok(Json(server.storage.get(&hash)))
+    server
+        .storage
+        .get(&hash)
+        .ok_or(StatusCode::NOT_FOUND)
+        .map(Json)
 }
 
 /// Download data associated with an hash-tree from its root
@@ -281,6 +313,7 @@ where
         .map(Body::from)
 }
 
+/// Create a new `axum::Router` with all the routes
 pub fn make_app<T>(server: RawServer<T>) -> IntoMakeServiceWithConnectInfo<Router, SocketAddr>
 where
     T: ChunkStorage + Sync + Send + Clone + Default + Debug + 'static,

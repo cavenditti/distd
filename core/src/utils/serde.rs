@@ -21,7 +21,7 @@ where
 }
 
 pub mod hashes {
-    use super::*;
+    use super::{Deserialize, Deserializer, FromStr, Hash, Serialize, de};
 
     pub fn serialize_hash<S>(v: &Hash, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -53,7 +53,7 @@ pub mod hashes {
     {
         if serializer.is_human_readable() {
             v.iter()
-                .map(|e| e.to_string())
+                .map(std::string::ToString::to_string)
                 .collect::<Vec<String>>()
                 .serialize(serializer)
         } else {
@@ -83,7 +83,7 @@ pub mod hashes {
 }
 
 pub mod opt_hash_struct {
-    use super::*;
+    use super::{Deserialize, Deserializer, FromStr, Hash, Serialize};
 
     pub fn serialize_opt_hash<S>(v: &Option<Hash>, serializer: S) -> Result<S::Ok, S::Error>
     where

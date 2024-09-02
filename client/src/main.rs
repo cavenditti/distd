@@ -23,7 +23,7 @@ async fn main() -> Result<(), i32> {
     let mut i = std::env::args();
     i.advance_by(2).expect("Invalid arguments");
     let cmd_args = i.collect::<Vec<String>>();
-    println!("CMD: {} {:?}", cmd, cmd_args);
+    println!("CMD: {cmd} {cmd_args:?}");
 
     let settings = Config::builder()
         // Add in `./Settings.toml`
@@ -34,7 +34,7 @@ async fn main() -> Result<(), i32> {
         .build()
         .expect("Missing configuration file");
 
-    println!("Config: {:?}", settings);
+    println!("Config: {settings:?}");
 
     let url = settings
         .get_string("server_url")
@@ -47,8 +47,8 @@ async fn main() -> Result<(), i32> {
             Ok(client) => break client,
             Err(e) => {
                 const T: u64 = 5;
-                println!("Error: '{}', retrying in {} seconds", e, T);
-                sleep(Duration::from_secs(T))
+                println!("Error: '{e}', retrying in {T} seconds");
+                sleep(Duration::from_secs(T));
             }
         }
     };
@@ -73,7 +73,7 @@ async fn client_loop(client: Client<FsStorage>) -> Result<(), i32> {
 
 async fn fetch(client: Client<FsStorage>, args: Vec<String>) -> Result<(), i32> {
     let (url, method) = args.get(1).zip(args.get(2)).expect("Invalid args");
-    println!("Fetch {} {}", method, url);
+    println!("Fetch {method} {url}");
 
     // HTTPS requires picking a TLS implementation, so give a better
     // warning if the user tries to request an 'https' URL.
@@ -88,7 +88,7 @@ async fn fetch(client: Client<FsStorage>, args: Vec<String>) -> Result<(), i32> 
         .send_request(method, url.path_and_query().unwrap().clone())
         .await
         .inspect(|r| println!("Got {:?}", &r))
-        .inspect_err(|e| println!("{}", e))
+        .inspect_err(|e| println!("{e}"))
         .map_err(|_| -7)?;
 
     // send help plz
@@ -106,6 +106,6 @@ async fn fetch(client: Client<FsStorage>, args: Vec<String>) -> Result<(), i32> 
             s
         }));
     //.unwrap_or(body.iter().map(|x| format!("{:x?}", x)).collect());
-    println!("Body: `{}`", body_str);
+    println!("Body: `{body_str}`");
     Ok(())
 }

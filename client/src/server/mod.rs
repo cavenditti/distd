@@ -1,6 +1,6 @@
 //use std::{net::SocketAddr
 use anyhow::Error;
-use std::{ops::Deref, time::Duration};
+use std::time::Duration;
 use uuid::Uuid;
 
 use http_body_util::{BodyExt, Empty};
@@ -241,12 +241,12 @@ impl Server {
             .await
             .map_err(Error::msg)
             .and_then(|x| {
-                std::str::from_utf8(x.to_bytes().deref())
+                std::str::from_utf8(&x.to_bytes())
                     .map_err(Error::msg)
                     .and_then(|x| Uuid::parse_str(x).map_err(Error::msg))
             })
             .inspect(|uid| {
-                println!("Got id '{:?}' from server", uid);
+                println!("Got id '{uid:?}' from server");
                 self.client_uid = Some(*uid);
             })
     }
