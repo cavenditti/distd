@@ -87,8 +87,7 @@ impl From<StoredChunkRef> for OwnedHashTreeNode {
 impl StoredChunkRef {
     pub fn hash(&self) -> &Hash {
         match self {
-            Self::Stored { hash, .. } => hash,
-            Self::Parent { hash, .. } => hash,
+            Self::Stored { hash, .. } | Self::Parent { hash, .. } => hash,
         }
     }
 

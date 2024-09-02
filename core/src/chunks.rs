@@ -55,8 +55,7 @@ pub enum OwnedHashTreeNode {
 impl HashTreeNode for OwnedHashTreeNode {
     fn hash(&self) -> &Hash {
         match self {
-            Self::Parent { hash, .. } => hash,
-            Self::Stored { hash, .. } => hash,
+            Self::Parent { hash, .. } | Self::Stored { hash, .. } => hash,
         }
     }
 
