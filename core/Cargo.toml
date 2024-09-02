@@ -6,6 +6,9 @@ authors.workspace = true
 description.workspace = true
 documentation.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 tokio = { workspace = true }
 

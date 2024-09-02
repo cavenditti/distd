@@ -10,6 +10,9 @@ authors = [""]
 description = ""
 documentation = "https://example.com/bar"
 
+[workspace.lints.clippy]
+pedantic = "warn"
+
 [workspace.dependencies]
 tokio = { version = "1.39.2", features = ["full"] }
 axum = { version = "0.7.5", features = ["json", "multipart"] }
