@@ -26,6 +26,10 @@ the (eventually private storage repo) and keep all items deduplicated.
 > `blake3::hash(some_bytes)` for that sub-tree. This is because BLAKE3 is meant to be resistant to
 > length-extension attacks but we are not using it for MAC and will ignore the Subtree-freeness of BLAKE3
 
+### Design considerations
+- Items are identified by name and may have conflicting paths. This is because the path is the intended installation
+    path for that item and may not be unique.
+
 ## TODO:
 ### Short term (first pre-release):
 - [x] ~~Implement merkle-tree computing~~

@@ -27,11 +27,11 @@ use distd_core::{
 };
 use distd_core::{item::ItemName, version::Version};
 
+use crate::ChunkStorage;
 use crate::Client;
 use crate::Feed;
 use crate::Server as RawServer;
 use crate::{error::ServerError, FeedName};
-use crate::ChunkStorage;
 
 type Server<T> = Arc<RawServer<T>>;
 
@@ -270,7 +270,67 @@ where
         .map(Json)
 }
 
-/// Download data associated with an hash-tree from its root
+/// Download data associated with an hash-(sub-)trees, differing from the provided hashes
+///
+/// This endpoint is used to download a set of chunks from the server
+/// The server will return a binary bitcode serialized representation of the chunks
+async fn get_transfer_diff<T>(
+    Path(hash): Path<String>,
+    Path(from): Path<String>,
+    State(server): State<Server<T>>,
+) -> Result<impl IntoResponse, StatusCode>
+where
+    T: ChunkStorage + Sync + Send + Clone + Default,
+{
+    tracing::debug!("Transfer {hash} from {from}");
+    let hash = Hash::from_str(hash.as_str())
+        .inspect_err(|e| tracing::error!("Cannot decode hash {}", e))
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let from: Result<Vec<Hash>, blake3::HexError> = from.split(',').map(Hash::from_str).collect();
+    let from = from
+        .inspect_err(|e| tracing::error!("Cannot decode hash {}", e))
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    let hashes = server
+        .storage
+        .diff(&hash, from)
+        .ok_or(StatusCode::NOT_FOUND)
+        .inspect_err(|_| tracing::warn!("Cannot find hash {hash}"))?;
+
+    let hashes: Result<Vec<Arc<StoredChunkRef>>, StatusCode> = hashes
+        .iter()
+        .map(|hash| {
+            server
+                .storage
+                .get(hash)
+                .ok_or(StatusCode::INTERNAL_SERVER_ERROR)
+                .inspect_err(|_| tracing::error!("Missing hash provided by storage itself: {hash}"))
+        }) // this should never happen
+        .collect();
+
+    let chunks: Vec<OwnedHashTreeNode> = hashes?
+        .iter()
+        .map(|x| OwnedHashTreeNode::from((**x).clone()))
+        .collect();
+
+    tracing::debug!("Returned chunks: {chunks:?}");
+
+    let serialized: Result<Vec<u8>, StatusCode> = bitcode::serialize(&chunks)
+        .inspect_err(|e| tracing::error!("Cannot serialize chunk {}", e))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+
+    serialized.map(Body::from)
+}
+
+/// Download data associated with one or more hash-(sub-)trees from their root
+///
+/// This endpoint is used to download a set of chunks from the server
+/// The server will return a binary bitcode serialized representation of the chunks
+/// The endpoint accepts a comma-separated list of hash
+///
+/// # Errors
+/// Returns `StatusCode::BAD_REQUEST` if some hash is not a valid `blake3::Hash`
+/// Returns `StatusCode::NOT_FOUND` if some hash is not found in the storage
 async fn get_transfer<T>(
     Path(hashes): Path<String>,
     State(server): State<Server<T>>,
@@ -332,7 +392,8 @@ where
         .route("/feeds/:feed_name", get(get_one_feed))
         // 'transfer' routes return binary bitcode serialized bodies
         .route("/transfer/metadata", get(get_metadata))
-        .route("/transfer/:hashes", get(get_transfer))
+        .route("/transfer/diff/:hash/:from", get(get_transfer_diff))
+        .route("/transfer/whole/:hashes", get(get_transfer))
         .with_state(Arc::new(server))
         .layer(
             TraceLayer::new_for_http()

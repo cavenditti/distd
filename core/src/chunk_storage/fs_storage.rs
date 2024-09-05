@@ -1,16 +1,20 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::{create_dir_all, remove_file, File},
-    io::{BufReader, Read, Seek},
-    os::unix::fs::FileExt,
-    path::PathBuf,
+    io::{BufReader, Read, Seek, Write},
+    os::{fd::AsRawFd, unix::fs::FileExt},
+    path::{Path, PathBuf},
     sync::{atomic::AtomicBool, Arc, Mutex, RwLock},
 };
 
 use anyhow::Error;
 use blake3::Hash;
 
-use crate::{chunks::ChunkInfo, item::Item};
+use crate::{
+    chunks::{ChunkInfo, CHUNK_SIZE},
+    hash::hash as do_hash,
+    item::{Item, ItemName},
+};
 
 use super::{ChunkStorage, StoredChunkRef};
 
@@ -28,12 +32,11 @@ struct InFileChunk {
     pub info: ChunkInfo,
     pub paths: HashSet<InFileChunkPaths>,
     pub populated: Arc<AtomicBool>,
-    buf_reader: Arc<Mutex<Option<BufReader<File>>>>,
+    //buf_reader: Arc<Mutex<Option<BufReader<File>>>>,
 }
 
 impl TryFrom<InFileChunk> for StoredChunkRef {
     type Error = Error;
-
 
     /// Try to read the chunk from the file at first path
     ///
@@ -42,24 +45,15 @@ impl TryFrom<InFileChunk> for StoredChunkRef {
         if !value.populated.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(Error::msg("missing data"));
         }
-        let mut buf_reader = value.buf_reader.lock().expect("Poisoned Lock");
-
         let first_path = value.paths.iter().next().ok_or(Error::msg("empty"))?;
-        if buf_reader.is_none() {
-            let file = File::open(&first_path.path).map_err(Error::msg)?;
-            let reader = BufReader::new(file);
-            *buf_reader = Some(reader);
-        }
-        let reader = buf_reader
-            .as_mut()
-            .ok_or(Error::msg("Cannot open buffer"))?;
-        reader
-            .seek(std::io::SeekFrom::Start(first_path.offset))
+        let mut file = File::open(&first_path.path).map_err(Error::msg)?;
+        file.seek(std::io::SeekFrom::Start(first_path.offset))
             .map_err(Error::msg)?;
 
         let mut buf = vec![0u8; value.info.size as usize];
 
-        reader.read_exact(&mut buf).map_err(Error::msg)?;
+        file.read_exact(&mut buf).map_err(Error::msg)?;
+
         Ok(StoredChunkRef::Stored {
             hash: value.info.hash,
             data: Arc::new(buf),
@@ -91,24 +85,43 @@ impl TryFrom<&mut InFileChunk> for StoredChunkRef {
 impl InFileChunk {
     /// Write a chunk to the file at all the registered paths for that chunk
     pub fn write(&self, hash: &Hash, chunk: &[u8]) -> Result<(), Error> {
+        tracing::debug!(
+            "Writing {hash}, {} bytes at {} locations",
+            chunk.len(),
+            self.paths.len()
+        );
         assert_eq!(&self.info.hash, hash);
 
+        if self.populated.load(std::sync::atomic::Ordering::Relaxed) {
+            tracing::debug!("Already populated {hash}, skipping");
+            return Ok(());
+        }
+
+        let mut count = 0;
         // write chunk to all associated files (and offsets)
-        self.paths.iter().try_for_each(|p| {
-            let buffer = File::create(&p.path).map_err(Error::msg)?;
-            match buffer.write_at(chunk, p.offset) {
-                Ok(size) if size as u32 == self.info.size => Ok(()),
-                _ => Err(Error::msg("Cannot write to file")),
-            }
-            .map(|()| {
-                self.populated
-                    .swap(true, std::sync::atomic::Ordering::Relaxed);
-                // TODO investigate:
-                // I noticed while testing that even calling sync_all doesn't ensure the write actually happens
-                // right away. I'm not sure why this is the case.
-                buffer.sync_all().unwrap();
+        self.paths
+            .iter()
+            .try_for_each(|p| {
+                //tracing::trace!("Writing InFileChunk for {hash} @ {:?}", p);
+                let buffer = File::create(&p.path)
+                    .inspect_err(|e| tracing::error!("Cannot create file at {:?}: {}", p.path, e))
+                    .map_err(Error::msg)?;
+                match buffer.write_at(chunk, p.offset) {
+                    Ok(size) if size as u32 == self.info.size => Ok(()),
+                    _ => Err(Error::msg("Cannot write to file")),
+                }
+                .map(|()| {
+                    self.populated
+                        .swap(true, std::sync::atomic::Ordering::Relaxed);
+                    // TODO investigate:
+                    // I noticed while testing that even calling sync_all doesn't ensure the write actually happens
+                    // right away. I'm not sure why this is the case.
+                    //buffer.sync_all().unwrap();
+                })
+                .inspect(|_| count += chunk.len())
             })
-        })
+            .inspect(|_| tracing::trace!("{count} bytes written"))
+            .inspect_err(|e| tracing::error!("Failed writing {hash} after {count} bytes: {e}"))
     }
 }
 
@@ -124,8 +137,9 @@ struct InnerFsStorage {
     /// Items, used to get the paths where to store chunks
     pub items: HashSet<Item>,
 
-    /// Data, used to store `InFileChunks`
+    /// Data, used to store `InFileChunks` (stored nodes) and link nodes
     pub data: HashMap<Hash, InFileChunk>,
+    pub links: HashMap<Hash, Arc<StoredChunkRef>>,
 }
 
 impl InnerFsStorage {
@@ -137,9 +151,54 @@ impl InnerFsStorage {
     }
 }
 
+/*
+#[cfg(target_os = "linux")]
+fn preallocate_file(path: &Path, len: usize) {
+    use libc;
+    let file = File::create(path).unwrap();
+    let res = unsafe {
+        let res = libc::fallocate(file.as_raw_fd(), 0, 0, len as i64);
+        libc::sync();
+        res
+    };
+    tracing::debug!("`fallocate` returned {res}")
+}
+
+//#[cfg(not(target_os = "linux"))]
+*/
+
+fn preallocate_file(path: &Path, len: usize) {
+    tracing::trace!("preallocate_file: {len} bytes at {path:?}");
+    let mut file = File::create(path)
+        .inspect_err(|e| tracing::error!("Cannot create file at {:?}: {}", path, e))
+        .unwrap();
+    file.set_len(len as u64).unwrap();
+    file.seek(std::io::SeekFrom::Start(len as u64)).unwrap();
+    file.write_all(&[]).unwrap();
+    file.flush().unwrap();
+    file.sync_all().unwrap();
+
+    /*
+    File::create(&path)
+        .and_then(|x| x.set_len(data.len() as u64).map(|_| x))
+        .and_then(|mut x| x.flush().map(|_| x))
+        .and_then(|x| x.sync_all())
+        .map_err(Error::msg)?;
+    */
+}
+
 impl InnerFsStorage {
     /// Returns the (eventual) stored path of the item provided
-    fn path(&self, item: &Item) -> Result<PathBuf, Error> {
+    fn path(&self, path: &Path) -> PathBuf {
+        if path.starts_with(&self.root) {
+            path.to_path_buf()
+        } else {
+            crate::utils::path::join(&self.root, path)
+        }
+    }
+
+    /// Returns the (eventual) stored path of the item provided
+    fn item_path(&self, item: &Item) -> Result<PathBuf, Error> {
         let full_path = self.root.join(
             item.metadata
                 .path
@@ -147,38 +206,42 @@ impl InnerFsStorage {
                 .unwrap_or(&item.metadata.path),
         );
         create_dir_all(full_path.parent().unwrap_or(&full_path)).map_err(Error::msg)?;
+        tracing::debug!(
+            "Created path {:?}",
+            full_path.parent().unwrap_or(&full_path)
+        );
         Ok(full_path)
     }
 
-    /// Pre-allocate space for an item in the filesystem
-    pub fn pre_allocate(&mut self, item: &Item) -> Result<(), Error> {
-        let path = self.path(item)?;
-        if self.items.contains(item) {
-            return Ok(());
-        };
+    /// Pre-allocate space for multiple `ChunkInfo` in the filesystem at a path
+    pub fn pre_allocate(&mut self, path: &Path, data: &[ChunkInfo]) -> Result<(), Error> {
+        tracing::debug!(
+            "Preallocating {} chunks at {path:?}, for a total of {} bytes",
+            data.len(),
+            data.iter().map(|x| x.size as u64).sum::<u64>()
+        );
         if self
             .items
             .iter()
-            .any(|it| self.path(it).is_ok_and(|p| p == path))
+            .any(|it| self.item_path(it).is_ok_and(|p| p == path))
         {
             return Err(Error::msg(format!(
                 "Conflict found: path {} already present in filesystem",
                 path.to_string_lossy()
             )));
         }
-        File::create(&path)
-            .and_then(|x| x.set_len(u64::from(item.size())))
-            .map_err(Error::msg)?;
+
+        preallocate_file(&self.path(path), data.iter().map(|x| x.size as usize).sum());
 
         let mut offset = 0;
 
         // Prepare all InFileChunk and add them to self.data
-        for chunk in &item.chunks {
+        for chunk in data {
             let paths = InFileChunkPaths {
-                path: path.clone(),
+                path: self.path(path),
                 offset,
             };
-            offset += u64::from(chunk.size);
+            offset += chunk.size as u64;
             if let Some(infile_chunk) = self.data.get_mut(&chunk.hash) {
                 infile_chunk.paths.insert(paths);
             } else {
@@ -188,18 +251,44 @@ impl InnerFsStorage {
                         info: *chunk,
                         paths: HashSet::from_iter([paths]),
                         populated: Arc::default(),
-                        buf_reader: Arc::default(),
                     },
                 );
             }
         }
+        Ok(())
+    }
+
+    /// Pre-allocate space for `Bytes` in the filesystem at a path
+    pub fn pre_allocate_bytes(&mut self, path: &Path, data: &[u8]) -> Result<(), Error> {
+        tracing::debug!("Preallocating {} bytes at {path:?}", data.len());
+        let chunks: Vec<ChunkInfo> = data
+            .chunks(CHUNK_SIZE)
+            .into_iter()
+            .map(|x| ChunkInfo {
+                hash: do_hash(x),
+                size: x.len() as u32,
+            })
+            .collect();
+        self.pre_allocate(path, &chunks.as_slice())
+    }
+
+    /// Pre-allocate space for an item in the filesystem
+    pub fn pre_allocate_item(&mut self, item: &Item) -> Result<(), Error> {
+        let path = self.item_path(item)?;
+        tracing::debug!("Preallocating item to {:?}", path);
+        if self.items.contains(item) {
+            return Ok(());
+        };
+
+        self.pre_allocate(&path, &item.chunks[..])?;
+
         self.items.insert(item.clone());
         Ok(())
     }
 
     /// Remove references to file from `FsStorage`, doesn't actually delete the file from filesystem
     pub fn remove(&mut self, item: Item) -> Result<(), Error> {
-        let path = self.path(&item)?;
+        let path = self.item_path(&item)?;
         // First check wheter the item is actually present, if not return Err
         let item = self
             .items
@@ -225,7 +314,7 @@ impl InnerFsStorage {
 
     /// Remove references to file from `FsStorage` and deletes the file from filesystem
     fn delete(&mut self, item: Item) -> Result<(), Error> {
-        let path = self.path(&item)?;
+        let path = self.item_path(&item)?;
         self.remove(item)
             .and_then(|()| remove_file(path).map_err(Error::msg))
     }
@@ -266,17 +355,33 @@ impl FsStorage {
     }
 
     /// Root path for the `FsStorage`
-    #[must_use] pub fn root(&self) -> PathBuf {
+    #[must_use]
+    pub fn root(&self) -> PathBuf {
         self.read().root.clone()
     }
 
-    #[must_use] pub fn items(&self) -> HashSet<Item> {
+    #[must_use]
+    pub fn items(&self) -> HashSet<Item> {
         self.read().items.clone()
     }
 
+    pub fn path(&self, path: &Path) -> PathBuf {
+        self.read().path(path)
+    }
+
     /// Wrapper around `InnerFsStorage::pre_allocate`
-    pub fn pre_allocate(&self, item: &Item) -> Result<(), Error> {
-        self.write().pre_allocate(item)
+    pub fn pre_allocate(&self, path: &Path, data: &[ChunkInfo]) -> Result<(), Error> {
+        self.write().pre_allocate(&path, data)
+    }
+
+    /// Wrapper around `InnerFsStorage::pre_allocate_bytes`
+    pub fn pre_allocate_bytes(&self, path: &Path, data: &[u8]) -> Result<(), Error> {
+        self.write().pre_allocate_bytes(&path, data)
+    }
+
+    /// Wrapper around `InnerFsStorage::pre_allocate_item`
+    pub fn pre_allocate_item(&self, item: &Item) -> Result<(), Error> {
+        self.write().pre_allocate_item(item)
     }
 
     /// Remove references to file from `FsStorage`, doesn't actually delete the file from filesystem
@@ -295,11 +400,12 @@ impl FsStorage {
 impl ChunkStorage for FsStorage {
     /// Get a `StoredChunkRef` chunk from storage
     fn get(&self, hash: &Hash) -> Option<Arc<StoredChunkRef>> {
-        self.read()
+        let inner = self.read();
+        inner.links.get(hash).cloned().or(inner
             .data
             .get(hash)
             .and_then(|x| StoredChunkRef::try_from(x).ok())
-            .map(Arc::new)
+            .map(Arc::new))
     }
 
     fn size(&self) -> usize {
@@ -308,29 +414,70 @@ impl ChunkStorage for FsStorage {
 
     /// May only add chunks by adding items. Dummy implementation always returning None
     fn _insert_chunk(&self, hash: Hash, chunk: &[u8]) -> Option<Arc<StoredChunkRef>> {
+        tracing::trace!("Insert chunk {hash}, {} bytes", chunk.len());
+
         self.write().data.get_mut(&hash).and_then(|infile_chunk| {
-            infile_chunk.write(&hash, chunk).ok()?;
-            StoredChunkRef::try_from(infile_chunk).map(Arc::new).ok()
-        })
+            infile_chunk
+                .write(&hash, chunk)
+                .inspect_err(|e| tracing::error!("Cannot write infile chunk: {e}"))
+                .ok()
+
+            /*
+                StoredChunkRef::try_from(infile_chunk)
+                    .inspect_err(|e| tracing::error!("Cannot create StoredChunkRef: {e}"))
+                    .map(Arc::new)
+                    .inspect_err(|e| tracing::error!("Cannot insert chunk: {e}"))
+                    .ok()
+            */
+        });
+        Some(Arc::new(StoredChunkRef::Stored {
+            hash,
+            data: Arc::new(chunk.to_vec()),
+        }))
+    }
+
+    /// Create a new Item from its metadata and Bytes
+    /// This is the preferred way to create a new Item
+    fn create_item(
+        &self,
+        name: ItemName,
+        path: PathBuf,
+        revision: u32,
+        description: Option<String>,
+        file: bytes::Bytes,
+    ) -> Option<Item>
+    where
+        Self: Sized,
+    {
+        tracing::debug!("Create item {name} at {path:?}");
+        self.pre_allocate_bytes(&path, &file).ok()?;
+        tracing::info!("Preallocated on disk {:?}", path);
+
+        let hash_tree = self.insert(file)?;
+        let item = Item::new(name, path, revision, description, hash_tree);
+        tracing::debug!("Inserted chunks in storage for item {}", item.metadata.name);
+        tracing::trace!("Item: {item:?}");
+
+        Some(item)
     }
 
     /// May only link chunks by adding items. Dummy implementation always returning None
     fn _link(
         &self,
-        _hash: Hash,
-        _left: Arc<StoredChunkRef>,
-        _right: Arc<StoredChunkRef>,
+        hash: Hash,
+        left: Arc<StoredChunkRef>,
+        right: Arc<StoredChunkRef>,
     ) -> Option<Arc<StoredChunkRef>> {
-        None
+        let mut l = self.write();
+        let res = l
+            .links
+            .try_insert(hash, Arc::new(StoredChunkRef::Parent { hash, left, right }));
+        Some(res.map_or_else(|e| (*e.entry.get()).clone(), |x| (*x).clone()))
     }
 
     /// Get a Vec of all chunks' hashes in storage
     fn chunks(&self) -> Vec<Hash> {
-        self.read()
-            .data
-            .keys()
-            .copied()
-            .collect()
+        self.read().data.keys().copied().collect()
     }
 
     /*
@@ -344,8 +491,14 @@ impl ChunkStorage for FsStorage {
 
 #[cfg(test)]
 mod tests {
-    use crate::{chunks::CHUNK_SIZE, hash::hash as do_hash, item::tests::make_ones_item};
+    use crate::{
+        chunks::CHUNK_SIZE,
+        hash::hash as do_hash,
+        item::tests::{make_ones_item, new_dummy_item},
+    };
     use std::{str::FromStr, thread::sleep, time::Duration};
+
+    use test_log::test;
 
     use super::*;
 
@@ -362,18 +515,17 @@ mod tests {
         );
     }
 
-    fn make_infile_chunk() -> ([u8; CHUNK_SIZE], Hash, InFileChunk) {
+    fn make_infile_chunk<const SIZE: usize>() -> ([u8; SIZE], Hash, InFileChunk) {
         // Create infile_chunk with some data
-        let data = [1u8; CHUNK_SIZE];
+        let data = [1u8; SIZE];
         let hash = do_hash(&data);
         let infile_chunk = InFileChunk {
             info: ChunkInfo {
                 hash,
-                size: CHUNK_SIZE as u32,
+                size: SIZE as u32,
             },
             paths: HashSet::default(),
             populated: Arc::default(),
-            buf_reader: Arc::default(),
         };
         (data, hash, infile_chunk)
     }
@@ -408,7 +560,7 @@ mod tests {
 
     #[test]
     fn test_infile_chunk() {
-        let (data, hash, mut infile_chunk) = make_infile_chunk();
+        let (data, hash, mut infile_chunk) = make_infile_chunk::<CHUNK_SIZE>();
         assert!(!is_populated(&infile_chunk));
 
         let path = write_data_to_infile_chunk(&data, hash, &mut infile_chunk);
@@ -424,7 +576,7 @@ mod tests {
 
     #[test]
     fn test_infile_chunk_conversion() {
-        let (data, hash, mut infile_chunk) = make_infile_chunk();
+        let (data, hash, mut infile_chunk) = make_infile_chunk::<CHUNK_SIZE>();
         let _path = write_data_to_infile_chunk(&data, hash, &mut infile_chunk);
 
         assert!(is_populated(&infile_chunk));
@@ -447,19 +599,22 @@ mod tests {
 
         // create storage in a temporary directory
         let tempdir = std::env::temp_dir().join(PathBuf::from_str("in_a_temp_dir").unwrap());
-        let storage = FsStorage::new(tempdir).unwrap();
+        let storage = FsStorage::new(tempdir.clone()).unwrap();
 
         // make an item with a know content, a single chunk of all zeros
         let item = make_ones_item();
-        storage.pre_allocate(&item).unwrap();
+        storage.pre_allocate_item(&item).unwrap();
+
+        let itempath = crate::utils::path::join(&tempdir, &item.metadata.path);
+        println!("{tempdir:?} ||| {itempath:?}");
+        assert!(itempath.exists());
 
         // Actually store the item chunk
         storage.insert_chunk(&[1u8; CHUNK_SIZE]).unwrap();
 
         print_fsstorage(&storage);
 
-        // TODO read file and check its content are correct
-        let path = storage.data.read().unwrap().path(&item).unwrap();
+        let path = storage.data.read().unwrap().item_path(&item).unwrap();
         let mut f = File::open(&path).unwrap();
         let mut buffer = vec![0u8; item.size() as usize];
 
@@ -483,7 +638,27 @@ mod tests {
             ),
             item.metadata.root.hash
         );
+    }
 
-        // TODO do the same with an item with multiple chunks
+    #[test]
+    fn test_fs_storage_round_trip() {
+        // create storage in a temporary directory
+        let tempdir = std::env::temp_dir().join(PathBuf::from_str("in_a_temp_dir").unwrap());
+        let storage = FsStorage::new(tempdir.clone()).unwrap();
+
+        let item = new_dummy_item::<FsStorage, 1u8, 1_000_000>(storage.clone());
+        println!("Created item: {item:?}");
+        print_fsstorage(&storage);
+
+        let stored = storage
+            .get(&item.metadata.root.hash)
+            .unwrap()
+            .clone_data()
+            .unwrap();
+
+        assert_eq!(stored.len(), 1_000_000);
+        for b in stored {
+            assert_eq!(b, 1u8);
+        }
     }
 }

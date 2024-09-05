@@ -66,11 +66,12 @@ pub struct Item {
 }
 
 impl Item {
-    /// Create a new Item from its metadata and `ChunkStorage`
+    /// Create a new Item from its metadata and `StoredChunkRef`
     ///
     /// Calling `create_item` on a `ChunkStorage` object encapsulates this and its the recommended way to create
     /// an Item unless there is an explicit reason not to do so.
-    #[must_use] pub fn new(
+    #[must_use]
+    pub fn new(
         name: ItemName,
         path: PathBuf,
         revision: u32,
@@ -125,19 +126,22 @@ impl Item {
 
     /// Recompute total size of the item
     /// Computed as the sum of the sizes of the chunks
-    #[must_use] pub fn recompute_size(&self) -> u32 {
+    #[must_use]
+    pub fn recompute_size(&self) -> u32 {
         // useful?
         self.chunks.iter().map(|x| x.size).sum()
     }
 
     /// Total size of the item
-    #[must_use] pub fn size(&self) -> u32 {
+    #[must_use]
+    pub fn size(&self) -> u32 {
         self.metadata.size()
     }
 
     /// `Stored` chunks diff of two items
     /// Chunks in self and not in other
-    #[must_use] pub fn diff(&self, other: &Self) -> HashSet<ChunkInfo> {
+    #[must_use]
+    pub fn diff(&self, other: &Self) -> HashSet<ChunkInfo> {
         self.hashes.difference(&other.hashes).copied().collect()
     }
 }
@@ -154,6 +158,7 @@ pub mod tests {
     use std::str::FromStr;
 
     use bytes::Bytes;
+    use uuid::Uuid;
 
     use crate::chunk_storage::hashmap_storage::HashMapStorage;
     use crate::chunk_storage::ChunkStorage;
@@ -162,6 +167,11 @@ pub mod tests {
     use crate::utils::serde::bitcode::BitcodeSerializable;
 
     use super::*;
+
+    // Using a random path to avoid confliting file creation from mutliple concurrent tests
+    fn random_path() -> PathBuf {
+        PathBuf::from_str(&format!("/random/unique/path/{}", Uuid::new_v4())).unwrap()
+    }
 
     /*
      * Most of these tests are bad. I wasn't sure about Item interfaces at first and their spaghettified
@@ -175,10 +185,27 @@ pub mod tests {
         storage
             .create_item(
                 "name".to_string(),
-                PathBuf::from_str("/some/path").unwrap(),
+                random_path(),
                 0,
                 None,
                 Bytes::from_static(b""),
+            )
+            .unwrap()
+    }
+
+    pub fn new_dummy_item<T, const VALUE: u8, const SIZE: usize>(storage: T) -> Item
+    where
+        T: ChunkStorage + Clone,
+    {
+        println!("Inserting {SIZE} {VALUE}u8");
+
+        storage
+            .create_item(
+                "name".to_string(),
+                random_path(),
+                0,
+                Some("Some description for the larger item".to_string()),
+                Bytes::from_static(&[VALUE; SIZE]),
             )
             .unwrap()
     }
@@ -187,18 +214,11 @@ pub mod tests {
     where
         T: ChunkStorage + Clone,
     {
-        storage
-            .create_item(
-                "name".to_string(),
-                PathBuf::from_str("some/path").unwrap(),
-                0,
-                Some("Some description for the larger item".to_string()),
-                Bytes::from_static(&[0u8; 100_000_000]),
-            )
-            .unwrap()
+        new_dummy_item::<T, 0u8, 100_000_000>(storage)
     }
 
-    #[must_use] pub fn make_repeated_item(value: u8) -> Item {
+    #[must_use]
+    pub fn make_repeated_item(value: u8) -> Item {
         let data = Bytes::from_iter([value; CHUNK_SIZE]);
         let chunk = ChunkInfo {
             hash: hash(&data),
@@ -206,7 +226,7 @@ pub mod tests {
         };
         Item::make(
             "name".to_string(),
-            PathBuf::from_str("/some/path").unwrap(),
+            random_path(),
             0,
             Some("Some description for the larger item".to_string()),
             chunk,
@@ -216,11 +236,13 @@ pub mod tests {
         .unwrap()
     }
 
-    #[must_use] pub fn make_zeros_item() -> Item {
+    #[must_use]
+    pub fn make_zeros_item() -> Item {
         make_repeated_item(0)
     }
 
-    #[must_use] pub fn make_ones_item() -> Item {
+    #[must_use]
+    pub fn make_ones_item() -> Item {
         make_repeated_item(1)
     }
 

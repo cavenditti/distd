@@ -1,6 +1,7 @@
 //use std::{net::SocketAddr
 use anyhow::Error;
-use std::time::Duration;
+use blake3::Hash;
+use std::{collections::HashSet, io::Read, str::FromStr, time::Duration};
 use uuid::Uuid;
 
 use http_body_util::{BodyExt, Empty};
@@ -15,7 +16,7 @@ use tokio::{sync::RwLock, time::Instant};
 
 //use ring::agreement::PublicKey;
 
-use distd_core::{metadata::ServerMetadata, version::VERSION};
+use distd_core::{chunks::OwnedHashTreeNode, metadata::ServerMetadata, version::VERSION};
 
 use crate::connection;
 
@@ -86,6 +87,7 @@ impl Server {
         sender: &mut SendRequest<Empty<Bytes>>,
         method: &str,
     ) -> Result<impl Buf, Error> {
+        println!("Request: {method} {url}");
         // make request
         let res = Self::send_request_raw(url, sender, method).await?;
 
@@ -160,6 +162,41 @@ impl Server {
             println!("Metadata didn't change.");
         }
         Ok(())
+    }
+
+    // TODO diff may optionally be computed client-side
+    /// Transfer chunks from server, computing diff from local data
+    pub async fn transfer_diff(
+        &self,
+        hash: &str,
+        from: Vec<Hash>,
+    ) -> Result<Vec<OwnedHashTreeNode>, Error> {
+        let mut shared = self.shared.write().await;
+
+        // comma separated list of hashes
+        let from = from
+            .iter()
+            .map(|x| x.to_string())
+            .collect::<Vec<String>>()
+            .join(",");
+
+        let path_and_query = PathAndQuery::from_str(format!("/transfer/diff/{hash}/{from}").as_str())
+            .map_err(Error::msg)?;
+
+        let body = Self::send_and_collect_request_raw(
+            self.make_uri(path_and_query)?,
+            &mut shared.sender,
+            "GET",
+        )
+        .await?;
+        let mut buf: Vec<u8> = vec![];
+        body.reader().read(&mut buf).map_err(Error::msg)?;
+
+        println!("Extracted {} bytes from body", buf.len());
+
+        // try to deserialize ServerMetadata from body
+        let chunks: Vec<OwnedHashTreeNode> = bitcode::deserialize(&buf).map_err(Error::msg)?;
+        Ok(chunks)
     }
 
     pub async fn fetch_loop(&self) {

@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
 use blake3::Hash;
 use bytes::Bytes;
@@ -45,6 +45,7 @@ pub trait ChunkStorage {
 
     fn insert_chunk(&self, chunk: &[u8]) -> Option<Arc<StoredChunkRef>> {
         let hash = blake3::hash(chunk);
+        tracing::trace!("Insert chunk {}", hash);
         self._insert_chunk(hash, chunk)
             .inspect(|x| assert!(*x.hash() == hash))
     }
@@ -55,6 +56,7 @@ pub trait ChunkStorage {
         right: Arc<StoredChunkRef>,
     ) -> Option<Arc<StoredChunkRef>> {
         let hash = merge_hashes(left.hash(), right.hash());
+        tracing::trace!("Link {} {} → {}", left.hash(), right.hash(), hash);
         self._link(hash, left, right)
             .inspect(|x| assert!(*x.hash() == hash))
     }
@@ -69,21 +71,15 @@ pub trait ChunkStorage {
             slices: &[&[u8]],
         ) -> Option<Arc<StoredChunkRef>> {
             /*
-            println!(
-                "[StorageChunks] {} {:?}",
+            tracing::trace!(
+                "{} {:?}",
                 slices.len(),
                 slices.iter().map(|x| x.len()).collect::<Vec<usize>>()
             );
             */
             match slices.len() {
-                0 => storage.insert_chunk(b""), // Transparently andle empty files too
+                0 => storage.insert_chunk(b""), // Transparently handle empty files too
                 1 => storage.insert_chunk(slices[0]),
-                /*
-                                 _ => storage.link(
-                                    partial_tree(storage, slices, &[])?,
-                                    partial_tree(storage, &[], slices)?,
-                                ),
-                */
                 _ => storage.link(
                     partial_tree(storage, &slices[..slices.len() / 2])?,
                     partial_tree(storage, &slices[slices.len() / 2..])?,
@@ -92,10 +88,20 @@ pub trait ChunkStorage {
         }
 
         let (chunks, remainder) = data.as_chunks::<CHUNK_SIZE>();
-        let mut slices = chunks.iter().map(std::convert::AsRef::as_ref).collect::<Vec<&[u8]>>(); // FIXME is this zero copy?
+        tracing::trace!(
+            "{} exact size chunks, {} bytes in remainder",
+            chunks.len(),
+            remainder.len()
+        );
+        let mut slices = chunks
+            .iter()
+            .map(std::convert::AsRef::as_ref)
+            .collect::<Vec<&[u8]>>(); // FIXME is this zero copy?
         if !remainder.is_empty() {
+            tracing::trace!("Pushing remainder to slices");
             slices.push(remainder);
         }
+        tracing::trace!("{} chunks", slices.len());
         partial_tree(self, slices.as_slice())
     }
 
@@ -114,5 +120,20 @@ pub trait ChunkStorage {
     {
         let hash_tree = self.insert(file)?;
         Some(Item::new(name, path, revision, description, hash_tree))
+    }
+
+    /// Minimal set of hashes required to reconstruct `target` using `from`
+    ///
+    /// # Errors
+    /// Returns None if `target` doesn't exist in storage
+    fn diff(&self, target: &Hash, from: Vec<Hash>) -> Option<HashSet<Hash>> {
+        let target_chunk = self.get(target)?;
+        from.iter()
+            .map(|from_hash| self.get(from_hash))
+            .flatten()
+            .fold(target_chunk.hashes(), |t: HashSet<Hash>, from_chunk| {
+                t.difference(&from_chunk.hashes()).copied().collect()
+            })
+            .into()
     }
 }
