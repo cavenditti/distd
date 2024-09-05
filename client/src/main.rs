@@ -7,48 +7,60 @@ use std::{
 
 use config::Config;
 
-use distd_core::chunk_storage::{fs_storage::FsStorage, ChunkStorage};
-use distd_core::hash::hash as do_hash;
+use error::ClientError;
 use http_body_util::BodyExt;
 use hyper::body::Buf;
+use hyper::http::uri::PathAndQuery;
+
+use distd_core::{
+    chunk_storage::{fs_storage::FsStorage, ChunkStorage},
+    chunks::flatten,
+};
 
 use crate::client::Client;
 
 pub mod client;
 pub mod connection;
+pub mod error;
 pub mod server;
 
 #[tokio::main]
-async fn main() -> Result<(), i32> {
+async fn main() -> Result<(), ClientError> {
     tracing_subscriber::fmt()
         .with_target(false)
         .compact()
-        .with_max_level(tracing::Level::DEBUG)
+        .with_max_level(tracing::Level::TRACE)
         .init();
 
     tracing::info!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
 
-    let cmd = std::env::args().nth(1).expect("no cmd given");
+    let cmd = std::env::args().nth(1).ok_or(ClientError::InvalidArgs)?;
     let mut i = std::env::args();
-    i.advance_by(2).expect("Invalid arguments");
+    i.advance_by(2).map_err(|_| ClientError::InvalidArgs)?;
     let cmd_args = i.collect::<Vec<String>>();
-    println!("CMD: {cmd} {cmd_args:?}");
+    tracing::debug!("Running \"{cmd}\" {cmd_args:?}");
 
     let settings = Config::builder()
-        // Add in `./Settings.toml`
+        // Add in `./ClientSettings.toml`
         .add_source(config::File::with_name("ClientSettings"))
         // Add in settings from the environment (with a prefix of APP)
-        // Eg.. `APP_DEBUG=1 ./target/app` would set the `debug` key
+        // Eg.. `DISTD_DEBUG=1 ./target/app` would set the `debug` key
         .add_source(config::Environment::with_prefix("DISTD"))
         .build()
         .expect("Missing configuration file");
 
-    println!("Config: {settings:?}");
+    tracing::debug!("Config: {settings:?}");
 
     let url = settings
         .get_string("server_url")
         .expect("Missing server url in configuration");
     let uri = url.parse::<hyper::Uri>().unwrap();
+
+    // Only HTTP for now.
+    if uri.scheme_str() != Some("http") {
+        println!("This example only works with 'http' URLs.");
+        return Err(ClientError::InvalidArgs);
+    }
 
     let storage = FsStorage::new(PathBuf::from_str("here").unwrap()).unwrap();
     let client = loop {
@@ -68,72 +80,97 @@ async fn main() -> Result<(), i32> {
         "sync" => sync(client, &cmd_args[..]).await,
         _ => {
             println!("Invalid command specified");
-            return Err(-3);
+            Err(ClientError::InvalidArgs)
         }
     }
 }
 
-async fn sync(client: Client<FsStorage>, args: &[String]) -> Result<(), i32> {
-    let (target, path) = args.get(0).zip(args.get(1)).expect("Invalid args");
-    let mut f = File::open(path).expect("Invalid or unreachable file path");
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf).unwrap();
-    let file_hash = do_hash(&buf);
+async fn sync(client: Client<FsStorage>, args: &[String]) -> Result<(), ClientError> {
+    let (target, path) = match args.len() {
+        1 => Ok((args.get(0).unwrap(), args.get(0).unwrap())),
+        2 => Ok((args.get(0).unwrap(), args.get(1).unwrap())),
+        _ => Err(ClientError::InvalidArgs),
+    }?;
+    let path = PathBuf::from_str(path).unwrap();
 
-    let insertion_result =
-        client
-            .storage
-            .create_item("ok".into(), path.into(), 0, None, buf.into());
+    let mut buf = vec![];
+
+    let from = client.storage.chunks(); // FIXME this could get very very large
+
+    if path.exists() {
+        let mut f = File::open(&path).expect("Invalid or unreachable file path");
+        f.read_to_end(&mut buf).unwrap();
+    }
+
+    let server_metadata = client.server.metadata().await;
+    let item = server_metadata
+        .items
+        .get(&PathBuf::from_str(target.as_str()).unwrap())
+        .ok_or(ClientError::FileNotFound(target.to_string()))?;
+
+    let insertion_result = client.storage.create_item(
+        item.name.clone(),
+        path.clone(),
+        item.revision,
+        item.description.clone(),
+        buf.clone().into(),
+    );
     println!("{:?}", insertion_result);
 
-    let from = if client.storage.get(&file_hash).is_some() {
-        vec![file_hash]
-    } else {
-        vec![]
-    };
-    println!("target: {target}, from:{from:?}");
     let result = client
         .server
-        .transfer_diff(&target, from)
+        .transfer_diff(&item.root.hash.to_string(), from)
         .await
         .inspect_err(|e| println!("Error on transfer_diff: {e}"))
         .unwrap();
-    println!("{:x?}", result);
+
+    tracing::trace!("Got {} chunks from server", result.len());
+    let flat = flatten(result)?;
+    tracing::trace!("{} bytes total", flat.len());
+
+    let _insertion_result = client
+        .storage
+        .create_item(
+            item.name.clone(),
+            path.into(),
+            item.revision,
+            item.description.clone(),
+            flat.into(),
+        )
+        .ok_or(ClientError::IoError("Cannot insert downloaded file".into()))?;
     Ok(())
 }
 
 /// Main client loop
-async fn client_loop(client: Client<FsStorage>) -> Result<(), i32> {
+async fn client_loop(client: Client<FsStorage>) -> Result<(), ClientError> {
     client.server.fetch_loop().await;
     Ok(())
 }
 
 /// Fetch a resource from the server, mostly used for debug
-async fn fetch(client: Client<FsStorage>, args: Vec<String>) -> Result<(), i32> {
+async fn fetch(client: Client<FsStorage>, args: Vec<String>) -> Result<(), ClientError> {
     let (method, url) = args.get(0).zip(args.get(1)).expect("Invalid args");
-    println!("Fetch {method} {url}");
+    tracing::debug!("Fetch {method} {url}");
 
-    // HTTPS requires picking a TLS implementation, so give a better
-    // warning if the user tries to request an 'https' URL.
-    let url = url.parse::<hyper::Uri>().unwrap();
-    if url.scheme_str() != Some("http") {
-        println!("This example only works with 'http' URLs.");
-        return Ok(());
-    }
+    // url should always start with exactly one "/"
+    let url = format!("/{}", url.trim_start_matches("/"));
 
     let mut response = client
         .server
-        .send_request(method, url.path_and_query().unwrap().clone())
+        .send_request(
+            method,
+            PathAndQuery::from_str(url.as_str()).expect("Invalid path specified"),
+        )
         .await
-        .inspect(|r| println!("Got {:?}", &r))
+        .inspect(|r| tracing::debug!("Got {:?}", &r))
         .inspect_err(|e| println!("{e}"))
-        .map_err(|_| -7)?;
+        .map_err(|_| ClientError::ServerRequestError)?;
 
     let body = response
         .body_mut()
         .collect()
         .await
-        .map_err(|_| -6)?
+        .map_err(|_| ClientError::ServerResponseError)?
         .aggregate()
         .chunk()
         .to_vec();
@@ -143,6 +180,6 @@ async fn fetch(client: Client<FsStorage>, args: Vec<String>) -> Result<(), i32> 
             let _ = write!(s, "{x:x?}");
             s
         }));
-    println!("Body: `{body_str}`");
+    tracing::trace!("Body: `{body_str}`");
     Ok(())
 }

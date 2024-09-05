@@ -1,7 +1,7 @@
 //use std::{net::SocketAddr
 use anyhow::Error;
 use blake3::Hash;
-use std::{collections::HashSet, io::Read, str::FromStr, time::Duration};
+use std::{fmt::Debug, io::Read, str::FromStr, time::Duration};
 use uuid::Uuid;
 
 use http_body_util::{BodyExt, Empty};
@@ -87,14 +87,17 @@ impl Server {
         sender: &mut SendRequest<Empty<Bytes>>,
         method: &str,
     ) -> Result<impl Buf, Error> {
-        println!("Request: {method} {url}");
+        tracing::trace!("Request: {method} {url}");
         // make request
         let res = Self::send_request_raw(url, sender, method).await?;
+
+        tracing::debug!("Server returned {}", res.status());
 
         // asynchronously aggregate the chunks of the body
         let body = res
             .collect()
             .await
+            .inspect(|b| tracing::trace!("Response body: {b:?}"))
             .map_err(|_| Error::msg("Cannot collect response"))?
             .aggregate();
 
@@ -110,6 +113,7 @@ impl Server {
             .authority(self.url.authority().unwrap().clone())
             .path_and_query(path_and_query)
             .build()
+            .inspect(|x| tracing::trace!("Made uri {x}"))
             .map_err(Error::msg)
     }
 
@@ -123,8 +127,9 @@ impl Server {
 
     pub async fn send_request<T>(&self, method: &str, path: T) -> Result<Response<Incoming>, Error>
     where
-        T: Into<PathAndQuery>,
+        T: Into<PathAndQuery> + Debug,
     {
+        tracing::debug!("send_request {method} {path:?}");
         Self::send_request_raw(
             self.make_uri(path)?,
             &mut self.shared.write().await.sender,
@@ -157,11 +162,35 @@ impl Server {
 
         if shared.metadata != new_metadata {
             shared.metadata = new_metadata;
-            println!("New metadata: {:?}", shared.metadata);
+            tracing::trace!("New metadata: {:?}", shared.metadata);
         } else {
-            println!("Metadata didn't change.");
+            tracing::trace!("Metadata didn't change.");
         }
         Ok(())
+    }
+
+    pub async fn transfer(&self, hash: &str) -> Result<Vec<OwnedHashTreeNode>, Error> {
+        tracing::trace!("Preparing transfer request: target: {hash}");
+        let mut shared = self.shared.write().await;
+
+        let path_and_query = PathAndQuery::from_str(format!("/transfer/whole/{hash}").as_str())
+            .map_err(Error::msg)?;
+
+        let body = Self::send_and_collect_request_raw(
+            self.make_uri(path_and_query)?,
+            &mut shared.sender,
+            "GET",
+        )
+        .await
+        .inspect_err(|e| tracing::error!("Error during request: {e}"))?;
+        let mut buf: Vec<u8> = vec![];
+        body.reader().read(&mut buf).map_err(Error::msg)?;
+
+        tracing::trace!("Extracted {} bytes from body", buf.len());
+
+        // try to deserialize ServerMetadata from body
+        let chunks: Vec<OwnedHashTreeNode> = bitcode::deserialize(&buf).map_err(Error::msg)?;
+        Ok(chunks)
     }
 
     // TODO diff may optionally be computed client-side
@@ -171,6 +200,7 @@ impl Server {
         hash: &str,
         from: Vec<Hash>,
     ) -> Result<Vec<OwnedHashTreeNode>, Error> {
+        tracing::trace!("Preparing transfer/diff request: target: {hash}, from:{from:?}");
         let mut shared = self.shared.write().await;
 
         // comma separated list of hashes
@@ -180,19 +210,27 @@ impl Server {
             .collect::<Vec<String>>()
             .join(",");
 
-        let path_and_query = PathAndQuery::from_str(format!("/transfer/diff/{hash}/{from}").as_str())
-            .map_err(Error::msg)?;
+        let from_query = if from.is_empty() {
+            ""
+        } else {
+            &format!("?from={from}")
+        };
+
+        let path_and_query =
+            PathAndQuery::from_str(format!("/transfer/diff/{hash}{from_query}").as_str())
+                .map_err(Error::msg)?;
 
         let body = Self::send_and_collect_request_raw(
             self.make_uri(path_and_query)?,
             &mut shared.sender,
             "GET",
         )
-        .await?;
+        .await
+        .inspect_err(|e| tracing::error!("Error during request: {e}"))?;
         let mut buf: Vec<u8> = vec![];
-        body.reader().read(&mut buf).map_err(Error::msg)?;
+        body.reader().read_to_end(&mut buf).map_err(Error::msg)?;
 
-        println!("Extracted {} bytes from body", buf.len());
+        tracing::trace!("Extracted {} bytes from body", buf.len());
 
         // try to deserialize ServerMetadata from body
         let chunks: Vec<OwnedHashTreeNode> = bitcode::deserialize(&buf).map_err(Error::msg)?;
@@ -205,10 +243,10 @@ impl Server {
             if self.fetch().await.is_err() {
                 // try to re-establish connection to server
                 if let Ok(sender) = connection::make_connection(self.url.clone()).await {
-                    println!("Connected to server");
+                    tracing::info!("Connected to server");
                     self.shared.write().await.sender = sender;
                 } else {
-                    println!(
+                    tracing::warn!(
                         "Cannot connect to server, retrying in {} seconds",
                         self.timeout.as_secs()
                     );
@@ -272,7 +310,7 @@ impl Server {
             .await
             .map_err(|_| Error::msg("Cannot complete request"))?;
 
-        println!("Received response {}", res.status());
+        tracing::trace!("Received response {}", res.status());
         res.body_mut()
             .collect()
             .await
@@ -283,7 +321,7 @@ impl Server {
                     .and_then(|x| Uuid::parse_str(x).map_err(Error::msg))
             })
             .inspect(|uid| {
-                println!("Got id '{uid:?}' from server");
+                tracing::info!("Got uuid '{uid:?}' from server");
                 self.client_uid = Some(*uid);
             })
     }

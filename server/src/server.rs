@@ -33,7 +33,7 @@ pub struct ServerInternalMetadata {
     // Feed map
     pub feeds: HashMap<FeedName, Feed>,
     // Item map
-    pub items: HashMap<ItemName, Item>,
+    pub items: HashMap<PathBuf, Item>,
 }
 
 impl From<ServerInternalMetadata> for ServerMetadata {
@@ -116,6 +116,10 @@ where
         })
     }
 
+    /// Register a new client
+    ///
+    /// This function will insert a new client into the clients map.
+    /// The clients map key will be a UUID generated from the client name, the server nonce and the client address.
     pub fn register_client(
         &self,
         name: ClientName,
@@ -161,7 +165,14 @@ where
             .ok_or(RegisterError)
     }
 
-    /// Publish a new item to the server
+    /// Publish a new item
+    ///
+    /// This function will insert the item into the storage and the metadata map.
+    /// The item will be inserted into the metadata map using the path as key.
+    ///
+    /// # Panics
+    ///
+    /// Conversion of paths to UTF-8 may panic on some OSes (Windows for sure)
     pub fn publish_item(
         &self,
         name: ItemName,
@@ -178,9 +189,11 @@ where
                     .write()
                     .expect("Poisoned Lock")
                     .items
-                    .try_insert(i.metadata.name.clone(), i)
+                    .try_insert(i.metadata.path.clone(), i)
                     .map(|item| item.to_owned())
-                    .map_err(|e| ServerError::ItemInsertionError(e.entry.key().clone()))
+                    .map_err(|e| {
+                        ServerError::ItemInsertionError(e.entry.key().to_str().unwrap().to_owned())
+                    })
             })
     }
 

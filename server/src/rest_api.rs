@@ -1,5 +1,6 @@
 use std::{fmt::Debug, net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc};
 
+use axum_extra::extract::OptionalQuery;
 use bitcode;
 use blake3::Hash;
 use serde::{Deserialize, Serialize};
@@ -164,13 +165,14 @@ where
             .items
             .keys()
             .cloned()
+            .map(|x| x.to_string_lossy().into())
             .collect::<Vec<String>>(),
     )
 }
 
 /// Get one item
 async fn get_one_item<T>(
-    Path(name): Path<ItemName>,
+    Query(path): Query<PathBuf>,
     State(server): State<Server<T>>,
 ) -> impl IntoResponse
 where
@@ -182,7 +184,7 @@ where
             .read()
             .expect("Poisoned Lock")
             .items
-            .get(&name)
+            .get(&path)
             .cloned(),
     )
 }
@@ -193,11 +195,11 @@ struct ItemPostObj {
     #[serde(default, deserialize_with = "empty_string_as_none")]
     pub description: Option<String>,
     pub path: PathBuf,
+    pub name: String,
 }
 
 /// Publish an item
 async fn publish_item<T>(
-    Path(name): Path<ItemName>,
     Query(item_data): Query<ItemPostObj>,
     State(server): State<Server<T>>,
     mut multipart: Multipart,
@@ -214,7 +216,7 @@ where
             continue;
         }
         let res = server.publish_item(
-            name,
+            item_data.name,
             item_data.path,
             0,
             item_data.description,
@@ -276,25 +278,34 @@ where
 /// The server will return a binary bitcode serialized representation of the chunks
 async fn get_transfer_diff<T>(
     Path(hash): Path<String>,
-    Path(from): Path<String>,
+    OptionalQuery(from): OptionalQuery<String>,
     State(server): State<Server<T>>,
 ) -> Result<impl IntoResponse, StatusCode>
 where
     T: ChunkStorage + Sync + Send + Clone + Default,
 {
-    tracing::debug!("Transfer {hash} from {from}");
+    tracing::debug!("Transfer {hash} from {from:?}");
+
     let hash = Hash::from_str(hash.as_str())
         .inspect_err(|e| tracing::error!("Cannot decode hash {}", e))
         .map_err(|_| StatusCode::BAD_REQUEST)?;
-    let from: Result<Vec<Hash>, blake3::HexError> = from.split(',').map(Hash::from_str).collect();
-    let from = from
-        .inspect_err(|e| tracing::error!("Cannot decode hash {}", e))
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    // handle None `from`
+    let from = match from {
+        None => vec![],
+        Some(from) => {
+            let from: Result<Vec<Hash>, blake3::HexError> =
+                from.split(',').map(Hash::from_str).collect();
+            from.inspect_err(|e| tracing::error!("Cannot decode hash {}", e))
+                .map_err(|_| StatusCode::BAD_REQUEST)?
+        }
+    };
 
     let hashes = server
         .storage
         .diff(&hash, from)
         .ok_or(StatusCode::NOT_FOUND)
+        .inspect(|hs| tracing::debug!("Transferring chunks: {hs:?}"))
         .inspect_err(|_| tracing::warn!("Cannot find hash {hash}"))?;
 
     let hashes: Result<Vec<Arc<StoredChunkRef>>, StatusCode> = hashes
@@ -383,8 +394,8 @@ where
         .route("/version", get(version))
         .route("/clients", get(get_clients).post(register_client))
         .route("/clients/:uuid", get(get_one_client))
-        .route("/items", get(get_items))
-        .route("/items/:name", get(get_one_item).post(publish_item))
+        .route("/items/all", get(get_items))
+        .route("/items", get(get_one_item).post(publish_item))
         .route("/chunks", get(get_chunks))
         .route("/chunks/size-sum", get(get_chunks_size_sum))
         .route("/chunks/get/:hash", get(get_chunk))
@@ -392,7 +403,7 @@ where
         .route("/feeds/:feed_name", get(get_one_feed))
         // 'transfer' routes return binary bitcode serialized bodies
         .route("/transfer/metadata", get(get_metadata))
-        .route("/transfer/diff/:hash/:from", get(get_transfer_diff))
+        .route("/transfer/diff/:hash", get(get_transfer_diff))
         .route("/transfer/whole/:hashes", get(get_transfer))
         .with_state(Arc::new(server))
         .layer(

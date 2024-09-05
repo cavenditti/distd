@@ -20,7 +20,7 @@ pub struct ServerMetadata {
     // Feed map
     pub feeds: HashMap<FeedName, Feed>,
     // Item map
-    pub items: HashMap<ItemName, ItemMetadata>,
+    pub items: HashMap<PathBuf, ItemMetadata>,
 }
 
 impl<'a> BitcodeSerializable<'a, ServerMetadata> for ServerMetadata {}

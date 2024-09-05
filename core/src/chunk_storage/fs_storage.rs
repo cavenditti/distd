@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::{create_dir_all, remove_file, File},
-    io::{Read, Seek},
+    io::{Read, Seek, Write},
     os::{fd::AsRawFd, unix::fs::FileExt},
     path::{Path, PathBuf},
     sync::{atomic::AtomicBool, Arc, RwLock},
@@ -102,13 +102,19 @@ impl InFileChunk {
         self.paths
             .iter()
             .try_for_each(|p| {
-                //tracing::trace!("Writing InFileChunk for {hash} @ {:?}", p);
-                let buffer = File::create(&p.path)
+                tracing::trace!("Writing InFileChunk for {hash} @ {:?}", p);
+                // TODO this doesn't work with File::create, I'm not sure why
+                let mut buffer = File::options().write(true).open(&p.path)
                     .inspect_err(|e| tracing::error!("Cannot create file at {:?}: {}", p.path, e))
                     .map_err(Error::msg)?;
-                match buffer.write_at(chunk, p.offset) {
+                buffer.seek(std::io::SeekFrom::Start(p.offset)).unwrap();
+                match buffer.write(chunk) {
                     Ok(size) if size as u32 == self.info.size => Ok(()),
-                    _ => Err(Error::msg("Cannot write to file")),
+                    Ok(size) => Err(Error::msg(format!(
+                        "Wrote {size} instead of expected {}",
+                        self.info.size
+                    ))),
+                    Err(e) => Err(Error::msg(format!("Cannot write to file: {e}"))),
                 }
                 .map(|()| {
                     self.populated
@@ -443,7 +449,7 @@ impl ChunkStorage for FsStorage {
         let hash_tree = self.insert(file)?;
         let item = Item::new(name, path, revision, description, hash_tree);
         tracing::debug!("Inserted chunks in storage for item {}", item.metadata.name);
-        tracing::trace!("Item: {item:?}");
+        tracing::trace!("New item: {item:?}");
 
         Some(item)
     }

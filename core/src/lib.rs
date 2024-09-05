@@ -17,5 +17,6 @@ pub mod peer;
 pub mod unique_name;
 pub mod utils;
 pub mod version;
+pub mod error;
 
 pub mod benchmarks;

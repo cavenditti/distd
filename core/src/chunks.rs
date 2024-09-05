@@ -1,9 +1,10 @@
 //! common chunks and hash-tree data structs
 
-use blake3::Hash;
 use std::sync::Arc;
 
+use blake3::Hash;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use crate::utils::serde::hashes::{deserialize_hash, serialize_hash};
 
@@ -31,6 +32,12 @@ pub trait HashTreeNode {
 
     /// Get contained data, returns None if is not Stored
     fn stored_data(&self) -> Option<&OwnedChunk>;
+
+    /// Get mutable contained data, returns None if is not Stored
+    fn stored_data_mut(&mut self) -> Option<&mut OwnedChunk>;
+
+    /// Get owned contained data, returns None if is not `Stored`
+    fn stored_data_owned(self) -> Option<OwnedChunk>;
 
     /// Get contained data, returns None if is not Parent
     fn children(&self) -> Option<(&Self, &Self)>;
@@ -93,6 +100,44 @@ impl HashTreeNode for OwnedHashTreeNode {
             Self::Stored { data, .. } => Some(data),
         }
     }
+
+    /// Get mutable contained data, returns None if is not `Stored`
+    fn stored_data_mut(&mut self) -> Option<&mut OwnedChunk> {
+        match self {
+            Self::Parent { .. } => None,
+            Self::Stored { data, .. } => Some(data),
+        }
+    }
+
+    /// Get owned contained data, returns None if is not `Stored`
+    fn stored_data_owned(self) -> Option<OwnedChunk> {
+        match self {
+            Self::Parent { .. } => None,
+            Self::Stored { data, .. } => Some(data),
+        }
+    }
+}
+
+#[derive(Error, Debug)]
+#[error("Expected {expected} instead")]
+pub struct HashTreeNodeTypeError {
+    pub expected: String,
+}
+
+/// Flatten hash-tree chunks (`Stored` nodes) into a single vector of bytes
+pub fn flatten(chunks: Vec<OwnedHashTreeNode>) -> Result<Vec<u8>, HashTreeNodeTypeError> {
+    Ok(chunks
+        .into_iter()
+        // no flat_map here, as Result implements IntoIterator and errors just get ignored
+        .map(|x| {
+            x.stored_data_owned().ok_or(HashTreeNodeTypeError {
+                expected: "Stored".into(),
+            })
+        })
+        .collect::<Result<Vec<Vec<u8>>, HashTreeNodeTypeError>>()?
+        .into_iter()
+        .flatten()
+        .collect())
 }
 
 /// Seralizable view of an hash tree node, only contains size and hash
@@ -115,5 +160,40 @@ impl ChunkInfo {
     fn is_leaf(&self) -> bool {
         //self.children.is_none()
         self.size == CHUNK_SIZE as u32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::hash::hash;
+
+    use super::{flatten, OwnedHashTreeNode};
+
+    #[test]
+    fn test_flatten() {
+        const L: usize = 2000;
+        let b1 = vec![0; L];
+        let b2 = vec![1; L];
+        let l1 = b1.len();
+        let l2 = b2.len();
+        let n1 = OwnedHashTreeNode::Stored {
+            hash: hash(b""),
+            data: b1.into(),
+        };
+        let n2 = OwnedHashTreeNode::Stored {
+            hash: hash(b""),
+            data: b2.into(),
+        };
+        let flat = flatten(vec![n1, n2]).unwrap();
+
+        assert_eq!(flat.len(), l1 + l2);
+
+        for v in &flat[..L] {
+            assert_eq!(*v, 0);
+        }
+
+        for v in &flat[L..] {
+            assert_eq!(*v, 1);
+        }
     }
 }
