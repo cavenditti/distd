@@ -1,10 +1,10 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::{create_dir_all, remove_file, File},
-    io::{BufReader, Read, Seek, Write},
+    io::{Read, Seek},
     os::{fd::AsRawFd, unix::fs::FileExt},
     path::{Path, PathBuf},
-    sync::{atomic::AtomicBool, Arc, Mutex, RwLock},
+    sync::{atomic::AtomicBool, Arc, RwLock},
 };
 
 use anyhow::Error;
@@ -151,7 +151,6 @@ impl InnerFsStorage {
     }
 }
 
-/*
 #[cfg(target_os = "linux")]
 fn preallocate_file(path: &Path, len: usize) {
     use libc;
@@ -164,32 +163,20 @@ fn preallocate_file(path: &Path, len: usize) {
     tracing::debug!("`fallocate` returned {res}")
 }
 
-//#[cfg(not(target_os = "linux"))]
-*/
-
+#[cfg(not(target_os = "linux"))]
 fn preallocate_file(path: &Path, len: usize) {
     tracing::trace!("preallocate_file: {len} bytes at {path:?}");
     let mut file = File::create(path)
         .inspect_err(|e| tracing::error!("Cannot create file at {:?}: {}", path, e))
         .unwrap();
     file.set_len(len as u64).unwrap();
-    file.seek(std::io::SeekFrom::Start(len as u64)).unwrap();
-    file.write_all(&[]).unwrap();
-    file.flush().unwrap();
     file.sync_all().unwrap();
-
-    /*
-    File::create(&path)
-        .and_then(|x| x.set_len(data.len() as u64).map(|_| x))
-        .and_then(|mut x| x.flush().map(|_| x))
-        .and_then(|x| x.sync_all())
-        .map_err(Error::msg)?;
-    */
 }
 
 impl InnerFsStorage {
     /// Returns the (eventual) stored path of the item provided
     fn path(&self, path: &Path) -> PathBuf {
+        // TODO also create parent?
         if path.starts_with(&self.root) {
             path.to_path_buf()
         } else {
@@ -494,7 +481,7 @@ mod tests {
     use crate::{
         chunks::CHUNK_SIZE,
         hash::hash as do_hash,
-        item::tests::{make_ones_item, new_dummy_item},
+        item::tests::{make_ones_item, new_dummy_item, random_path},
     };
     use std::{str::FromStr, thread::sleep, time::Duration};
 
@@ -558,6 +545,24 @@ mod tests {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Creates a random path in /tmp, ensuring its parent directory exists
+    fn temp_path() -> PathBuf {
+        let path = std::env::temp_dir().join(random_path());
+        create_dir_all(path.parent().unwrap_or(&path)).unwrap();
+        path
+    }
+
+    #[test]
+    fn test_preallocate_file() {
+        let path = temp_path();
+        println!("{path:?}");
+        preallocate_file(&path, 22);
+        assert!(path.exists());
+        let mut buf = vec![];
+        File::open(path).unwrap().read_to_end(&mut buf).unwrap();
+        assert_eq!(buf.len(), 22);
+    }
+
     #[test]
     fn test_infile_chunk() {
         let (data, hash, mut infile_chunk) = make_infile_chunk::<CHUNK_SIZE>();
@@ -606,7 +611,6 @@ mod tests {
         storage.pre_allocate_item(&item).unwrap();
 
         let itempath = crate::utils::path::join(&tempdir, &item.metadata.path);
-        println!("{tempdir:?} ||| {itempath:?}");
         assert!(itempath.exists());
 
         // Actually store the item chunk

@@ -169,8 +169,8 @@ pub mod tests {
     use super::*;
 
     // Using a random path to avoid confliting file creation from mutliple concurrent tests
-    fn random_path() -> PathBuf {
-        PathBuf::from_str(&format!("/random/unique/path/{}", Uuid::new_v4())).unwrap()
+    pub fn random_path() -> PathBuf {
+        PathBuf::from_str(&format!("random/unique/path/{}", Uuid::new_v4())).unwrap()
     }
 
     /*
