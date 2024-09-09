@@ -23,7 +23,6 @@ pub struct Client {
     pub uuid: Uuid,
 
     //realm: Option<Arc<Realm>>,
-
     /// Client version, optional
     pub version: Option<Version>,
 

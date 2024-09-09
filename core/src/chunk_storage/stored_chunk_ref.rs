@@ -85,21 +85,24 @@ impl From<StoredChunkRef> for OwnedHashTreeNode {
 }
 
 impl StoredChunkRef {
-    #[must_use] pub fn hash(&self) -> &Hash {
+    #[must_use]
+    pub fn hash(&self) -> &Hash {
         match self {
             Self::Stored { hash, .. } | Self::Parent { hash, .. } => hash,
         }
     }
 
     /// Compute sum size in bytes of all descending chunks
-    #[must_use] pub fn size(&self) -> usize {
+    #[must_use]
+    pub fn size(&self) -> usize {
         match self {
             Self::Stored { data, .. } => data.len(),
             Self::Parent { left, right, .. } => left.size() + right.size(),
         }
     }
 
-    #[must_use] pub fn chunk_info(&self) -> ChunkInfo {
+    #[must_use]
+    pub fn chunk_info(&self) -> ChunkInfo {
         match self {
             Self::Stored { hash, data } => ChunkInfo {
                 hash: *hash,
@@ -113,7 +116,8 @@ impl StoredChunkRef {
     }
 
     /// Get contained data, returns None if is not Stored
-    #[must_use] pub fn stored_data(&self) -> Option<RawChunk> {
+    #[must_use]
+    pub fn stored_data(&self) -> Option<RawChunk> {
         match self {
             Self::Stored { data, .. } => Some(data.clone()),
             Self::Parent { .. } => None,
@@ -121,7 +125,8 @@ impl StoredChunkRef {
     }
 
     /// Get contained data, returns None if is not Parent
-    #[must_use] pub fn children(&self) -> Option<(&Arc<StoredChunkRef>, &Arc<StoredChunkRef>)> {
+    #[must_use]
+    pub fn children(&self) -> Option<(&Arc<StoredChunkRef>, &Arc<StoredChunkRef>)> {
         match self {
             Self::Parent { left, right, .. } => Some((left, right)),
             Self::Stored { .. } => None,
@@ -129,7 +134,8 @@ impl StoredChunkRef {
     }
 
     /// Get a view on contained data, recursing across all children
-    #[must_use] pub fn data(&self) -> Option<Vec<RawChunk>> {
+    #[must_use]
+    pub fn data(&self) -> Option<Vec<RawChunk>> {
         match self {
             Self::Stored { data, .. } => Some(vec![data.clone()]),
             Self::Parent { left, right, .. } => {
@@ -142,7 +148,8 @@ impl StoredChunkRef {
 
     /// Get contained data, recursing across all children
     /// This method may be slow and produce (copying) a large result, pay attention when using it
-    #[must_use] pub fn clone_data(&self) -> Option<Vec<u8>> {
+    #[must_use]
+    pub fn clone_data(&self) -> Option<Vec<u8>> {
         match self {
             Self::Stored { data, .. } => Some((*data.clone()).clone()),
             Self::Parent { left, right, .. } => {
@@ -154,7 +161,8 @@ impl StoredChunkRef {
     }
 
     /// Get flatten representation of `Stored` hashes, eventually repeating hashes
-    #[must_use] pub fn flatten(&self) -> Vec<Hash> {
+    #[must_use]
+    pub fn flatten(&self) -> Vec<Hash> {
         match self {
             Self::Stored { hash, .. } => {
                 vec![*hash]
@@ -168,7 +176,8 @@ impl StoredChunkRef {
     }
 
     /// Get all unique `Stored` hashes referenced by the (sub-)tree
-    #[must_use] pub fn hashes(&self) -> HashSet<Hash> {
+    #[must_use]
+    pub fn hashes(&self) -> HashSet<Hash> {
         match self {
             Self::Stored { hash, .. } => HashSet::from([*hash]),
             Self::Parent { left, right, .. } => {
@@ -179,7 +188,8 @@ impl StoredChunkRef {
     }
 
     /// Get all unique hashes (`Stored` or `Parent`) referenced by the (sub-)tree
-    #[must_use] pub fn all_hashes(&self) -> HashSet<Hash> {
+    #[must_use]
+    pub fn all_hashes(&self) -> HashSet<Hash> {
         match self {
             Self::Stored { hash, .. } => HashSet::from([*hash]),
             Self::Parent { hash, left, right } => {
@@ -191,7 +201,8 @@ impl StoredChunkRef {
     }
 
     /// Get all unique `Stored` hashes referenced by the (sub-)tree
-    #[must_use] pub fn hashes_with_sizes(&self) -> HashSet<ChunkInfo> {
+    #[must_use]
+    pub fn hashes_with_sizes(&self) -> HashSet<ChunkInfo> {
         match self {
             Self::Stored { hash, .. } => HashSet::from([ChunkInfo {
                 size: self.size() as u32,
@@ -208,7 +219,8 @@ impl StoredChunkRef {
     }
 
     /// Get all unique `Stored` hashes referenced by the (sub-)tree
-    #[must_use] pub fn all_hashes_with_sizes(&self) -> HashSet<ChunkInfo> {
+    #[must_use]
+    pub fn all_hashes_with_sizes(&self) -> HashSet<ChunkInfo> {
         match self {
             Self::Stored { hash, .. } => HashSet::from([ChunkInfo {
                 size: self.size() as u32,
@@ -229,7 +241,8 @@ impl StoredChunkRef {
     }
 
     /// Get flatten representation of `Stored` hashes with sizes, eventually repeating hashes
-    #[must_use] pub fn flatten_with_sizes(&self) -> Vec<ChunkInfo> {
+    #[must_use]
+    pub fn flatten_with_sizes(&self) -> Vec<ChunkInfo> {
         match self {
             Self::Stored { hash, .. } => {
                 vec![ChunkInfo {

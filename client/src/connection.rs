@@ -7,9 +7,7 @@ use tokio::net::TcpStream;
 use crate::error::{InvalidParameter, ServerConnection};
 
 /// Make a connection to a given URL
-pub async fn make(
-    url: hyper::Uri,
-) -> Result<SendRequest<Empty<Bytes>>, ServerConnection> {
+pub async fn make(url: hyper::Uri) -> Result<SendRequest<Empty<Bytes>>, ServerConnection> {
     let host = url.host().ok_or(InvalidParameter::Generic {
         expected: String::from("URL"),
         got: url.to_string(),

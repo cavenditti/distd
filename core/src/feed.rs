@@ -21,7 +21,8 @@ pub struct Feed {
 }
 
 impl Feed {
-    #[must_use] pub fn new(name: &str) -> Self {
+    #[must_use]
+    pub fn new(name: &str) -> Self {
         Self {
             name: name.to_string(),
             paths: BTreeMap::new(),

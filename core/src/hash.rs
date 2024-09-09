@@ -1,9 +1,9 @@
-
 use blake3::Hash;
 
 use crate::chunks::CHUNK_SIZE;
 
-#[must_use] pub fn merge_hashes(left: &Hash, right: &Hash) -> Hash {
+#[must_use]
+pub fn merge_hashes(left: &Hash, right: &Hash) -> Hash {
     let mut combined_hashes = left.as_bytes().to_vec();
     combined_hashes.extend(right.as_bytes());
     blake3::hash(&combined_hashes)
@@ -50,7 +50,8 @@ pub fn hash(input_data: &[u8]) -> Hash {
 */
 
 /// Hashing function. Uses BLAKE3 but without Subtree-freeness
-#[must_use] pub fn hash(data: &[u8]) -> Hash {
+#[must_use]
+pub fn hash(data: &[u8]) -> Hash {
     fn partial_tree(slices: &[&[u8]]) -> Hash {
         /*
         println!(
@@ -72,7 +73,10 @@ pub fn hash(input_data: &[u8]) -> Hash {
     }
 
     let (chunks, remainder) = data.as_chunks::<CHUNK_SIZE>();
-    let mut slices = chunks.iter().map(std::convert::AsRef::as_ref).collect::<Vec<&[u8]>>(); // FIXME is this zero copy?
+    let mut slices = chunks
+        .iter()
+        .map(std::convert::AsRef::as_ref)
+        .collect::<Vec<&[u8]>>(); // FIXME is this zero copy?
     if !remainder.is_empty() {
         slices.push(remainder);
     }

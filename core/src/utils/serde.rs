@@ -23,7 +23,7 @@ where
 }
 
 pub mod hashes {
-    use super::{Deserialize, Deserializer, FromStr, Hash, Serialize, de};
+    use super::{de, Deserialize, Deserializer, FromStr, Hash, Serialize};
 
     pub fn serialize_hash<S>(v: &Hash, serializer: S) -> Result<S::Ok, S::Error>
     where

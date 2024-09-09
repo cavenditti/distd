@@ -9,6 +9,7 @@
 
 pub mod chunk_storage;
 pub mod chunks;
+pub mod error;
 pub mod feed;
 pub mod hash;
 pub mod item;
@@ -17,6 +18,5 @@ pub mod peer;
 pub mod unique_name;
 pub mod utils;
 pub mod version;
-pub mod error;
 
 pub mod benchmarks;

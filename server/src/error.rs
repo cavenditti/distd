@@ -10,10 +10,7 @@ pub enum Server {
     ItemInsertionError(String),
 
     #[error("invalid header (expected {expected:?}, found {found:?})")]
-    InvalidHeader {
-        expected: String,
-        found: String,
-    },
+    InvalidHeader { expected: String, found: String },
 
     #[error("unknown data store error")]
     UnknownDataStore,
