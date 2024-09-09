@@ -62,13 +62,13 @@ impl<T> Client<T>
 where
     T: ChunkStorage,
 {
-    pub async fn sync(self: Self, target: &Path, path: &Path) -> Result<(), ClientError> {
+    pub async fn sync(self, target: &Path, path: &Path) -> Result<(), ClientError> {
         let mut buf = vec![];
 
         let from = self.storage.chunks(); // FIXME this could get very very large
 
         if path.exists() {
-            let mut f = File::open(&path).expect("Invalid or unreachable file path");
+            let mut f = File::open(path).expect("Invalid or unreachable file path");
             f.read_to_end(&mut buf).unwrap();
         }
 
@@ -85,7 +85,7 @@ where
             item.description.clone(),
             buf.clone().into(),
         );
-        println!("{:?}", insertion_result);
+        println!("{insertion_result:?}");
 
         let result = self
             .server
@@ -112,13 +112,13 @@ where
     }
 
     /// Main client loop
-    pub async fn client_loop(self: Self) -> Result<(), ClientError> {
+    pub async fn client_loop(self) -> Result<(), ClientError> {
         self.server.fetch_loop().await;
         Ok(())
     }
 
     /// Fetch a resource from the server, mostly used for debug
-    pub async fn fetch(self: Self, method: &str, url: PathAndQuery) -> Result<(), ClientError> {
+    pub async fn fetch(self, method: &str, url: PathAndQuery) -> Result<(), ClientError> {
         tracing::debug!("Fetch {method} {url}");
 
         let mut response = self
@@ -227,8 +227,8 @@ pub mod cli {
 
     async fn sync(client: Client<FsStorage>, args: &[String]) -> Result<(), ClientError> {
         let (target, path) = match args.len() {
-            1 => Ok((args.get(0).unwrap(), args.get(0).unwrap())),
-            2 => Ok((args.get(0).unwrap(), args.get(1).unwrap())),
+            1 => Ok((args.first().unwrap(), args.first().unwrap())),
+            2 => Ok((args.first().unwrap(), args.get(1).unwrap())),
             _ => Err(ClientError::InvalidArgs),
         }?;
         let path = PathBuf::from_str(path).unwrap();
@@ -239,11 +239,11 @@ pub mod cli {
 
     /// Fetch a resource from the server, mostly used for debug
     async fn fetch(client: Client<FsStorage>, args: Vec<String>) -> Result<(), ClientError> {
-        let (method, url) = args.get(0).zip(args.get(1)).expect("Invalid args");
+        let (method, url) = args.first().zip(args.get(1)).expect("Invalid args");
         tracing::debug!("Fetch {method} {url}");
 
         // url should always start with exactly one "/"
-        let url = format!("/{}", url.trim_start_matches("/"));
+        let url = format!("/{}", url.trim_start_matches('/'));
         let url = PathAndQuery::from_str(url.as_str()).expect("Invalid path specified");
 
         client.fetch(method, url).await

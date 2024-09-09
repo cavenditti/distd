@@ -129,8 +129,7 @@ pub trait ChunkStorage {
     fn diff(&self, target: &Hash, from: Vec<Hash>) -> Option<HashSet<Hash>> {
         let target_chunk = self.get(target)?;
         from.iter()
-            .map(|from_hash| self.get(from_hash))
-            .flatten()
+            .filter_map(|from_hash| self.get(from_hash))
             .fold(target_chunk.hashes(), |t: HashSet<Hash>, from_chunk| {
                 t.difference(&from_chunk.hashes()).copied().collect()
             })

@@ -206,7 +206,7 @@ impl Server {
         // comma separated list of hashes
         let from = from
             .iter()
-            .map(|x| x.to_string())
+            .map(std::string::ToString::to_string)
             .collect::<Vec<String>>()
             .join(",");
 

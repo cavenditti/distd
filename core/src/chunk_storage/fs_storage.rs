@@ -126,9 +126,9 @@ impl InFileChunk {
                     // right away. I'm not sure why this is the case.
                     //buffer.sync_all().unwrap();
                 })
-                .inspect(|_| count += chunk.len())
+                .inspect(|()| count += chunk.len())
             })
-            .inspect(|_| tracing::trace!("{count} bytes written"))
+            .inspect(|()| tracing::trace!("{count} bytes written"))
             .inspect_err(|e| tracing::error!("Failed writing {hash} after {count} bytes: {e}"))
     }
 }
@@ -168,7 +168,7 @@ fn preallocate_file(path: &Path, len: usize) {
         libc::sync();
         res
     };
-    tracing::debug!("`fallocate` returned {res}")
+    tracing::debug!("`fallocate` returned {res}");
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -213,7 +213,7 @@ impl InnerFsStorage {
         tracing::debug!(
             "Preallocating {} chunks at {path:?}, for a total of {} bytes",
             data.len(),
-            data.iter().map(|x| x.size as u64).sum::<u64>()
+            data.iter().map(|x| u64::from(x.size)).sum::<u64>()
         );
         if self
             .items
@@ -236,7 +236,7 @@ impl InnerFsStorage {
                 path: self.path(path),
                 offset,
             };
-            offset += chunk.size as u64;
+            offset += u64::from(chunk.size);
             if let Some(infile_chunk) = self.data.get_mut(&chunk.hash) {
                 infile_chunk.paths.insert(paths);
             } else {
@@ -258,13 +258,12 @@ impl InnerFsStorage {
         tracing::debug!("Preallocating {} bytes at {path:?}", data.len());
         let chunks: Vec<ChunkInfo> = data
             .chunks(CHUNK_SIZE)
-            .into_iter()
             .map(|x| ChunkInfo {
                 hash: do_hash(x),
                 size: x.len() as u32,
             })
             .collect();
-        self.pre_allocate(path, &chunks.as_slice())
+        self.pre_allocate(path, chunks.as_slice())
     }
 
     /// Pre-allocate space for an item in the filesystem
@@ -360,18 +359,18 @@ impl FsStorage {
         self.read().items.clone()
     }
 
-    pub fn path(&self, path: &Path) -> PathBuf {
+    #[must_use] pub fn path(&self, path: &Path) -> PathBuf {
         self.read().path(path)
     }
 
     /// Wrapper around `InnerFsStorage::pre_allocate`
     pub fn pre_allocate(&self, path: &Path, data: &[ChunkInfo]) -> Result<(), Error> {
-        self.write().pre_allocate(&path, data)
+        self.write().pre_allocate(path, data)
     }
 
     /// Wrapper around `InnerFsStorage::pre_allocate_bytes`
     pub fn pre_allocate_bytes(&self, path: &Path, data: &[u8]) -> Result<(), Error> {
-        self.write().pre_allocate_bytes(&path, data)
+        self.write().pre_allocate_bytes(path, data)
     }
 
     /// Wrapper around `InnerFsStorage::pre_allocate_item`

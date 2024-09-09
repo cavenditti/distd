@@ -178,11 +178,11 @@ mod tests {
         let l2 = b2.len();
         let n1 = OwnedHashTreeNode::Stored {
             hash: hash(b""),
-            data: b1.into(),
+            data: b1,
         };
         let n2 = OwnedHashTreeNode::Stored {
             hash: hash(b""),
-            data: b2.into(),
+            data: b2,
         };
         let flat = flatten(vec![n1, n2]).unwrap();
 

@@ -26,7 +26,7 @@ use distd_core::{chunk_storage::StoredChunkRef, utils::serde::empty_string_as_no
 use distd_core::{
     chunks::OwnedHashTreeNode, metadata::ServerMetadata, utils::serde::bitcode::BitcodeSerializable,
 };
-use distd_core::{item::ItemName, version::Version};
+use distd_core::version::Version;
 
 use crate::ChunkStorage;
 use crate::Client;
