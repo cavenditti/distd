@@ -102,6 +102,18 @@ impl InFileChunk {
         self.paths
             .iter()
             .try_for_each(|p| {
+                // This special handling is needed because in my case `File::create` wasn't behaving as expected.
+                // When writing to a pre-allocated file writes failed, using `.write(true).open()` instead works
+                // but requires to explicitly check if the file doesn't yet exist before.
+                if !p.path.exists() {
+                    let f = File::create(&p.path)
+                    .inspect_err(|e| tracing::error!("Cannot create file at {:?}: {}", p.path, e))
+                    .map_err(Error::msg)?;
+                    f.set_len(p.offset + self.info.size as u64)
+                    .inspect_err(|e| tracing::error!("Cannot extend file at {:?}: {}", p.path, e))
+                    .map_err(Error::msg)?;
+                }
+
                 tracing::trace!("Writing InFileChunk for {hash} @ {:?}", p);
                 // TODO this doesn't work with File::create, I'm not sure why
                 let mut buffer = File::options()
