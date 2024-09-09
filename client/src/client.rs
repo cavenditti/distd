@@ -2,7 +2,10 @@ use std::{collections::HashMap, path::Path};
 
 use anyhow::Error;
 
-use crate::{error::ClientError, server::Server};
+use crate::{
+    error::{Client as ClientError, ServerRequest},
+    server::Server,
+};
 
 use std::{fmt::Write, fs::File, io::Read};
 
@@ -70,7 +73,7 @@ where
         if path.exists() {
             File::open(path)
                 .and_then(|mut f| f.read_to_end(&mut buf))
-                .map_err(ClientError::IoError)?;
+                .map_err(ClientError::Io)?;
         }
 
         let server_metadata = self.server.metadata().await;
@@ -86,17 +89,15 @@ where
             item.description.clone(),
             buf.clone().into(),
         );
-        println!("{insertion_result:?}");
+        tracing::debug!("{insertion_result:?}");
 
         let result = self
             .server
             .transfer_diff(&item.root.hash.to_string(), from)
-            .await
-            .inspect_err(|e| println!("Error on transfer_diff: {e}"))
-            .unwrap();
+            .await?;
 
         tracing::trace!("Got {} chunks from server", result.len());
-        let flat = flatten(result)?;
+        let flat = flatten(result).map_err(ServerRequest::ResponseReconstruct)?;
         tracing::trace!("{} bytes total", flat.len());
 
         let _insertion_result = self
@@ -128,15 +129,13 @@ where
             .server
             .send_request(method, url)
             .await
-            .inspect(|r| tracing::debug!("Got {:?}", &r))
-            .inspect_err(|e| println!("{e}"))
-            .map_err(|_| ClientError::ServerRequestError)?;
+            .inspect(|r| tracing::debug!("Got {:?}", &r))?;
 
         let body = response
             .body_mut()
             .collect()
             .await
-            .map_err(|_| ClientError::ServerResponseError)?
+            .map_err(ServerRequest::Request)?
             .aggregate()
             .chunk()
             .to_vec();
@@ -161,7 +160,7 @@ pub mod cli {
     use distd_core::chunk_storage::fs_storage::FsStorage;
 
     use crate::client::Client;
-    use crate::error::ClientError;
+    use crate::error::Client as ClientError;
     use crate::settings::Settings;
 
     pub async fn main() -> Result<(), ClientError> {
@@ -184,21 +183,23 @@ pub mod cli {
         tracing::debug!("Settings: {settings:?}");
 
         let url = settings.server.url;
-        let url = url.parse::<hyper::Uri>().unwrap();
+        let url = url
+            .parse::<hyper::Uri>()
+            .map_err(|_| ClientError::InvalidArgs(cmd_args.clone()))?;
 
         // Only HTTP for now.
         if url.scheme_str() != Some("http") {
-            println!("This example only works with 'http' URLs.");
             return Err(ClientError::InvalidArgs(cmd_args));
         }
 
-        let storage = FsStorage::new(PathBuf::from_str(&settings.fsstorage.root).unwrap()).unwrap();
+        let Ok(storage_root) = PathBuf::from_str(&settings.fsstorage.root);
+        let storage = FsStorage::new(storage_root).map_err(|_| ClientError::Storage)?;
         let client = loop {
             match Client::new("Some name", url.clone(), &[0u8; 32], storage.clone()).await {
                 Ok(client) => break client,
                 Err(e) => {
                     const T: u64 = 5;
-                    println!("Error: '{e}', retrying in {T} seconds");
+                    tracing::warn!("Error: '{e}', retrying in {T} seconds");
                     sleep(Duration::from_secs(T));
                 }
             }
@@ -209,22 +210,32 @@ pub mod cli {
             "fetch" => fetch(client, cmd_args).await,
             "sync" => sync(client, &cmd_args[..]).await,
             _ => {
-                println!("Invalid command specified");
+                tracing::error!("Invalid command specified");
                 Err(ClientError::InvalidCmd(cmd))
             }
         }
+        .inspect_err(|e| tracing::error!("Fatal: {e}"))
     }
 
     async fn sync(client: Client<FsStorage>, args: &[String]) -> Result<(), ClientError> {
-        let (target, path) = match args.len() {
-            1 => Ok((args.first().unwrap(), args.first().unwrap())),
-            2 => Ok((args.first().unwrap(), args.get(1).unwrap())),
-            _ => Err(ClientError::InvalidArgs(args.to_owned())),
-        }?;
-        let path = PathBuf::from_str(path).unwrap();
-        let target = &PathBuf::from_str(target.as_str()).unwrap();
+        let first = args
+            .first()
+            .ok_or(ClientError::InvalidArgs(args.to_owned()))?;
 
-        client.sync(target, &path).await
+        let (target, path) = match args.len() {
+            1 => (first, first),
+            2 => (
+                first,
+                args.get(1)
+                    .ok_or(ClientError::InvalidArgs(args.to_owned()))?,
+            ),
+            _ => return Err(ClientError::InvalidArgs(args.to_owned())),
+        };
+
+        let Ok(path) = PathBuf::from_str(path);
+        let Ok(target) = PathBuf::from_str(target.as_str());
+
+        client.sync(&target, &path).await
     }
 
     /// Fetch a resource from the server, mostly used for debug

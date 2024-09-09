@@ -2,7 +2,7 @@ use config::{Config, Environment, File};
 use serde::Deserialize;
 use std::env;
 
-use crate::error::ClientError;
+use crate::error::Client as ClientError;
 
 #[derive(Debug, Deserialize)]
 #[allow(unused)]

@@ -119,7 +119,7 @@ pub trait ChunkStorage {
         Self: Sized,
     {
         let hash_tree = self.insert(file)?;
-        Some(Item::new(name, path, revision, description, hash_tree))
+        Some(Item::new(name, path, revision, description, &hash_tree))
     }
 
     /// Minimal set of hashes required to reconstruct `target` using `from`

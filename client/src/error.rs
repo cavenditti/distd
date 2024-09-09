@@ -1,9 +1,65 @@
+use std::str::Utf8Error;
+
 use config::ConfigError;
 use distd_core::chunks::HashTreeNodeTypeError;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
-pub enum ClientError {
+pub enum ServerConnection {
+    #[error("Cannot create stream")]
+    StreamCreation(#[from] std::io::Error),
+
+    #[error("Cannot perform handshake")]
+    Handshake(#[from] hyper::Error),
+
+    #[error("Invalid parameter")]
+    InvalidParmeter(#[from] InvalidParameter),
+}
+
+#[derive(Error, Debug)]
+pub enum ServerRequest {
+    #[error("Cannot build request")]
+    Build(#[from] hyper::http::Error),
+
+    #[error("Cannot complete server request")]
+    Request(#[from] hyper::Error),
+
+    #[error("Cannot read response")]
+    ReadFromResponse(#[from] std::io::Error),
+
+    #[error("Cannot reconstruct buffer from server response")]
+    ResponseReconstruct(#[from] HashTreeNodeTypeError),
+
+    #[error("Cannot reconstruct buffer from server response")]
+    ResponseDeserialize(#[from] bitcode::Error),
+
+    #[error("Cannot decode UTF-8 string from server response")]
+    Utf8(#[from] Utf8Error),
+
+    #[error("Cannot decode UTF-8 string from server response")]
+    Uuid(#[from] uuid::Error),
+
+    #[error("Invalid parameter")]
+    InvalidParmeter(#[from] InvalidParameter),
+
+    #[error("Cannot connect to server")]
+    Connection(#[from] ServerConnection),
+}
+
+#[derive(Error, Debug)]
+pub enum InvalidParameter {
+    #[error("Invalid URL")]
+    Url(#[from] hyper::http::Error),
+
+    #[error("Invalid URI")]
+    Uri(#[from] hyper::http::uri::InvalidUri),
+
+    #[error("Invalid parameter: expected {expected}, got \"{got}\"")]
+    Generic { expected: String, got: String },
+}
+
+#[derive(Error, Debug)]
+pub enum Client {
     #[error("No command specified")]
     MissingCmd,
 
@@ -16,17 +72,11 @@ pub enum ClientError {
     #[error("Invalid config")]
     InvaldConfig(#[from] ConfigError),
 
+    #[error("Cannot connect to server")]
+    ServerConnection(#[from] ServerConnection),
+
     #[error("Cannot complete server request")]
-    ServerRequestError,
-
-    #[error("Cannot parse server response")]
-    ServerResponseError,
-
-    #[error("Cannot reconstruct buffer from server response")]
-    ServerResponseReconstructError{
-        #[from]
-        source: HashTreeNodeTypeError,
-    },
+    ServerRequest(#[from] ServerRequest),
 
     #[error("Requested file could not be found on server: \"{0}\"")]
     FileNotFound(String),
@@ -35,20 +85,11 @@ pub enum ClientError {
     ItemInsertion(String),
 
     #[error("IO error")]
-    IoError(#[from] std::io::Error),
+    Io(#[from] std::io::Error),
 
-    /*
-    #[error("Bad config specified: \"{0}\"")]
-    InvaldConfig(String),
+    #[error("Generic storage error")]
+    Storage,
 
-    #[error("invalid header (expected {expected:?}, found {found:?})")]
-    InvalidHeader {
-        expected: String,
-        found: String,
-    },
-    #[error("unknown data store error")]
-    UnknownDataStore,
-    #[error("unknown server error")]
-    Unknown,
-    */
+    #[error("Invalid parameter")]
+    InvalidParmeter(#[from] InvalidParameter),
 }

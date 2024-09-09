@@ -323,7 +323,7 @@ where
         .map(|x| OwnedHashTreeNode::from((**x).clone()))
         .collect();
 
-    tracing::debug!("Returned chunks: {chunks:?}");
+    tracing::trace!("Returned chunks: {chunks:x?}");
 
     let serialized: Result<Vec<u8>, StatusCode> = bitcode::serialize(&chunks)
         .inspect_err(|e| tracing::error!("Cannot serialize chunk {}", e))

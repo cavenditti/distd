@@ -8,7 +8,7 @@ pub mod error;
 pub mod server;
 pub mod settings;
 
-use error::ClientError;
+pub use error::Client as ClientError;
 
 #[tokio::main]
 pub async fn main() -> Result<(), ClientError> {

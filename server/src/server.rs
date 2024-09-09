@@ -26,7 +26,7 @@ use distd_core::version::Version;
 
 /// Data structure used internally by server, may be converted to `ServerMetadata`
 #[derive(Debug, Clone, Default)]
-pub struct ServerInternalMetadata {
+pub struct InternalMetadata {
     // TODO
     // server version
     pub version: Version,
@@ -36,17 +36,16 @@ pub struct ServerInternalMetadata {
     pub items: HashMap<PathBuf, Item>,
 }
 
-impl From<ServerInternalMetadata> for ServerMetadata {
-    fn from(value: ServerInternalMetadata) -> Self {
+impl From<InternalMetadata> for ServerMetadata {
+    fn from(value: InternalMetadata) -> Self {
         Self {
             version: value.version,
             feeds: value.feeds,
-            items: HashMap::from_iter(
-                value
-                    .items
-                    .iter()
-                    .map(|x| (x.0.clone(), x.1.metadata.clone())),
-            ),
+            items: value
+                .items
+                .iter()
+                .map(|x| (x.0.clone(), x.1.metadata.clone()))
+                .collect(),
         }
     }
 }
@@ -63,7 +62,7 @@ where
     key_pair: Ed25519KeyPair, // needs server restart to be changed
     uuid_nonce: String,       // needs server restart to be changed
     // global server metadata
-    pub metadata: RwLock<ServerInternalMetadata>,
+    pub metadata: RwLock<InternalMetadata>,
     // A storage implementing ChunkStorage, basically a key-value database of some sort
     pub storage: T,
     // Client map
@@ -87,7 +86,7 @@ where
         Self {
             key_pair,
             uuid_nonce,
-            metadata: RwLock::new(ServerInternalMetadata::default()),
+            metadata: RwLock::new(InternalMetadata::default()),
             clients: RwLock::new(BTreeMap::<Uuid, Client>::new()),
             storage: T::default(),
         }
@@ -102,10 +101,7 @@ where
     T: ChunkStorage + Sync + Send + Clone + Default + Debug,
 {
     /// Create a new server instance, with a specific key pair and metadata
-    pub fn new(
-        pkcs8_bytes: Document,
-        metadata: ServerInternalMetadata,
-    ) -> Result<Self, KeyRejected> {
+    pub fn new(pkcs8_bytes: &Document, metadata: InternalMetadata) -> Result<Self, KeyRejected> {
         let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8_bytes.as_ref())?;
         Ok(Self {
             key_pair,
@@ -120,6 +116,7 @@ where
     ///
     /// This function will insert a new client into the clients map.
     /// The clients map key will be a UUID generated from the client name, the server nonce and the client address.
+    #[allow(clippy::missing_panics_doc)]
     pub fn register_client(
         &self,
         name: ClientName,
@@ -153,6 +150,7 @@ where
             .ok_or(RegisterError)
     }
 
+    #[allow(clippy::missing_panics_doc)]
     pub fn expose_feed(&self, feed: Feed) -> Result<FeedName, RegisterError> {
         self.metadata
             .write()
@@ -173,6 +171,7 @@ where
     /// # Panics
     ///
     /// Conversion of paths to UTF-8 may panic on some OSes (Windows for sure)
+    #[allow(clippy::missing_panics_doc)]
     pub fn publish_item(
         &self,
         name: ItemName,

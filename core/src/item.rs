@@ -76,7 +76,7 @@ impl Item {
         path: PathBuf,
         revision: u32,
         description: Option<String>,
-        hash_tree: Arc<StoredChunkRef>,
+        hash_tree: &Arc<StoredChunkRef>,
     ) -> Self {
         let now = SystemTime::now();
         Self {

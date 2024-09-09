@@ -1,5 +1,6 @@
 //use std::{net::SocketAddr
-use anyhow::Error;
+use crate::error::{InvalidParameter, ServerRequest};
+
 use blake3::Hash;
 use std::{fmt::Debug, io::Read, str::FromStr, time::Duration};
 use uuid::Uuid;
@@ -67,17 +68,12 @@ impl Server {
         url: hyper::Uri,
         sender: &mut SendRequest<Empty<Bytes>>,
         method: &str,
-    ) -> Result<Response<Incoming>, Error> {
+    ) -> Result<Response<Incoming>, ServerRequest> {
         // Prepare request
-        let request = Self::request_builder(url, method)
-            .body(Empty::<Bytes>::new())
-            .map_err(|_| Error::msg("Cannot build request body"))?;
+        let request = Self::request_builder(url, method).body(Empty::<Bytes>::new())?;
 
         // Fetch from url
-        let res = sender
-            .send_request(request)
-            .await
-            .map_err(|_| Error::msg("Cannot complete request"))?;
+        let res = sender.send_request(request).await?;
 
         Ok(res)
     }
@@ -86,7 +82,7 @@ impl Server {
         url: hyper::Uri,
         sender: &mut SendRequest<Empty<Bytes>>,
         method: &str,
-    ) -> Result<impl Buf, Error> {
+    ) -> Result<impl Buf, ServerRequest> {
         tracing::trace!("Request: {method} {url}");
         // make request
         let res = Self::send_request_raw(url, sender, method).await?;
@@ -97,15 +93,14 @@ impl Server {
         let body = res
             .collect()
             .await
-            .inspect(|b| tracing::trace!("Response body: {b:?}"))
-            .map_err(|_| Error::msg("Cannot collect response"))?
+            .inspect(|b| tracing::trace!("Response body: {b:?}"))?
             .aggregate();
 
         Ok(body)
     }
 
     #[allow(clippy::missing_panics_doc)]
-    fn make_uri<T>(&self, path_and_query: T) -> Result<hyper::Uri, Error>
+    fn make_uri<T>(&self, path_and_query: T) -> Result<hyper::Uri, InvalidParameter>
     where
         T: Into<PathAndQuery>,
     {
@@ -116,7 +111,7 @@ impl Server {
             .path_and_query(path_and_query)
             .build()
             .inspect(|x| tracing::trace!("Made uri {x}"))
-            .map_err(Error::msg)
+            .map_err(InvalidParameter::Url)
     }
 
     pub async fn metadata(&self) -> ServerMetadata {
@@ -127,7 +122,11 @@ impl Server {
         self.shared.read().await.last_update
     }
 
-    pub async fn send_request<T>(&self, method: &str, path: T) -> Result<Response<Incoming>, Error>
+    pub async fn send_request<T>(
+        &self,
+        method: &str,
+        path: T,
+    ) -> Result<Response<Incoming>, ServerRequest>
     where
         T: Into<PathAndQuery> + Debug,
     {
@@ -140,14 +139,14 @@ impl Server {
         .await
     }
 
-    pub async fn prepare_request<T>(&self, method: &str, path: T) -> Result<Builder, Error>
+    pub async fn prepare_request<T>(&self, method: &str, path: T) -> Result<Builder, ServerRequest>
     where
         T: Into<PathAndQuery>,
     {
         Ok(Self::request_builder(self.make_uri(path)?, method))
     }
 
-    async fn fetch(&self) -> Result<(), Error> {
+    async fn fetch(&self) -> Result<(), ServerRequest> {
         let mut shared = self.shared.write().await;
 
         let body = Self::send_and_collect_request_raw(
@@ -159,7 +158,7 @@ impl Server {
         let buf = body.chunk();
 
         // try to deserialize ServerMetadata from body
-        let new_metadata = bitcode::deserialize(buf).map_err(Error::msg)?;
+        let new_metadata = bitcode::deserialize(buf)?;
         shared.last_update = Instant::now();
 
         if shared.metadata != new_metadata {
@@ -171,12 +170,12 @@ impl Server {
         Ok(())
     }
 
-    pub async fn transfer(&self, hash: &str) -> Result<Vec<OwnedHashTreeNode>, Error> {
+    pub async fn transfer(&self, hash: &str) -> Result<Vec<OwnedHashTreeNode>, ServerRequest> {
         tracing::trace!("Preparing transfer request: target: {hash}");
         let mut shared = self.shared.write().await;
 
         let path_and_query = PathAndQuery::from_str(format!("/transfer/whole/{hash}").as_str())
-            .map_err(Error::msg)?;
+            .map_err(InvalidParameter::Uri)?;
 
         let body = Self::send_and_collect_request_raw(
             self.make_uri(path_and_query)?,
@@ -186,12 +185,12 @@ impl Server {
         .await
         .inspect_err(|e| tracing::error!("Error during request: {e}"))?;
         let mut buf: Vec<u8> = vec![];
-        body.reader().read(&mut buf).map_err(Error::msg)?;
+        body.reader().read(&mut buf)?;
 
         tracing::trace!("Extracted {} bytes from body", buf.len());
 
         // try to deserialize ServerMetadata from body
-        let chunks: Vec<OwnedHashTreeNode> = bitcode::deserialize(&buf).map_err(Error::msg)?;
+        let chunks: Vec<OwnedHashTreeNode> = bitcode::deserialize(&buf)?;
         Ok(chunks)
     }
 
@@ -201,7 +200,7 @@ impl Server {
         &self,
         hash: &str,
         from: Vec<Hash>,
-    ) -> Result<Vec<OwnedHashTreeNode>, Error> {
+    ) -> Result<Vec<OwnedHashTreeNode>, ServerRequest> {
         tracing::trace!("Preparing transfer/diff request: target: {hash}, from:{from:?}");
         let mut shared = self.shared.write().await;
 
@@ -220,7 +219,7 @@ impl Server {
 
         let path_and_query =
             PathAndQuery::from_str(format!("/transfer/diff/{hash}{from_query}").as_str())
-                .map_err(Error::msg)?;
+                .map_err(InvalidParameter::Uri)?;
 
         let body = Self::send_and_collect_request_raw(
             self.make_uri(path_and_query)?,
@@ -230,12 +229,13 @@ impl Server {
         .await
         .inspect_err(|e| tracing::error!("Error during request: {e}"))?;
         let mut buf: Vec<u8> = vec![];
-        body.reader().read_to_end(&mut buf).map_err(Error::msg)?;
+        body.reader().read_to_end(&mut buf)?;
 
         tracing::trace!("Extracted {} bytes from body", buf.len());
 
         // try to deserialize ServerMetadata from body
-        let chunks: Vec<OwnedHashTreeNode> = bitcode::deserialize(&buf).map_err(Error::msg)?;
+        let chunks: Vec<OwnedHashTreeNode> =
+            bitcode::deserialize(&buf)?;
         Ok(chunks)
     }
 
@@ -262,7 +262,7 @@ impl Server {
         //pub_key: &PublicKey,
         client_name: &str,
         pub_key: &[u8; 32],
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, ServerRequest> {
         // Uri values are not going to change so we'll check them now and then just unwrap
         assert!(url.scheme().is_some());
         assert!(url.authority().is_some());
@@ -287,9 +287,9 @@ impl Server {
         Ok(server)
     }
 
-    pub async fn register(&mut self, client_name: &str) -> Result<Uuid, Error> {
+    pub async fn register(&mut self, client_name: &str) -> Result<Uuid, ServerRequest> {
         use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
-        let req = self
+        let request = self
             .prepare_request(
                 "POST",
                 PathAndQuery::try_from(format!(
@@ -300,31 +300,30 @@ impl Server {
                 .unwrap(),
             )
             .await?
-            .body(Empty::<Bytes>::new())
-            .map_err(Error::msg)?;
+            .body(Empty::<Bytes>::new())?;
 
         let mut res = self
             .shared
             .write()
             .await
             .sender
-            .send_request(req)
-            .await
-            .map_err(|_| Error::msg("Cannot complete request"))?;
+            .send_request(request)
+            .await?;
 
         tracing::trace!("Received response {}", res.status());
-        res.body_mut()
+        let collected = res
+            .body_mut()
             .collect()
-            .await
-            .map_err(Error::msg)
-            .and_then(|x| {
-                std::str::from_utf8(&x.to_bytes())
-                    .map_err(Error::msg)
-                    .and_then(|x| Uuid::parse_str(x).map_err(Error::msg))
-            })
+            .await?;
+
+        let uid = std::str::from_utf8(&collected.to_bytes())
+            .map_err(ServerRequest::Utf8)
+            .and_then(|x| Uuid::parse_str(x).map_err(ServerRequest::Uuid))
             .inspect(|uid| {
                 tracing::info!("Got uuid '{uid:?}' from server");
                 self.client_uid = Some(*uid);
-            })
+            })?;
+
+        Ok(uid)
     }
 }

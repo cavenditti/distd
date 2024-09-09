@@ -465,7 +465,7 @@ impl ChunkStorage for FsStorage {
         tracing::info!("Preallocated on disk {:?}", path);
 
         let hash_tree = self.insert(file)?;
-        let item = Item::new(name, path, revision, description, hash_tree);
+        let item = Item::new(name, path, revision, description, &hash_tree);
         tracing::debug!("Inserted chunks in storage for item {}", item.metadata.name);
         tracing::trace!("New item: {item:?}");
 
