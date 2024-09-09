@@ -57,20 +57,21 @@ pub struct Server {
 }
 
 impl Server {
-    fn request_builder(url: hyper::Uri, method: &str) -> Builder {
+    fn request_builder(url: &hyper::Uri, method: &str) -> Builder {
         Request::builder()
             .uri(url.clone())
             .method(method)
             .header(hyper::header::HOST, url.authority().unwrap().as_str())
     }
 
+    /// Send a request to the server
     async fn send_request_raw(
         url: hyper::Uri,
         sender: &mut SendRequest<Empty<Bytes>>,
         method: &str,
     ) -> Result<Response<Incoming>, ServerRequest> {
         // Prepare request
-        let request = Self::request_builder(url, method).body(Empty::<Bytes>::new())?;
+        let request = Self::request_builder(&url, method).body(Empty::<Bytes>::new())?;
 
         // Fetch from url
         let res = sender.send_request(request).await?;
@@ -78,6 +79,7 @@ impl Server {
         Ok(res)
     }
 
+    /// Send a request to the server and collect the response
     async fn send_and_collect_request_raw(
         url: hyper::Uri,
         sender: &mut SendRequest<Empty<Bytes>>,
@@ -99,6 +101,7 @@ impl Server {
         Ok(body)
     }
 
+    /// Make a URI from a path and query
     #[allow(clippy::missing_panics_doc)]
     fn make_uri<T>(&self, path_and_query: T) -> Result<hyper::Uri, InvalidParameter>
     where
@@ -114,14 +117,17 @@ impl Server {
             .map_err(InvalidParameter::Url)
     }
 
+    /// Get the server metadata
     pub async fn metadata(&self) -> ServerMetadata {
         self.shared.read().await.metadata.clone()
     }
 
+    /// Get the last time metadata was fetched from the server
     pub async fn last_update(&self) -> Instant {
         self.shared.read().await.last_update
     }
 
+    /// Send a request to the server
     pub async fn send_request<T>(
         &self,
         method: &str,
@@ -139,13 +145,15 @@ impl Server {
         .await
     }
 
-    pub async fn prepare_request<T>(&self, method: &str, path: T) -> Result<Builder, ServerRequest>
+    /// Prepare a request to be sent to the server
+    pub fn prepare_request<T>(&self, method: &str, path: T) -> Result<Builder, ServerRequest>
     where
         T: Into<PathAndQuery>,
     {
-        Ok(Self::request_builder(self.make_uri(path)?, method))
+        Ok(Self::request_builder(&self.make_uri(path)?, method))
     }
 
+    /// Fetch metadata from server
     async fn fetch(&self) -> Result<(), ServerRequest> {
         let mut shared = self.shared.write().await;
 
@@ -164,12 +172,12 @@ impl Server {
         if shared.metadata != new_metadata {
             shared.metadata = new_metadata;
             tracing::trace!("New metadata: {:?}", shared.metadata);
-        } else {
-            tracing::trace!("Metadata didn't change.");
         }
+
         Ok(())
     }
 
+    /// Transfer chunks from server
     pub async fn transfer(&self, hash: &str) -> Result<Vec<OwnedHashTreeNode>, ServerRequest> {
         tracing::trace!("Preparing transfer request: target: {hash}");
         let mut shared = self.shared.write().await;
@@ -185,7 +193,7 @@ impl Server {
         .await
         .inspect_err(|e| tracing::error!("Error during request: {e}"))?;
         let mut buf: Vec<u8> = vec![];
-        body.reader().read(&mut buf)?;
+        body.reader().read_exact(&mut buf)?;
 
         tracing::trace!("Extracted {} bytes from body", buf.len());
 
@@ -234,17 +242,17 @@ impl Server {
         tracing::trace!("Extracted {} bytes from body", buf.len());
 
         // try to deserialize ServerMetadata from body
-        let chunks: Vec<OwnedHashTreeNode> =
-            bitcode::deserialize(&buf)?;
+        let chunks: Vec<OwnedHashTreeNode> = bitcode::deserialize(&buf)?;
         Ok(chunks)
     }
 
+    /// Fetch metadata from server in a loop
     pub async fn fetch_loop(&self) {
         loop {
             tokio::time::sleep(self.timeout).await;
             if self.fetch().await.is_err() {
                 // try to re-establish connection to server
-                if let Ok(sender) = connection::make_connection(self.url.clone()).await {
+                if let Ok(sender) = connection::make(self.url.clone()).await {
                     tracing::info!("Connected to server");
                     self.shared.write().await.sender = sender;
                 } else {
@@ -257,6 +265,25 @@ impl Server {
         }
     }
 
+    /// Create a new server instance
+    ///
+    /// # Arguments
+    /// * `url` - server url
+    /// * `pub_key` - client public key, TODO
+    /// * `client_name` - client name
+    /// * `timeout` - timeout for server fetches, TODO
+    ///
+    /// # Returns
+    /// A new server instance
+    ///
+    /// # Errors
+    /// * `ServerRequest::BadPubKey` - if the public key is invalid
+    /// * `ServerRequest::Request` - if the request fails
+    /// * `ServerRequest::Utf8` - if the response is not valid utf8
+    /// * `ServerRequest::Uuid` - if the response is not a valid uuid
+    ///
+    /// # Panics
+    /// * If the url does not have a scheme or authority
     pub async fn new(
         url: hyper::Uri,
         //pub_key: &PublicKey,
@@ -267,11 +294,14 @@ impl Server {
         assert!(url.scheme().is_some());
         assert!(url.authority().is_some());
 
-        let sender = connection::make_connection(url.clone()).await?;
+        let sender = connection::make(url.clone()).await?;
         let timeout = Duration::new(5, 0); // TODO make this configurable
 
         let mut server = Self {
-            pub_key: pub_key.as_ref().try_into().unwrap(), // FIXME
+            pub_key: pub_key
+                .as_ref()
+                .try_into()
+                .map_err(|_| ServerRequest::BadPubKey)?,
             url,
             client_uid: None,
             shared: RwLock::new(SharedServer {
@@ -287,6 +317,7 @@ impl Server {
         Ok(server)
     }
 
+    /// Register a new client
     pub async fn register(&mut self, client_name: &str) -> Result<Uuid, ServerRequest> {
         use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
         let request = self
@@ -297,9 +328,8 @@ impl Server {
                     utf8_percent_encode(client_name, NON_ALPHANUMERIC),
                     *VERSION,
                 ))
-                .unwrap(),
-            )
-            .await?
+                .map_err(InvalidParameter::Uri)?,
+            )?
             .body(Empty::<Bytes>::new())?;
 
         let mut res = self
@@ -311,18 +341,13 @@ impl Server {
             .await?;
 
         tracing::trace!("Received response {}", res.status());
-        let collected = res
-            .body_mut()
-            .collect()
-            .await?;
+        let collected = res.body_mut().collect().await?;
 
-        let uid = std::str::from_utf8(&collected.to_bytes())
-            .map_err(ServerRequest::Utf8)
-            .and_then(|x| Uuid::parse_str(x).map_err(ServerRequest::Uuid))
-            .inspect(|uid| {
-                tracing::info!("Got uuid '{uid:?}' from server");
-                self.client_uid = Some(*uid);
-            })?;
+        let b = collected.to_bytes();
+        let uid_str = std::str::from_utf8(&b)?;
+        let uid = Uuid::parse_str(uid_str)?;
+        tracing::info!("Got uuid '{uid:?}' from server");
+        self.client_uid = Some(uid);
 
         Ok(uid)
     }

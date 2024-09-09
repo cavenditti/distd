@@ -44,6 +44,9 @@ pub enum ServerRequest {
 
     #[error("Cannot connect to server")]
     Connection(#[from] ServerConnection),
+
+    #[error("Invalid format for provided server public key")]
+    BadPubKey,
 }
 
 #[derive(Error, Debug)]
