@@ -1,12 +1,12 @@
 use bitcode;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize as De, Serialize as Ser};
 
 pub type Bitcode = Vec<u8>;
 
-pub trait BitcodeSerializable<'a, T: Serialize + Deserialize<'a>> {
+pub trait Serializable<'a, T: Ser + De<'a>> {
     fn to_bitcode(self) -> Result<Vec<u8>, bitcode::Error>
     where
-        Self: Sized + Serialize,
+        Self: Sized + Ser,
     {
         bitcode::serialize(&self)
     }

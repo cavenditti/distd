@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::item::Item;
 use crate::unique_name::UniqueName;
 
-pub type FeedName = UniqueName;
+pub type Name = UniqueName;
 
 /// A `Feed` is a collection of items
 ///
@@ -14,7 +14,7 @@ pub type FeedName = UniqueName;
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Feed {
     /// Name of the feed
-    pub name: FeedName,
+    pub name: Name,
 
     /// Paths of items in the feed
     pub paths: BTreeMap<PathBuf, Item>,

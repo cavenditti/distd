@@ -1,8 +1,7 @@
 #![feature(map_try_insert)]
 
 use distd_core::chunk_storage::hashmap_storage::HashMapStorage;
-use distd_core::chunk_storage::ChunkStorage;
-use distd_core::feed::{Feed, FeedName};
+use distd_core::feed::Feed;
 
 use crate::client::Client;
 use crate::server::Server;

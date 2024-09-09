@@ -4,13 +4,13 @@ use anyhow::Error;
 
 use crate::{error::ClientError, server::Server};
 
-use std::{fmt::Write, fs::File, io::Read, str::FromStr};
+use std::{fmt::Write, fs::File, io::Read};
 
 use http_body_util::BodyExt;
 use hyper::body::Buf;
 use hyper::http::uri::PathAndQuery;
 
-use distd_core::{chunk_storage::ChunkStorage, chunks::flatten, metadata::ItemMetadata};
+use distd_core::{chunk_storage::ChunkStorage, chunks::flatten, metadata::Item as ItemMetadata};
 
 #[derive(Debug)]
 pub struct RegisterError;
@@ -68,8 +68,9 @@ where
         let from = self.storage.chunks(); // FIXME this could get very very large
 
         if path.exists() {
-            let mut f = File::open(path).expect("Invalid or unreachable file path");
-            f.read_to_end(&mut buf).unwrap();
+            File::open(path)
+                .and_then(|mut f| f.read_to_end(&mut buf))
+                .map_err(ClientError::IoError)?;
         }
 
         let server_metadata = self.server.metadata().await;
@@ -107,7 +108,9 @@ where
                 item.description.clone(),
                 flat.into(),
             )
-            .ok_or(ClientError::IoError("Cannot insert downloaded file".into()))?;
+            .ok_or(ClientError::ItemInsertion(
+                "Cannot insert downloaded file".into(),
+            ))?;
         Ok(())
     }
 
@@ -123,10 +126,7 @@ where
 
         let mut response = self
             .server
-            .send_request(
-                method,
-                PathAndQuery::from_str(url.as_str()).expect("Invalid path specified"),
-            )
+            .send_request(method, url)
             .await
             .inspect(|r| tracing::debug!("Got {:?}", &r))
             .inspect_err(|e| println!("{e}"))
@@ -156,15 +156,14 @@ where
 pub mod cli {
     use std::{env, path::PathBuf, str::FromStr, thread::sleep, time::Duration};
 
-    use config::Config;
     use hyper::http::uri::PathAndQuery;
 
     use distd_core::chunk_storage::fs_storage::FsStorage;
 
-    use super::super::error::ClientError;
-    use super::Client;
+    use crate::client::Client;
+    use crate::error::ClientError;
+    use crate::settings::Settings;
 
-    #[tokio::main]
     pub async fn main() -> Result<(), ClientError> {
         tracing_subscriber::fmt()
             .with_target(false)
@@ -174,37 +173,28 @@ pub mod cli {
 
         tracing::info!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
 
-        let cmd = std::env::args().nth(1).ok_or(ClientError::InvalidArgs)?;
+        let cmd = std::env::args().nth(1).ok_or(ClientError::MissingCmd)?;
         let mut i = std::env::args();
-        i.advance_by(2).map_err(|_| ClientError::InvalidArgs)?;
+        i.advance_by(2).map_err(|_| ClientError::MissingCmd)?; // FIXME may not be the right type
         let cmd_args = i.collect::<Vec<String>>();
         tracing::debug!("Running \"{cmd}\" {cmd_args:?}");
 
-        let settings = Config::builder()
-            // Add in `./ClientSettings.toml`
-            .add_source(config::File::with_name("ClientSettings"))
-            // Add in settings from the environment (with a prefix of APP)
-            // Eg.. `DISTD_DEBUG=1 ./target/app` would set the `debug` key
-            .add_source(config::Environment::with_prefix("DISTD"))
-            .build()
-            .expect("Missing configuration file");
+        let settings = Settings::new("ClientSettings")?;
 
-        tracing::debug!("Config: {settings:?}");
+        tracing::debug!("Settings: {settings:?}");
 
-        let url = settings
-            .get_string("server_url")
-            .expect("Missing server url in configuration");
-        let uri = url.parse::<hyper::Uri>().unwrap();
+        let url = settings.server.url;
+        let url = url.parse::<hyper::Uri>().unwrap();
 
         // Only HTTP for now.
-        if uri.scheme_str() != Some("http") {
+        if url.scheme_str() != Some("http") {
             println!("This example only works with 'http' URLs.");
-            return Err(ClientError::InvalidArgs);
+            return Err(ClientError::InvalidArgs(cmd_args));
         }
 
-        let storage = FsStorage::new(PathBuf::from_str("here").unwrap()).unwrap();
+        let storage = FsStorage::new(PathBuf::from_str(&settings.fsstorage.root).unwrap()).unwrap();
         let client = loop {
-            match Client::new("Some name", uri.clone(), &[0u8; 32], storage.clone()).await {
+            match Client::new("Some name", url.clone(), &[0u8; 32], storage.clone()).await {
                 Ok(client) => break client,
                 Err(e) => {
                     const T: u64 = 5;
@@ -220,7 +210,7 @@ pub mod cli {
             "sync" => sync(client, &cmd_args[..]).await,
             _ => {
                 println!("Invalid command specified");
-                Err(ClientError::InvalidArgs)
+                Err(ClientError::InvalidCmd(cmd))
             }
         }
     }
@@ -229,7 +219,7 @@ pub mod cli {
         let (target, path) = match args.len() {
             1 => Ok((args.first().unwrap(), args.first().unwrap())),
             2 => Ok((args.first().unwrap(), args.get(1).unwrap())),
-            _ => Err(ClientError::InvalidArgs),
+            _ => Err(ClientError::InvalidArgs(args.to_owned())),
         }?;
         let path = PathBuf::from_str(path).unwrap();
         let target = &PathBuf::from_str(target.as_str()).unwrap();
@@ -239,12 +229,16 @@ pub mod cli {
 
     /// Fetch a resource from the server, mostly used for debug
     async fn fetch(client: Client<FsStorage>, args: Vec<String>) -> Result<(), ClientError> {
-        let (method, url) = args.first().zip(args.get(1)).expect("Invalid args");
+        let (method, url) = args
+            .first()
+            .zip(args.get(1))
+            .ok_or(ClientError::InvalidArgs(args.clone()))?;
         tracing::debug!("Fetch {method} {url}");
 
         // url should always start with exactly one "/"
         let url = format!("/{}", url.trim_start_matches('/'));
-        let url = PathAndQuery::from_str(url.as_str()).expect("Invalid path specified");
+        let url = PathAndQuery::from_str(url.as_str())
+            .map_err(|_| ClientError::InvalidArgs(args.clone()))?;
 
         client.fetch(method, url).await
     }

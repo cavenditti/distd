@@ -1,1 +1,9 @@
-server_url = "http://localhost:3000"
+[fsstorage]
+enabled = true
+root = "here"
+
+[server]
+url = "http://localhost:3000"
+
+[log]
+level = "DEBUG"

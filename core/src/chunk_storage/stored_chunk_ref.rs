@@ -116,7 +116,7 @@ impl StoredChunkRef {
     #[must_use] pub fn stored_data(&self) -> Option<RawChunk> {
         match self {
             Self::Stored { data, .. } => Some(data.clone()),
-            _ => None,
+            Self::Parent { .. } => None,
         }
     }
 
@@ -124,7 +124,7 @@ impl StoredChunkRef {
     #[must_use] pub fn children(&self) -> Option<(&Arc<StoredChunkRef>, &Arc<StoredChunkRef>)> {
         match self {
             Self::Parent { left, right, .. } => Some((left, right)),
-            _ => None,
+            Self::Stored { .. } => None,
         }
     }
 

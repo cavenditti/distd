@@ -44,14 +44,13 @@ impl std::str::FromStr for Version {
             .map(|frag| u16::from_str(frag).map_err(|_| ParseVersionError))
             .collect();
         let v = v?;
-        if v.len() != 3 {
-            Err(ParseVersionError)
-        } else {
-            Ok(Version {
+        match v.len() {
+            3 => Ok(Version {
                 major: v[0],
                 minor: v[1],
                 patch: v[2],
-            })
+            }),
+            _ => Err(ParseVersionError),
         }
     }
 }

@@ -22,17 +22,16 @@ use tower_http::{
     LatencyUnit,
 };
 
-use distd_core::{chunk_storage::StoredChunkRef, utils::serde::empty_string_as_none};
-use distd_core::{
-    chunks::OwnedHashTreeNode, metadata::ServerMetadata, utils::serde::bitcode::BitcodeSerializable,
-};
+use distd_core::chunk_storage::{ChunkStorage, StoredChunkRef};
+use distd_core::feed::{Feed, Name as FeedName};
+use distd_core::utils::serde::empty_string_as_none;
+use distd_core::utils::serde::BitcodeSerializable;
 use distd_core::version::Version;
+use distd_core::{chunks::OwnedHashTreeNode, metadata::Server as ServerMetadata};
 
-use crate::ChunkStorage;
+use crate::error::Server as ServerError;
 use crate::Client;
-use crate::Feed;
 use crate::Server as RawServer;
-use crate::{error::ServerError, FeedName};
 
 type Server<T> = Arc<RawServer<T>>;
 

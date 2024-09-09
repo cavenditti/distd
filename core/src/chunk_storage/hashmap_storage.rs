@@ -73,7 +73,7 @@ impl ChunkStorage for HashMapStorage {
             .values()
             .map(|x| match &**x {
                 StoredChunkRef::Stored { data, .. } => data.len(),
-                _ => 0,
+                StoredChunkRef::Parent { .. } => 0,
             })
             .sum()
     }

@@ -8,13 +8,13 @@ use uuid::Uuid;
 use distd_core::unique_name::UniqueName;
 use distd_core::version::Version;
 
-pub type ClientName = UniqueName;
+pub type Name = UniqueName;
 
 /// Server-side client representation
 #[derive(Debug, Clone)]
 pub struct Client {
     /// Client advertised name
-    pub name: ClientName,
+    pub name: Name,
 
     /// Client address
     pub addr: SocketAddr,

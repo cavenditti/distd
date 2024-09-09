@@ -13,7 +13,7 @@ use blake3::Hash;
 use crate::{
     chunks::{ChunkInfo, CHUNK_SIZE},
     hash::hash as do_hash,
-    item::{Item, ItemName},
+    item::{Item, Name as ItemName},
 };
 
 use super::{ChunkStorage, StoredChunkRef};
@@ -107,11 +107,15 @@ impl InFileChunk {
                 // but requires to explicitly check if the file doesn't yet exist before.
                 if !p.path.exists() {
                     let f = File::create(&p.path)
-                    .inspect_err(|e| tracing::error!("Cannot create file at {:?}: {}", p.path, e))
-                    .map_err(Error::msg)?;
-                    f.set_len(p.offset + self.info.size as u64)
-                    .inspect_err(|e| tracing::error!("Cannot extend file at {:?}: {}", p.path, e))
-                    .map_err(Error::msg)?;
+                        .inspect_err(|e| {
+                            tracing::error!("Cannot create file at {:?}: {}", p.path, e);
+                        })
+                        .map_err(Error::msg)?;
+                    f.set_len(p.offset + u64::from(self.info.size))
+                        .inspect_err(|e| {
+                            tracing::error!("Cannot extend file at {:?}: {}", p.path, e);
+                        })
+                        .map_err(Error::msg)?;
                 }
 
                 tracing::trace!("Writing InFileChunk for {hash} @ {:?}", p);
@@ -371,7 +375,8 @@ impl FsStorage {
         self.read().items.clone()
     }
 
-    #[must_use] pub fn path(&self, path: &Path) -> PathBuf {
+    #[must_use]
+    pub fn path(&self, path: &Path) -> PathBuf {
         self.read().path(path)
     }
 

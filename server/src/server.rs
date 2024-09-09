@@ -7,8 +7,8 @@ use std::time::SystemTime;
 
 use axum::body::Bytes;
 use distd_core::chunk_storage::ChunkStorage;
-use distd_core::item::{Item, ItemName};
-use distd_core::metadata::ServerMetadata;
+use distd_core::item::{Item, Name as ItemName};
+use distd_core::metadata::Server as ServerMetadata;
 use ring::error::KeyRejected;
 use ring::pkcs8::Document;
 use ring::signature::{Ed25519KeyPair, KeyPair};
@@ -19,9 +19,9 @@ use ring::{
 use tracing::span;
 use uuid::Uuid;
 
-use crate::client::{Client, ClientName};
-use crate::error::ServerError;
-use distd_core::feed::{Feed, FeedName};
+use crate::client::{Client, Name as ClientName};
+use crate::error::Server as ServerError;
+use distd_core::feed::{Feed, Name as FeedName};
 use distd_core::version::Version;
 
 /// Data structure used internally by server, may be converted to `ServerMetadata`

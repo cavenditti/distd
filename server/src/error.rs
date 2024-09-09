@@ -1,7 +1,7 @@
 use thiserror::Error;
 
 #[derive(Error, Debug)]
-pub enum ServerError {
+pub enum Server {
     #[error("Cannot insert chunk in data store")]
     ChunkInsertError,
 

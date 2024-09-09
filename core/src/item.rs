@@ -38,13 +38,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::chunk_storage::StoredChunkRef;
 use crate::chunks::ChunkInfo;
-use crate::metadata::ItemMetadata;
+use crate::metadata::Item as ItemMetadata;
 use crate::unique_name::UniqueName;
 
-pub type ItemName = UniqueName;
+pub type Name = UniqueName;
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ItemFormat {
+pub enum Format {
     V1 = 1,
 }
 
@@ -72,7 +72,7 @@ impl Item {
     /// an Item unless there is an explicit reason not to do so.
     #[must_use]
     pub fn new(
-        name: ItemName,
+        name: Name,
         path: PathBuf,
         revision: u32,
         description: Option<String>,
@@ -89,7 +89,7 @@ impl Item {
                 created: now,
                 updated: now,
                 created_by: env!("CARGO_PKG_VERSION").to_owned(),
-                format: ItemFormat::V1,
+                format: Format::V1,
             },
             chunks: hash_tree.flatten_with_sizes(),
             hashes: hash_tree.all_hashes_with_sizes(),
@@ -98,7 +98,7 @@ impl Item {
 
     /// Make a new Item without adding it to a storage
     pub fn make(
-        name: ItemName,
+        name: Name,
         path: PathBuf,
         revision: u32,
         description: Option<String>,
@@ -117,7 +117,7 @@ impl Item {
                 created: now,
                 updated: now,
                 created_by: env!("CARGO_PKG_VERSION").to_owned(),
-                format: ItemFormat::V1,
+                format: Format::V1,
             },
             chunks,
             hashes,
@@ -164,7 +164,7 @@ pub mod tests {
     use crate::chunk_storage::ChunkStorage;
     use crate::chunks::CHUNK_SIZE;
     use crate::hash::hash;
-    use crate::utils::serde::bitcode::BitcodeSerializable;
+    use crate::utils::serde::BitcodeSerializable;
 
     use super::*;
 

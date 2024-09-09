@@ -6,6 +6,8 @@ use std::{fmt, str::FromStr};
 //pub mod msgpack;
 pub mod bitcode;
 
+pub use bitcode::Serializable as BitcodeSerializable;
+
 /// Serde deserialization decorator to map empty Strings to None,
 pub fn empty_string_as_none<'de, D, T>(de: D) -> Result<Option<T>, D::Error>
 where

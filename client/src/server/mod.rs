@@ -16,7 +16,7 @@ use tokio::{sync::RwLock, time::Instant};
 
 //use ring::agreement::PublicKey;
 
-use distd_core::{chunks::OwnedHashTreeNode, metadata::ServerMetadata, version::VERSION};
+use distd_core::{chunks::OwnedHashTreeNode, metadata::Server as ServerMetadata, version::VERSION};
 
 use crate::connection;
 
@@ -69,13 +69,13 @@ impl Server {
         method: &str,
     ) -> Result<Response<Incoming>, Error> {
         // Prepare request
-        let req = Self::request_builder(url, method)
+        let request = Self::request_builder(url, method)
             .body(Empty::<Bytes>::new())
             .map_err(|_| Error::msg("Cannot build request body"))?;
 
         // Fetch from url
         let res = sender
-            .send_request(req)
+            .send_request(request)
             .await
             .map_err(|_| Error::msg("Cannot complete request"))?;
 
@@ -104,11 +104,13 @@ impl Server {
         Ok(body)
     }
 
+    #[allow(clippy::missing_panics_doc)]
     fn make_uri<T>(&self, path_and_query: T) -> Result<hyper::Uri, Error>
     where
         T: Into<PathAndQuery>,
     {
         hyper::Uri::builder()
+            // Checked before, should never fail
             .scheme(self.url.scheme().unwrap().clone())
             .authority(self.url.authority().unwrap().clone())
             .path_and_query(path_and_query)

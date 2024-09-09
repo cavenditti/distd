@@ -7,7 +7,7 @@ pub use stored_chunk_ref::StoredChunkRef;
 use crate::{
     chunks::CHUNK_SIZE,
     hash::merge_hashes,
-    item::{Item, ItemName},
+    item::{Item, Name as ItemName},
 };
 
 pub mod fs_storage;

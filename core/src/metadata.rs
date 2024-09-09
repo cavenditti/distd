@@ -5,29 +5,29 @@ use std::{collections::HashMap, path::PathBuf, time::SystemTime};
 
 use crate::{
     chunks::ChunkInfo,
-    feed::{Feed, FeedName},
-    item::{ItemFormat, ItemName},
-    utils::serde::bitcode::BitcodeSerializable,
+    feed::{Feed, Name as FeedName},
+    item::{Format as ItemFormat, Name as ItemName},
+    utils::serde::BitcodeSerializable,
     version::Version,
 };
 
 /// Serializable Server Metadata to be used by server and clients
 #[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
-pub struct ServerMetadata {
+pub struct Server {
     // TODO
     // server version
     pub version: Version,
     // Feed map
     pub feeds: HashMap<FeedName, Feed>,
     // Item map
-    pub items: HashMap<PathBuf, ItemMetadata>,
+    pub items: HashMap<PathBuf, Item>,
 }
 
-impl<'a> BitcodeSerializable<'a, ServerMetadata> for ServerMetadata {}
+impl<'a> BitcodeSerializable<'a, Server> for Server {}
 
 /// A compact subset of the fields in an Item
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub struct ItemMetadata {
+pub struct Item {
     /// Name of the Item
     pub name: ItemName,
     /// Optional description, a generic String
@@ -49,7 +49,7 @@ pub struct ItemMetadata {
     //signature: Signature,
 }
 
-impl std::hash::Hash for ItemMetadata {
+impl std::hash::Hash for Item {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.root.hash.hash(state);
         self.name.hash(state);
@@ -58,18 +58,18 @@ impl std::hash::Hash for ItemMetadata {
     }
 }
 
-impl ItemMetadata {
+impl Item {
     #[must_use]
     pub fn size(&self) -> u32 {
         self.root.size
     }
 }
 
-impl<'a> BitcodeSerializable<'a, ItemMetadata> for ItemMetadata {}
+impl<'a> BitcodeSerializable<'a, Item> for Item {}
 
 //Will be used in future to handle server-side tracking of clients for p2p distribution
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ClientsMetadata {
+pub struct Clients {
     pub feed_subscriptions: HashMap<FeedName, Feed>,
-    pub item_subscriptions: HashMap<ItemName, ItemMetadata>,
+    pub item_subscriptions: HashMap<ItemName, Item>,
 }

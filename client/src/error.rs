@@ -1,3 +1,4 @@
+use config::ConfigError;
 use distd_core::chunks::HashTreeNodeTypeError;
 use thiserror::Error;
 
@@ -6,14 +7,14 @@ pub enum ClientError {
     #[error("No command specified")]
     MissingCmd,
 
-    #[error("Invalid args provided")]
-    InvalidArgs,
+    #[error("Invalid command provided: \"{0}\"")]
+    InvalidCmd(String),
 
-    #[error("Config file not found: {0}")]
-    MissingConfig(String),
+    #[error("Invalid args provided: {0:?}")]
+    InvalidArgs(Vec<String>),
 
-    #[error("Invalid config: {0}")]
-    InvaldConfig(String),
+    #[error("Invalid config")]
+    InvaldConfig(#[from] ConfigError),
 
     #[error("Cannot complete server request")]
     ServerRequestError,
@@ -30,8 +31,11 @@ pub enum ClientError {
     #[error("Requested file could not be found on server: \"{0}\"")]
     FileNotFound(String),
 
-    #[error("Cannot insert item into storage")]
-    IoError(String),
+    #[error("Cannot insert item \"{0}\" into storage")]
+    ItemInsertion(String),
+
+    #[error("IO error")]
+    IoError(#[from] std::io::Error),
 
     /*
     #[error("Bad config specified: \"{0}\"")]
