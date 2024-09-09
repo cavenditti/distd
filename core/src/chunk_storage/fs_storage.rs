@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs::{create_dir_all, remove_file, File},
     io::{Read, Seek, Write},
-    os::{fd::AsRawFd, unix::fs::FileExt},
+    os::fd::AsRawFd,
     path::{Path, PathBuf},
     sync::{atomic::AtomicBool, Arc, RwLock},
 };
@@ -104,7 +104,9 @@ impl InFileChunk {
             .try_for_each(|p| {
                 tracing::trace!("Writing InFileChunk for {hash} @ {:?}", p);
                 // TODO this doesn't work with File::create, I'm not sure why
-                let mut buffer = File::options().write(true).open(&p.path)
+                let mut buffer = File::options()
+                    .write(true)
+                    .open(&p.path)
                     .inspect_err(|e| tracing::error!("Cannot create file at {:?}: {}", p.path, e))
                     .map_err(Error::msg)?;
                 buffer.seek(std::io::SeekFrom::Start(p.offset)).unwrap();
