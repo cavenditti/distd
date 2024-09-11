@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs::{create_dir_all, remove_file, File},
     io::{Read, Seek, Write},
-    os::fd::AsRawFd,
+    os::unix::fs::FileExt,
     path::{Path, PathBuf},
     sync::{atomic::AtomicBool, Arc, RwLock},
 };
@@ -102,50 +102,29 @@ impl InFileChunk {
         self.paths
             .iter()
             .try_for_each(|p| {
-                // This special handling is needed because in my case `File::create` wasn't behaving as expected.
-                // When writing to a pre-allocated file writes failed, using `.write(true).open()` instead works
-                // but requires to explicitly check if the file doesn't yet exist before.
-                if !p.path.exists() {
-                    let f = File::create(&p.path)
-                        .inspect_err(|e| {
-                            tracing::error!("Cannot create file at {:?}: {}", p.path, e);
-                        })
-                        .map_err(Error::msg)?;
-                    f.set_len(p.offset + u64::from(self.info.size))
-                        .inspect_err(|e| {
-                            tracing::error!("Cannot extend file at {:?}: {}", p.path, e);
-                        })
-                        .map_err(Error::msg)?;
-                }
-
                 tracing::trace!("Writing InFileChunk for {hash} @ {:?}", p);
                 // TODO this doesn't work with File::create, I'm not sure why
-                let mut buffer = File::options()
+                File::options()
+                    .create(true)
                     .write(true)
+                    .append(false)
+                    .truncate(false)
                     .open(&p.path)
-                    .inspect_err(|e| tracing::error!("Cannot create file at {:?}: {}", p.path, e))
-                    .map_err(Error::msg)?;
-                buffer.seek(std::io::SeekFrom::Start(p.offset)).unwrap();
-                match buffer.write(chunk) {
-                    Ok(size) if size as u32 == self.info.size => Ok(()),
-                    Ok(size) => Err(Error::msg(format!(
-                        "Wrote {size} instead of expected {}",
-                        self.info.size
-                    ))),
-                    Err(e) => Err(Error::msg(format!("Cannot write to file: {e}"))),
-                }
-                .map(|()| {
-                    self.populated
-                        .swap(true, std::sync::atomic::Ordering::Relaxed);
-                    // TODO investigate:
-                    // I noticed while testing that even calling sync_all doesn't ensure the write actually happens
-                    // right away. I'm not sure why this is the case.
-                    //buffer.sync_all().unwrap();
-                })
-                .inspect(|()| count += chunk.len())
+                    .inspect_err(|e| tracing::error!("Cannot create file at {:?}: {}", p.path, e))?
+                    .write_all_at(chunk, p.offset)
+                    .map(|()| {
+                        self.populated
+                            .swap(true, std::sync::atomic::Ordering::Relaxed);
+                        // TODO investigate:
+                        // I noticed while testing that even calling sync_all doesn't ensure the write actually happens
+                        // right away. I'm not sure why this is the case.
+                        //buffer.sync_all().unwrap();
+                    })
+                    .inspect(|()| count += chunk.len())
             })
             .inspect(|()| tracing::trace!("{count} bytes written"))
             .inspect_err(|e| tracing::error!("Failed writing {hash} after {count} bytes: {e}"))
+            .map_err(Error::msg)
     }
 }
 
@@ -173,28 +152,6 @@ impl InnerFsStorage {
             ..Default::default()
         }
     }
-}
-
-#[cfg(target_os = "linux")]
-fn preallocate_file(path: &Path, len: usize) {
-    use libc;
-    let file = File::create(path).unwrap();
-    let res = unsafe {
-        let res = libc::fallocate(file.as_raw_fd(), 0, 0, len as i64);
-        libc::sync();
-        res
-    };
-    tracing::debug!("`fallocate` returned {res}");
-}
-
-#[cfg(not(target_os = "linux"))]
-fn preallocate_file(path: &Path, len: usize) {
-    tracing::trace!("preallocate_file: {len} bytes at {path:?}");
-    let mut file = File::create(path)
-        .inspect_err(|e| tracing::error!("Cannot create file at {:?}: {}", path, e))
-        .unwrap();
-    file.set_len(len as u64).unwrap();
-    file.sync_all().unwrap();
 }
 
 impl InnerFsStorage {
@@ -241,8 +198,6 @@ impl InnerFsStorage {
                 path.to_string_lossy()
             )));
         }
-
-        preallocate_file(&self.path(path), data.iter().map(|x| x.size as usize).sum());
 
         let mut offset = 0;
 
@@ -574,17 +529,6 @@ mod tests {
         let path = std::env::temp_dir().join(random_path());
         create_dir_all(path.parent().unwrap_or(&path)).unwrap();
         path
-    }
-
-    #[test]
-    fn test_preallocate_file() {
-        let path = temp_path();
-        println!("{path:?}");
-        preallocate_file(&path, 22);
-        assert!(path.exists());
-        let mut buf = vec![];
-        File::open(path).unwrap().read_to_end(&mut buf).unwrap();
-        assert_eq!(buf.len(), 22);
     }
 
     #[test]

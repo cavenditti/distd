@@ -13,7 +13,7 @@ use http_body_util::BodyExt;
 use hyper::body::Buf;
 use hyper::http::uri::PathAndQuery;
 
-use distd_core::{chunk_storage::ChunkStorage, chunks::flatten, metadata::Item as ItemMetadata};
+use distd_core::{chunk_storage::ChunkStorage, chunks::{flatten, HashTreeNode}, metadata::Item as ItemMetadata};
 
 #[derive(Debug)]
 pub struct RegisterError;
@@ -70,6 +70,7 @@ where
 
         let from = self.storage.chunks(); // FIXME this could get very very large
 
+        // If it exists read into buffer
         if path.exists() {
             File::open(path)
                 .and_then(|mut f| f.read_to_end(&mut buf))
@@ -96,8 +97,8 @@ where
             .transfer_diff(&item.root.hash.to_string(), from)
             .await?;
 
-        tracing::trace!("Got {} chunks from server", result.len());
-        let flat = flatten(result).map_err(ServerRequest::ResponseReconstruct)?;
+        tracing::trace!("Got {} chunks from server", result.hash());
+        let flat = result.flatten_iter().flatten().collect::<Vec<u8>>();
         tracing::trace!("{} bytes total", flat.len());
 
         let _insertion_result = self
@@ -122,8 +123,8 @@ where
     }
 
     /// Fetch a resource from the server, mostly used for debug
-    pub async fn fetch(self, method: &str, url: PathAndQuery) -> Result<(), ClientError> {
-        tracing::debug!("Fetch {method} {url}");
+    pub async fn rest(self, method: &str, url: PathAndQuery) -> Result<(), ClientError> {
+        tracing::debug!("REST request {method} {url}");
 
         let mut response = self
             .server
@@ -207,8 +208,10 @@ pub mod cli {
 
         match cmd.as_str() {
             "loop" => client.client_loop().await,
-            "fetch" => fetch(client, cmd_args).await,
-            "sync" => sync(client, &cmd_args[..]).await,
+            "rest" => rest(client, cmd_args).await,
+            "sync" => sync(client, &cmd_args[..]).await, // TODO change name and use sync to explicitly request syncing of items subscripted to
+            "publish" => todo!(),
+            "subscribe" => todo!(),
             _ => {
                 tracing::error!("Invalid command specified");
                 Err(ClientError::InvalidCmd(cmd))
@@ -239,7 +242,7 @@ pub mod cli {
     }
 
     /// Fetch a resource from the server, mostly used for debug
-    async fn fetch(client: Client<FsStorage>, args: Vec<String>) -> Result<(), ClientError> {
+    async fn rest(client: Client<FsStorage>, args: Vec<String>) -> Result<(), ClientError> {
         let (method, url) = args
             .first()
             .zip(args.get(1))
@@ -251,6 +254,6 @@ pub mod cli {
         let url = PathAndQuery::from_str(url.as_str())
             .map_err(|_| ClientError::InvalidArgs(args.clone()))?;
 
-        client.fetch(method, url).await
+        client.rest(method, url).await
     }
 }

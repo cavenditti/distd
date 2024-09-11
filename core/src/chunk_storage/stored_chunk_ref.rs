@@ -257,4 +257,41 @@ impl StoredChunkRef {
             }
         }
     }
+
+    /// Get diff sub-tree: required tree to reconstruct current node if one has the `hashes`
+    pub fn find_diff(&self, hashes: &[Hash]) -> OwnedHashTreeNode {
+        if hashes.contains(self.hash()) {
+            return OwnedHashTreeNode::Skipped {
+                hash: *self.hash(),
+                size: self.size() as u32,
+            };
+        }
+        match self {
+            Self::Parent { hash, left, right } => OwnedHashTreeNode::Parent {
+                size: self.size() as u32, // FIXME many wasted CPU cycles for little to no benefit
+                hash: *hash,
+                left: Box::new(left.find_diff(hashes)),
+                right: Box::new(right.find_diff(hashes)),
+            },
+            node => OwnedHashTreeNode::from(node.clone()),
+        }
+    }
+
+    /// Flatten the tree into an iterator on chunks
+    ///
+    /// This is a recursive function that returns an iterator on the chunks of the tree
+    ///
+    /// # Returns
+    /// An iterator on the chunks of the tree
+    ///
+    /// # Panics
+    /// If the tree contains a `Skipped` node
+    pub fn flatten_iter(&self) -> Box<dyn Iterator<Item = Arc<Vec<u8>>>> {
+        match self {
+            Self::Stored { data, .. } => Box::new([data.clone()].into_iter()),
+            Self::Parent { left, right, .. } => {
+                Box::new(left.flatten_iter().chain(right.flatten_iter()))
+            }
+        }
+    }
 }

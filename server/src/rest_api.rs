@@ -300,32 +300,16 @@ where
         }
     };
 
-    let hashes = server
+    let tree_diff = server
         .storage
-        .diff(&hash, from)
+        .diff_tree(&hash, &from)
         .ok_or(StatusCode::NOT_FOUND)
         .inspect(|hs| tracing::debug!("Transferring chunks: {hs:?}"))
         .inspect_err(|_| tracing::warn!("Cannot find hash {hash}"))?;
 
-    let hashes: Result<Vec<Arc<StoredChunkRef>>, StatusCode> = hashes
-        .iter()
-        .map(|hash| {
-            server
-                .storage
-                .get(hash)
-                .ok_or(StatusCode::INTERNAL_SERVER_ERROR)
-                .inspect_err(|_| tracing::error!("Missing hash provided by storage itself: {hash}"))
-        }) // this should never happen
-        .collect();
+    tracing::trace!("Tree diff: {tree_diff:x?}");
 
-    let chunks: Vec<OwnedHashTreeNode> = hashes?
-        .iter()
-        .map(|x| OwnedHashTreeNode::from((**x).clone()))
-        .collect();
-
-    tracing::trace!("Returned chunks: {chunks:x?}");
-
-    let serialized: Result<Vec<u8>, StatusCode> = bitcode::serialize(&chunks)
+    let serialized: Result<Vec<u8>, StatusCode> = bitcode::serialize(&tree_diff)
         .inspect_err(|e| tracing::error!("Cannot serialize chunk {}", e))
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
 

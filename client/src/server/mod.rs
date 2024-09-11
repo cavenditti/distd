@@ -208,7 +208,7 @@ impl Server {
         &self,
         hash: &str,
         from: Vec<Hash>,
-    ) -> Result<Vec<OwnedHashTreeNode>, ServerRequest> {
+    ) -> Result<OwnedHashTreeNode, ServerRequest> {
         tracing::trace!("Preparing transfer/diff request: target: {hash}, from:{from:?}");
         let mut shared = self.shared.write().await;
 
@@ -242,7 +242,7 @@ impl Server {
         tracing::trace!("Extracted {} bytes from body", buf.len());
 
         // try to deserialize ServerMetadata from body
-        let chunks: Vec<OwnedHashTreeNode> = bitcode::deserialize(&buf)?;
+        let chunks: OwnedHashTreeNode = bitcode::deserialize(&buf)?;
         Ok(chunks)
     }
 

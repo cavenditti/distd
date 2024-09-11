@@ -5,7 +5,7 @@ use bytes::Bytes;
 pub use stored_chunk_ref::StoredChunkRef;
 
 use crate::{
-    chunks::CHUNK_SIZE,
+    chunks::{OwnedHashTreeNode, CHUNK_SIZE},
     hash::merge_hashes,
     item::{Item, Name as ItemName},
 };
@@ -126,7 +126,7 @@ pub trait ChunkStorage {
     ///
     /// # Errors
     /// Returns None if `target` doesn't exist in storage
-    fn diff(&self, target: &Hash, from: Vec<Hash>) -> Option<HashSet<Hash>> {
+    fn diff(&self, target: &Hash, from: &[Hash]) -> Option<HashSet<Hash>> {
         let target_chunk = self.get(target)?;
         from.iter()
             .filter_map(|from_hash| self.get(from_hash))
@@ -134,5 +134,15 @@ pub trait ChunkStorage {
                 t.difference(&from_chunk.hashes()).copied().collect()
             })
             .into()
+    }
+
+
+    /// Minimal tree of hashes required to reconstruct `target` using `from`
+    ///
+    /// # Errors
+    /// Returns None if `target` doesn't exist in storage
+    fn diff_tree(&self, target: &Hash, from: &[Hash]) -> Option<OwnedHashTreeNode> {
+        let target_chunk = self.get(target)?;
+        Some(target_chunk.find_diff(from))
     }
 }

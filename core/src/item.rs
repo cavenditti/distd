@@ -194,7 +194,7 @@ pub mod tests {
             .unwrap()
     }
 
-    pub fn new_dummy_item<T, const VALUE: u8, const SIZE: usize>(storage: T) -> Item
+    pub fn new_dummy_item<T, const VALUE: u8, const SIZE: usize>(storage: &T) -> Item
     where
         T: ChunkStorage + Clone,
     {
@@ -211,11 +211,18 @@ pub mod tests {
             .unwrap()
     }
 
-    pub fn new_zeros_item<T>(storage: T) -> Item
+    pub fn new_zeros_item<T>(storage: &T) -> Item
     where
         T: ChunkStorage + Clone,
     {
         new_dummy_item::<T, 0u8, 100_000_000>(storage)
+    }
+
+    pub fn new_ones_item<T>(storage: &T) -> Item
+    where
+        T: ChunkStorage + Clone,
+    {
+        new_dummy_item::<T, 1u8, 100_000_000>(storage)
     }
 
     #[must_use]
@@ -272,7 +279,7 @@ pub mod tests {
         {
             // Same as above but with a larger one
             let storage = HashMapStorage::default();
-            let item = new_zeros_item(storage);
+            let item = new_zeros_item(&storage);
             let serialized = item.clone().metadata.to_bitcode().unwrap();
             println!("Small Item serialized size: {}", serialized.len());
 

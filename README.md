@@ -50,10 +50,10 @@ the (eventually private storage repo) and keep all items deduplicated.
 - [ ] Minimal client
 - [ ] Doc comments
 - [ ] Tests for everything
-- [ ] Replace some Option with Result to have better visibility on errors (in progress), mostly in chunk storage
+- [x] Replace some Option with Result to have better visibility on errors (in progress), mostly in chunk storage
 - [ ] Server sessions
 - [ ] Config
-- [ ] Logging
+- [x] Logging
 - [ ] Basic authentication and keys management
 - [ ] Evaluate whether to assign a 64-bit uid to each hash to reduce network overhead or not
 

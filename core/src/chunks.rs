@@ -41,6 +41,19 @@ pub trait HashTreeNode {
 
     /// Get contained data, returns None if is not Parent
     fn children(&self) -> Option<(&Self, &Self)>;
+
+    /// Get diff sub-tree: required tree to reconstruct current node if one has the `hashes`
+    fn find_diff(&self, hashes: &[Hash]) -> Self;
+
+    /// Flatten the tree into an iterator on chunks
+    fn flatten_iter(self) -> Box<dyn Iterator<Item = Vec<u8>>>;
+
+    /// Wheter the subtree has any missing node
+    ///
+    /// A default implementation si provided to skip this if the type cannot have missing nodes
+    fn is_complete(&self) -> bool {
+        true
+    }
 }
 
 /// Seralizable view of the hash tree, fully owns stored chunks and subtrees
@@ -67,36 +80,48 @@ pub enum OwnedHashTreeNode {
         hash: Hash,
         data: OwnedChunk,
     },
+
+    /// Node skipped in serialization
+    Skipped {
+        #[serde(
+            serialize_with = "serialize_hash",
+            deserialize_with = "deserialize_hash"
+        )]
+        hash: Hash,
+        size: u32,
+    },
 }
 
 impl HashTreeNode for OwnedHashTreeNode {
     /// Get hash of node
     fn hash(&self) -> &Hash {
         match self {
-            Self::Parent { hash, .. } | Self::Stored { hash, .. } => hash,
+            Self::Parent { hash, .. } | Self::Stored { hash, .. } | Self::Skipped { hash, .. } => {
+                hash
+            }
         }
     }
 
     /// Compute sum size in bytes of all descending chunks
     fn size(&self) -> u32 {
         match self {
-            Self::Parent { size, .. } => *size,
+            Self::Parent { size, .. } | Self::Skipped { size, .. } => *size,
             Self::Stored { data, .. } => data.len() as u32,
         }
     }
 
-    /// Get children, return None if is `Stored`
+    /// Get children, return None if is `Stored` or `Skipped`
     fn children(&self) -> Option<(&Self, &Self)> {
         match self {
             Self::Parent { left, right, .. } => Some((left, right)),
-            Self::Stored { .. } => None,
+            Self::Stored { .. } | Self::Skipped { .. } => None,
         }
     }
 
     /// Get contained data, returns None if is not `Stored`
     fn stored_data(&self) -> Option<&OwnedChunk> {
         match self {
-            Self::Parent { .. } => None,
+            Self::Parent { .. } | Self::Skipped { .. } => None,
             Self::Stored { data, .. } => Some(data),
         }
     }
@@ -104,7 +129,7 @@ impl HashTreeNode for OwnedHashTreeNode {
     /// Get mutable contained data, returns None if is not `Stored`
     fn stored_data_mut(&mut self) -> Option<&mut OwnedChunk> {
         match self {
-            Self::Parent { .. } => None,
+            Self::Parent { .. } | Self::Skipped { .. } => None,
             Self::Stored { data, .. } => Some(data),
         }
     }
@@ -112,8 +137,59 @@ impl HashTreeNode for OwnedHashTreeNode {
     /// Get owned contained data, returns None if is not `Stored`
     fn stored_data_owned(self) -> Option<OwnedChunk> {
         match self {
-            Self::Parent { .. } => None,
+            Self::Parent { .. } | Self::Skipped { .. } => None,
             Self::Stored { data, .. } => Some(data),
+        }
+    }
+
+    /// Get diff sub-tree: required tree to reconstruct current node if one has the `hashes`
+    fn find_diff(&self, hashes: &[Hash]) -> Self {
+        if hashes.contains(self.hash()) {
+            return Self::Skipped {
+                hash: *self.hash(),
+                size: self.size(),
+            };
+        }
+        match self {
+            Self::Parent {
+                size,
+                hash,
+                left,
+                right,
+            } => Self::Parent {
+                size: *size,
+                hash: *hash,
+                left: Box::new(left.find_diff(hashes)),
+                right: Box::new(right.find_diff(hashes)),
+            },
+            node => node.clone(),
+        }
+    }
+
+    /// Flatten the tree into an iterator on chunks
+    ///
+    /// This is a recursive function that returns an iterator on the chunks of the tree
+    ///
+    /// # Returns
+    /// An iterator on the chunks of the tree
+    ///
+    /// # Panics
+    /// If the tree contains a `Skipped` node
+    fn flatten_iter(self) -> Box<dyn Iterator<Item = Vec<u8>>> {
+        match self {
+            Self::Stored { data, .. } => Box::new([data].into_iter()),
+            Self::Parent { left, right, .. } => {
+                Box::new(left.flatten_iter().chain(right.flatten_iter()))
+            }
+            Self::Skipped { .. } => panic!("Trying to flatten a `Skipped` node"),
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        match self {
+            Self::Stored { .. } => true,
+            Self::Skipped { .. } => false,
+            Self::Parent { left, right, .. } => left.is_complete() && right.is_complete(),
         }
     }
 }
@@ -138,6 +214,30 @@ pub fn flatten(chunks: Vec<OwnedHashTreeNode>) -> Result<Vec<u8>, HashTreeNodeTy
         .into_iter()
         .flatten()
         .collect())
+}
+
+/// Flatten hash-tree chunks (`Stored` nodes) into an iteratorn on bytes
+pub fn flatten_iter(
+    chunks: Vec<OwnedHashTreeNode>,
+) -> Result<
+    std::iter::Flatten<
+        std::iter::Map<
+            std::vec::IntoIter<OwnedHashTreeNode>,
+            impl FnMut(OwnedHashTreeNode) -> Result<Vec<u8>, HashTreeNodeTypeError>,
+        >,
+    >,
+    HashTreeNodeTypeError,
+> {
+    Ok(chunks
+        .into_iter()
+        // no flat_map here, as Result implements IntoIterator and errors just get ignored
+        .map(|x| {
+            x.stored_data_owned().ok_or(HashTreeNodeTypeError {
+                expected: "Stored".into(),
+            })
+        })
+        .into_iter()
+        .flatten())
 }
 
 /// Seralizable view of an hash tree node, only contains size and hash
