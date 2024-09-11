@@ -6,7 +6,10 @@ use blake3::Hash;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::utils::serde::hashes::{deserialize_hash, serialize_hash};
+use crate::{
+    hash::merge_hashes,
+    utils::serde::hashes::{deserialize_hash, serialize_hash},
+};
 
 /// Chunk size in bytes
 /// It may useful to increase this in order to print hash tree when debugging
@@ -156,12 +159,25 @@ impl HashTreeNode for OwnedHashTreeNode {
                 hash,
                 left,
                 right,
-            } => Self::Parent {
-                size: *size,
-                hash: *hash,
-                left: Box::new(left.find_diff(hashes)),
-                right: Box::new(right.find_diff(hashes)),
-            },
+            } => {
+                // Go down and recursively find diffs
+                let left = left.find_diff(hashes);
+                let right = right.find_diff(hashes);
+
+                // When coming back up skip whole sub-trees if both children are skipped
+                match (&left, &right) {
+                    (Self::Skipped { .. }, Self::Skipped { .. }) => Self::Skipped {
+                        hash: *hash,
+                        size: *size,
+                    },
+                    _ => Self::Parent {
+                        size: *size,
+                        hash: *hash,
+                        left: Box::new(left),
+                        right: Box::new(right),
+                    },
+                }
+            }
             node => node.clone(),
         }
     }
@@ -199,6 +215,10 @@ impl HashTreeNode for OwnedHashTreeNode {
 pub struct HashTreeNodeTypeError {
     pub expected: String,
 }
+
+#[derive(Error, Debug)]
+#[error("Found skipped/missing node when one was expected")]
+pub struct HashTreeNodeMissingError;
 
 /// Flatten hash-tree chunks (`Stored` nodes) into a single vector of bytes
 pub fn flatten(chunks: Vec<OwnedHashTreeNode>) -> Result<Vec<u8>, HashTreeNodeTypeError> {
