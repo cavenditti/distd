@@ -1,7 +1,7 @@
 use std::{fmt::Debug, net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc};
 
 use bitcode;
-use blake3::{Hash, HexError};
+use blake3::Hash;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 

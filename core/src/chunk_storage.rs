@@ -1,3 +1,4 @@
+use std::fmt::Write;
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
 use blake3::Hash;
@@ -67,22 +68,6 @@ pub trait ChunkStorage {
     where
         Self: Sized,
     {
-        if data.len() > 32 {
-            tracing::trace!(
-                "Inserting: {}..{}, {}B",
-                data[..16]
-                    .iter()
-                    .map(|b| format!("{b:x}"))
-                    .collect::<String>(),
-                data[data.len() - 16..]
-                    .iter()
-                    .map(|b| format!("{b:x}"))
-                    .collect::<String>(),
-                data.len()
-            )
-        } else {
-            tracing::trace!("Inserting: {:?}, {}B", data, data.len());
-        };
         fn partial_tree(
             storage: &dyn ChunkStorage,
             slices: &[&[u8]],
@@ -103,6 +88,25 @@ pub trait ChunkStorage {
                 ),
             }
         }
+
+        if data.len() > 32 {
+            tracing::trace!(
+                "Inserting: {}..{}, {}B",
+                data[..16].iter().fold(String::new(), |mut s, b| {
+                    write!(s, "{b:x}").unwrap();
+                    s
+                }),
+                data[data.len() - 16..]
+                    .iter()
+                    .fold(String::new(), |mut s, b| {
+                        write!(s, "{b:x}").unwrap();
+                        s
+                    }),
+                data.len()
+            );
+        } else {
+            tracing::trace!("Inserting: {:?}, {}B", data, data.len());
+        };
 
         let chunks = data.chunks(CHUNK_SIZE).collect::<Vec<&[u8]>>();
 

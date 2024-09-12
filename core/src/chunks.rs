@@ -43,6 +43,7 @@ pub trait HashTreeNode {
     fn children(&self) -> Option<(&Self, &Self)>;
 
     /// Get diff sub-tree: required tree to reconstruct current node if one has the `hashes`
+    #[must_use]
     fn find_diff(&self, hashes: &[Hash]) -> Self;
 
     /// Flatten the tree into an iterator on chunks
@@ -216,9 +217,7 @@ impl Display for OwnedHashTreeNode {
             } => {
                 write!(
                     f,
-                    "HashTreeNode::Parent {{ {h_str}, <LEFT: {}, RIGHT: {}>, {size}B }}",
-                    left.to_string(),
-                    right.to_string(),
+                    "HashTreeNode::Parent {{ {h_str}, <LEFT: {left}, RIGHT: {right}>, {size}B }}",
                 )
             }
             Self::Stored { data, .. } => {
@@ -266,7 +265,7 @@ impl OwnedHashTreeNode {
     pub fn hashes_with_sizes(&self) -> HashSet<ChunkInfo> {
         match self {
             Self::Stored { hash, .. } => HashSet::from([ChunkInfo {
-                size: self.size() as u32,
+                size: self.size(),
                 hash: *hash,
             }]),
             Self::Parent { left, right, .. } => {
@@ -285,7 +284,7 @@ impl OwnedHashTreeNode {
     pub fn all_hashes_with_sizes(&self) -> HashSet<ChunkInfo> {
         match self {
             Self::Stored { hash, .. } => HashSet::from([ChunkInfo {
-                size: self.size() as u32,
+                size: self.size(),
                 hash: *hash,
             }]),
             Self::Parent {
@@ -293,7 +292,7 @@ impl OwnedHashTreeNode {
             } => {
                 let mut left_vec = left.hashes_with_sizes();
                 left_vec.insert(ChunkInfo {
-                    size: self.size() as u32,
+                    size: self.size(),
                     hash: *hash,
                 });
                 left_vec
@@ -311,7 +310,7 @@ impl OwnedHashTreeNode {
         match self {
             Self::Stored { hash, .. } => {
                 vec![ChunkInfo {
-                    size: self.size() as u32,
+                    size: self.size(),
                     hash: *hash,
                 }]
             }
@@ -352,6 +351,7 @@ pub fn flatten(chunks: Vec<OwnedHashTreeNode>) -> Result<Vec<u8>, HashTreeNodeTy
 }
 
 /// Flatten hash-tree chunks (`Stored` nodes) into an iteratorn on bytes
+#[allow(clippy::map_flatten)]
 pub fn flatten_iter(
     chunks: Vec<OwnedHashTreeNode>,
 ) -> Result<
@@ -371,7 +371,6 @@ pub fn flatten_iter(
                 expected: "Stored".into(),
             })
         })
-        .into_iter()
         .flatten())
 }
 

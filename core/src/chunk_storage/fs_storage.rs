@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::{create_dir_all, remove_file, File},
-    io::{Read, Seek, Write},
+    io::{Read, Seek},
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
     sync::{atomic::AtomicBool, Arc, RwLock},
@@ -227,12 +227,12 @@ impl InnerFsStorage {
     /// Pre-allocate space for `Bytes` in the filesystem at a path
     pub fn pre_allocate_bytes(&mut self, path: &Path, data: &[u8]) -> Result<(), Error> {
         tracing::debug!("Preallocating {} bytes at {path:?}", data.len());
-        let chunks = data.chunks(CHUNK_SIZE)
+        let chunks = data
+            .chunks(CHUNK_SIZE)
             .map(|chunk| ChunkInfo {
                 hash: do_hash(chunk),
                 size: chunk.len() as u32,
-            }
-            )
+            })
             .collect::<Vec<ChunkInfo>>();
 
         self.pre_allocate(path, &chunks)

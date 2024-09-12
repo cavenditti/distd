@@ -15,7 +15,6 @@ use hyper::http::uri::PathAndQuery;
 
 use distd_core::{
     chunk_storage::{fs_storage::FsStorage, ChunkStorage},
-    chunks::{flatten, HashTreeNode},
     metadata::Item as ItemMetadata,
 };
 
@@ -88,7 +87,7 @@ impl Client<FsStorage> {
 
         let _item = self.storage.create_item(
             item_metadata.name.clone(),
-            path.to_owned(),
+            path.clone(),
             item_metadata.revision,
             item_metadata.description.clone(),
             buf.clone().into(),
@@ -114,10 +113,10 @@ impl Client<FsStorage> {
             .storage
             .create_item(
                 item_metadata.name.clone(),
-                path.into(),
+                path,
                 item_metadata.revision,
                 item_metadata.description.clone(),
-                n.clone_data().unwrap().into(),
+                n.clone_data().into(),
             )
             .ok_or(ClientError::ItemInsertion(
                 "Cannot insert downloaded file".into(),

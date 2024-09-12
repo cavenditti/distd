@@ -100,7 +100,7 @@ impl TryFrom<OwnedHashTreeNode> for StoredChunkRef {
                 left: Arc::new(StoredChunkRef::try_from(*left)?),
                 right: Arc::new(StoredChunkRef::try_from(*right)?),
             }),
-            skipped => Err(skipped),
+            skipped @ OwnedHashTreeNode::Skipped { .. } => Err(skipped),
         }
     }
 }
@@ -170,13 +170,13 @@ impl StoredChunkRef {
     /// Get contained data, recursing across all children
     /// This method may be slow and produce (copying) a large result, pay attention when using it
     #[must_use]
-    pub fn clone_data(&self) -> Option<Vec<u8>> {
+    pub fn clone_data(&self) -> Vec<u8> {
         match self {
-            Self::Stored { data, .. } => Some((*data.clone()).clone()),
+            Self::Stored { data, .. } => (*data.clone()).clone(),
             Self::Parent { left, right, .. } => {
-                let mut left_vec = left.clone_data()?;
-                left_vec.extend(right.clone_data()?);
-                Some(left_vec)
+                let mut left_vec = left.clone_data();
+                left_vec.extend(right.clone_data());
+                left_vec
             }
         }
     }
@@ -280,6 +280,7 @@ impl StoredChunkRef {
     }
 
     /// Get diff sub-tree: required tree to reconstruct current node if one has the `hashes`
+    #[must_use]
     pub fn find_diff(&self, hashes: &[Hash]) -> OwnedHashTreeNode {
         if hashes.contains(self.hash()) {
             return OwnedHashTreeNode::Skipped {
@@ -308,7 +309,7 @@ impl StoredChunkRef {
                     },
                 }
             }
-            node => OwnedHashTreeNode::from(node.clone()),
+            node @ Self::Stored { .. } => OwnedHashTreeNode::from(node.clone()),
         }
     }
 
@@ -321,6 +322,7 @@ impl StoredChunkRef {
     ///
     /// # Panics
     /// If the tree contains a `Skipped` node
+    #[must_use]
     pub fn flatten_iter(&self) -> Box<dyn Iterator<Item = Arc<Vec<u8>>>> {
         match self {
             Self::Stored { data, .. } => Box::new([data.clone()].into_iter()),
