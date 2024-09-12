@@ -102,14 +102,13 @@ impl Client<FsStorage> {
             .transfer_diff(&item_metadata.root.hash.to_string(), from)
             .await?;
 
-        tracing::trace!("Got {} chunks from server", result.hash());
-        tracing::trace!("{} bytes total in chunks from server", result.size());
+        tracing::trace!("Got '{}' from server", result);
 
         let n = self
             .storage
             .try_fill_in(result)
             .ok_or(ClientError::TreeReconstruct)?;
-        tracing::trace!("{} bytes total", n.size());
+        tracing::trace!("Reconstructed with {} bytes total", n.size());
 
         let new_item = self
             .storage

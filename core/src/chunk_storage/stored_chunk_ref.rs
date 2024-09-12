@@ -3,9 +3,7 @@ use std::{collections::HashSet, sync::Arc};
 use blake3::Hash;
 use serde::ser::{Serialize, SerializeStructVariant};
 
-use crate::chunks::{
-    ChunkInfo, HashTreeNodeMissingError, OwnedHashTreeNode, RawChunk,
-};
+use crate::chunks::{ChunkInfo, HashTreeNode, OwnedHashTreeNode, RawChunk};
 
 /// This is the internal representation of the hash-tree
 /// As it contains in-memory references, it is not meant to be serialized
@@ -290,12 +288,26 @@ impl StoredChunkRef {
             };
         }
         match self {
-            Self::Parent { hash, left, right } => OwnedHashTreeNode::Parent {
-                size: self.size() as u32, // FIXME many wasted CPU cycles for little to no benefit
-                hash: *hash,
-                left: Box::new(left.find_diff(hashes)),
-                right: Box::new(right.find_diff(hashes)),
-            },
+            Self::Parent { hash, left, right } => {
+                // Go down and recursively find diffs
+                let left = left.find_diff(hashes);
+                let right = right.find_diff(hashes);
+
+                let size = left.size() + right.size();
+
+                // When coming back up skip whole sub-trees if both children are skipped
+                match (&left, &right) {
+                    (OwnedHashTreeNode::Skipped { .. }, OwnedHashTreeNode::Skipped { .. }) => {
+                        OwnedHashTreeNode::Skipped { hash: *hash, size }
+                    }
+                    _ => OwnedHashTreeNode::Parent {
+                        size,
+                        hash: *hash,
+                        left: Box::new(left),
+                        right: Box::new(right),
+                    },
+                }
+            }
             node => OwnedHashTreeNode::from(node.clone()),
         }
     }

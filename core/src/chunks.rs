@@ -1,19 +1,12 @@
 //! common chunks and hash-tree data structs
 
-use std::{
-    fmt::{Display, Write},
-    str::FromStr,
-    sync::Arc,
-};
+use std::{collections::HashSet, fmt::Display, sync::Arc};
 
 use blake3::Hash;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{
-    hash::merge_hashes,
-    utils::serde::hashes::{deserialize_hash, serialize_hash},
-};
+use crate::utils::serde::hashes::{deserialize_hash, serialize_hash};
 
 /// Chunk size in bytes
 /// It may useful to increase this in order to print hash tree when debugging
@@ -216,7 +209,7 @@ impl HashTreeNode for OwnedHashTreeNode {
 
 impl Display for OwnedHashTreeNode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let h_str = self.hash().to_string()[..8].to_string() + "..";
+        let h_str = self.hash().to_string()[..8].to_string() + "…";
         match self {
             Self::Parent {
                 size, left, right, ..
@@ -234,6 +227,100 @@ impl Display for OwnedHashTreeNode {
             Self::Skipped { size, .. } => {
                 write!(f, "HashTreeNode::Skipped {{ {h_str}, {size}B  }}")
             }
+        }
+    }
+}
+
+impl OwnedHashTreeNode {
+    /// Get all unique `Stored` hashes referenced by the (sub-)tree
+    #[must_use]
+    pub fn hashes(&self) -> HashSet<Hash> {
+        match self {
+            Self::Stored { hash, .. } => HashSet::from([*hash]),
+            Self::Parent { left, right, .. } => {
+                let left_vec = left.hashes();
+                left_vec.union(&right.hashes()).copied().collect()
+            }
+            Self::Skipped { .. } => HashSet::new(),
+        }
+    }
+
+    /// Get all unique hashes (`Stored` or `Parent`) referenced by the (sub-)tree
+    #[must_use]
+    pub fn all_hashes(&self) -> HashSet<Hash> {
+        match self {
+            Self::Stored { hash, .. } => HashSet::from([*hash]),
+            Self::Parent {
+                hash, left, right, ..
+            } => {
+                let mut left_vec = left.all_hashes();
+                left_vec.insert(*hash);
+                left_vec.union(&right.all_hashes()).copied().collect()
+            }
+            Self::Skipped { .. } => HashSet::new(),
+        }
+    }
+
+    /// Get all unique `Stored` hashes referenced by the (sub-)tree
+    #[must_use]
+    pub fn hashes_with_sizes(&self) -> HashSet<ChunkInfo> {
+        match self {
+            Self::Stored { hash, .. } => HashSet::from([ChunkInfo {
+                size: self.size() as u32,
+                hash: *hash,
+            }]),
+            Self::Parent { left, right, .. } => {
+                let left_vec = left.hashes_with_sizes();
+                left_vec
+                    .union(&right.hashes_with_sizes())
+                    .copied()
+                    .collect()
+            }
+            Self::Skipped { .. } => HashSet::new(),
+        }
+    }
+
+    /// Get all unique `Stored` hashes referenced by the (sub-)tree
+    #[must_use]
+    pub fn all_hashes_with_sizes(&self) -> HashSet<ChunkInfo> {
+        match self {
+            Self::Stored { hash, .. } => HashSet::from([ChunkInfo {
+                size: self.size() as u32,
+                hash: *hash,
+            }]),
+            Self::Parent {
+                hash, left, right, ..
+            } => {
+                let mut left_vec = left.hashes_with_sizes();
+                left_vec.insert(ChunkInfo {
+                    size: self.size() as u32,
+                    hash: *hash,
+                });
+                left_vec
+                    .union(&right.hashes_with_sizes())
+                    .copied()
+                    .collect()
+            }
+            Self::Skipped { .. } => HashSet::new(),
+        }
+    }
+
+    /// Get flatten representation of `Stored` hashes with sizes, eventually repeating hashes
+    #[must_use]
+    pub fn flatten_with_sizes(&self) -> Vec<ChunkInfo> {
+        match self {
+            Self::Stored { hash, .. } => {
+                vec![ChunkInfo {
+                    size: self.size() as u32,
+                    hash: *hash,
+                }]
+            }
+            Self::Parent { left, right, .. } => {
+                let mut left_vec = left.flatten_with_sizes();
+                left_vec.extend(right.flatten_with_sizes());
+                left_vec
+            }
+            Self::Skipped { .. } => vec![],
         }
     }
 }
