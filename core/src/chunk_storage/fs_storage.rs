@@ -420,8 +420,7 @@ impl ChunkStorage for FsStorage {
 
         let hash_tree = self.insert(file)?;
         let item = Item::new(name, path, revision, description, &hash_tree);
-        tracing::debug!("Inserted chunks in storage for item {}", item.metadata.name);
-        tracing::trace!("New item: {item:?}");
+        tracing::debug!("New item: {item}");
 
         Some(item)
     }
@@ -578,15 +577,16 @@ mod tests {
         let item = make_ones_item();
         storage.pre_allocate_item(&item).unwrap();
 
-        let itempath = crate::utils::path::join(&tempdir, &item.metadata.path);
-        assert!(itempath.exists());
-
         // Actually store the item chunk
         storage.insert_chunk(&[1u8; CHUNK_SIZE]).unwrap();
 
         print_fsstorage(&storage);
 
+        let itempath = crate::utils::path::join(&tempdir, &item.metadata.path);
+        assert!(itempath.exists());
+
         let path = storage.data.read().unwrap().item_path(&item).unwrap();
+        assert_eq!(itempath, path);
         let mut f = File::open(&path).unwrap();
         let mut buffer = vec![0u8; item.size() as usize];
 

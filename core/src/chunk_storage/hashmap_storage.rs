@@ -81,10 +81,13 @@ impl ChunkStorage for HashMapStorage {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    use bytes::{Bytes, BytesMut};
+    use rand::{self, RngCore};
+
     use crate::{chunks::CHUNK_SIZE, hash::hash};
 
-    use super::*;
-    use bytes::Bytes;
     #[test]
     fn test_hms_single_chunk_insertion() {
         let s = HashMapStorage::default();
@@ -149,9 +152,11 @@ mod tests {
     #[test]
     fn test_hms_2mb() {
         let s = HashMapStorage::default();
-        let data = Bytes::from_static(include_bytes!("../../../2mb.random"));
+        let mut data = BytesMut::with_capacity(2_000_000);
+        rand::rngs::OsRng::default().fill_bytes(&mut data);
+
         let len = data.len();
-        let root = s.insert(data.clone()).unwrap();
+        let root = s.insert(data.clone().into()).unwrap();
         //print_tree(&*root.to_owned()).unwrap();
         assert!(len >= s.size());
 

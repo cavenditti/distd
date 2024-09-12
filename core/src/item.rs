@@ -28,8 +28,10 @@
 //!```
 
 use std::collections::HashSet;
+use std::fmt::Display;
 use std::hash::Hash;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::SystemTime;
 //use ring::signature::Signature;
@@ -149,6 +151,23 @@ impl Item {
 impl std::hash::Hash for Item {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.metadata.hash(state);
+    }
+}
+
+impl Display for Item {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut desc = self.metadata.description.clone().unwrap_or(String::from(""));
+        if !desc.is_empty() {
+            desc = format!("description: {desc}, ");
+        }
+        write!(f, "Item {{ {}, revision: {}, name: {}, {desc}root: {}, {}B in {} chunks }}",
+            self.metadata.path.to_string_lossy(),
+            self.metadata.revision,
+            self.metadata.name,
+            self.metadata.root.hash,
+            self.metadata.root.size,
+            self.chunks.len(),
+        )
     }
 }
 

@@ -65,8 +65,7 @@ where
     }
 }
 
-impl Client<FsStorage>
-{
+impl Client<FsStorage> {
     pub async fn sync(self, target: &Path, path: &Path) -> Result<(), ClientError> {
         tracing::debug!("sync: {target:?} {path:?}");
         let mut buf = vec![];
@@ -87,14 +86,13 @@ impl Client<FsStorage>
             .get(target)
             .ok_or(ClientError::FileNotFound(target.to_string_lossy().into()))?;
 
-        let item = self.storage.create_item(
+        let _item = self.storage.create_item(
             item_metadata.name.clone(),
             path.to_owned(),
             item_metadata.revision,
             item_metadata.description.clone(),
             buf.clone().into(),
         );
-        item.inspect(|i| tracing::trace!("{:?}", i.hashes));
 
         let from = self.storage.chunks(); // FIXME this could get very very large
         tracing::trace!("Signalig to server we've got {from:?}");
@@ -126,11 +124,14 @@ impl Client<FsStorage>
                 "Cannot insert downloaded file".into(),
             ))?;
 
-        tracing::trace!("{:?}", new_item.hashes);
+        tracing::debug!(
+            "Updated {} to revision {}",
+            new_item.metadata.path.to_string_lossy(),
+            new_item.metadata.revision
+        );
         Ok(())
     }
 }
-
 
 impl<T> Client<T>
 where

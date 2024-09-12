@@ -319,6 +319,7 @@ where
         .inspect_err(|_| tracing::warn!("Cannot find hash {hash}"))?;
 
     let serialized: Result<Vec<u8>, StatusCode> = bitcode::serialize(&tree_diff)
+        .inspect(|s| tracing::debug!("Serialized size: {}B", s.len()))
         .inspect_err(|e| tracing::error!("Cannot serialize chunk {}", e))
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
 

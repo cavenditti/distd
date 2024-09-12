@@ -229,11 +229,7 @@ impl Display for OwnedHashTreeNode {
                 )
             }
             Self::Stored { data, .. } => {
-                write!(
-                    f,
-                    "HashTreeNode::Stored {{ {h_str}, {}B }}",
-                    data.len(),
-                )
+                write!(f, "HashTreeNode::Stored {{ {h_str}, {}B }}", data.len(),)
             }
             Self::Skipped { size, .. } => {
                 write!(f, "HashTreeNode::Skipped {{ {h_str}, {size}B  }}")
@@ -319,7 +315,7 @@ impl ChunkInfo {
 mod tests {
     use crate::hash::hash;
 
-    use super::{flatten, OwnedHashTreeNode};
+    use super::{flatten, HashTreeNode, OwnedHashTreeNode};
 
     #[test]
     fn test_flatten() {
@@ -347,5 +343,16 @@ mod tests {
         for v in &flat[L..] {
             assert_eq!(*v, 1);
         }
+    }
+
+    #[test]
+    fn test_node_find_diff_noop() {
+        let data = vec![1u8; 12_000];
+        let h = hash(&data);
+        let node = OwnedHashTreeNode::Stored { hash: h, data };
+        let diff = node.find_diff(&[h]);
+        assert!(matches!(diff, OwnedHashTreeNode::Skipped { .. }));
+        assert_eq!(diff.hash(), &h);
+        assert_eq!(diff.size(), 12_000);
     }
 }
