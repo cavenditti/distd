@@ -3,7 +3,9 @@ use std::{collections::HashSet, sync::Arc};
 use blake3::Hash;
 use serde::ser::{Serialize, SerializeStructVariant};
 
-use crate::chunks::{ChunkInfo, OwnedHashTreeNode, RawChunk};
+use crate::chunks::{
+    ChunkInfo, HashTreeNodeMissingError, OwnedHashTreeNode, RawChunk,
+};
 
 /// This is the internal representation of the hash-tree
 /// As it contains in-memory references, it is not meant to be serialized
@@ -80,6 +82,27 @@ impl From<StoredChunkRef> for OwnedHashTreeNode {
                 hash,
                 data: (*data).clone(),
             },
+        }
+    }
+}
+
+impl TryFrom<OwnedHashTreeNode> for StoredChunkRef {
+    type Error = OwnedHashTreeNode;
+
+    fn try_from(value: OwnedHashTreeNode) -> Result<Self, Self::Error> {
+        match value {
+            OwnedHashTreeNode::Stored { hash, data } => Ok(StoredChunkRef::Stored {
+                hash,
+                data: Arc::new(data),
+            }),
+            OwnedHashTreeNode::Parent {
+                hash, left, right, ..
+            } => Ok(StoredChunkRef::Parent {
+                hash,
+                left: Arc::new(StoredChunkRef::try_from(*left)?),
+                right: Arc::new(StoredChunkRef::try_from(*right)?),
+            }),
+            skipped => Err(skipped),
         }
     }
 }

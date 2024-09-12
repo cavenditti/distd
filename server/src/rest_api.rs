@@ -1,8 +1,7 @@
 use std::{fmt::Debug, net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc};
 
-use axum_extra::extract::OptionalQuery;
 use bitcode;
-use blake3::Hash;
+use blake3::{Hash, HexError};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -169,9 +168,14 @@ where
     )
 }
 
+#[derive(Deserialize, Serialize)]
+struct ItemGetObj {
+    pub path: PathBuf,
+}
+
 /// Get one item
 async fn get_one_item<T>(
-    Query(path): Query<PathBuf>,
+    Query(item): Query<ItemGetObj>,
     State(server): State<Server<T>>,
 ) -> impl IntoResponse
 where
@@ -183,7 +187,7 @@ where
             .read()
             .expect("Poisoned Lock")
             .items
-            .get(&path)
+            .get(&item.path)
             .cloned(),
     )
 }
@@ -271,18 +275,24 @@ where
         .map(Json)
 }
 
+#[derive(Deserialize, Serialize)]
+struct TransferGetObj {
+    got: String,
+}
+
 /// Download data associated with an hash-(sub-)trees, differing from the provided hashes
 ///
 /// This endpoint is used to download a set of chunks from the server
 /// The server will return a binary bitcode serialized representation of the chunks
 async fn get_transfer_diff<T>(
     Path(hash): Path<String>,
-    OptionalQuery(from): OptionalQuery<String>,
+    Query(hashes): Query<TransferGetObj>,
     State(server): State<Server<T>>,
 ) -> Result<impl IntoResponse, StatusCode>
 where
     T: ChunkStorage + Sync + Send + Clone + Default,
 {
+    let from = hashes.got;
     tracing::debug!("Transfer {hash} from {from:?}");
 
     let hash = Hash::from_str(hash.as_str())
@@ -290,24 +300,23 @@ where
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
     // handle None `from`
-    let from = match from {
-        None => vec![],
-        Some(from) => {
+    let from = match from.as_str() {
+        "" => vec![],
+        from => {
             let from: Result<Vec<Hash>, blake3::HexError> =
                 from.split(',').map(Hash::from_str).collect();
             from.inspect_err(|e| tracing::error!("Cannot decode hash {}", e))
                 .map_err(|_| StatusCode::BAD_REQUEST)?
         }
     };
+    tracing::trace!("Client signals it has already {from:?}");
 
     let tree_diff = server
         .storage
         .diff_tree(&hash, &from)
         .ok_or(StatusCode::NOT_FOUND)
-        .inspect(|hs| tracing::debug!("Transferring chunks: {hs:?}"))
+        .inspect(|hs| tracing::debug!("Transferring chunks: {hs}"))
         .inspect_err(|_| tracing::warn!("Cannot find hash {hash}"))?;
-
-    tracing::trace!("Tree diff: {tree_diff:x?}");
 
     let serialized: Result<Vec<u8>, StatusCode> = bitcode::serialize(&tree_diff)
         .inspect_err(|e| tracing::error!("Cannot serialize chunk {}", e))

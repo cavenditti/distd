@@ -45,7 +45,8 @@ pub trait ChunkStorage {
 
     fn insert_chunk(&self, chunk: &[u8]) -> Option<Arc<StoredChunkRef>> {
         let hash = blake3::hash(chunk);
-        tracing::trace!("Insert chunk {}", hash);
+        tracing::trace!("Insert chunk {hash}, {} bytes", chunk.len());
+
         self._insert_chunk(hash, chunk)
             .inspect(|x| assert!(*x.hash() == hash))
     }
@@ -66,6 +67,22 @@ pub trait ChunkStorage {
     where
         Self: Sized,
     {
+        if data.len() > 32 {
+            tracing::trace!(
+                "Inserting: {}..{}, {}B",
+                data[..16]
+                    .iter()
+                    .map(|b| format!("{b:x}"))
+                    .collect::<String>(),
+                data[data.len() - 16..]
+                    .iter()
+                    .map(|b| format!("{b:x}"))
+                    .collect::<String>(),
+                data.len()
+            )
+        } else {
+            tracing::trace!("Inserting: {:?}, {}B", data, data.len());
+        };
         fn partial_tree(
             storage: &dyn ChunkStorage,
             slices: &[&[u8]],
@@ -87,22 +104,10 @@ pub trait ChunkStorage {
             }
         }
 
-        let (chunks, remainder) = data.as_chunks::<CHUNK_SIZE>();
-        tracing::trace!(
-            "{} exact size chunks, {} bytes in remainder",
-            chunks.len(),
-            remainder.len()
-        );
-        let mut slices = chunks
-            .iter()
-            .map(std::convert::AsRef::as_ref)
-            .collect::<Vec<&[u8]>>(); // FIXME is this zero copy?
-        if !remainder.is_empty() {
-            tracing::trace!("Pushing remainder to slices");
-            slices.push(remainder);
-        }
-        tracing::trace!("{} chunks", slices.len());
-        partial_tree(self, slices.as_slice())
+        let chunks = data.chunks(CHUNK_SIZE).collect::<Vec<&[u8]>>();
+
+        tracing::trace!("{} chunks", chunks.len());
+        partial_tree(self, &chunks)
     }
 
     /// Create a new Item from its metadata and Bytes
@@ -136,7 +141,6 @@ pub trait ChunkStorage {
             .into()
     }
 
-
     /// Minimal tree of hashes required to reconstruct `target` using `from`
     ///
     /// # Errors
@@ -144,5 +148,16 @@ pub trait ChunkStorage {
     fn diff_tree(&self, target: &Hash, from: &[Hash]) -> Option<OwnedHashTreeNode> {
         let target_chunk = self.get(target)?;
         Some(target_chunk.find_diff(from))
+    }
+
+    /// Take ownership of an `OwnedHashTreeNode` and try to fill in any `Skipped` nodes
+    fn try_fill_in(&self, tree: OwnedHashTreeNode) -> Option<Arc<StoredChunkRef>> {
+        Some(match tree {
+            OwnedHashTreeNode::Stored { hash, data } => self._insert_chunk(hash, &data)?,
+            OwnedHashTreeNode::Parent { left, right, .. } => {
+                self.link(self.try_fill_in(*left)?, self.try_fill_in(*right)?)?
+            }
+            OwnedHashTreeNode::Skipped { hash, .. } => self.get(&hash)?,
+        })
     }
 }

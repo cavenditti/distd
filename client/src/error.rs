@@ -93,6 +93,9 @@ pub enum Client {
     #[error("Generic storage error")]
     Storage,
 
+    #[error("Cannot reconstruct tree from storage")]
+    TreeReconstruct,
+
     #[error("Invalid parameter")]
     InvalidParmeter(#[from] InvalidParameter),
 }

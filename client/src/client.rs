@@ -13,7 +13,11 @@ use http_body_util::BodyExt;
 use hyper::body::Buf;
 use hyper::http::uri::PathAndQuery;
 
-use distd_core::{chunk_storage::ChunkStorage, chunks::{flatten, HashTreeNode}, metadata::Item as ItemMetadata};
+use distd_core::{
+    chunk_storage::{fs_storage::FsStorage, ChunkStorage},
+    chunks::{flatten, HashTreeNode},
+    metadata::Item as ItemMetadata,
+};
 
 #[derive(Debug)]
 pub struct RegisterError;
@@ -61,21 +65,80 @@ where
     }
 }
 
+impl Client<FsStorage>
+{
+    pub async fn sync(self, target: &Path, path: &Path) -> Result<(), ClientError> {
+        tracing::debug!("sync: {target:?} {path:?}");
+        let mut buf = vec![];
+
+        let path = self.storage.path(path);
+
+        // If it exists read into buffer
+        if path.exists() {
+            tracing::trace!("File exists");
+            File::open(&path)
+                .and_then(|mut f| f.read_to_end(&mut buf))
+                .map_err(ClientError::Io)?;
+        }
+
+        let server_metadata = self.server.metadata().await;
+        let item_metadata = server_metadata
+            .items
+            .get(target)
+            .ok_or(ClientError::FileNotFound(target.to_string_lossy().into()))?;
+
+        let item = self.storage.create_item(
+            item_metadata.name.clone(),
+            path.to_owned(),
+            item_metadata.revision,
+            item_metadata.description.clone(),
+            buf.clone().into(),
+        );
+        item.inspect(|i| tracing::trace!("{:?}", i.hashes));
+
+        let from = self.storage.chunks(); // FIXME this could get very very large
+        tracing::trace!("Signalig to server we've got {from:?}");
+
+        let result = self
+            .server
+            .transfer_diff(&item_metadata.root.hash.to_string(), from)
+            .await?;
+
+        tracing::trace!("Got {} chunks from server", result.hash());
+        tracing::trace!("{} bytes total in chunks from server", result.size());
+
+        let n = self
+            .storage
+            .try_fill_in(result)
+            .ok_or(ClientError::TreeReconstruct)?;
+        tracing::trace!("{} bytes total", n.size());
+
+        let new_item = self
+            .storage
+            .create_item(
+                item_metadata.name.clone(),
+                path.into(),
+                item_metadata.revision,
+                item_metadata.description.clone(),
+                n.clone_data().unwrap().into(),
+            )
+            .ok_or(ClientError::ItemInsertion(
+                "Cannot insert downloaded file".into(),
+            ))?;
+
+        tracing::trace!("{:?}", new_item.hashes);
+        Ok(())
+    }
+}
+
+
 impl<T> Client<T>
 where
     T: ChunkStorage,
 {
+    /*
     pub async fn sync(self, target: &Path, path: &Path) -> Result<(), ClientError> {
-        let mut buf = vec![];
-
-        let from = self.storage.chunks(); // FIXME this could get very very large
-
-        // If it exists read into buffer
-        if path.exists() {
-            File::open(path)
-                .and_then(|mut f| f.read_to_end(&mut buf))
-                .map_err(ClientError::Io)?;
-        }
+        tracing::debug!("sync: {target:?} {path:?}");
 
         let server_metadata = self.server.metadata().await;
         let item = server_metadata
@@ -83,14 +146,9 @@ where
             .get(target)
             .ok_or(ClientError::FileNotFound(target.to_string_lossy().into()))?;
 
-        let insertion_result = self.storage.create_item(
-            item.name.clone(),
-            path.to_owned(),
-            item.revision,
-            item.description.clone(),
-            buf.clone().into(),
-        );
-        tracing::debug!("{insertion_result:?}");
+
+        let from = self.storage.chunks(); // FIXME this could get very very large
+        tracing::trace!("Signalig to server we've got {from:?}");
 
         let result = self
             .server
@@ -98,8 +156,13 @@ where
             .await?;
 
         tracing::trace!("Got {} chunks from server", result.hash());
-        let flat = result.flatten_iter().flatten().collect::<Vec<u8>>();
-        tracing::trace!("{} bytes total", flat.len());
+        tracing::trace!("{} bytes total in chunks from server", result.size());
+
+        let n = self
+            .storage
+            .try_fill_in(result)
+            .ok_or(ClientError::TreeReconstruct)?;
+        tracing::trace!("{} bytes total", n.size());
 
         let _insertion_result = self
             .storage
@@ -108,13 +171,14 @@ where
                 path.into(),
                 item.revision,
                 item.description.clone(),
-                flat.into(),
+                n.clone_data().unwrap().into(),
             )
             .ok_or(ClientError::ItemInsertion(
                 "Cannot insert downloaded file".into(),
             ))?;
         Ok(())
     }
+    */
 
     /// Main client loop
     pub async fn client_loop(self) -> Result<(), ClientError> {

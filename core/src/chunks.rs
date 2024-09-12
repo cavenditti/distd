@@ -1,6 +1,10 @@
 //! common chunks and hash-tree data structs
 
-use std::sync::Arc;
+use std::{
+    fmt::{Display, Write},
+    str::FromStr,
+    sync::Arc,
+};
 
 use blake3::Hash;
 use serde::{Deserialize, Serialize};
@@ -206,6 +210,34 @@ impl HashTreeNode for OwnedHashTreeNode {
             Self::Stored { .. } => true,
             Self::Skipped { .. } => false,
             Self::Parent { left, right, .. } => left.is_complete() && right.is_complete(),
+        }
+    }
+}
+
+impl Display for OwnedHashTreeNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let h_str = self.hash().to_string()[..8].to_string() + "..";
+        match self {
+            Self::Parent {
+                size, left, right, ..
+            } => {
+                write!(
+                    f,
+                    "HashTreeNode::Parent {{ {h_str}, <LEFT: {}, RIGHT: {}>, {size}B }}",
+                    left.to_string(),
+                    right.to_string(),
+                )
+            }
+            Self::Stored { data, .. } => {
+                write!(
+                    f,
+                    "HashTreeNode::Stored {{ {h_str}, {}B }}",
+                    data.len(),
+                )
+            }
+            Self::Skipped { size, .. } => {
+                write!(f, "HashTreeNode::Skipped {{ {h_str}, {size}B  }}")
+            }
         }
     }
 }

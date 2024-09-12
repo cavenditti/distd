@@ -219,14 +219,8 @@ impl Server {
             .collect::<Vec<String>>()
             .join(",");
 
-        let from_query = if from.is_empty() {
-            ""
-        } else {
-            &format!("?from={from}")
-        };
-
         let path_and_query =
-            PathAndQuery::from_str(format!("/transfer/diff/{hash}{from_query}").as_str())
+            PathAndQuery::from_str(format!("/transfer/diff/{hash}?got={from}").as_str())
                 .map_err(InvalidParameter::Uri)?;
 
         let body = Self::send_and_collect_request_raw(

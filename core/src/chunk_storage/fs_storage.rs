@@ -227,14 +227,15 @@ impl InnerFsStorage {
     /// Pre-allocate space for `Bytes` in the filesystem at a path
     pub fn pre_allocate_bytes(&mut self, path: &Path, data: &[u8]) -> Result<(), Error> {
         tracing::debug!("Preallocating {} bytes at {path:?}", data.len());
-        let chunks: Vec<ChunkInfo> = data
-            .chunks(CHUNK_SIZE)
-            .map(|x| ChunkInfo {
-                hash: do_hash(x),
-                size: x.len() as u32,
-            })
-            .collect();
-        self.pre_allocate(path, chunks.as_slice())
+        let chunks = data.chunks(CHUNK_SIZE)
+            .map(|chunk| ChunkInfo {
+                hash: do_hash(chunk),
+                size: chunk.len() as u32,
+            }
+            )
+            .collect::<Vec<ChunkInfo>>();
+
+        self.pre_allocate(path, &chunks)
     }
 
     /// Pre-allocate space for an item in the filesystem
@@ -380,8 +381,6 @@ impl ChunkStorage for FsStorage {
 
     /// May only add chunks by adding items. Dummy implementation always returning None
     fn _insert_chunk(&self, hash: Hash, chunk: &[u8]) -> Option<Arc<StoredChunkRef>> {
-        tracing::trace!("Insert chunk {hash}, {} bytes", chunk.len());
-
         self.write().data.get_mut(&hash).and_then(|infile_chunk| {
             infile_chunk
                 .write(&hash, chunk)
@@ -443,6 +442,7 @@ impl ChunkStorage for FsStorage {
 
     /// Get a Vec of all chunks' hashes in storage
     fn chunks(&self) -> Vec<Hash> {
+        tracing::trace!("data: {:?}", self.read().data);
         self.read().data.keys().copied().collect()
     }
 
@@ -618,7 +618,7 @@ mod tests {
         let tempdir = std::env::temp_dir().join(PathBuf::from_str("in_a_temp_dir").unwrap());
         let storage = FsStorage::new(tempdir.clone()).unwrap();
 
-        let item = new_dummy_item::<FsStorage, 1u8, 1_000_000>(storage.clone());
+        let item = new_dummy_item::<FsStorage, 1u8, 1_000_000>(&storage);
         println!("Created item: {item:?}");
         print_fsstorage(&storage);
 
