@@ -72,15 +72,8 @@ pub fn hash(data: &[u8]) -> Hash {
         //println!("[HASH-NE] HASH: {}", x);
     }
 
-    let (chunks, remainder) = data.as_chunks::<CHUNK_SIZE>();
-    let mut slices = chunks
-        .iter()
-        .map(std::convert::AsRef::as_ref)
-        .collect::<Vec<&[u8]>>(); // FIXME is this zero copy?
-    if !remainder.is_empty() {
-        slices.push(remainder);
-    }
-    partial_tree(slices.as_slice())
+    let chunks: Vec<&[u8]> = data.chunks(CHUNK_SIZE).collect();
+    partial_tree(&chunks)
 }
 
 #[cfg(test)]

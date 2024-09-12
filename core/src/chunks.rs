@@ -313,7 +313,11 @@ impl ChunkInfo {
 
 #[cfg(test)]
 mod tests {
-    use crate::hash::hash;
+    use crate::{
+        chunks::CHUNK_SIZE,
+        hash::{hash, merge_hashes},
+    };
+    use rand::RngCore;
 
     use super::{flatten, HashTreeNode, OwnedHashTreeNode};
 
@@ -354,5 +358,121 @@ mod tests {
         assert!(matches!(diff, OwnedHashTreeNode::Skipped { .. }));
         assert_eq!(diff.hash(), &h);
         assert_eq!(diff.size(), 12_000);
+    }
+
+    #[test]
+    fn test_node_find_diff() {
+        let data_size = CHUNK_SIZE * 3 + 4;
+        let mut data = vec![0u8; data_size];
+        rand::rngs::OsRng::default().fill_bytes(&mut data);
+
+        let h1 = hash(&data[..CHUNK_SIZE]);
+        let h2 = hash(&data[CHUNK_SIZE..CHUNK_SIZE * 2]);
+        let h12 = merge_hashes(&h1, &h2);
+        let h3 = hash(&data[CHUNK_SIZE * 2..CHUNK_SIZE * 3]);
+        let h4 = hash(&data[CHUNK_SIZE * 3..]);
+        let h34 = merge_hashes(&h3, &h4);
+        let h = merge_hashes(&h12, &h34);
+
+        // Actually testing the test here
+        assert_eq!(h, hash(&data));
+
+        // Manually create nodes
+        let node = OwnedHashTreeNode::Parent {
+            hash: h,
+            size: data_size as u32,
+            left: Box::new(OwnedHashTreeNode::Parent {
+                hash: h12,
+                size: (CHUNK_SIZE * 2) as u32,
+                left: Box::new(OwnedHashTreeNode::Stored {
+                    hash: h1,
+                    data: data[..CHUNK_SIZE].to_vec(),
+                }),
+                right: Box::new(OwnedHashTreeNode::Stored {
+                    hash: h2,
+                    data: data[CHUNK_SIZE..CHUNK_SIZE * 2].to_vec(),
+                }),
+            }),
+            right: Box::new(OwnedHashTreeNode::Parent {
+                hash: h34,
+                size: (CHUNK_SIZE + 4) as u32,
+                left: Box::new(OwnedHashTreeNode::Stored {
+                    hash: h3,
+                    data: data[CHUNK_SIZE * 2..CHUNK_SIZE * 3].to_vec(),
+                }),
+                right: Box::new(OwnedHashTreeNode::Stored {
+                    hash: h4,
+                    data: data[CHUNK_SIZE * 3..].to_vec(),
+                }),
+            }),
+        };
+
+        // We now proceed to test all possible combinations of provided hashes to check the results are the expected ones.
+
+        // Single elements
+        for comb in [&[h1], &[h2], &[h3], &[h4]] {
+            let diff = node.find_diff(comb);
+            assert!(matches!(diff, OwnedHashTreeNode::Parent { .. }));
+            assert_eq!(diff.hash(), &h);
+            assert_eq!(diff.size(), data_size as u32);
+
+            let (left, right) = diff.children().unwrap();
+            assert!(matches!(left, OwnedHashTreeNode::Parent { .. }));
+            assert!(matches!(right, OwnedHashTreeNode::Parent { .. }));
+        }
+
+        // Disjoint pairs, i.e. pairs not constituting a sub-tree of their own
+        for comb in [&[h1, h3], &[h2, h3], &[h1, h4], &[h2, h4]] {
+            let diff = node.find_diff(comb);
+            assert!(matches!(diff, OwnedHashTreeNode::Parent { .. }));
+            assert_eq!(diff.hash(), &h);
+            assert_eq!(diff.size(), data_size as u32);
+
+            let (left, right) = diff.children().unwrap();
+            assert!(matches!(left, OwnedHashTreeNode::Parent { .. }));
+            assert!(matches!(right, OwnedHashTreeNode::Parent { .. }));
+        }
+
+        // Sub-tree pairs
+        for comb in [&[h1, h2], &[h3, h4]] {
+            let diff = node.find_diff(comb);
+            assert!(matches!(diff, OwnedHashTreeNode::Parent { .. }));
+            assert_eq!(diff.hash(), &h);
+            assert_eq!(diff.size(), data_size as u32);
+
+            let (left, right) = diff.children().unwrap();
+            assert!(
+                (matches!(left, OwnedHashTreeNode::Parent { .. })
+                    && matches!(right, OwnedHashTreeNode::Skipped { .. }))
+                    || (matches!(left, OwnedHashTreeNode::Skipped { .. })
+                        && matches!(right, OwnedHashTreeNode::Parent { .. }))
+            );
+        }
+
+        // Three elements
+        for comb in [&[h1, h2, h3], &[h1, h2, h4], &[h1, h3, h4], &[h2, h3, h4]] {
+            let diff = node.find_diff(comb);
+            assert!(matches!(diff, OwnedHashTreeNode::Parent { .. }));
+            assert_eq!(diff.hash(), &h);
+            assert_eq!(diff.size(), data_size as u32);
+
+            let (left, right) = diff.children().unwrap();
+            assert!(
+                (matches!(left, OwnedHashTreeNode::Parent { .. })
+                    && matches!(right, OwnedHashTreeNode::Skipped { .. }))
+                    || (matches!(left, OwnedHashTreeNode::Skipped { .. })
+                        && matches!(right, OwnedHashTreeNode::Parent { .. }))
+            );
+        }
+
+        let diff = node.find_diff(&[h]);
+        assert!(matches!(diff, OwnedHashTreeNode::Skipped { .. }));
+        assert_eq!(diff.hash(), &h);
+        assert_eq!(diff.size(), data_size as u32);
+
+        let diff = node.find_diff(&[h1, h2, h3, h4]);
+        assert!(matches!(diff, OwnedHashTreeNode::Skipped { .. }));
+        assert_eq!(diff.hash(), &h);
+        assert_eq!(diff.size(), data_size as u32);
     }
 }
