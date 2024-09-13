@@ -1,0 +1,18 @@
+{
+  "fsstorage": {
+    "enabled": true,
+    "root": "here"
+  },
+  "server": {
+    "url": "http://localhost:3000"
+  },
+  "log": {
+    "level": "DEBUG"
+  },
+  "client": {
+    "name": "",
+    "sync": [
+      "ok"
+    ]
+  }
+}

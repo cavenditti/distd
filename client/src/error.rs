@@ -98,4 +98,7 @@ pub enum Client {
 
     #[error("Invalid parameter")]
     InvalidParmeter(#[from] InvalidParameter),
+
+    #[error("User terminated")]
+    Terminated,
 }

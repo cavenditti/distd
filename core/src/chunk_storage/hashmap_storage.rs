@@ -142,7 +142,7 @@ mod tests {
             assert_eq!(i, zeros_chunk_hash);
         }
 
-        let cloned = root.clone_data().unwrap();
+        let cloned = root.clone_data();
         assert_eq!(cloned.len(), SIZE);
         for b in cloned {
             assert_eq!(b, 0u8);
@@ -160,7 +160,7 @@ mod tests {
         //print_tree(&*root.to_owned()).unwrap();
         assert!(len >= s.size());
 
-        let cloned = root.clone_data().unwrap();
+        let cloned = root.clone_data();
         for (i, b) in cloned.iter().enumerate() {
             //println!("{} {} {}", i, data[i], *b);
             assert_eq!(data[i], *b);

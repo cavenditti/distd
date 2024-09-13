@@ -2,7 +2,7 @@
 use crate::error::{InvalidParameter, ServerRequest};
 
 use blake3::Hash;
-use std::{fmt::Debug, io::Read, str::FromStr, time::Duration};
+use std::{fmt::Debug, io::Read, str::FromStr, sync::Arc, time::Duration};
 use uuid::Uuid;
 
 use http_body_util::{BodyExt, Empty};
@@ -35,6 +35,7 @@ struct SharedServer {
 }
 
 /// Server representation used by clients
+#[derive(Debug, Clone)]
 pub struct Server {
     //pub connection: ..
 
@@ -50,7 +51,7 @@ pub struct Server {
     client_uid: Option<Uuid>,
 
     /// Shared data
-    shared: RwLock<SharedServer>,
+    shared: Arc<RwLock<SharedServer>>,
 
     /// Elapsed time between server fetches
     timeout: Duration,
@@ -241,7 +242,7 @@ impl Server {
     }
 
     /// Fetch metadata from server in a loop
-    pub async fn fetch_loop(&self) {
+    pub async fn fetch_loop(self) {
         loop {
             tokio::time::sleep(self.timeout).await;
             if self.fetch().await.is_err() {
@@ -298,11 +299,11 @@ impl Server {
                 .map_err(|_| ServerRequest::BadPubKey)?,
             url,
             client_uid: None,
-            shared: RwLock::new(SharedServer {
+            shared: Arc::new(RwLock::new(SharedServer {
                 metadata: ServerMetadata::default(),
                 sender,
                 last_update: Instant::now(),
-            }),
+            })),
             timeout,
         };
         server.register(client_name).await?;

@@ -1,10 +1,11 @@
-use std::{collections::HashMap, path::Path};
+use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 
-use anyhow::Error;
+use tokio::time::sleep;
 
 use crate::{
-    error::{Client as ClientError, ServerRequest},
+    error::{Client as ClientError, InvalidParameter, ServerRequest},
     server::Server,
+    settings::Settings,
 };
 
 use std::{fmt::Write, fs::File, io::Read};
@@ -21,6 +22,7 @@ use distd_core::{
 #[derive(Debug)]
 pub struct RegisterError;
 
+#[derive(Debug, Clone)]
 pub struct Client<T>
 where
     T: ChunkStorage,
@@ -35,7 +37,9 @@ where
     pub storage: T,
 
     /// Items the client keeps updated
-    pub items: HashMap<String, ItemMetadata>,
+    pub items: Arc<HashMap<String, ItemMetadata>>,
+
+    pub settings: Arc<Settings>,
 }
 
 impl<T> Client<T>
@@ -43,20 +47,37 @@ where
     T: ChunkStorage,
 {
     pub async fn new(
-        client_name: &str,
-        server_addr: hyper::Uri,
         server_public_key: &[u8; 32],
         storage: T,
-    ) -> Result<Self, Error> {
-        Server::new(server_addr, client_name, server_public_key)
-            .await
-            .map_err(Error::msg)
-            .map(|server| Self {
-                name: String::from(client_name),
-                server,
-                storage,
-                items: HashMap::default(),
-            })
+        settings: Settings,
+    ) -> Result<Self, ClientError> {
+        let url = settings.server.url.clone();
+        let url = url.parse::<hyper::Uri>().map_err(InvalidParameter::Uri)?;
+
+        // Only HTTP for now.
+        if url.scheme_str() != Some("http") {
+            return Err(ClientError::InvalidArgs(vec![url.to_string()]));
+        }
+
+        // Wait for server connection to get client uid
+        let server = loop {
+            match Server::new(url.clone(), &settings.client.name, server_public_key).await {
+                Ok(server) => break server,
+                Err(e) => {
+                    const T: u64 = 5;
+                    tracing::warn!("Error: '{e}', retrying in {T} seconds");
+                    sleep(Duration::from_secs(T)).await;
+                }
+            }
+        };
+
+        Ok(Self {
+            name: String::from(&settings.client.name),
+            server,
+            storage,
+            items: Arc::default(),
+            settings: Arc::new(settings),
+        })
     }
 
     pub fn name(&self) -> &str {
@@ -133,52 +154,8 @@ impl Client<FsStorage> {
 
 impl<T> Client<T>
 where
-    T: ChunkStorage,
+    T: ChunkStorage + Clone + Send + 'static,
 {
-    /*
-    pub async fn sync(self, target: &Path, path: &Path) -> Result<(), ClientError> {
-        tracing::debug!("sync: {target:?} {path:?}");
-
-        let server_metadata = self.server.metadata().await;
-        let item = server_metadata
-            .items
-            .get(target)
-            .ok_or(ClientError::FileNotFound(target.to_string_lossy().into()))?;
-
-
-        let from = self.storage.chunks(); // FIXME this could get very very large
-        tracing::trace!("Signalig to server we've got {from:?}");
-
-        let result = self
-            .server
-            .transfer_diff(&item.root.hash.to_string(), from)
-            .await?;
-
-        tracing::trace!("Got {} chunks from server", result.hash());
-        tracing::trace!("{} bytes total in chunks from server", result.size());
-
-        let n = self
-            .storage
-            .try_fill_in(result)
-            .ok_or(ClientError::TreeReconstruct)?;
-        tracing::trace!("{} bytes total", n.size());
-
-        let _insertion_result = self
-            .storage
-            .create_item(
-                item.name.clone(),
-                path.into(),
-                item.revision,
-                item.description.clone(),
-                n.clone_data().unwrap().into(),
-            )
-            .ok_or(ClientError::ItemInsertion(
-                "Cannot insert downloaded file".into(),
-            ))?;
-        Ok(())
-    }
-    */
-
     /// Main client loop
     pub async fn client_loop(self) -> Result<(), ClientError> {
         self.server.fetch_loop().await;
@@ -217,7 +194,7 @@ where
 }
 
 pub mod cli {
-    use std::{env, path::PathBuf, str::FromStr, thread::sleep, time::Duration};
+    use std::{env, path::PathBuf, str::FromStr};
 
     use hyper::http::uri::PathAndQuery;
 
@@ -246,28 +223,9 @@ pub mod cli {
 
         tracing::debug!("Settings: {settings:?}");
 
-        let url = settings.server.url;
-        let url = url
-            .parse::<hyper::Uri>()
-            .map_err(|_| ClientError::InvalidArgs(cmd_args.clone()))?;
-
-        // Only HTTP for now.
-        if url.scheme_str() != Some("http") {
-            return Err(ClientError::InvalidArgs(cmd_args));
-        }
-
         let Ok(storage_root) = PathBuf::from_str(&settings.fsstorage.root);
         let storage = FsStorage::new(storage_root).map_err(|_| ClientError::Storage)?;
-        let client = loop {
-            match Client::new("Some name", url.clone(), &[0u8; 32], storage.clone()).await {
-                Ok(client) => break client,
-                Err(e) => {
-                    const T: u64 = 5;
-                    tracing::warn!("Error: '{e}', retrying in {T} seconds");
-                    sleep(Duration::from_secs(T));
-                }
-            }
-        };
+        let client = Client::new(&[0u8; 32], storage.clone(), settings).await?;
 
         match cmd.as_str() {
             "loop" => client.client_loop().await,

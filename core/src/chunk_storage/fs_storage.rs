@@ -7,11 +7,11 @@ use std::{
     sync::{atomic::AtomicBool, Arc, RwLock},
 };
 
-use anyhow::Error;
 use blake3::Hash;
 
 use crate::{
     chunks::{ChunkInfo, CHUNK_SIZE},
+    error::Error,
     hash::hash as do_hash,
     item::{Item, Name as ItemName},
 };
@@ -43,16 +43,15 @@ impl TryFrom<InFileChunk> for StoredChunkRef {
     /// If the chunk is not populated, it will return an error
     fn try_from(value: InFileChunk) -> Result<Self, Self::Error> {
         if !value.populated.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(Error::msg("missing data"));
+            return Err(Error::MissingData);
         }
-        let first_path = value.paths.iter().next().ok_or(Error::msg("empty"))?;
-        let mut file = File::open(&first_path.path).map_err(Error::msg)?;
-        file.seek(std::io::SeekFrom::Start(first_path.offset))
-            .map_err(Error::msg)?;
+        let first_path = value.paths.iter().next().ok_or(Error::MissingData)?;
+        let mut file = File::open(&first_path.path)?;
+        file.seek(std::io::SeekFrom::Start(first_path.offset))?;
 
         let mut buf = vec![0u8; value.info.size as usize];
 
-        file.read_exact(&mut buf).map_err(Error::msg)?;
+        file.read_exact(&mut buf)?;
 
         Ok(StoredChunkRef::Stored {
             hash: value.info.hash,
@@ -124,7 +123,7 @@ impl InFileChunk {
             })
             .inspect(|()| tracing::trace!("{count} bytes written"))
             .inspect_err(|e| tracing::error!("Failed writing {hash} after {count} bytes: {e}"))
-            .map_err(Error::msg)
+            .map_err(Error::IoError)
     }
 }
 
@@ -173,7 +172,7 @@ impl InnerFsStorage {
                 .strip_prefix("/")
                 .unwrap_or(&item.metadata.path),
         );
-        create_dir_all(full_path.parent().unwrap_or(&full_path)).map_err(Error::msg)?;
+        create_dir_all(full_path.parent().unwrap_or(&full_path))?;
         tracing::debug!(
             "Created path {:?}",
             full_path.parent().unwrap_or(&full_path)
@@ -193,7 +192,7 @@ impl InnerFsStorage {
             .iter()
             .any(|it| self.item_path(it).is_ok_and(|p| p == path))
         {
-            return Err(Error::msg(format!(
+            return Err(Error::Other(format!(
                 "Conflict found: path {} already present in filesystem",
                 path.to_string_lossy()
             )));
@@ -260,7 +259,7 @@ impl InnerFsStorage {
             .items
             .remove(&item)
             .then_some(item)
-            .ok_or(Error::msg("Item was not present in FsStorage"))?;
+            .ok_or(Error::MissingData)?;
 
         for chunk in &item.chunks {
             // We may have duplicated hashes in chunks, so we need to check first if it's there and otherwise
@@ -282,7 +281,7 @@ impl InnerFsStorage {
     fn delete(&mut self, item: Item) -> Result<(), Error> {
         let path = self.item_path(&item)?;
         self.remove(item)
-            .and_then(|()| remove_file(path).map_err(Error::msg))
+            .and_then(|()| remove_file(path).map_err(Error::IoError))
     }
 }
 
@@ -622,11 +621,7 @@ mod tests {
         println!("Created item: {item:?}");
         print_fsstorage(&storage);
 
-        let stored = storage
-            .get(&item.metadata.root.hash)
-            .unwrap()
-            .clone_data()
-            .unwrap();
+        let stored = storage.get(&item.metadata.root.hash).unwrap().clone_data();
 
         assert_eq!(stored.len(), 1_000_000);
         for b in stored {

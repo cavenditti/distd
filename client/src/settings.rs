@@ -1,6 +1,6 @@
 use config::{Config, Environment, File};
 use serde::Deserialize;
-use std::env;
+use std::{env, path::PathBuf};
 
 use crate::error::Client as ClientError;
 
@@ -25,11 +25,19 @@ pub struct FsStorage {
 
 #[derive(Debug, Deserialize)]
 #[allow(unused)]
+pub struct Client {
+    pub name: String,
+    pub sync: Vec<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(unused)]
 pub struct Settings {
     pub debug: bool,
     pub fsstorage: FsStorage,
     pub server: Server,
     pub log: Log,
+    pub client: Client,
 }
 
 impl Settings {
