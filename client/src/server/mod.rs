@@ -47,7 +47,7 @@ pub struct Server {
     shared: Arc<RwLock<SharedServer>>,
 
     /// Elapsed time between server fetches
-    timeout: Duration,
+    pub timeout: Duration,
 }
 
 impl Server {

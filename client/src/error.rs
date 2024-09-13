@@ -101,4 +101,7 @@ pub enum Client {
 
     #[error("User terminated")]
     Terminated,
+
+    #[error("User specified item doesn't exist on server")]
+    MissingItem,
 }

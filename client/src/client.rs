@@ -1,4 +1,8 @@
-use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use tokio::time::sleep;
 
@@ -8,6 +12,7 @@ use std::{fs::File, io::Read};
 
 use distd_core::{
     chunk_storage::{fs_storage::FsStorage, ChunkStorage},
+    item::Item,
     metadata::Item as ItemMetadata,
 };
 
@@ -27,9 +32,6 @@ where
 
     /// Storage, implementing `ChunkStorage`
     pub storage: T,
-
-    /// Items the client keeps updated
-    pub items: Arc<HashMap<String, ItemMetadata>>,
 
     pub settings: Arc<Settings>,
 }
@@ -61,11 +63,31 @@ where
             }
         };
 
+        // Check for missing paths on server
+        let items = server.metadata().await.items;
+        let server_paths: Vec<&PathBuf> = items.keys().collect();
+        let missing: Vec<&PathBuf> = settings
+            .client
+            .sync
+            .iter()
+            .filter(|p| !server_paths.contains(p))
+            .collect();
+        if !missing.is_empty() {
+            tracing::error!(
+                "Some requested paths could not be found found in server: {}",
+                missing
+                    .iter()
+                    .map(|p| format!("'{}'", p.to_string_lossy()))
+                    .collect::<Vec<String>>()
+                    .join(",")
+            );
+            return Err(ClientError::MissingItem);
+        }
+
         Ok(Self {
             name: String::from(&settings.client.name),
             server,
             storage,
-            items: Arc::default(),
             settings: Arc::new(settings),
         })
     }
@@ -146,10 +168,42 @@ impl<T> Client<T>
 where
     T: ChunkStorage + Clone + Send + 'static,
 {
+    async fn update(&self, new: &ItemMetadata) -> Result<Item, ClientError> {
+        let from = self.storage.chunks(); // FIXME this could get very very large
+        let new_data = self
+            .server
+            .transfer_diff(&new.root.hash.to_string(), from)
+            .await?;
+
+        let n = self
+            .storage
+            .try_fill_in(new_data)
+            .ok_or(ClientError::TreeReconstruct)?;
+        tracing::trace!("Reconstructed with {} bytes total", n.size());
+
+        let item = Item::new(
+            new.name.clone(),
+            new.path.clone(),
+            new.revision,
+            new.description.clone(),
+            &n,
+        );
+
+        Ok(item)
+    }
+
     /// Main client loop
     pub async fn client_loop(self) -> Result<(), ClientError> {
-        self.server.fetch_loop().await;
-        Ok(())
+        tokio::spawn(self.server.clone().fetch_loop());
+
+        loop {
+            tokio::time::sleep(self.server.timeout).await;
+            let items = self.server.metadata().await.items;
+            for path in &self.settings.client.sync {
+                let i = items.get(path).ok_or(ClientError::Storage)?; //FIXME not very clear
+                self.update(i).await?;
+            }
+        }
     }
 }
 
@@ -166,7 +220,7 @@ pub mod cli {
         tracing_subscriber::fmt()
             .with_target(false)
             .compact()
-            .with_max_level(tracing::Level::TRACE)
+            .with_max_level(tracing::Level::DEBUG)
             .init();
 
         tracing::info!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));

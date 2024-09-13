@@ -1,5 +1,6 @@
 //#![deny(warnings)]
 #![feature(iter_advance_by)]
+#![feature(async_closure)]
 #![warn(rust_2018_idioms)]
 
 pub mod client;
