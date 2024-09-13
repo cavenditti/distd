@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
 use axum::body::Bytes;
@@ -54,19 +54,19 @@ impl From<InternalMetadata> for ServerMetadata {
 ///
 /// Server signature is used to check replicated data among clients when shared p2p,
 /// Note that this is different from an eventual "build" signature.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Server<T>
 where
     T: ChunkStorage + Sync + Send + Clone + Default,
 {
-    key_pair: Ed25519KeyPair, // needs server restart to be changed
-    uuid_nonce: String,       // needs server restart to be changed
+    key_pair: Arc<Ed25519KeyPair>, // needs server restart to be changed
+    uuid_nonce: String,            // needs server restart to be changed
     // global server metadata
-    pub metadata: RwLock<InternalMetadata>,
+    pub metadata: Arc<RwLock<InternalMetadata>>,
     // A storage implementing ChunkStorage, basically a key-value database of some sort
     pub storage: T,
     // Client map
-    pub clients: RwLock<BTreeMap<Uuid, Client>>,
+    pub clients: Arc<RwLock<BTreeMap<Uuid, Client>>>,
 }
 
 impl<T> Default for Server<T>
@@ -84,10 +84,10 @@ where
         let key_pair = signature::Ed25519KeyPair::from_pkcs8(pkcs8_bytes.as_ref()).unwrap();
 
         Self {
-            key_pair,
+            key_pair: Arc::new(key_pair),
             uuid_nonce,
-            metadata: RwLock::new(InternalMetadata::default()),
-            clients: RwLock::new(BTreeMap::<Uuid, Client>::new()),
+            metadata: Arc::new(RwLock::new(InternalMetadata::default())),
+            clients: Arc::new(RwLock::new(BTreeMap::<Uuid, Client>::new())),
             storage: T::default(),
         }
     }
@@ -104,10 +104,10 @@ where
     pub fn new(pkcs8_bytes: &Document, metadata: InternalMetadata) -> Result<Self, KeyRejected> {
         let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8_bytes.as_ref())?;
         Ok(Self {
-            key_pair,
+            key_pair: Arc::new(key_pair),
             uuid_nonce: blake3::hash(pkcs8_bytes.as_ref()).to_string(),
-            metadata: RwLock::new(metadata),
-            clients: RwLock::new(BTreeMap::<Uuid, Client>::new()), // TODO save and reload from disk
+            metadata: Arc::new(RwLock::new(metadata)),
+            clients: Arc::new(RwLock::new(BTreeMap::<Uuid, Client>::new())), // TODO save and reload from disk
             storage: T::default(),
         })
     }

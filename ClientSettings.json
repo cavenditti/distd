@@ -4,7 +4,7 @@
     "root": "here"
   },
   "server": {
-    "url": "http://localhost:3000"
+    "url": "http://localhost:50051"
   },
   "log": {
     "level": "DEBUG"

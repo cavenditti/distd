@@ -2,17 +2,9 @@ use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 
 use tokio::time::sleep;
 
-use crate::{
-    error::{Client as ClientError, InvalidParameter, ServerRequest},
-    server::Server,
-    settings::Settings,
-};
+use crate::{error::Client as ClientError, server::Server, settings::Settings};
 
-use std::{fmt::Write, fs::File, io::Read};
-
-use http_body_util::BodyExt;
-use hyper::body::Buf;
-use hyper::http::uri::PathAndQuery;
+use std::{fs::File, io::Read};
 
 use distd_core::{
     chunk_storage::{fs_storage::FsStorage, ChunkStorage},
@@ -51,17 +43,15 @@ where
         storage: T,
         settings: Settings,
     ) -> Result<Self, ClientError> {
-        let url = settings.server.url.clone();
-        let url = url.parse::<hyper::Uri>().map_err(InvalidParameter::Uri)?;
-
-        // Only HTTP for now.
-        if url.scheme_str() != Some("http") {
-            return Err(ClientError::InvalidArgs(vec![url.to_string()]));
-        }
-
         // Wait for server connection to get client uid
         let server = loop {
-            match Server::new(url.clone(), &settings.client.name, server_public_key).await {
+            match Server::new(
+                &settings.server.url,
+                &settings.client.name,
+                server_public_key,
+            )
+            .await
+            {
                 Ok(server) => break server,
                 Err(e) => {
                     const T: u64 = 5;
@@ -161,42 +151,10 @@ where
         self.server.fetch_loop().await;
         Ok(())
     }
-
-    /// Fetch a resource from the server, mostly used for debug
-    pub async fn rest(self, method: &str, url: PathAndQuery) -> Result<(), ClientError> {
-        tracing::debug!("REST request {method} {url}");
-
-        let mut response = self
-            .server
-            .send_request(method, url)
-            .await
-            .inspect(|r| tracing::debug!("Got {:?}", &r))?;
-
-        let body = response
-            .body_mut()
-            .collect()
-            .await
-            .map_err(ServerRequest::Request)?
-            .aggregate()
-            .chunk()
-            .to_vec();
-
-        let body_str = String::from_utf8(body.clone()).unwrap_or(body.iter().fold(
-            String::new(),
-            |mut s, x| {
-                let _ = write!(s, "{x:x?}");
-                s
-            },
-        ));
-        tracing::trace!("Body: `{body_str}`");
-        Ok(())
-    }
 }
 
 pub mod cli {
     use std::{env, path::PathBuf, str::FromStr};
-
-    use hyper::http::uri::PathAndQuery;
 
     use distd_core::chunk_storage::fs_storage::FsStorage;
 
@@ -228,8 +186,7 @@ pub mod cli {
         let client = Client::new(&[0u8; 32], storage.clone(), settings).await?;
 
         match cmd.as_str() {
-            "loop" => client.client_loop().await,
-            "rest" => rest(client, cmd_args).await,
+            "start" => client.client_loop().await,
             "sync" => sync(client, &cmd_args[..]).await, // TODO change name and use sync to explicitly request syncing of items subscripted to
             "publish" => todo!(),
             "subscribe" => todo!(),
@@ -260,21 +217,5 @@ pub mod cli {
         let Ok(target) = PathBuf::from_str(target.as_str());
 
         client.sync(&target, &path).await
-    }
-
-    /// Fetch a resource from the server, mostly used for debug
-    async fn rest(client: Client<FsStorage>, args: Vec<String>) -> Result<(), ClientError> {
-        let (method, url) = args
-            .first()
-            .zip(args.get(1))
-            .ok_or(ClientError::InvalidArgs(args.clone()))?;
-        tracing::debug!("Fetch {method} {url}");
-
-        // url should always start with exactly one "/"
-        let url = format!("/{}", url.trim_start_matches('/'));
-        let url = PathAndQuery::from_str(url.as_str())
-            .map_err(|_| ClientError::InvalidArgs(args.clone()))?;
-
-        client.rest(method, url).await
     }
 }

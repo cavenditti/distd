@@ -15,17 +15,12 @@ pedantic = { level = "warn", priority = 0 }
 missing_errors_doc = { level = "allow", priority = 1 }
 
 [workspace.dependencies]
-tokio = { version = "1.40.0", features = ["full"] }
-axum = { version = "0.7.5", features = ["json", "multipart"] }
-axum-extra = { version = "0.9.3", features = ["query"] }
-tower-http = { version = "0.5.2", features = ["trace"] }
-hyper = { version = "1", features = ["full"] }
-hyper-util = { version = "0.1", features = ["full"] }
-http-body-util = "0.1"
+tonic = "0.12"
+tonic-build = "0.12"
+prost = "0.13"
+tokio = { version = "1.40.0", features = ["macros", "rt-multi-thread"] }
 
-anyhow = { version = "1.0", default-features = false }
 thiserror = "1.0"
-
 tracing = { version = "0.1.40" }
 tracing-subscriber = { version = "0.3.16" }
 test-log = { version = "0.2" }
