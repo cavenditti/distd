@@ -22,7 +22,7 @@ pub mod version;
 pub mod benchmarks;
 
 pub mod proto {
-    tonic::include_proto!("distd"); // The string specified here must match the proto package name
+    tonic::include_proto!("distd");
 }
 
 pub type Client = proto::distd_client::DistdClient<tonic::transport::Channel>;
@@ -32,7 +32,3 @@ pub type Request<T> = tonic::Request<T>;
 
 pub type GrpcError = tonic::Status;
 pub type TransportError = tonic::transport::Error;
-
-pub fn make_request<T>(req: T) -> Request<T>{
-    Request::new(req)
-}
