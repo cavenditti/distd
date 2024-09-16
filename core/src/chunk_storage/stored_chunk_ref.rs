@@ -3,7 +3,10 @@ use std::{collections::HashSet, sync::Arc};
 use blake3::Hash;
 use serde::ser::{Serialize, SerializeStructVariant};
 
-use crate::chunks::{ChunkInfo, HashTreeNode, OwnedHashTreeNode, RawChunk};
+use crate::chunks::{ChunkInfo, HashTreeNode, OwnedHashTreeNode};
+
+/// Arc reference to a raw byte chunk
+pub type ArcChunk = Arc<Vec<u8>>;
 
 /// This is the internal representation of the hash-tree
 /// As it contains in-memory references, it is not meant to be serialized
@@ -16,7 +19,7 @@ pub enum StoredChunkRef {
     },
     Stored {
         hash: Hash,
-        data: RawChunk,
+        data: ArcChunk,
     },
 }
 
@@ -138,7 +141,7 @@ impl StoredChunkRef {
 
     /// Get contained data, returns None if is not Stored
     #[must_use]
-    pub fn stored_data(&self) -> Option<RawChunk> {
+    pub fn stored_data(&self) -> Option<ArcChunk> {
         match self {
             Self::Stored { data, .. } => Some(data.clone()),
             Self::Parent { .. } => None,
@@ -156,7 +159,7 @@ impl StoredChunkRef {
 
     /// Get a view on contained data, recursing across all children
     #[must_use]
-    pub fn data(&self) -> Option<Vec<RawChunk>> {
+    pub fn data(&self) -> Option<Vec<ArcChunk>> {
         match self {
             Self::Stored { data, .. } => Some(vec![data.clone()]),
             Self::Parent { left, right, .. } => {

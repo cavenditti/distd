@@ -168,7 +168,8 @@ impl<T> Client<T>
 where
     T: ChunkStorage + Clone + Send + 'static,
 {
-    async fn update(&self, new: &ItemMetadata) -> Result<Item, ClientError> {
+    async fn update(&mut self, new: &ItemMetadata) -> Result<Item, ClientError> {
+        tracing::debug!("Updating item '{}'", new.name);
         let from = self.storage.chunks(); // FIXME this could get very very large
         let new_data = self
             .server
@@ -181,26 +182,34 @@ where
             .ok_or(ClientError::TreeReconstruct)?;
         tracing::trace!("Reconstructed with {} bytes total", n.size());
 
-        let item = Item::new(
-            new.name.clone(),
-            new.path.clone(),
-            new.revision,
-            new.description.clone(),
-            &n,
-        );
+        let item = self
+            .storage
+            .build_item(
+                new.name.clone(),
+                new.path.clone(),
+                new.revision,
+                new.description.clone(),
+                n,
+            )
+            .ok_or(ClientError::ItemInsertion(
+                "Cannot insert downloaded file".into(),
+            ))?;
+
+        tracing::debug!("Got {item:?}");
 
         Ok(item)
     }
 
     /// Main client loop
-    pub async fn client_loop(self) -> Result<(), ClientError> {
+    pub async fn client_loop(mut self) -> Result<(), ClientError> {
         tokio::spawn(self.server.clone().fetch_loop());
 
         loop {
             tokio::time::sleep(self.server.timeout).await;
             let items = self.server.metadata().await.items;
-            for path in &self.settings.client.sync {
-                let i = items.get(path).ok_or(ClientError::Storage)?; //FIXME not very clear
+            for path in &self.settings.client.sync.clone() {
+                tracing::debug!("Syncing '{}'", path.to_string_lossy());
+                let i = items.get(path).ok_or(ClientError::Storage)?; //FIXME should fail on missing on server or sync other files anyway?
                 self.update(i).await?;
             }
         }
@@ -220,7 +229,7 @@ pub mod cli {
         tracing_subscriber::fmt()
             .with_target(false)
             .compact()
-            .with_max_level(tracing::Level::DEBUG)
+            .with_max_level(tracing::Level::TRACE)
             .init();
 
         tracing::info!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
