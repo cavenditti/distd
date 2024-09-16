@@ -6,8 +6,8 @@ pub enum Server {
     ChunkInsertError,
 
     //ChunkInsertError(#[from] std::io::Error),
-    #[error("Cannot insert key `{0}` as item name, already taken")]
-    ItemInsertionError(String),
+    #[error("Cannot insert item into storage")]
+    ItemInsertionError,
 
     #[error("invalid header (expected {expected:?}, found {found:?})")]
     InvalidHeader { expected: String, found: String },

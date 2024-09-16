@@ -221,14 +221,12 @@ where
         let res = server.publish_item(
             item_data.name,
             item_data.path,
-            0,
             item_data.description,
             field.bytes().await.map_err(|_| StatusCode::BAD_REQUEST)?,
         );
         let res = res.map(|x| x.metadata);
         tracing::debug!("{:?}", res);
         return res.map(Json).map_err(|e| match e {
-            ServerError::ItemInsertionError(..) => StatusCode::NOT_IMPLEMENTED,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         });
     }

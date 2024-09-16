@@ -22,6 +22,7 @@ use uuid::Uuid;
 use crate::client::{Client, Name as ClientName};
 use crate::error::Server as ServerError;
 use distd_core::feed::{Feed, Name as FeedName};
+use distd_core::hash::hash as do_hash;
 use distd_core::version::Version;
 
 /// Data structure used internally by server, may be converted to `ServerMetadata`
@@ -176,24 +177,45 @@ where
         &self,
         name: ItemName,
         path: PathBuf,
-        revision: u32,
         description: Option<String>,
         file: Bytes,
     ) -> Result<Item, ServerError> {
-        self.storage
+        // Get last revision, if any. 0 otherwise
+        let revision = self
+            .metadata
+            .read()
+            .unwrap()
+            .items
+            .get(&path)
+            .map(|i| i.metadata.revision + 1)
+            .unwrap_or_default();
+
+        // Check if already exists and if so just return the old one
+        // This is doing duplicated hashing calculations, may be improved
+        let root = &do_hash(&file);
+        if let Some(old) = self.metadata.read().unwrap().items.get(&path) {
+            if old.metadata.name == name
+                && old.metadata.path == path
+                && old.metadata.description == description
+                && &old.metadata.root.hash == root
+            {
+                return Ok(old.clone());
+            }
+        }
+
+        // Create item and return it
+        let item = self
+            .storage
             .create_item(name, path, revision, description, file)
-            .ok_or(ServerError::ChunkInsertError)
-            .and_then(|i| {
-                self.metadata
-                    .write()
-                    .expect("Poisoned Lock")
-                    .items
-                    .try_insert(i.metadata.path.clone(), i)
-                    .map(|item| item.to_owned())
-                    .map_err(|e| {
-                        ServerError::ItemInsertionError(e.entry.key().to_str().unwrap().to_owned())
-                    })
-            })
+            .ok_or(ServerError::ChunkInsertError)?;
+
+        self.metadata
+            .write()
+            .expect("Poisoned Lock")
+            .items
+            .insert(item.metadata.path.clone(), item.clone());
+
+        Ok(item)
     }
 
     /// Get the public key of the server

@@ -56,12 +56,12 @@ Most important part missing is the "chunk-adapter" to make chunking content-awar
 - [x] ~~Make storage agnostic about hash computation, it's not its business~~
 - [x] ~~Implement FsStorage, to store items directly in the filesystem without deduplication (will be used by client)~~
         **needs extensive testing**
-- [ ] Minimal client
-- [ ] Allow upload of item's revisions on server
+- [x] Allow upload of item's revisions on server
 - [x] Replace some Option with Result to have better visibility on errors (in progress), mostly in chunk storage
+- [x] Logging
+- [x] Minimal client (very minimal :)
 - [ ] Server sessions
 - [ ] Config
-- [x] Logging
 - [ ] Evaluate whether to assign a 64-bit uid to each hash to reduce network overhead or not
 
 ### Medium term:
@@ -88,7 +88,6 @@ This works pretty much like a partitioned Bittorent swarm, but:
 
 ## Current state
 ### Code organization
-- distd_core contains common data structures and algorithms
+- distd_core contains common data structures and algorithms, as well as protobuf files and auto-generated implementations.
 - distd_server is responsible of chunking, hashing and first serving the file
 - distd_client fetches files from the server
-
