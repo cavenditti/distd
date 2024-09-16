@@ -1,6 +1,6 @@
 //! common chunks and hash-tree data structs
 
-use std::{collections::HashSet, fmt::Display, sync::Arc};
+use std::{collections::HashSet, fmt::Display};
 
 use blake3::Hash;
 use serde::{Deserialize, Serialize};
@@ -12,9 +12,6 @@ use crate::utils::serde::hashes::{deserialize_hash, serialize_hash};
 /// It may useful to increase this in order to print hash tree when debugging
 pub const CHUNK_SIZE: usize = blake3::guts::CHUNK_LEN;
 //pub const CHUNK_SIZE: usize = 4 * 1024;
-
-/// Raw chunk reference
-pub type RawChunk = Arc<Vec<u8>>;
 
 /// Owned chunk
 pub type OwnedChunk = Vec<u8>;

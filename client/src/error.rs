@@ -1,7 +1,7 @@
 use std::str::Utf8Error;
 
 use config::ConfigError;
-use distd_core::chunks::HashTreeNodeTypeError;
+use distd_core::{chunks::HashTreeNodeTypeError, GrpcError, TransportError};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -9,21 +9,12 @@ pub enum ServerConnection {
     #[error("Cannot create stream")]
     StreamCreation(#[from] std::io::Error),
 
-    #[error("Cannot perform handshake")]
-    Handshake(#[from] hyper::Error),
-
     #[error("Invalid parameter")]
     InvalidParmeter(#[from] InvalidParameter),
 }
 
 #[derive(Error, Debug)]
 pub enum ServerRequest {
-    #[error("Cannot build request")]
-    Build(#[from] hyper::http::Error),
-
-    #[error("Cannot complete server request")]
-    Request(#[from] hyper::Error),
-
     #[error("Cannot read response")]
     ReadFromResponse(#[from] std::io::Error),
 
@@ -33,8 +24,20 @@ pub enum ServerRequest {
     #[error("Cannot reconstruct buffer from server response")]
     ResponseDeserialize(#[from] bitcode::Error),
 
+    #[error("gRPC error")]
+    Grpc(#[from] GrpcError),
+
+    #[error("gRPC transport error, is server accepting connetions?")]
+    Transport(#[from] TransportError),
+
     #[error("Cannot decode UTF-8 string from server response")]
     Utf8(#[from] Utf8Error),
+
+    #[error("Server didn't return a Uuid")]
+    MissingUuid,
+
+    #[error("Server didn't return a valid Uuid")]
+    BadUuid,
 
     #[error("Cannot decode UTF-8 string from server response")]
     Uuid(#[from] uuid::Error),
@@ -51,11 +54,8 @@ pub enum ServerRequest {
 
 #[derive(Error, Debug)]
 pub enum InvalidParameter {
-    #[error("Invalid URL")]
-    Url(#[from] hyper::http::Error),
-
-    #[error("Invalid URI")]
-    Uri(#[from] hyper::http::uri::InvalidUri),
+    #[error("Invalid BLAKE3 hash")]
+    Hash(#[from] blake3::HexError),
 
     #[error("Invalid parameter: expected {expected}, got \"{got}\"")]
     Generic { expected: String, got: String },
@@ -101,4 +101,7 @@ pub enum Client {
 
     #[error("User terminated")]
     Terminated,
+
+    #[error("User specified item doesn't exist on server")]
+    MissingItem,
 }

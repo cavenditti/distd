@@ -1,0 +1,40 @@
+syntax = "proto3";
+package distd;
+
+service Distd {
+  rpc Register(ClientRegister) returns (ServerMetadata);
+  rpc Fetch(ClientKeepAlive) returns (ServerMetadata);
+  rpc AdvHashes(Hashes) returns (Acknowledge);
+  rpc TreeTransfer(ItemRequest) returns (SerializedTree);
+}
+
+message Hashes { repeated bytes hashes = 1; }
+
+message ItemRequest {
+  bytes item_root = 1;
+  Hashes hashes = 2;
+}
+
+message SerializedTree { bytes bitcode_hashtree = 1; }
+
+message Acknowledge { EnumAcknowledge ack = 1; }
+
+message ClientKeepAlive { bytes uuid = 1; }
+
+message ServerMetadata {
+  bytes serialized = 1; // yet to be defined
+  optional bytes uuid = 2; // Returned only on client registration
+}
+message ClientRegister {
+  string name = 1;
+  string version = 2;
+}
+
+enum EnumAcknowledge {
+  // option allow_alias = true;
+  ACK_UNSPECIFIED = 0;
+  ACK_OK = 1;
+  ACK_CONFUSED = 2; // Something wrong, provided invalid hash maybe?
+  ACK_IGNORED = 3;  // Request well formed but will be ignored (item didn't
+                    // change from last hashes maybe)
+}

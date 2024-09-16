@@ -131,6 +131,21 @@ pub trait ChunkStorage {
         Some(Item::new(name, path, revision, description, &hash_tree))
     }
 
+    /// Build a new Item from its metadata and root node
+    fn build_item(
+        &self,
+        name: ItemName,
+        path: PathBuf,
+        revision: u32,
+        description: Option<String>,
+        root: Arc<StoredChunkRef>,
+    ) -> Option<Item>
+    where
+        Self: Sized,
+    {
+        Some(Item::new(name, path, revision, description, &root))
+    }
+
     /// Minimal set of hashes required to reconstruct `target` using `from`
     ///
     /// # Errors

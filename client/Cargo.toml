@@ -11,17 +11,10 @@ workspace = true
 
 [dependencies]
 tokio = { workspace = true }
-hyper = { workspace = true }
-hyper-util = { workspace = true }
-http-body-util = { workspace = true }
-hyper-rustls = { version = "0.27.2" }
 
-anyhow = { workspace = true }
 thiserror = { workspace = true }
-
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-test-log = { workspace = true }
 clap = { workspace = true }
 config = { workspace = true }
 
@@ -35,3 +28,6 @@ percent-encoding = { workspace = true }
 bitcode = { workspace = true }
 
 distd_core = { path = "../core" }
+
+[dev-dependencies]
+test-log = { workspace = true }

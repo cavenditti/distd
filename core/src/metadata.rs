@@ -52,9 +52,7 @@ pub struct Item {
 impl std::hash::Hash for Item {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.root.hash.hash(state);
-        self.name.hash(state);
         self.path.hash(state);
-        self.format.hash(state);
     }
 }
 

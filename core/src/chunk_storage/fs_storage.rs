@@ -10,7 +10,7 @@ use std::{
 use blake3::Hash;
 
 use crate::{
-    chunks::{ChunkInfo, CHUNK_SIZE},
+    chunks::{ChunkInfo, HashTreeNode, OwnedHashTreeNode, CHUNK_SIZE},
     error::Error,
     hash::hash as do_hash,
     item::{Item, Name as ItemName},
@@ -187,6 +187,8 @@ impl InnerFsStorage {
             data.len(),
             data.iter().map(|x| u64::from(x.size)).sum::<u64>()
         );
+        /*
+        // do it only if it doesn't already exist
         if self
             .items
             .iter()
@@ -197,6 +199,7 @@ impl InnerFsStorage {
                 path.to_string_lossy()
             )));
         }
+        */
 
         let mut offset = 0;
 
@@ -419,6 +422,27 @@ impl ChunkStorage for FsStorage {
 
         let hash_tree = self.insert(file)?;
         let item = Item::new(name, path, revision, description, &hash_tree);
+        tracing::debug!("New item: {item}");
+
+        Some(item)
+    }
+
+    fn build_item(
+        &self,
+        name: ItemName,
+        path: PathBuf,
+        revision: u32,
+        description: Option<String>,
+        root: Arc<StoredChunkRef>,
+    ) -> Option<Item>
+    where
+        Self: Sized,
+    {
+        tracing::debug!("Create item {name} at {path:?}");
+        self.pre_allocate(&path, &root.flatten_with_sizes()).ok()?;
+        tracing::info!("Preallocated on disk {:?}", path);
+
+        let item = Item::new(name, path, revision, description, &root);
         tracing::debug!("New item: {item}");
 
         Some(item)
