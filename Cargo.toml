@@ -15,6 +15,7 @@ pedantic = { level = "warn", priority = 0 }
 missing_errors_doc = { level = "allow", priority = 1 }
 
 [workspace.dependencies]
+http = { version = "*", default-flags = false }
 tonic = "0.12"
 tonic-build = "0.12"
 prost = "0.13"

@@ -19,12 +19,13 @@ message SerializedTree { bytes bitcode_hashtree = 1; }
 
 message Acknowledge { EnumAcknowledge ack = 1; }
 
-message ClientKeepAlive { bytes uuid = 1; }
+message ClientKeepAlive {}
 
 message ServerMetadata {
-  bytes serialized = 1; // yet to be defined
+  bytes serialized = 1;    // yet to be defined
   optional bytes uuid = 2; // Returned only on client registration
 }
+
 message ClientRegister {
   string name = 1;
   string version = 2;

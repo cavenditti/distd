@@ -60,7 +60,8 @@ Most important part missing is the "chunk-adapter" to make chunking content-awar
 - [x] Replace some Option with Result to have better visibility on errors (in progress), mostly in chunk storage
 - [x] Logging
 - [x] Minimal client (very minimal :)
-- [ ] Server sessions
+- [ ] Ephemeral token for client auth
+- [ ] Server and Client persistence (client uuid, server registered clients and items, etc.)
 - [ ] Config
 - [ ] Evaluate whether to assign a 64-bit uid to each hash to reduce network overhead or not
 

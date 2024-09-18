@@ -241,7 +241,6 @@ pub mod cli {
         tracing::debug!("Running \"{cmd}\" {cmd_args:?}");
 
         let settings = Settings::new("ClientSettings")?;
-
         tracing::debug!("Settings: {settings:?}");
 
         let Ok(storage_root) = PathBuf::from_str(&settings.fsstorage.root);

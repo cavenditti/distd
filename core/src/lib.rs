@@ -25,8 +25,10 @@ pub mod proto {
     tonic::include_proto!("distd");
 }
 
-pub type Client = proto::distd_client::DistdClient<tonic::transport::Channel>;
-pub type Server = proto::distd_server::DistdServer<tonic::transport::Channel>;
+pub use tonic;
+
+pub type Client<T> = proto::distd_client::DistdClient<T>;
+pub type Server<T> = proto::distd_server::DistdServer<T>;
 
 pub type Request<T> = tonic::Request<T>;
 

@@ -9,6 +9,8 @@ use axum::body::Bytes;
 use distd_core::chunk_storage::ChunkStorage;
 use distd_core::item::{Item, Name as ItemName};
 use distd_core::metadata::Server as ServerMetadata;
+use distd_core::proto::distd_server::DistdServer;
+use distd_core::utils::grpc::uuid_to_metadata;
 use ring::error::KeyRejected;
 use ring::pkcs8::Document;
 use ring::signature::{Ed25519KeyPair, KeyPair};
@@ -16,11 +18,14 @@ use ring::{
     rand,
     signature::{self},
 };
+use tonic::service::interceptor::InterceptedService;
+use tonic::transport::Channel;
 use tracing::span;
 use uuid::Uuid;
 
 use crate::client::{Client, Name as ClientName};
 use crate::error::Server as ServerError;
+use crate::grpc::UuidAuthInterceptor;
 use distd_core::feed::{Feed, Name as FeedName};
 use distd_core::hash::hash as do_hash;
 use distd_core::version::Version;
@@ -62,12 +67,16 @@ where
 {
     key_pair: Arc<Ed25519KeyPair>, // needs server restart to be changed
     uuid_nonce: String,            // needs server restart to be changed
-    // global server metadata
+
+    /// global server metadata
     pub metadata: Arc<RwLock<InternalMetadata>>,
-    // A storage implementing ChunkStorage, basically a key-value database of some sort
+    /// A storage implementing ChunkStorage, basically a key-value database of some sort
     pub storage: T,
-    // Client map
+    /// Client map
     pub clients: Arc<RwLock<BTreeMap<Uuid, Client>>>,
+
+    /// gRPC interceptor for uuids check
+    pub uuid_interceptor: UuidAuthInterceptor,
 }
 
 impl<T> Default for Server<T>
@@ -90,6 +99,7 @@ where
             metadata: Arc::new(RwLock::new(InternalMetadata::default())),
             clients: Arc::new(RwLock::new(BTreeMap::<Uuid, Client>::new())),
             storage: T::default(),
+            uuid_interceptor: UuidAuthInterceptor::default(),
         }
     }
 }
@@ -108,8 +118,7 @@ where
             key_pair: Arc::new(key_pair),
             uuid_nonce: blake3::hash(pkcs8_bytes.as_ref()).to_string(),
             metadata: Arc::new(RwLock::new(metadata)),
-            clients: Arc::new(RwLock::new(BTreeMap::<Uuid, Client>::new())), // TODO save and reload from disk
-            storage: T::default(),
+            ..Default::default()
         })
     }
 
@@ -140,6 +149,14 @@ where
             version,
             last_heartbeat: SystemTime::now(),
         };
+
+        // Add uuid to valid list in interceptor
+        self.uuid_interceptor
+            .uuids
+            .write()
+            .unwrap()
+            .insert(uuid_to_metadata(&uuid));
+
         self.clients
             .write()
             .expect("Poisoned Lock")

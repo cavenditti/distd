@@ -1,7 +1,9 @@
 use std::str::Utf8Error;
 
 use config::ConfigError;
-use distd_core::{chunks::HashTreeNodeTypeError, GrpcError, TransportError};
+use distd_core::{
+    chunks::HashTreeNodeTypeError, error::InvalidParameter, GrpcError, TransportError,
+};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -50,15 +52,6 @@ pub enum ServerRequest {
 
     #[error("Invalid format for provided server public key")]
     BadPubKey,
-}
-
-#[derive(Error, Debug)]
-pub enum InvalidParameter {
-    #[error("Invalid BLAKE3 hash")]
-    Hash(#[from] blake3::HexError),
-
-    #[error("Invalid parameter: expected {expected}, got \"{got}\"")]
-    Generic { expected: String, got: String },
 }
 
 #[derive(Error, Debug)]

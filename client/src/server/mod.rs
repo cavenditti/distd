@@ -1,5 +1,5 @@
 //use std::{net::SocketAddr
-use crate::error::{InvalidParameter, ServerRequest};
+use crate::{error::ServerRequest, grpc::DistdGrpcClient};
 
 use blake3::Hash;
 use std::{fmt::Debug, str::FromStr, sync::Arc, time::Duration};
@@ -10,7 +10,13 @@ use tokio::{sync::RwLock, time::Instant};
 //use ring::agreement::PublicKey;
 
 use distd_core::{
-    chunks::OwnedHashTreeNode, metadata::Server as ServerMetadata, proto::Hashes, version::VERSION,
+    chunks::OwnedHashTreeNode,
+    error::InvalidParameter,
+    metadata::Server as ServerMetadata,
+    proto::{distd_client::DistdClient, Hashes},
+    tonic::{service::interceptor::InterceptedService, transport::Channel},
+    utils::grpc::uuid_to_metadata,
+    version::VERSION,
     Request,
 };
 
@@ -24,7 +30,7 @@ struct SharedServer {
     pub last_update: Instant,
 
     /// client for gRPC requests to server
-    pub grpc_client: distd_core::Client,
+    pub grpc_client: distd_core::Client<InterceptedService<Channel, DistdGrpcClient>>,
 }
 
 /// Server representation used by clients
@@ -41,7 +47,10 @@ pub struct Server {
     pub pub_key: [u8; 32], // TODO Check this
 
     /// Client Uuid assigned to client from server
-    client_uid: Option<Uuid>,
+    client_uuid: Option<Uuid>,
+
+    /// Client name
+    client_name: String,
 
     /// Shared data
     shared: Arc<RwLock<SharedServer>>,
@@ -51,6 +60,105 @@ pub struct Server {
 }
 
 impl Server {
+    /// Create a new server instance
+    ///
+    /// # Arguments
+    /// * `url` - server url
+    /// * `pub_key` - client public key, TODO
+    /// * `client_name` - client name
+    /// * `timeout` - timeout for server fetches, TODO
+    ///
+    /// # Returns
+    /// A new server instance
+    ///
+    /// # Errors
+    /// * `ServerRequest::BadPubKey` - if the public key is invalid
+    /// * `ServerRequest::Request` - if the request fails
+    /// * `ServerRequest::Utf8` - if the response is not valid utf8
+    /// * `ServerRequest::Uuid` - if the response is not a valid uuid
+    ///
+    /// # Panics
+    /// * If the url does not have a scheme or authority
+    pub async fn new(
+        url: &str,
+        //pub_key: &PublicKey,
+        client_name: &str,
+        pub_key: &[u8; 32],
+    ) -> Result<Self, ServerRequest> {
+        let grpc_client = Self::make_grpc_client(url, &Uuid::nil()).await?;
+        tracing::debug!("Connected to server");
+
+        let timeout = Duration::new(5, 0); // TODO make this configurable
+
+        let mut server = Self {
+            pub_key: pub_key
+                .as_ref()
+                .try_into()
+                .map_err(|_| ServerRequest::BadPubKey)?,
+            url: url.to_string(),
+            client_uuid: None,
+            client_name: client_name.to_string(),
+            shared: Arc::new(RwLock::new(SharedServer {
+                metadata: ServerMetadata::default(),
+                grpc_client,
+                last_update: Instant::now(),
+            })),
+            timeout,
+        };
+        server.register().await?;
+        server.fetch().await?;
+
+        Ok(server)
+    }
+
+    fn uuid(&self) -> Uuid {
+        self.client_uuid.unwrap_or(Uuid::nil())
+    }
+
+    async fn make_grpc_client(
+        url: &str,
+        uuid: &Uuid,
+    ) -> Result<DistdClient<InterceptedService<Channel, DistdGrpcClient>>, ServerRequest> {
+        tracing::debug!("Connecting to server at {url}");
+        let grpc_channel = distd_core::tonic::transport::Channel::from_shared(url.to_string())
+            .map_err(InvalidParameter::InvalidUri)?
+            .connect()
+            .await?;
+        Ok(distd_core::Client::with_interceptor(
+            grpc_channel,
+            DistdGrpcClient {
+                uuid: uuid_to_metadata(&uuid),
+            },
+        ))
+    }
+
+    /// Register a new client
+    pub async fn register(&mut self) -> Result<Uuid, ServerRequest> {
+        let mut shared = self.shared.write().await;
+
+        tracing::trace!("Starting `Register` request");
+        let res = shared
+            .grpc_client
+            .register(Request::new(distd_core::proto::ClientRegister {
+                name: self.client_name.to_string(),
+                version: VERSION.to_string(),
+            }))
+            .await?
+            .into_inner();
+        tracing::trace!("Parsed `Register` response");
+
+        let uuid = res.uuid.ok_or(ServerRequest::MissingUuid)?;
+        let uuid: [u8; 16] = uuid.try_into().map_err(|_| ServerRequest::BadUuid)?;
+        let uuid = Uuid::from_bytes(uuid);
+        tracing::info!("Got uuid '{uuid:?}' from server");
+
+        // Update client_uuid and create a new gRPC connection setting it in the metadata
+        self.client_uuid = Some(uuid);
+        shared.grpc_client = Self::make_grpc_client(&self.url, &self.uuid()).await?;
+
+        Ok(uuid)
+    }
+
     /// Get the server metadata
     pub async fn metadata(&self) -> ServerMetadata {
         self.shared.read().await.metadata.clone()
@@ -63,18 +171,19 @@ impl Server {
 
     /// Fetch metadata from server
     async fn fetch(&self) -> Result<(), ServerRequest> {
+        tracing::trace!("Starting `Fetch` request");
+
         let mut shared = self.shared.write().await;
 
-        assert!(self.client_uid.is_some());
+        assert!(self.client_uuid.is_some());
 
         //distd_core::AcknowledgeRequest::new(distd_core::proto::EnumAcknowledge::AckOk);
         let res = shared
             .grpc_client
-            .fetch(Request::new(distd_core::proto::ClientKeepAlive {
-                uuid: self.client_uid.unwrap().into(),
-            }))
+            .fetch(Request::new(distd_core::proto::ClientKeepAlive {}))
             .await?
             .into_inner();
+        tracing::trace!("Parsed `Fetch` response");
 
         let new_metadata = bitcode::deserialize(&res.serialized)?;
         shared.last_update = Instant::now();
@@ -128,7 +237,7 @@ impl Server {
             tokio::time::sleep(self.timeout).await;
             if self.fetch().await.is_err() {
                 // try to re-establish connection to server
-                if let Ok(client) = distd_core::Client::connect(self.url.clone()).await {
+                if let Ok(client) = Self::make_grpc_client(&self.url, &self.uuid()).await {
                     tracing::info!("Connected to server");
                     self.shared.write().await.grpc_client = client;
                 } else {
@@ -139,78 +248,5 @@ impl Server {
                 }
             }
         }
-    }
-
-    /// Create a new server instance
-    ///
-    /// # Arguments
-    /// * `url` - server url
-    /// * `pub_key` - client public key, TODO
-    /// * `client_name` - client name
-    /// * `timeout` - timeout for server fetches, TODO
-    ///
-    /// # Returns
-    /// A new server instance
-    ///
-    /// # Errors
-    /// * `ServerRequest::BadPubKey` - if the public key is invalid
-    /// * `ServerRequest::Request` - if the request fails
-    /// * `ServerRequest::Utf8` - if the response is not valid utf8
-    /// * `ServerRequest::Uuid` - if the response is not a valid uuid
-    ///
-    /// # Panics
-    /// * If the url does not have a scheme or authority
-    pub async fn new(
-        url: &str,
-        //pub_key: &PublicKey,
-        client_name: &str,
-        pub_key: &[u8; 32],
-    ) -> Result<Self, ServerRequest> {
-        tracing::debug!("Connecting to server at {url}");
-        let grpc_client = distd_core::Client::connect(url.to_string()).await?;
-        let timeout = Duration::new(5, 0); // TODO make this configurable
-
-        let mut server = Self {
-            pub_key: pub_key
-                .as_ref()
-                .try_into()
-                .map_err(|_| ServerRequest::BadPubKey)?,
-            url: url.to_string(),
-            client_uid: None,
-            shared: Arc::new(RwLock::new(SharedServer {
-                metadata: ServerMetadata::default(),
-                grpc_client,
-                last_update: Instant::now(),
-            })),
-            timeout,
-        };
-        server.register(client_name).await?;
-        server.fetch().await?;
-
-        Ok(server)
-    }
-
-    /// Register a new client
-    pub async fn register(&mut self, client_name: &str) -> Result<Uuid, ServerRequest> {
-        let mut shared = self.shared.write().await;
-
-        tracing::trace!("Starting `Register` response");
-        let res = shared
-            .grpc_client
-            .register(Request::new(distd_core::proto::ClientRegister {
-                name: client_name.to_string(),
-                version: VERSION.to_string(),
-            }))
-            .await?
-            .into_inner();
-        tracing::trace!("Parsed `Register` response");
-
-        let uuid = res.uuid.ok_or(ServerRequest::MissingUuid)?;
-        let uuid: [u8; 16] = uuid.try_into().map_err(|_| ServerRequest::BadUuid)?;
-        let uid = Uuid::from_bytes(uuid);
-        tracing::info!("Got uuid '{uid:?}' from server");
-        self.client_uid = Some(uid);
-
-        Ok(uid)
     }
 }

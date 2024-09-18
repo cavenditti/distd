@@ -1,18 +1,69 @@
+use std::borrow::Borrow;
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::str::FromStr;
+use std::sync::{Arc, RwLock};
 
 use distd_core::chunk_storage::ChunkStorage;
-use distd_core::proto::{EnumAcknowledge, ItemRequest, SerializedTree};
+use distd_core::proto::{self, EnumAcknowledge, ItemRequest, SerializedTree};
+use distd_core::utils::grpc::metadata_to_uuid;
 use distd_core::utils::serde::BitcodeSerializable;
 use distd_core::version::Version;
+use tonic::metadata::MetadataValue;
+use tonic::service::Interceptor;
 use tonic::{Code, Request, Response, Status};
 
 use distd_core::metadata::Server as ServerMetadataRepr;
 use distd_core::proto::{
     distd_server::Distd, Acknowledge, ClientKeepAlive, ClientRegister, Hashes, ServerMetadata,
 };
+use uuid::Uuid;
 
+use crate::error::Server as ServerError;
 use crate::Server;
+
+#[derive(Clone)]
+struct ClientUuidExtension {
+    pub uuid: Uuid,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct UuidAuthInterceptor {
+    pub uuids: Arc<RwLock<HashSet<MetadataValue<distd_core::tonic::metadata::Binary>>>>,
+}
+
+impl Interceptor for UuidAuthInterceptor {
+    fn call(&mut self, mut request: tonic::Request<()>) -> Result<tonic::Request<()>, Status> {
+        let uuid: MetadataValue<tonic::metadata::Binary>;
+        {
+            uuid = match request.borrow().metadata().get_bin("x-uuid-bin") {
+                Some(uuid) if self.uuids.read().unwrap().contains(uuid) => Ok(uuid),
+                _ => Err(Status::unauthenticated("Unauthenticated")),
+            }?
+            .clone();
+        }
+
+        request.extensions_mut().insert(ClientUuidExtension {
+            uuid: metadata_to_uuid(&uuid)
+                //.map_err(|_| Status::unauthenticated("Unauthenticated"))?,
+                .map_err(|_| Status::unauthenticated("Invalid metadata"))?,
+        });
+
+        Ok(request)
+    }
+}
+
+impl<T> Server<T>
+where
+    T: ChunkStorage + Sync + Send + Clone + Default + Debug + 'static,
+{
+    pub async fn make_grcp_service(self) -> Result<tonic::transport::server::Router, ServerError> {
+        let interceptor = self.uuid_interceptor.clone();
+        let svc = proto::distd_server::DistdServer::with_interceptor(self, interceptor);
+
+        Ok(tonic::transport::Server::builder().add_service(svc))
+    }
+}
 
 #[tonic::async_trait]
 impl<T> Distd for Server<T>

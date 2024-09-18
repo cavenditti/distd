@@ -10,6 +10,7 @@ documentation.workspace = true
 workspace = true
 
 [dependencies]
+http = { workspace = true }
 tokio = { workspace = true }
 
 thiserror = { workspace = true }
