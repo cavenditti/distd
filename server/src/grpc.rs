@@ -5,6 +5,7 @@ use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 
 use distd_core::chunk_storage::ChunkStorage;
+use distd_core::hash::Hash;
 use distd_core::proto::{self, EnumAcknowledge, ItemRequest, SerializedTree};
 use distd_core::utils::grpc::metadata_to_uuid;
 use distd_core::utils::serde::BitcodeSerializable;
@@ -118,26 +119,26 @@ where
             .item_root
             .try_into()
             .map_err(|_| Status::new(Code::InvalidArgument, "Bad BLAKE3 hash"))?;
-        let hash = blake3::Hash::from_bytes(hash);
+        let hash = Hash::from_bytes(hash);
         tracing::debug!("Transfer {hash}");
 
         let from = inner.hashes.unwrap_or_default();
-        let from: Result<Vec<[u8; 32]>, Status> = from
+        let from = from
             .hashes
             .into_iter()
-            .map(|v| {
+            .flat_map(|v| {
                 v.try_into()
                     .map_err(|_| Status::new(Code::InvalidArgument, "Bad BLAKE3 hash"))
             })
-            .collect();
-        let from: Vec<blake3::Hash> = from?.into_iter().map(blake3::Hash::from_bytes).collect();
-        tracing::trace!("Client signals it has already {from:?}");
+            .map(Hash::from_bytes);
+
+        let from: Vec<Hash> = from.collect();
 
         let tree_diff = self
             .storage
             .diff_tree(&hash, &from)
             .ok_or(Status::new(Code::NotFound, "tree not found"))
-            .inspect(|hs| tracing::debug!("Transferring chunks: {hs}"))
+            .inspect(|hs| tracing::trace!("Transferring chunks: {hs}"))
             .inspect_err(|_| tracing::warn!("Cannot find hash {hash}"))?;
 
         let bitcode_hashtree: Vec<u8> = bitcode::serialize(&tree_diff)

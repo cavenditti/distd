@@ -14,7 +14,7 @@ tonic = { workspace = true }
 prost = { workspace = true }
 tokio = { workspace = true }
 
-axum = { version = "0.7.5", features = ["json", "multipart"] }
+axum = { version = "0.7.5", features = ["json", "multipart", "http2"] }
 #axum-extra = { version = "0.9.3", features = ["query"] }
 tower-http = { version = "0.5.2", features = ["trace"] }
 

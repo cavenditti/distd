@@ -1,7 +1,6 @@
 //use std::{net::SocketAddr
 use crate::{error::ServerRequest, grpc::DistdGrpcClient};
 
-use blake3::Hash;
 use std::{fmt::Debug, str::FromStr, sync::Arc, time::Duration};
 use uuid::Uuid;
 
@@ -12,6 +11,7 @@ use tokio::{sync::RwLock, time::Instant};
 use distd_core::{
     chunks::OwnedHashTreeNode,
     error::InvalidParameter,
+    hash::Hash,
     metadata::Server as ServerMetadata,
     proto::{distd_client::DistdClient, Hashes},
     tonic::{service::interceptor::InterceptedService, transport::Channel},
@@ -206,7 +206,7 @@ impl Server {
         tracing::trace!("Preparing transfer/diff request: target: {hash}, from:{from:?}");
         let mut shared = self.shared.write().await;
 
-        let item_root = blake3::Hash::from_str(hash)
+        let item_root = Hash::from_str(hash)
             .map_err(InvalidParameter::Hash)?
             .as_bytes()
             .to_vec();

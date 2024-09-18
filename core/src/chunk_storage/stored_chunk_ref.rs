@@ -1,8 +1,8 @@
 use std::{collections::HashSet, sync::Arc};
 
-use blake3::Hash;
 use serde::ser::{Serialize, SerializeStructVariant};
 
+use crate::hash::Hash;
 use crate::chunks::{ChunkInfo, HashTreeNode, OwnedHashTreeNode};
 
 /// Arc reference to a raw byte chunk
@@ -110,6 +110,7 @@ impl TryFrom<OwnedHashTreeNode> for StoredChunkRef {
 
 impl StoredChunkRef {
     #[must_use]
+    #[inline(always)]
     pub fn hash(&self) -> &Hash {
         match self {
             Self::Stored { hash, .. } | Self::Parent { hash, .. } => hash,
@@ -118,6 +119,7 @@ impl StoredChunkRef {
 
     /// Compute sum size in bytes of all descending chunks
     #[must_use]
+    #[inline(always)]
     pub fn size(&self) -> usize {
         match self {
             Self::Stored { data, .. } => data.len(),
@@ -285,12 +287,6 @@ impl StoredChunkRef {
     /// Get diff sub-tree: required tree to reconstruct current node if one has the `hashes`
     #[must_use]
     pub fn find_diff(&self, hashes: &[Hash]) -> OwnedHashTreeNode {
-        if hashes.contains(self.hash()) {
-            return OwnedHashTreeNode::Skipped {
-                hash: *self.hash(),
-                size: self.size() as u32,
-            };
-        }
         match self {
             Self::Parent { hash, left, right } => {
                 // Go down and recursively find diffs
@@ -312,6 +308,10 @@ impl StoredChunkRef {
                     },
                 }
             }
+            Self::Stored { hash, .. } if hashes.contains(hash) => OwnedHashTreeNode::Skipped {
+                hash: *self.hash(),
+                size: self.size() as u32,
+            },
             node @ Self::Stored { .. } => OwnedHashTreeNode::from(node.clone()),
         }
     }

@@ -1,14 +1,14 @@
 use std::{fmt::Debug, net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc};
 
 use bitcode;
-use blake3::Hash;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use axum::{
     body::Body,
     extract::{
-        connect_info::IntoMakeServiceWithConnectInfo, ConnectInfo, Multipart, Path, Query, State,
+        connect_info::IntoMakeServiceWithConnectInfo, ConnectInfo, DefaultBodyLimit, Multipart,
+        Path, Query, State,
     },
     http::StatusCode,
     response::IntoResponse,
@@ -21,12 +21,15 @@ use tower_http::{
     LatencyUnit,
 };
 
-use distd_core::chunk_storage::{ChunkStorage, StoredChunkRef};
-use distd_core::feed::{Feed, Name as FeedName};
-use distd_core::utils::serde::empty_string_as_none;
-use distd_core::utils::serde::BitcodeSerializable;
-use distd_core::version::Version;
-use distd_core::{chunks::OwnedHashTreeNode, metadata::Server as ServerMetadata};
+use distd_core::{
+    chunk_storage::{ChunkStorage, StoredChunkRef},
+    chunks::OwnedHashTreeNode,
+    feed::{Feed, Name as FeedName},
+    hash::{Hash, HexError},
+    metadata::Server as ServerMetadata,
+    utils::serde::{empty_string_as_none, BitcodeSerializable},
+    version::Version,
+};
 
 use crate::error::Server as ServerError;
 use crate::Client;
@@ -222,7 +225,11 @@ where
             item_data.name,
             item_data.path,
             item_data.description,
-            field.bytes().await.map_err(|_| StatusCode::BAD_REQUEST)?,
+            field
+                .bytes()
+                .await
+                .inspect_err(|e| tracing::warn!("Cannot extract bytes from item field: {e}"))
+                .map_err(|_| StatusCode::BAD_REQUEST)?,
         );
         let res = res.map(|x| x.metadata);
         tracing::debug!("{:?}", res);
@@ -256,7 +263,7 @@ where
 /// This is a simple wrapper around `ChunkStorage::get`
 ///
 /// # Errors
-/// Returns `StatusCode::BAD_REQUEST` if the hash is not a valid `blake3::Hash`
+/// Returns `StatusCode::BAD_REQUEST` if the hash is not a valid `Hash`
 /// Returns `StatusCode::NOT_FOUND` if the hash is not found in the storage
 async fn get_chunk<T>(
     Path(hash): Path<String>,
@@ -301,7 +308,7 @@ where
     let from = match from.as_str() {
         "" => vec![],
         from => {
-            let from: Result<Vec<Hash>, blake3::HexError> =
+            let from: Result<Vec<Hash>, HexError> =
                 from.split(',').map(Hash::from_str).collect();
             from.inspect_err(|e| tracing::error!("Cannot decode hash {}", e))
                 .map_err(|_| StatusCode::BAD_REQUEST)?
@@ -331,7 +338,7 @@ where
 /// The endpoint accepts a comma-separated list of hash
 ///
 /// # Errors
-/// Returns `StatusCode::BAD_REQUEST` if some hash is not a valid `blake3::Hash`
+/// Returns `StatusCode::BAD_REQUEST` if some hash is not a valid `Hash`
 /// Returns `StatusCode::NOT_FOUND` if some hash is not found in the storage
 async fn get_transfer<T>(
     Path(hashes): Path<String>,
@@ -341,7 +348,7 @@ where
     T: ChunkStorage + Sync + Send + Clone + Default,
 {
     // Manually splitting at ',' is actually enough for this case
-    let hashes: Result<Vec<Hash>, blake3::HexError> =
+    let hashes: Result<Vec<Hash>, HexError> =
         hashes.split(',').map(Hash::from_str).collect();
 
     let hashes: Result<Vec<Arc<StoredChunkRef>>, StatusCode> = hashes
@@ -397,6 +404,7 @@ where
         .route("/transfer/diff/:hash", get(get_transfer_diff))
         .route("/transfer/whole/:hashes", get(get_transfer))
         .with_state(Arc::new(server))
+        .layer(DefaultBodyLimit::max(1024 * 1024 * 1024 * 48))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(DefaultMakeSpan::new().include_headers(true))

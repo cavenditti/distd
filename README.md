@@ -35,7 +35,7 @@ the (eventually private storage repo) and keep all items deduplicated.
 I started this as a mean to get better at Rust programming, some code is somewhat convoluted and not everything is
 ironed out and properly tested.
 
-The are some serious limitations and missing functionalities at the moment.
+Currently the are some serious limitations, missing functionalities and performance is abysmal.
 Most important part missing is the "chunk-adapter" to make chunking content-aware
 
 

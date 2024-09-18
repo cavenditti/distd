@@ -19,7 +19,7 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_target(false)
         .compact()
-        .with_max_level(tracing::Level::TRACE)
+        .with_max_level(tracing::Level::DEBUG)
         .init();
 
     tracing::info!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));

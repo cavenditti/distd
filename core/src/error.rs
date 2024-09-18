@@ -19,7 +19,7 @@ pub enum Error {
 #[derive(Error, Debug)]
 pub enum InvalidParameter {
     #[error("Invalid BLAKE3 hash")]
-    Hash(#[from] blake3::HexError),
+    Hash(#[from] crate::hash::HexError),
 
     #[error("Invalid parameter: expected {expected}, got \"{got}\"")]
     Generic { expected: String, got: String },

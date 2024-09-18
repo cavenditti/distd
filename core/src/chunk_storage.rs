@@ -1,10 +1,10 @@
 use std::fmt::Write;
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
-use blake3::Hash;
 use bytes::Bytes;
 pub use stored_chunk_ref::StoredChunkRef;
 
+use crate::hash::{hash, Hash};
 use crate::{
     chunks::{OwnedHashTreeNode, CHUNK_SIZE},
     hash::merge_hashes,
@@ -45,7 +45,7 @@ pub trait ChunkStorage {
     //fn drop(hash: Hash); // TODO
 
     fn insert_chunk(&self, chunk: &[u8]) -> Option<Arc<StoredChunkRef>> {
-        let hash = blake3::hash(chunk);
+        let hash = hash(chunk);
         tracing::trace!("Insert chunk {hash}, {} bytes", chunk.len());
 
         self._insert_chunk(hash, chunk)

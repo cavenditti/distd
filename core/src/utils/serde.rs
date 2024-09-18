@@ -1,5 +1,5 @@
 //! Various serde-related utils
-use blake3::Hash;
+use crate::hash::Hash;
 use serde::{de, Deserialize, Deserializer, Serialize};
 use std::{fmt, str::FromStr};
 
@@ -42,10 +42,10 @@ pub mod hashes {
     {
         if deserializer.is_human_readable() {
             let s: String = Deserialize::deserialize(deserializer)?;
-            blake3::Hash::from_str(&s).map_err(|e| de::Error::custom(e.to_string()))
+            Hash::from_str(&s).map_err(|e| de::Error::custom(e.to_string()))
         } else {
             let s: [u8; 32] = Deserialize::deserialize(deserializer)?;
-            Ok(blake3::Hash::from_bytes(s))
+            Ok(Hash::from_bytes(s))
         }
     }
 
@@ -73,12 +73,12 @@ pub mod hashes {
         if deserializer.is_human_readable() {
             let s: Vec<String> = Deserialize::deserialize(deserializer)?;
             Ok(s.into_iter()
-                .flat_map(|e| blake3::Hash::from_str(&e))
+                .flat_map(|e| Hash::from_str(&e))
                 .collect::<Vec<Hash>>())
         } else {
             let s: Vec<[u8; 32]> = Deserialize::deserialize(deserializer)?;
             Ok(s.into_iter()
-                .map(blake3::Hash::from_bytes)
+                .map(Hash::from_bytes)
                 .collect::<Vec<Hash>>())
         }
     }

@@ -1,8 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use blake3::Hash;
-
+use crate::hash::Hash;
 use crate::chunk_storage::ChunkStorage;
 
 use super::StoredChunkRef;

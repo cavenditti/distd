@@ -169,7 +169,7 @@ where
     T: ChunkStorage + Clone + Send + 'static,
 {
     async fn update(&mut self, new: &ItemMetadata) -> Result<Item, ClientError> {
-        tracing::debug!("Updating item '{}'", new.name);
+        tracing::debug!("Updating item '{}' @ {}", new.name, new.path.to_string_lossy());
         let from = self.storage.chunks(); // FIXME this could get very very large
         let new_data = self
             .server
@@ -229,7 +229,7 @@ pub mod cli {
         tracing_subscriber::fmt()
             .with_target(false)
             .compact()
-            .with_max_level(tracing::Level::TRACE)
+            .with_max_level(tracing::Level::INFO)
             .init();
 
         tracing::info!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));

@@ -2,10 +2,10 @@
 
 use std::{collections::HashSet, fmt::Display};
 
-use blake3::Hash;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::hash::Hash;
 use crate::utils::serde::hashes::{deserialize_hash, serialize_hash};
 
 /// Chunk size in bytes

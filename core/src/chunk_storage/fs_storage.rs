@@ -7,12 +7,11 @@ use std::{
     sync::{atomic::AtomicBool, Arc, RwLock},
 };
 
-use blake3::Hash;
-
 use crate::{
     chunks::{ChunkInfo, HashTreeNode, OwnedHashTreeNode, CHUNK_SIZE},
     error::Error,
     hash::hash as do_hash,
+    hash::Hash,
     item::{Item, Name as ItemName},
 };
 
