@@ -123,16 +123,15 @@ where
         tracing::debug!("Transfer {hash}");
 
         let from = inner.hashes.unwrap_or_default();
-        let from = from
+        let from: Vec<Hash> = from
             .hashes
             .into_iter()
             .flat_map(|v| {
                 v.try_into()
                     .map_err(|_| Status::new(Code::InvalidArgument, "Bad BLAKE3 hash"))
             })
-            .map(Hash::from_bytes);
-
-        let from: Vec<Hash> = from.collect();
+            .map(Hash::from_bytes)
+            .collect();
 
         let tree_diff = self
             .storage

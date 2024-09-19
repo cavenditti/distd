@@ -25,11 +25,14 @@ pub enum InvalidParameter {
     Generic { expected: String, got: String },
 
     #[error("Invalid URI")]
-    InvalidUri(#[from] http::uri::InvalidUri),
+    Uri(#[from] http::uri::InvalidUri),
 
     #[error("Invalid metadata, possibly a bug in code")]
-    InvalidMetadata(#[from] InvalidMetadataValue),
+    Metadata(#[from] InvalidMetadataValue),
 
     #[error("Invalid binary metadata, possibly a bug in code")]
-    InvalidMetadataBytes(#[from] InvalidMetadataValueBytes),
+    MetadataBytes(#[from] InvalidMetadataValueBytes),
+
+    #[error("Invalid bitcode")]
+    Bitcode(#[from] bitcode::Error),
 }

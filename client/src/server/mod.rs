@@ -13,8 +13,8 @@ use distd_core::{
     error::InvalidParameter,
     hash::Hash,
     metadata::Server as ServerMetadata,
-    proto::{distd_client::DistdClient, Hashes},
-    tonic::{service::interceptor::InterceptedService, transport::Channel},
+    proto::{distd_client::DistdClient, Hashes, SerializedTree},
+    tonic::{service::interceptor::InterceptedService, transport::Channel, Streaming},
     utils::grpc::uuid_to_metadata,
     version::VERSION,
     Request,
@@ -121,7 +121,7 @@ impl Server {
     ) -> Result<DistdClient<InterceptedService<Channel, DistdGrpcClient>>, ServerRequest> {
         tracing::debug!("Connecting to server at {url}");
         let grpc_channel = distd_core::tonic::transport::Channel::from_shared(url.to_string())
-            .map_err(InvalidParameter::InvalidUri)?
+            .map_err(InvalidParameter::Uri)?
             .connect()
             .await?;
         Ok(distd_core::Client::with_interceptor(
@@ -202,7 +202,7 @@ impl Server {
         &self,
         hash: &str,
         from: Vec<Hash>,
-    ) -> Result<OwnedHashTreeNode, ServerRequest> {
+    ) -> Result<Streaming<SerializedTree>, ServerRequest> {
         tracing::trace!("Preparing transfer/diff request: target: {hash}, from:{from:?}");
         let mut shared = self.shared.write().await;
 
@@ -217,18 +217,14 @@ impl Server {
             .map(|x| x.as_bytes().to_vec())
             .collect::<Vec<Vec<u8>>>();
 
-        let res = shared
+        Ok(shared
             .grpc_client
             .tree_transfer(Request::new(distd_core::proto::ItemRequest {
                 item_root,
                 hashes: Some(Hashes { hashes: from }),
             }))
             .await?
-            .into_inner();
-
-        // try to deserialize ServerMetadata from body
-        let chunks: OwnedHashTreeNode = bitcode::deserialize(&res.bitcode_hashtree)?;
-        Ok(chunks)
+            .into_inner())
     }
 
     /// Fetch metadata from server in a loop

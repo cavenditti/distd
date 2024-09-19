@@ -6,12 +6,18 @@ use std::{
 
 use tokio::time::sleep;
 
-use crate::{error::Client as ClientError, server::Server, settings::Settings};
+use crate::{
+    error::{Client as ClientError, ServerRequest},
+    server::Server,
+    settings::Settings,
+};
 
 use std::{fs::File, io::Read};
 
 use distd_core::{
-    chunk_storage::{fs_storage::FsStorage, ChunkStorage},
+    chunk_storage::{fs_storage::FsStorage, ChunkStorage, StoredChunkRef},
+    chunks::{HashTreeNode, OwnedHashTreeNode},
+    error::InvalidParameter,
     item::Item,
     metadata::Item as ItemMetadata,
 };
@@ -126,30 +132,41 @@ impl Client<FsStorage> {
             buf.clone().into(),
         );
 
-        let from = self.storage.chunks(); // FIXME this could get very very large
+        let from = self.storage.chunks(); // FIXME this could get very very large (optimize by only sending roots of sub-trees)
         tracing::trace!("Signalig to server we've got {from:?}");
 
-        let result = self
+        let mut result = self
             .server
             .transfer_diff(&item_metadata.root.hash.to_string(), from)
             .await?;
 
-        tracing::trace!("Got '{}' from server", result);
+        let mut root: Option<Arc<StoredChunkRef>> = None;
+        while let Some(next_node) = result.message().await.map_err(ServerRequest::Grpc)? {
+            let nodes: Vec<OwnedHashTreeNode> = bitcode::deserialize(&next_node.bitcode_hashtree)
+                .map_err(InvalidParameter::Bitcode)?;
+            tracing::trace!("Received {} nodes from server", nodes.len());
 
-        let n = self
-            .storage
-            .try_fill_in(result)
-            .ok_or(ClientError::TreeReconstruct)?;
-        tracing::trace!("Reconstructed with {} bytes total", n.size());
+            for n in nodes {
+                root = Some(
+                    self.storage
+                        .try_fill_in(n)
+                        .ok_or(ClientError::TreeReconstruct)?,
+                );
+            }
+        }
+
+        let root = root.ok_or(ClientError::TreeReconstruct)?; // FIXME is the right error?
+
+        tracing::trace!("Reconstructed with {} bytes total", root.size());
 
         let new_item = self
             .storage
-            .create_item(
+            .build_item(
                 item_metadata.name.clone(),
                 path,
                 item_metadata.revision,
                 item_metadata.description.clone(),
-                n.clone_data().into(),
+                root,
             )
             .ok_or(ClientError::ItemInsertion(
                 "Cannot insert downloaded file".into(),
@@ -169,7 +186,11 @@ where
     T: ChunkStorage + Clone + Send + 'static,
 {
     async fn update(&mut self, new: &ItemMetadata) -> Result<Item, ClientError> {
-        tracing::debug!("Updating item '{}' @ {}", new.name, new.path.to_string_lossy());
+        tracing::debug!(
+            "Updating item '{}' @ {}",
+            new.name,
+            new.path.to_string_lossy()
+        );
         let from = self.storage.chunks(); // FIXME this could get very very large
         let new_data = self
             .server

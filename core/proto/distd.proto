@@ -5,7 +5,7 @@ service Distd {
   rpc Register(ClientRegister) returns (ServerMetadata);
   rpc Fetch(ClientKeepAlive) returns (ServerMetadata);
   rpc AdvHashes(Hashes) returns (Acknowledge);
-  rpc TreeTransfer(ItemRequest) returns (SerializedTree);
+  rpc TreeTransfer(ItemRequest) returns (stream SerializedTree);
 }
 
 message Hashes { repeated bytes hashes = 1; }
