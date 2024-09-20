@@ -81,8 +81,7 @@ impl ChunkStorage for HashMapStorage {
             .values()
             .map(|x| match &**x {
                 StoredChunkRef::Stored { data, .. } => data.len() as u64,
-                StoredChunkRef::Parent { size, .. } => *size,
-                StoredChunkRef::Skipped { size, .. } => *size,
+                StoredChunkRef::Parent { .. } | StoredChunkRef::Skipped { .. } => 0,
             })
             .sum()
     }
@@ -94,6 +93,7 @@ mod tests {
 
     use bytes::{Bytes, BytesMut};
     use rand::{self, RngCore};
+    use test_log::test;
 
     use crate::{chunks::CHUNK_SIZE, hash::hash};
 
@@ -127,8 +127,8 @@ mod tests {
         let s = HashMapStorage::default();
         let data = Bytes::from_static(&[0u8; SIZE]);
         println!("{:?}", data.len());
+
         let root = s.insert(data).unwrap();
-        //print_tree(&*root.to_owned()).unwrap();
         assert_eq!(CHUNK_SIZE as u64, s.size());
 
         let root_hash = hash(&[0u8; SIZE]);
