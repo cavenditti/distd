@@ -2,7 +2,7 @@ use std::str::Utf8Error;
 
 use config::ConfigError;
 use distd_core::{
-    chunks::HashTreeNodeTypeError, error::InvalidParameter, GrpcError, TransportError,
+    error::InvalidParameter, GrpcError, TransportError,
 };
 use thiserror::Error;
 
@@ -19,9 +19,6 @@ pub enum ServerConnection {
 pub enum ServerRequest {
     #[error("Cannot read response")]
     ReadFromResponse(#[from] std::io::Error),
-
-    #[error("Cannot reconstruct buffer from server response")]
-    ResponseReconstruct(#[from] HashTreeNodeTypeError),
 
     #[error("Cannot reconstruct buffer from server response")]
     ResponseDeserialize(#[from] bitcode::Error),

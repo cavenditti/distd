@@ -15,11 +15,7 @@ use crate::{
 use std::{fs::File, io::Read};
 
 use distd_core::{
-    chunk_storage::{fs_storage::FsStorage, ChunkStorage, StoredChunkRef},
-    chunks::{HashTreeNode, OwnedHashTreeNode},
-    error::InvalidParameter,
-    item::Item,
-    metadata::Item as ItemMetadata,
+    chunk_storage::{fs_storage::FsStorage, ChunkStorage, StoredChunkRef}, error::InvalidParameter, hash::Hash, item::Item, metadata::Item as ItemMetadata
 };
 
 #[derive(Debug)]
@@ -135,27 +131,7 @@ impl Client<FsStorage> {
         let from = self.storage.chunks(); // FIXME this could get very very large (optimize by only sending roots of sub-trees)
         tracing::trace!("Signalig to server we've got {from:?}");
 
-        let mut result = self
-            .server
-            .transfer_diff(&item_metadata.root.hash.to_string(), from)
-            .await?;
-
-        let mut root: Option<Arc<StoredChunkRef>> = None;
-        while let Some(next_node) = result.message().await.map_err(ServerRequest::Grpc)? {
-            let nodes: Vec<OwnedHashTreeNode> = bitcode::deserialize(&next_node.bitcode_hashtree)
-                .map_err(InvalidParameter::Bitcode)?;
-            tracing::trace!("Received {} nodes from server", nodes.len());
-
-            for n in nodes {
-                root = Some(
-                    self.storage
-                        .try_fill_in(n)
-                        .ok_or(ClientError::TreeReconstruct)?,
-                );
-            }
-        }
-
-        let root = root.ok_or(ClientError::TreeReconstruct)?; // FIXME is the right error?
+        let root = self.transfer_diff(&item_metadata.root.hash, &from).await?;
 
         tracing::trace!("Reconstructed with {} bytes total", root.size());
 
@@ -185,23 +161,39 @@ impl<T> Client<T>
 where
     T: ChunkStorage + Clone + Send + 'static,
 {
+    async fn transfer_diff(&self, target: &Hash, from: &[Hash]) -> Result<Arc<StoredChunkRef>, ClientError> {
+        let mut node_stream = self
+            .server
+            .transfer_diff(target, from)
+            .await?;
+
+        let mut n = None; // final node
+        let mut i = 0; // node counter
+        while let Some(node) = node_stream.message().await.map_err(ServerRequest::Grpc)? {
+            let deser =
+                bitcode::deserialize(&node.bitcode_hashtree).map_err(InvalidParameter::Bitcode)?;
+            n = Some(
+                self.storage
+                    .try_fill_in(&deser)
+                    .ok_or(ClientError::TreeReconstruct)?,
+            );
+            i += 1;
+        }
+
+        let n = n.ok_or(ClientError::TreeReconstruct)?;
+        tracing::trace!("Reconstructed {i} nodes with {} bytes total", n.size());
+        Ok(n)
+    }
+
     async fn update(&mut self, new: &ItemMetadata) -> Result<Item, ClientError> {
         tracing::debug!(
             "Updating item '{}' @ {}",
             new.name,
             new.path.to_string_lossy()
         );
-        let from = self.storage.chunks(); // FIXME this could get very very large
-        let new_data = self
-            .server
-            .transfer_diff(&new.root.hash.to_string(), from)
-            .await?;
 
-        let n = self
-            .storage
-            .try_fill_in(new_data)
-            .ok_or(ClientError::TreeReconstruct)?;
-        tracing::trace!("Reconstructed with {} bytes total", n.size());
+        let from = self.storage.chunks(); // FIXME this could get very very large
+        let n = self.transfer_diff(&new.root.hash, &from).await?;
 
         let item = self
             .storage

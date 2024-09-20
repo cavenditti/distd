@@ -1,6 +1,7 @@
 use std::borrow::Borrow;
 use std::collections::HashSet;
 use std::fmt::Debug;
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 
@@ -66,11 +67,17 @@ where
     }
 }
 
+use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
+
+//type ResponseStream = Pin<Box<dyn Stream<Item = Result<EchoResponse, Status>> + Send>>;
+
 #[tonic::async_trait]
 impl<T> Distd for Server<T>
 where
     T: ChunkStorage + Sync + Send + Clone + Default + Debug + 'static,
 {
+    type TreeTransferStream = SerializedTree;
+
     async fn register(
         &self,
         request: Request<ClientRegister>,
@@ -135,10 +142,10 @@ where
 
         let tree_diff = self
             .storage
-            .diff_tree(&hash, &from)
-            .ok_or(Status::new(Code::NotFound, "tree not found"))
-            .inspect(|hs| tracing::trace!("Transferring chunks: {hs}"))
-            .inspect_err(|_| tracing::warn!("Cannot find hash {hash}"))?;
+            .get(&hash)
+            .ok_or(Status::new(Code::NotFound, "tree not found"))?
+            .find_diff(&from)
+            .inspect(|hs| tracing::trace!("Transferring chunks: {hs}"));
 
         let bitcode_hashtree: Vec<u8> = bitcode::serialize(&tree_diff)
             .inspect(|s| tracing::debug!("Serialized size: {}B", s.len()))

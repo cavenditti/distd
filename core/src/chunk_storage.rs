@@ -6,7 +6,7 @@ pub use stored_chunk_ref::StoredChunkRef;
 
 use crate::hash::{hash, Hash};
 use crate::{
-    chunks::{OwnedHashTreeNode, CHUNK_SIZE},
+    chunks::CHUNK_SIZE,
     hash::merge_hashes,
     item::{Item, Name as ItemName},
 };
@@ -40,7 +40,7 @@ pub trait ChunkStorage {
 
     /// Allocated size for all chunks, in bytes
     /// This only counts actual chunks size, excluding any auxiliary structure used by storage backend/adapter
-    fn size(&self) -> usize;
+    fn size(&self) -> u64;
 
     //fn drop(hash: Hash); // TODO
 
@@ -160,23 +160,14 @@ pub trait ChunkStorage {
             .into()
     }
 
-    /// Minimal tree of hashes required to reconstruct `target` using `from`
-    ///
-    /// # Errors
-    /// Returns None if `target` doesn't exist in storage
-    fn diff_tree(&self, target: &Hash, from: &[Hash]) -> Option<OwnedHashTreeNode> {
-        let target_chunk = self.get(target)?;
-        Some(target_chunk.find_diff(from))
-    }
-
     /// Take ownership of an `OwnedHashTreeNode` and try to fill in any `Skipped` nodes
-    fn try_fill_in(&self, tree: OwnedHashTreeNode) -> Option<Arc<StoredChunkRef>> {
-        Some(match tree {
-            OwnedHashTreeNode::Stored { hash, data } => self._insert_chunk(hash, &data)?,
-            OwnedHashTreeNode::Parent { left, right, .. } => {
-                self.link(self.try_fill_in(*left)?, self.try_fill_in(*right)?)?
+    fn try_fill_in(&self, tree: &Arc<StoredChunkRef>) -> Option<Arc<StoredChunkRef>> {
+        Some(match tree.as_ref() {
+            StoredChunkRef::Stored { hash, data } => self._insert_chunk(*hash, &data)?,
+            StoredChunkRef::Parent { left, right, .. } => {
+                self.link(self.try_fill_in(left)?, self.try_fill_in(right)?)?
             }
-            OwnedHashTreeNode::Skipped { hash, .. } => self.get(&hash)?,
+            StoredChunkRef::Skipped { hash, .. } => self.get(&hash)?,
         })
     }
 }

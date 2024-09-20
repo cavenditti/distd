@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::{
-    chunks::{ChunkInfo, HashTreeNode, OwnedHashTreeNode, CHUNK_SIZE},
+    chunks::{ChunkInfo, CHUNK_SIZE},
     error::Error,
     hash::hash as do_hash,
     hash::Hash,
@@ -232,7 +232,7 @@ impl InnerFsStorage {
             .chunks(CHUNK_SIZE)
             .map(|chunk| ChunkInfo {
                 hash: do_hash(chunk),
-                size: chunk.len() as u32,
+                size: chunk.len() as u64,
             })
             .collect::<Vec<ChunkInfo>>();
 
@@ -376,7 +376,7 @@ impl ChunkStorage for FsStorage {
             .map(Arc::new))
     }
 
-    fn size(&self) -> usize {
+    fn size(&self) -> u64 {
         0 // TODO
     }
 
@@ -455,9 +455,16 @@ impl ChunkStorage for FsStorage {
         right: Arc<StoredChunkRef>,
     ) -> Option<Arc<StoredChunkRef>> {
         let mut l = self.write();
-        let res = l
-            .links
-            .try_insert(hash, Arc::new(StoredChunkRef::Parent { hash, left, right }));
+        let size = left.size() + right.size();
+        let res = l.links.try_insert(
+            hash,
+            Arc::new(StoredChunkRef::Parent {
+                hash,
+                left,
+                right,
+                size,
+            }),
+        );
         Some(res.map_or_else(|e| (*e.entry.get()).clone(), |x| (*x).clone()))
     }
 
@@ -509,7 +516,7 @@ mod tests {
         let infile_chunk = InFileChunk {
             info: ChunkInfo {
                 hash,
-                size: SIZE as u32,
+                size: SIZE as u64,
             },
             paths: HashSet::default(),
             populated: Arc::default(),

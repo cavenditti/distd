@@ -1,11 +1,9 @@
 use std::{fmt::Debug, net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc};
 
-use bitcode;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use axum::{
-    body::Body,
     extract::{
         connect_info::IntoMakeServiceWithConnectInfo, ConnectInfo, DefaultBodyLimit, Multipart,
         Path, Query, State,
@@ -22,16 +20,14 @@ use tower_http::{
 };
 
 use distd_core::{
-    chunk_storage::{ChunkStorage, StoredChunkRef},
-    chunks::OwnedHashTreeNode,
+    chunk_storage::ChunkStorage,
     feed::{Feed, Name as FeedName},
-    hash::{Hash, HexError},
+    hash::Hash,
     metadata::Server as ServerMetadata,
-    utils::serde::{empty_string_as_none, BitcodeSerializable},
+    utils::serde::empty_string_as_none,
     version::Version,
 };
 
-use crate::error::Server as ServerError;
 use crate::Client;
 use crate::Server as RawServer;
 
@@ -285,101 +281,13 @@ struct TransferGetObj {
     got: String,
 }
 
-/// Download data associated with an hash-(sub-)trees, differing from the provided hashes
-///
-/// This endpoint is used to download a set of chunks from the server
-/// The server will return a binary bitcode serialized representation of the chunks
-async fn get_transfer_diff<T>(
-    Path(hash): Path<String>,
-    Query(hashes): Query<TransferGetObj>,
-    State(server): State<Server<T>>,
-) -> Result<impl IntoResponse, StatusCode>
-where
-    T: ChunkStorage + Sync + Send + Clone + Default,
-{
-    let from = hashes.got;
-    tracing::debug!("Transfer {hash} from {from:?}");
-
-    let hash = Hash::from_str(hash.as_str())
-        .inspect_err(|e| tracing::error!("Cannot decode hash {}", e))
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
-
-    // handle None `from`
-    let from = match from.as_str() {
-        "" => vec![],
-        from => {
-            let from: Result<Vec<Hash>, HexError> =
-                from.split(',').map(Hash::from_str).collect();
-            from.inspect_err(|e| tracing::error!("Cannot decode hash {}", e))
-                .map_err(|_| StatusCode::BAD_REQUEST)?
-        }
-    };
-    tracing::trace!("Client signals it has already {from:?}");
-
-    let tree_diff = server
-        .storage
-        .diff_tree(&hash, &from)
-        .ok_or(StatusCode::NOT_FOUND)
-        .inspect(|hs| tracing::debug!("Transferring chunks: {hs}"))
-        .inspect_err(|_| tracing::warn!("Cannot find hash {hash}"))?;
-
-    let serialized: Result<Vec<u8>, StatusCode> = bitcode::serialize(&tree_diff)
-        .inspect(|s| tracing::debug!("Serialized size: {}B", s.len()))
-        .inspect_err(|e| tracing::error!("Cannot serialize chunk {}", e))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
-
-    serialized.map(Body::from)
-}
-
-/// Download data associated with one or more hash-(sub-)trees from their root
-///
-/// This endpoint is used to download a set of chunks from the server
-/// The server will return a binary bitcode serialized representation of the chunks
-/// The endpoint accepts a comma-separated list of hash
-///
-/// # Errors
-/// Returns `StatusCode::BAD_REQUEST` if some hash is not a valid `Hash`
-/// Returns `StatusCode::NOT_FOUND` if some hash is not found in the storage
-async fn get_transfer<T>(
-    Path(hashes): Path<String>,
-    State(server): State<Server<T>>,
-) -> Result<impl IntoResponse, StatusCode>
-where
-    T: ChunkStorage + Sync + Send + Clone + Default,
-{
-    // Manually splitting at ',' is actually enough for this case
-    let hashes: Result<Vec<Hash>, HexError> =
-        hashes.split(',').map(Hash::from_str).collect();
-
-    let hashes: Result<Vec<Arc<StoredChunkRef>>, StatusCode> = hashes
-        .inspect_err(|e| tracing::error!("Cannot decode hash {}", e))
-        .map_err(|_| StatusCode::BAD_REQUEST)?
-        .iter()
-        .map(|hash| server.storage.get(hash).ok_or(StatusCode::NOT_FOUND))
-        .collect();
-
-    let chunks: Vec<OwnedHashTreeNode> = hashes?
-        .iter()
-        .map(|x| OwnedHashTreeNode::from((**x).clone()))
-        .collect();
-
-    let serialized: Result<Vec<u8>, StatusCode> = bitcode::serialize(&chunks)
-        .inspect_err(|e| tracing::error!("Cannot serialize chunk {}", e))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
-
-    serialized.map(Body::from)
-}
-
 /// Download data associated with an hash-tree from its root
-async fn get_metadata<T>(State(server): State<Server<T>>) -> Result<impl IntoResponse, StatusCode>
+async fn get_metadata<T>(State(server): State<Server<T>>) -> impl IntoResponse
 where
     T: ChunkStorage + Sync + Send + Clone + Default,
 {
     let metadata = (*server.metadata.read().expect("Poisoned Lock")).clone();
-    ServerMetadata::from(metadata)
-        .to_bitcode()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
-        .map(Body::from)
+    Json(ServerMetadata::from(metadata))
 }
 
 /// Create a new `axum::Router` with all the routes
@@ -399,10 +307,7 @@ where
         .route("/chunks/get/:hash", get(get_chunk))
         .route("/feeds", get(get_feeds))
         .route("/feeds/:feed_name", get(get_one_feed))
-        // 'transfer' routes return binary bitcode serialized bodies
-        .route("/transfer/metadata", get(get_metadata))
-        .route("/transfer/diff/:hash", get(get_transfer_diff))
-        .route("/transfer/whole/:hashes", get(get_transfer))
+        .route("/metadata", get(get_metadata))
         .with_state(Arc::new(server))
         .layer(DefaultBodyLimit::max(1024 * 1024 * 1024 * 48))
         .layer(
