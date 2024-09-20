@@ -4,6 +4,7 @@ use std::fmt::Debug;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use distd_core::chunk_storage::ChunkStorage;
 use distd_core::hash::Hash;
@@ -11,6 +12,7 @@ use distd_core::proto::{self, EnumAcknowledge, ItemRequest, SerializedTree};
 use distd_core::utils::grpc::metadata_to_uuid;
 use distd_core::utils::serde::BitcodeSerializable;
 use distd_core::version::Version;
+use tokio::sync::mpsc;
 use tonic::metadata::MetadataValue;
 use tonic::service::Interceptor;
 use tonic::{Code, Request, Response, Status};
@@ -69,14 +71,14 @@ where
 
 use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
 
-//type ResponseStream = Pin<Box<dyn Stream<Item = Result<EchoResponse, Status>> + Send>>;
+type ResponseStream = Pin<Box<dyn Stream<Item = Result<SerializedTree, Status>> + Send>>;
 
 #[tonic::async_trait]
 impl<T> Distd for Server<T>
 where
     T: ChunkStorage + Sync + Send + Clone + Default + Debug + 'static,
 {
-    type TreeTransferStream = SerializedTree;
+    type TreeTransferStream = ResponseStream;
 
     async fn register(
         &self,
@@ -119,7 +121,7 @@ where
     async fn tree_transfer(
         &self,
         request: Request<ItemRequest>,
-    ) -> Result<Response<SerializedTree>, Status> {
+    ) -> Result<Response<ResponseStream>, Status> {
         let inner = request.into_inner();
 
         let hash: [u8; 32] = inner
@@ -140,18 +142,47 @@ where
             .map(Hash::from_bytes)
             .collect();
 
-        let tree_diff = self
+        let nodes = self
             .storage
             .get(&hash)
             .ok_or(Status::new(Code::NotFound, "tree not found"))?
             .find_diff(&from)
-            .inspect(|hs| tracing::trace!("Transferring chunks: {hs}"));
+            .inspect(|hs| tracing::trace!("Transferring chunks: {hs}"))
+            .map(|n| bitcode::serialize(&n))
+            .map(|n| {
+                n.map(|inner| SerializedTree {
+                    bitcode_hashtree: inner,
+                })
+                .inspect_err(|e| tracing::error!("Cannot serialize chunk {}", e))
+                .map_err(|_| Status::new(Code::Internal, "Cannot serialize"))
+            });
+        //.flatten(); // FIXME this ignores any error, it's unwrapped down here but equally bad
 
-        let bitcode_hashtree: Vec<u8> = bitcode::serialize(&tree_diff)
-            .inspect(|s| tracing::debug!("Serialized size: {}B", s.len()))
-            .inspect_err(|e| tracing::error!("Cannot serialize chunk {}", e))
-            .map_err(|_| Status::new(Code::Internal, "Cannot serialize"))?;
+        let mut stream = Box::pin(tokio_stream::iter(nodes).throttle(Duration::from_millis(200)));
 
-        Ok(Response::new(SerializedTree { bitcode_hashtree }))
+        // spawn and channel are required if you want handle "disconnect" functionality
+        // the `out_stream` will not be polled after client disconnect
+        let (tx, rx) = mpsc::channel(128);
+        tokio::spawn(async move {
+            while let Some(item) = stream.next().await {
+                // FIXME make this fail gracefully instead of panicking
+                // This is due to the Results in the Iterator having to be checked one by one
+                match tx.send(Result::<_, Status>::Ok(item.unwrap())).await {
+                    Ok(_) => {
+                        // item (serialized tree) was queued to be send to client
+                    }
+                    Err(_item) => {
+                        // output_stream was build from rx and both are dropped
+                        break;
+                    }
+                }
+            }
+            tracing::trace!("\tclient disconnected");
+        });
+
+        let output_stream = ReceiverStream::new(rx);
+        Ok(Response::new(
+            Box::pin(output_stream) as Self::TreeTransferStream
+        ))
     }
 }
