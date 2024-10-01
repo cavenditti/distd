@@ -199,13 +199,13 @@ impl Server {
     /// Transfer chunks from server, computing diff from local data
     pub async fn transfer_diff(
         &self,
-        hash: &Hash,
+        item_path: String,
+        request_version: Option<u32>,
+        from_version: Option<u32>,
         from: &[Hash],
     ) -> Result<Streaming<SerializedTree>, ServerRequest> {
-        tracing::trace!("Preparing transfer/diff request: target: {hash}, from:{from:?}");
+        tracing::trace!("Preparing transfer/diff request: target: '{item_path}', {from_version:?}->{request_version:?}, {from:?}");
         let mut shared = self.shared.write().await;
-
-        let item_root = hash.as_bytes().to_vec();
 
         // comma separated list of hashes
         let from = from
@@ -216,7 +216,9 @@ impl Server {
         Ok(shared
             .grpc_client
             .tree_transfer(Request::new(distd_core::proto::ItemRequest {
-                item_root,
+                item_path,
+                request_version,
+                from_version,
                 hashes: Some(Hashes { hashes: from }),
             }))
             .await?

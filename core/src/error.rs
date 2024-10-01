@@ -5,6 +5,7 @@ use tonic::metadata::errors::{InvalidMetadataValue, InvalidMetadataValueBytes};
 
 use crate::{chunk_storage::StorageError, GrpcError, TransportError};
 
+/// Generic distd_core error
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("Generic IO error")]
@@ -26,6 +27,7 @@ pub enum Error {
     Storage(#[from] StorageError),
 }
 
+/// Invalid parameter error
 #[derive(Error, Debug)]
 pub enum InvalidParameter {
     #[error("Invalid BLAKE3 hash")]
@@ -56,6 +58,7 @@ pub enum InvalidParameter {
     Uuid(#[from] uuid::Error),
 }
 
+/// Communication error
 #[derive(Error, Debug)]
 pub enum Communication {
     #[error("Cannot read response")]

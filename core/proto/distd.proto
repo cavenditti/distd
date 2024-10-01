@@ -13,8 +13,8 @@ message Hashes { repeated bytes hashes = 1; }
 message ItemRequest {
   string item_path = 1; // This is out primary key to identify an item
   reserved 2; //bytes item_root = 2; // root hash of the item
-  optional int32 request_version = 3; // if not specified latest is returned
-  optional int32 from_version = 4;
+  optional uint32 request_version = 3; // if not specified latest is returned
+  optional uint32 from_version = 4;
   optional Hashes hashes = 5;
 }
 

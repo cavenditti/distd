@@ -94,4 +94,7 @@ pub enum Client {
 
     #[error("User specified item doesn't exist on server")]
     MissingItem,
+
+    #[error("Error reported from core")]
+    Core(#[from] distd_core::error::Error),
 }

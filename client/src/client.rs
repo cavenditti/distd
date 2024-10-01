@@ -1,10 +1,9 @@
 use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
+    collections::HashMap, path::{Path, PathBuf}, sync::Arc, time::Duration
 };
 
 use tokio::time::sleep;
+use tokio_stream::StreamExt;
 
 use crate::{
     error::{Client as ClientError, ServerRequest},
@@ -135,22 +134,9 @@ impl Client<FsStorage> {
         let from = self.storage.chunks(); // FIXME this could get very very large (optimize by only sending roots of sub-trees)
         tracing::trace!("Signalig to server we've got {from:?}");
 
-        let root = self.transfer_diff(&item_metadata.root.hash, &from).await?;
-
-        tracing::trace!("Reconstructed with {} bytes total", root.size());
-
         let new_item = self
-            .storage
-            .build_item(
-                item_metadata.name.clone(),
-                path,
-                item_metadata.revision,
-                item_metadata.description.clone(),
-                root,
-            )
-            .ok_or(ClientError::ItemInsertion(
-                "Cannot insert downloaded file".into(),
-            ))?;
+            .transfer_diff(item_metadata.clone(), None, None, &from) // FIXME pass item versions
+            .await?;
 
         tracing::debug!(
             "Updated {} to revision {}",
@@ -171,62 +157,55 @@ where
     /// preallocated an item in order to be able to reconstruct sub-trees
     async fn transfer_diff(
         &self,
-        target: &Hash,
+        target: ItemMetadata,
+        request_version: Option<u32>,
+        from_version: Option<u32>,
         from: &[Hash],
-    ) -> Result<Arc<StoredChunkRef>, ClientError> {
-        let mut node_stream = self.server.transfer_diff(target, from).await?;
+    ) -> Result<Item, ClientError> {
+        let stream = self
+            .server
+            .transfer_diff(
+                target.path.to_string_lossy().into_owned(),
+                request_version,
+                from_version,
+                from,
+            )
+            .await?;
 
-        let mut n = None; // final node
-        let mut i = 0; // node counter
-        while let Some(node) = node_stream.message().await.map_err(ServerRequest::Grpc)? {
-            tracing::trace!(
-                "Received {} bytes ({:x?}..{:x?})",
-                node.bitcode_hashtree.len(),
-                &node.bitcode_hashtree[..8],
-                &node.bitcode_hashtree[..node.bitcode_hashtree.len() - 8]
-            );
-            let deser =
-                bitcode::deserialize(&node.bitcode_hashtree).map_err(InvalidParameter::Bitcode)?;
-            tracing::trace!("Deserialized: {:?}", deser);
-            n = Some(
-                self.storage
-                    .try_fill_in(&deser)
-                    .ok_or(ClientError::TreeReconstruct)?,
-            );
-            i += 1;
-        }
+        let stream = stream.map(|x| x.unwrap()); // FIXME
 
-        let n = n.ok_or(ClientError::TreeReconstruct)?;
-        tracing::trace!("Reconstructed {i} nodes with {} bytes total", n.size());
-        Ok(n)
+        self.storage
+            .receive_item(
+                target.name,
+                target.path,
+                target.revision,
+                target.description,
+                stream,
+            )
+            .await
+            .map_err(ClientError::Core)
     }
 
     async fn update(&mut self, new_item_metadata: &ItemMetadata) -> Result<Item, ClientError> {
-        tracing::debug!(
-            "Updating item '{}' @ {}",
+        tracing::info!(
+            "Updating item '{}' at '{}'",
             new_item_metadata.name,
             new_item_metadata.path.to_string_lossy()
         );
 
         let from = self.storage.chunks(); // FIXME this could get very very large
-        let n = self
-            .transfer_diff(&new_item_metadata.root.hash, &from)
-            .await?;
 
         let item = self
-            .storage
-            .build_item(
-                new_item_metadata.name.clone(),
-                new_item_metadata.path.clone(),
-                new_item_metadata.revision,
-                new_item_metadata.description.clone(),
-                n,
+            .transfer_diff(
+                // FIXME pass item versions
+                new_item_metadata.clone(),
+                None,
+                None,
+                &from,
             )
-            .ok_or(ClientError::ItemInsertion(
-                "Cannot insert downloaded file".into(),
-            ))?;
+            .await?;
 
-        tracing::debug!("Got {item:?}");
+        tracing::info!("Got {} v{}, {} bytes", item.metadata.name, item.metadata.revision, item.size());
 
         Ok(item)
     }
@@ -235,13 +214,20 @@ where
     pub async fn client_loop(mut self) -> Result<(), ClientError> {
         tokio::spawn(self.server.clone().fetch_loop());
 
+        let mut latest: HashMap<PathBuf, Hash> = HashMap::default();
+
         loop {
             tokio::time::sleep(self.server.timeout).await;
             let items = self.server.metadata().await.items;
             for path in &self.settings.client.sync.clone() {
+                if latest.get(path) == self.server.metadata().await.items.get(path).map(|i| &i.root.hash) {
+                    continue
+                }
+
                 tracing::debug!("Syncing '{}'", path.to_string_lossy());
-                let i = items.get(path).ok_or(ClientError::Storage)?; //FIXME should fail on missing on server or sync other files anyway?
-                self.update(i).await?;
+                let old_item = items.get(path).ok_or(ClientError::Storage)?; //FIXME should fail on missing on server or sync other files anyway?
+                let item = self.update(old_item).await?;
+                latest.insert(path.clone(), *item.root());
             }
         }
     }
@@ -260,7 +246,7 @@ pub mod cli {
         tracing_subscriber::fmt()
             .with_target(false)
             .compact()
-            .with_max_level(tracing::Level::DEBUG)
+            .with_max_level(tracing::Level::INFO)
             .init();
 
         tracing::info!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));

@@ -9,7 +9,6 @@ use axum::body::Bytes;
 use distd_core::chunk_storage::ChunkStorage;
 use distd_core::item::{Item, Name as ItemName};
 use distd_core::metadata::Server as ServerMetadata;
-use distd_core::proto::distd_server::DistdServer;
 use distd_core::utils::grpc::uuid_to_metadata;
 use ring::error::KeyRejected;
 use ring::pkcs8::Document;
@@ -18,8 +17,6 @@ use ring::{
     rand,
     signature::{self},
 };
-use tonic::service::interceptor::InterceptedService;
-use tonic::transport::Channel;
 use tracing::span;
 use uuid::Uuid;
 
@@ -137,11 +134,11 @@ where
         let span = span!(tracing::Level::INFO, "register_client");
         let _entered = span.enter();
 
-        tracing::info!("Got new client: '{}' ver:{:?}, @{}", name, version, addr);
+        tracing::info!("Got new client: \"{}\" ver:{:?}, @{}", name, version, addr);
         let nonced_name = name.clone() + &self.uuid_nonce + &addr.to_string();
         tracing::debug!("Client nonced name: '{}'", nonced_name);
         let uuid = Uuid::new_v5(&Uuid::NAMESPACE_URL, nonced_name.as_bytes());
-        tracing::debug!("client uuid: '{}'", uuid.to_string());
+        tracing::info!("Assigned client uuid '{}' to \"{}\"@{}", uuid.to_string(), name, addr);
         let client = Client {
             addr,
             name,

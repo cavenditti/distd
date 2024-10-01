@@ -87,7 +87,7 @@ impl TryFrom<&mut InFileChunk> for StoredChunkRef {
 impl InFileChunk {
     /// Write a chunk to the file at all the registered paths for that chunk
     pub fn write(&self, hash: &Hash, chunk: &[u8]) -> Result<(), Error> {
-        tracing::debug!(
+        tracing::trace!(
             "Writing {hash}, {} bytes at {} locations",
             chunk.len(),
             self.paths.len()
@@ -516,8 +516,10 @@ impl ChunkStorage for FsStorage {
         Self: Sized,
         T: Stream<Item = SerializedTree> + std::marker::Unpin,
     {
+        tracing::trace!("Receiving item at '{}'", path.to_string_lossy());
         let mut n = None; // final node
         let mut i = 0; // node counter
+        let mut o = 0u64; // offset counter
         while let Some(node) = stream.next().await {
             tracing::trace!(
                 "Received {} bytes ({:x?}..{:x?})",
@@ -525,9 +527,17 @@ impl ChunkStorage for FsStorage {
                 &node.bitcode_hashtree[..8],
                 &node.bitcode_hashtree[..node.bitcode_hashtree.len() - 8]
             );
-            let deser =
+            let deser: StoredChunkRef =
                 bitcode::deserialize(&node.bitcode_hashtree).map_err(InvalidParameter::Bitcode)?;
             tracing::trace!("Deserialized: {:?}", deser);
+            match deser.clone() {
+                d @ StoredChunkRef::Stored { .. } => {
+                    tracing::trace!("Preallocating {} bytes in {}@'{}'", d.size(), o, path.to_string_lossy());
+                    self.pre_allocate_chunk(&path, d.chunk_info(), o)?;
+                    o = o + d.size();
+                },
+                _ => {},
+            }
             n = Some(
                 self.try_fill_in(&deser)
                     .ok_or(StorageError::TreeReconstruct)?,

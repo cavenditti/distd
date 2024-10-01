@@ -166,7 +166,8 @@ where
             });
         //.flatten(); // FIXME this ignores any error, it's unwrapped down here but equally bad
 
-        let mut stream = Box::pin(tokio_stream::iter(nodes).throttle(Duration::from_millis(200)));
+        //let mut stream = Box::pin(tokio_stream::iter(nodes).throttle(Duration::from_millis(200)));
+        let mut stream = Box::pin(tokio_stream::iter(nodes));
 
         // spawn and channel are required if you want handle "disconnect" functionality
         // the `out_stream` will not be polled after client disconnect

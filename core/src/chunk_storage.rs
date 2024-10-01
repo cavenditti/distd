@@ -5,7 +5,7 @@ use bytes::Bytes;
 pub use stored_chunk_ref::StoredChunkRef;
 use tokio_stream::{Stream, StreamExt};
 
-use crate::error::{InvalidParameter};
+use crate::error::InvalidParameter;
 use crate::hash::{hash, Hash};
 use crate::proto::SerializedTree;
 use crate::{
@@ -161,7 +161,7 @@ pub trait ChunkStorage {
         revision: u32,
         description: Option<String>,
         mut stream: T,
-    //) -> Result<Item, crate::error::Error>
+        //) -> Result<Item, crate::error::Error>
     ) -> Result<Item, crate::error::Error>
     where
         Self: Sized,
@@ -207,9 +207,9 @@ pub trait ChunkStorage {
     }
 
     /// Take ownership of an `OwnedHashTreeNode` and try to fill in any `Skipped` nodes
-    fn try_fill_in(&self, tree: &Arc<StoredChunkRef>) -> Option<Arc<StoredChunkRef>> {
-        tracing::debug!("{:?}", self.chunks()); //FIXME remove this
-        Some(match tree.as_ref() {
+    fn try_fill_in(&self, tree: &StoredChunkRef) -> Option<Arc<StoredChunkRef>> {
+        tracing::trace!("Current chunks in storage: {:?}", self.chunks()); //FIXME remove this
+        Some(match tree {
             StoredChunkRef::Stored { hash, data } => self._insert_chunk(*hash, &data)?,
             StoredChunkRef::Parent { left, right, .. } => {
                 self.link(self.try_fill_in(left)?, self.try_fill_in(right)?)?
