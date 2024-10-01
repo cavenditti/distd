@@ -145,6 +145,11 @@ impl Item {
     pub fn diff(&self, other: &Self) -> HashSet<ChunkInfo> {
         self.hashes.difference(&other.hashes).copied().collect()
     }
+
+    #[inline(always)]
+    pub fn root(&self) -> &crate::hash::Hash {
+        &self.metadata.root.hash
+    }
 }
 
 impl std::hash::Hash for Item {

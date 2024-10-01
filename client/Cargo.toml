@@ -27,6 +27,7 @@ serde = { workspace = true }
 uuid = { workspace = true }
 percent-encoding = { workspace = true }
 bitcode = { workspace = true }
+#lru = { version = "0.12.4" }
 
 distd_core = { path = "../core" }
 

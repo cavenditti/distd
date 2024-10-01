@@ -3,8 +3,11 @@ use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
 use bytes::Bytes;
 pub use stored_chunk_ref::StoredChunkRef;
+use tokio_stream::{Stream, StreamExt};
 
+use crate::error::{InvalidParameter};
 use crate::hash::{hash, Hash};
+use crate::proto::SerializedTree;
 use crate::{
     chunks::CHUNK_SIZE,
     hash::merge_hashes,
@@ -21,8 +24,12 @@ use thiserror::Error;
 pub enum StorageError {
     #[error("Unknown storage size")]
     UnknownSize,
+
     #[error("Cannot insert chunk in data store")]
     UnknownChunkInsertError(#[from] std::io::Error),
+
+    #[error("Cannot reconstruct tree from storage")]
+    TreeReconstruct,
 }
 
 /// Defines a backend used to store hashes and chunks ad key-value pairs
@@ -146,6 +153,45 @@ pub trait ChunkStorage {
         Some(Item::new(name, path, revision, description, &root))
     }
 
+    /// Build a new Item from its metadata and a streaming of nodes
+    async fn receive_item<T>(
+        &self,
+        name: ItemName,
+        path: PathBuf,
+        revision: u32,
+        description: Option<String>,
+        mut stream: T,
+    //) -> Result<Item, crate::error::Error>
+    ) -> Result<Item, crate::error::Error>
+    where
+        Self: Sized,
+        T: Stream<Item = SerializedTree> + std::marker::Unpin,
+    {
+        let mut n = None; // final node
+        let mut i = 0; // node counter
+        while let Some(node) = stream.next().await {
+            tracing::trace!(
+                "Received {} bytes ({:x?}..{:x?})",
+                node.bitcode_hashtree.len(),
+                &node.bitcode_hashtree[..8],
+                &node.bitcode_hashtree[..node.bitcode_hashtree.len() - 8]
+            );
+            let deser =
+                bitcode::deserialize(&node.bitcode_hashtree).map_err(InvalidParameter::Bitcode)?;
+            tracing::trace!("Deserialized: {:?}", deser);
+            n = Some(
+                self.try_fill_in(&deser)
+                    .ok_or(StorageError::TreeReconstruct)?,
+            );
+            i += 1;
+        }
+
+        let n = n.ok_or(StorageError::TreeReconstruct)?;
+        tracing::trace!("Reconstructed {i} nodes with {} bytes total", n.size());
+
+        Ok(Item::new(name, path, revision, description, &n))
+    }
+
     /// Minimal set of hashes required to reconstruct `target` using `from`
     ///
     /// # Errors
@@ -162,6 +208,7 @@ pub trait ChunkStorage {
 
     /// Take ownership of an `OwnedHashTreeNode` and try to fill in any `Skipped` nodes
     fn try_fill_in(&self, tree: &Arc<StoredChunkRef>) -> Option<Arc<StoredChunkRef>> {
+        tracing::debug!("{:?}", self.chunks()); //FIXME remove this
         Some(match tree.as_ref() {
             StoredChunkRef::Stored { hash, data } => self._insert_chunk(*hash, &data)?,
             StoredChunkRef::Parent { left, right, .. } => {

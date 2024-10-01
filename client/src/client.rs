@@ -15,7 +15,11 @@ use crate::{
 use std::{fs::File, io::Read};
 
 use distd_core::{
-    chunk_storage::{fs_storage::FsStorage, ChunkStorage, StoredChunkRef}, error::InvalidParameter, hash::Hash, item::Item, metadata::Item as ItemMetadata
+    chunk_storage::{fs_storage::FsStorage, ChunkStorage, StoredChunkRef},
+    error::InvalidParameter,
+    hash::Hash,
+    item::Item,
+    metadata::Item as ItemMetadata,
 };
 
 #[derive(Debug)]
@@ -161,17 +165,29 @@ impl<T> Client<T>
 where
     T: ChunkStorage + Clone + Send + 'static,
 {
-    async fn transfer_diff(&self, target: &Hash, from: &[Hash]) -> Result<Arc<StoredChunkRef>, ClientError> {
-        let mut node_stream = self
-            .server
-            .transfer_diff(target, from)
-            .await?;
+    /// Transfer a diff from the server
+    ///
+    /// Note: this function is item-agnostic, if using the FsStorage backend one should have already
+    /// preallocated an item in order to be able to reconstruct sub-trees
+    async fn transfer_diff(
+        &self,
+        target: &Hash,
+        from: &[Hash],
+    ) -> Result<Arc<StoredChunkRef>, ClientError> {
+        let mut node_stream = self.server.transfer_diff(target, from).await?;
 
         let mut n = None; // final node
         let mut i = 0; // node counter
         while let Some(node) = node_stream.message().await.map_err(ServerRequest::Grpc)? {
+            tracing::trace!(
+                "Received {} bytes ({:x?}..{:x?})",
+                node.bitcode_hashtree.len(),
+                &node.bitcode_hashtree[..8],
+                &node.bitcode_hashtree[..node.bitcode_hashtree.len() - 8]
+            );
             let deser =
                 bitcode::deserialize(&node.bitcode_hashtree).map_err(InvalidParameter::Bitcode)?;
+            tracing::trace!("Deserialized: {:?}", deser);
             n = Some(
                 self.storage
                     .try_fill_in(&deser)
@@ -185,23 +201,25 @@ where
         Ok(n)
     }
 
-    async fn update(&mut self, new: &ItemMetadata) -> Result<Item, ClientError> {
+    async fn update(&mut self, new_item_metadata: &ItemMetadata) -> Result<Item, ClientError> {
         tracing::debug!(
             "Updating item '{}' @ {}",
-            new.name,
-            new.path.to_string_lossy()
+            new_item_metadata.name,
+            new_item_metadata.path.to_string_lossy()
         );
 
         let from = self.storage.chunks(); // FIXME this could get very very large
-        let n = self.transfer_diff(&new.root.hash, &from).await?;
+        let n = self
+            .transfer_diff(&new_item_metadata.root.hash, &from)
+            .await?;
 
         let item = self
             .storage
             .build_item(
-                new.name.clone(),
-                new.path.clone(),
-                new.revision,
-                new.description.clone(),
+                new_item_metadata.name.clone(),
+                new_item_metadata.path.clone(),
+                new_item_metadata.revision,
+                new_item_metadata.description.clone(),
                 n,
             )
             .ok_or(ClientError::ItemInsertion(
@@ -242,7 +260,7 @@ pub mod cli {
         tracing_subscriber::fmt()
             .with_target(false)
             .compact()
-            .with_max_level(tracing::Level::INFO)
+            .with_max_level(tracing::Level::DEBUG)
             .init();
 
         tracing::info!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));

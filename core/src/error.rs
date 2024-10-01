@@ -1,5 +1,9 @@
+use std::str::Utf8Error;
+
 use thiserror::Error;
 use tonic::metadata::errors::{InvalidMetadataValue, InvalidMetadataValueBytes};
+
+use crate::{chunk_storage::StorageError, GrpcError, TransportError};
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -12,8 +16,14 @@ pub enum Error {
     #[error("{0}")]
     Other(String),
 
-    #[error("Invalid parameter '{0}'")]
+    #[error("Invalid parameter")]
     InvalidParmeter(#[from] InvalidParameter),
+
+    #[error("Communication error")]
+    Communication(#[from] Communication),
+
+    #[error("Storage error")]
+    Storage(#[from] StorageError),
 }
 
 #[derive(Error, Debug)]
@@ -35,4 +45,34 @@ pub enum InvalidParameter {
 
     #[error("Invalid bitcode")]
     Bitcode(#[from] bitcode::Error),
+
+    #[error("Cannot decode UTF-8 string")]
+    Utf8(#[from] Utf8Error),
+
+    #[error("Parameter missing: '{0}'")]
+    Missing(String),
+
+    #[error("Invalid UUID")]
+    Uuid(#[from] uuid::Error),
+}
+
+#[derive(Error, Debug)]
+pub enum Communication {
+    #[error("Cannot read response")]
+    ReadFromResponse(#[from] std::io::Error),
+
+    #[error("Cannot reconstruct buffer from response")]
+    ResponseDeserialize(#[from] bitcode::Error),
+
+    #[error("gRPC error")]
+    Grpc(#[from] GrpcError),
+
+    #[error("gRPC transport error, is server accepting connetions?")]
+    Transport(#[from] TransportError),
+
+    #[error("Invalid parameter")]
+    InvalidParmeter(#[from] InvalidParameter),
+
+    #[error("Invalid format for provided public key")]
+    BadPubKey,
 }

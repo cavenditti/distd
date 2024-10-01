@@ -7,19 +7,22 @@ use std::{
     sync::{atomic::AtomicBool, Arc, RwLock},
 };
 
+use tokio_stream::{Stream, StreamExt};
+
 use crate::{
+    chunk_storage::StorageError,
     chunks::{ChunkInfo, CHUNK_SIZE},
-    error::Error,
-    hash::hash as do_hash,
-    hash::Hash,
+    error::{Error, InvalidParameter},
+    hash::{hash as do_hash, Hash},
     item::{Item, Name as ItemName},
+    proto::SerializedTree,
 };
 
 use super::{ChunkStorage, StoredChunkRef};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 /// Path and offset of a chunk in a file
-struct InFileChunkPaths {
+struct InFileChunkPath {
     pub path: PathBuf,
     pub offset: u64,
 }
@@ -29,8 +32,9 @@ struct InFileChunkPaths {
 #[derive(Debug, Clone)]
 struct InFileChunk {
     pub info: ChunkInfo,
-    pub paths: HashSet<InFileChunkPaths>,
+    pub paths: HashSet<InFileChunkPath>,
     pub populated: Arc<AtomicBool>,
+    //pub cached: Arc<Mutex<Option<Bytes>>>,
     //buf_reader: Arc<Mutex<Option<BufReader<File>>>>,
 }
 
@@ -179,6 +183,30 @@ impl InnerFsStorage {
         Ok(full_path)
     }
 
+    /// Pre-allocate a single `ChunkInfo` in the filesystem at a path
+    pub fn pre_allocate_chunk(
+        &mut self,
+        path: &Path,
+        chunk_info: ChunkInfo,
+        offset: u64,
+    ) -> Result<(), Error> {
+        // If already exists do nothing
+        if let Some(_) = self.data.get(&chunk_info.hash) {
+            return Ok(());
+        }
+
+        let ifc = InFileChunk {
+            info: chunk_info,
+            paths: HashSet::from([InFileChunkPath {
+                path: path.to_owned(),
+                offset,
+            }]),
+            populated: Arc::default(),
+        };
+        self.data.insert(chunk_info.hash, ifc);
+        Ok(())
+    }
+
     /// Pre-allocate space for multiple `ChunkInfo` in the filesystem at a path
     pub fn pre_allocate(&mut self, path: &Path, data: &[ChunkInfo]) -> Result<(), Error> {
         tracing::debug!(
@@ -204,7 +232,7 @@ impl InnerFsStorage {
 
         // Prepare all InFileChunk and add them to self.data
         for chunk in data {
-            let paths = InFileChunkPaths {
+            let paths = InFileChunkPath {
                 path: self.path(path),
                 offset,
             };
@@ -218,6 +246,7 @@ impl InnerFsStorage {
                         info: *chunk,
                         paths: HashSet::from_iter([paths]),
                         populated: Arc::default(),
+                        //cached: Arc::default(),
                     },
                 );
             }
@@ -337,6 +366,11 @@ impl FsStorage {
         self.read().path(path)
     }
 
+    /// Wrapper around `InnerFsStorage::pre_allocate_chunk`
+    pub fn pre_allocate_chunk(&self, path: &Path, chunk_info: ChunkInfo, offset: u64) -> Result<(), Error> {
+        self.write().pre_allocate_chunk(path, chunk_info, offset)
+    }
+
     /// Wrapper around `InnerFsStorage::pre_allocate`
     pub fn pre_allocate(&self, path: &Path, data: &[ChunkInfo]) -> Result<(), Error> {
         self.write().pre_allocate(path, data)
@@ -380,7 +414,7 @@ impl ChunkStorage for FsStorage {
         0 // TODO
     }
 
-    /// May only add chunks by adding items. Dummy implementation always returning None
+    /// Insert chunk into storage, requires an item to have been created with the appropriate chunks to be preallocate
     fn _insert_chunk(&self, hash: Hash, chunk: &[u8]) -> Option<Arc<StoredChunkRef>> {
         self.write().data.get_mut(&hash).and_then(|infile_chunk| {
             infile_chunk
@@ -400,6 +434,27 @@ impl ChunkStorage for FsStorage {
             hash,
             data: Arc::new(chunk.to_vec()),
         }))
+    }
+
+    /// May only link chunks by adding items. Dummy implementation always returning None
+    fn _link(
+        &self,
+        hash: Hash,
+        left: Arc<StoredChunkRef>,
+        right: Arc<StoredChunkRef>,
+    ) -> Option<Arc<StoredChunkRef>> {
+        let mut l = self.write();
+        let size = left.size() + right.size();
+        let res = l.links.try_insert(
+            hash,
+            Arc::new(StoredChunkRef::Parent {
+                hash,
+                left,
+                right,
+                size,
+            }),
+        );
+        Some(res.map_or_else(|e| (*e.entry.get()).clone(), |x| (*x).clone()))
     }
 
     /// Create a new Item from its metadata and Bytes
@@ -447,25 +502,43 @@ impl ChunkStorage for FsStorage {
         Some(item)
     }
 
-    /// May only link chunks by adding items. Dummy implementation always returning None
-    fn _link(
+    /// Build a new Item from its metadata and a streaming of nodes
+    async fn receive_item<T>(
         &self,
-        hash: Hash,
-        left: Arc<StoredChunkRef>,
-        right: Arc<StoredChunkRef>,
-    ) -> Option<Arc<StoredChunkRef>> {
-        let mut l = self.write();
-        let size = left.size() + right.size();
-        let res = l.links.try_insert(
-            hash,
-            Arc::new(StoredChunkRef::Parent {
-                hash,
-                left,
-                right,
-                size,
-            }),
-        );
-        Some(res.map_or_else(|e| (*e.entry.get()).clone(), |x| (*x).clone()))
+        name: ItemName,
+        path: PathBuf,
+        revision: u32,
+        description: Option<String>,
+        mut stream: T,
+        //) -> Result<Item, crate::error::Error>
+    ) -> Result<Item, crate::error::Error>
+    where
+        Self: Sized,
+        T: Stream<Item = SerializedTree> + std::marker::Unpin,
+    {
+        let mut n = None; // final node
+        let mut i = 0; // node counter
+        while let Some(node) = stream.next().await {
+            tracing::trace!(
+                "Received {} bytes ({:x?}..{:x?})",
+                node.bitcode_hashtree.len(),
+                &node.bitcode_hashtree[..8],
+                &node.bitcode_hashtree[..node.bitcode_hashtree.len() - 8]
+            );
+            let deser =
+                bitcode::deserialize(&node.bitcode_hashtree).map_err(InvalidParameter::Bitcode)?;
+            tracing::trace!("Deserialized: {:?}", deser);
+            n = Some(
+                self.try_fill_in(&deser)
+                    .ok_or(StorageError::TreeReconstruct)?,
+            );
+            i += 1;
+        }
+
+        let n = n.ok_or(StorageError::TreeReconstruct)?;
+        tracing::trace!("Reconstructed {i} nodes with {} bytes total", n.size());
+
+        Ok(Item::new(name, path, revision, description, &n))
     }
 
     /// Get a Vec of all chunks' hashes in storage
@@ -531,7 +604,7 @@ mod tests {
     ) -> PathBuf {
         //  Add a temporary path
         let path = std::env::temp_dir().join(PathBuf::from_str("tempfile").unwrap());
-        infile_chunk.paths.insert(InFileChunkPaths {
+        infile_chunk.paths.insert(InFileChunkPath {
             path: path.clone(),
             offset: 0,
         });

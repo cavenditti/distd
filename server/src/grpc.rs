@@ -1,6 +1,7 @@
 use std::borrow::Borrow;
 use std::collections::HashSet;
 use std::fmt::Debug;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
@@ -124,11 +125,18 @@ where
     ) -> Result<Response<ResponseStream>, Status> {
         let inner = request.into_inner();
 
-        let hash: [u8; 32] = inner
-            .item_root
-            .try_into()
-            .map_err(|_| Status::new(Code::InvalidArgument, "Bad BLAKE3 hash"))?;
-        let hash = Hash::from_bytes(hash);
+        let hash = {
+            let metadata = self.metadata.read().unwrap();
+            *PathBuf::from_str(&inner.item_path)
+                .ok()
+                .and_then(|x| metadata.items.get(&x))
+                .ok_or(Status::new(
+                    Code::InvalidArgument,
+                    "Bad or missing item path",
+                ))?
+                .root()
+        };
+
         tracing::debug!("Transfer {hash}");
 
         let from = inner.hashes.unwrap_or_default();
