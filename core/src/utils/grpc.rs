@@ -9,7 +9,7 @@ pub fn uuid_to_metadata(uuid: &Uuid) -> MetadataValue<Binary> {
 
 pub fn metadata_to_uuid(uuid: &MetadataValue<Binary>) -> Result<Uuid, InvalidParameter> {
     uuid.to_bytes()
-        .map_err(InvalidParameter::InvalidMetadataBytes)
+        .map_err(InvalidParameter::MetadataBytes)
         .map(|x| Uuid::from_bytes_le(*x.array_chunks::<16>().collect::<Vec<&[u8; 16]>>()[0]))
 }
 

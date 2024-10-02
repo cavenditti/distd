@@ -1,10 +1,12 @@
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
 
-use tokio::time::sleep;
+use tokio::time::{sleep, Instant};
+use tokio_stream::StreamExt;
 
 use crate::{error::Client as ClientError, server::Server, settings::Settings};
 
@@ -12,6 +14,7 @@ use std::{fs::File, io::Read};
 
 use distd_core::{
     chunk_storage::{fs_storage::FsStorage, ChunkStorage},
+    hash::Hash,
     item::Item,
     metadata::Item as ItemMetadata,
 };
@@ -98,7 +101,7 @@ where
 }
 
 impl Client<FsStorage> {
-    pub async fn sync(self, target: &Path, path: &Path) -> Result<(), ClientError> {
+    pub async fn sync(&mut self, target: &Path, path: &Path) -> Result<Item, ClientError> {
         tracing::debug!("sync: {target:?} {path:?}");
         let mut buf = vec![];
 
@@ -126,76 +129,76 @@ impl Client<FsStorage> {
             buf.clone().into(),
         );
 
-        let from = self.storage.chunks(); // FIXME this could get very very large
-        tracing::trace!("Signalig to server we've got {from:?}");
-
-        let result = self
-            .server
-            .transfer_diff(&item_metadata.root.hash.to_string(), from)
-            .await?;
-
-        tracing::trace!("Got '{}' from server", result);
-
-        let n = self
-            .storage
-            .try_fill_in(result)
-            .ok_or(ClientError::TreeReconstruct)?;
-        tracing::trace!("Reconstructed with {} bytes total", n.size());
-
-        let new_item = self
-            .storage
-            .create_item(
-                item_metadata.name.clone(),
-                path,
-                item_metadata.revision,
-                item_metadata.description.clone(),
-                n.clone_data().into(),
-            )
-            .ok_or(ClientError::ItemInsertion(
-                "Cannot insert downloaded file".into(),
-            ))?;
-
-        tracing::debug!(
-            "Updated {} to revision {}",
-            new_item.metadata.path.to_string_lossy(),
-            new_item.metadata.revision
-        );
-        Ok(())
+        self.update(item_metadata).await
     }
 }
 
 impl<T> Client<T>
 where
-    T: ChunkStorage + Clone + Send + 'static,
+    T: ChunkStorage + Send + 'static,
 {
-    async fn update(&mut self, new: &ItemMetadata) -> Result<Item, ClientError> {
-        tracing::debug!("Updating item '{}' @ {}", new.name, new.path.to_string_lossy());
-        let from = self.storage.chunks(); // FIXME this could get very very large
-        let new_data = self
+    /// Transfer a diff from the server
+    ///
+    /// Note: this function is item-agnostic, if using the FsStorage backend one should have already
+    /// preallocated an item in order to be able to reconstruct sub-trees
+    async fn transfer_diff(
+        &mut self,
+        target: ItemMetadata,
+        request_version: Option<u32>,
+        from_version: Option<u32>,
+        from: &[Hash],
+    ) -> Result<Item, ClientError> {
+        let stream = self
             .server
-            .transfer_diff(&new.root.hash.to_string(), from)
+            .transfer_diff(
+                target.path.to_string_lossy().into_owned(),
+                request_version,
+                from_version,
+                from,
+            )
             .await?;
 
-        let n = self
-            .storage
-            .try_fill_in(new_data)
-            .ok_or(ClientError::TreeReconstruct)?;
-        tracing::trace!("Reconstructed with {} bytes total", n.size());
+        let stream = stream.map(|x| x.unwrap()); // FIXME
+
+        self.storage
+            .receive_item(
+                target.name,
+                target.path,
+                target.revision,
+                target.description,
+                stream,
+            )
+            .await
+            .map_err(ClientError::Core)
+    }
+
+    async fn update(&mut self, new_item_metadata: &ItemMetadata) -> Result<Item, ClientError> {
+        tracing::info!(
+            "Updating item '{}' at '{}'",
+            new_item_metadata.name,
+            new_item_metadata.path.to_string_lossy()
+        );
+        let now = Instant::now();
+
+        let from = self.storage.chunks(); // FIXME this could get very very large
 
         let item = self
-            .storage
-            .build_item(
-                new.name.clone(),
-                new.path.clone(),
-                new.revision,
-                new.description.clone(),
-                n,
+            .transfer_diff(
+                // FIXME pass item versions
+                new_item_metadata.clone(),
+                None,
+                None,
+                &from,
             )
-            .ok_or(ClientError::ItemInsertion(
-                "Cannot insert downloaded file".into(),
-            ))?;
+            .await?;
 
-        tracing::debug!("Got {item:?}");
+        tracing::info!(
+            "Got {} v{}, {} bytes after {}s",
+            item.metadata.name,
+            item.metadata.revision,
+            item.size(),
+            now.elapsed().as_secs()
+        );
 
         Ok(item)
     }
@@ -204,13 +207,28 @@ where
     pub async fn client_loop(mut self) -> Result<(), ClientError> {
         tokio::spawn(self.server.clone().fetch_loop());
 
+        let mut latest: HashMap<PathBuf, Hash> = HashMap::default();
+
         loop {
             tokio::time::sleep(self.server.timeout).await;
             let items = self.server.metadata().await.items;
             for path in &self.settings.client.sync.clone() {
+                if latest.get(path)
+                    == self
+                        .server
+                        .metadata()
+                        .await
+                        .items
+                        .get(path)
+                        .map(|i| &i.root.hash)
+                {
+                    continue;
+                }
+
                 tracing::debug!("Syncing '{}'", path.to_string_lossy());
-                let i = items.get(path).ok_or(ClientError::Storage)?; //FIXME should fail on missing on server or sync other files anyway?
-                self.update(i).await?;
+                let old_item = items.get(path).ok_or(ClientError::Storage)?; //FIXME should fail on missing on server or sync other files anyway?
+                let item = self.update(old_item).await?;
+                latest.insert(path.clone(), *item.root());
             }
         }
     }
@@ -220,6 +238,7 @@ pub mod cli {
     use std::{env, path::PathBuf, str::FromStr};
 
     use distd_core::chunk_storage::fs_storage::FsStorage;
+    use distd_core::chunk_storage::hashmap_storage::HashMapStorage;
 
     use crate::client::Client;
     use crate::error::Client as ClientError;
@@ -227,8 +246,8 @@ pub mod cli {
 
     pub async fn main() -> Result<(), ClientError> {
         tracing_subscriber::fmt()
-            .with_target(false)
-            .compact()
+            .with_target(true)
+            //.compact()
             .with_max_level(tracing::Level::INFO)
             .init();
 
@@ -244,12 +263,13 @@ pub mod cli {
         tracing::debug!("Settings: {settings:?}");
 
         let Ok(storage_root) = PathBuf::from_str(&settings.fsstorage.root);
-        let storage = FsStorage::new(storage_root).map_err(|_| ClientError::Storage)?;
-        let client = Client::new(&[0u8; 32], storage.clone(), settings).await?;
+        let storage = FsStorage::new(storage_root);
+        //let storage = HashMapStorage::default();
+        let client = Client::new(&[0u8; 32], storage, settings).await?;
 
         match cmd.as_str() {
             "start" => client.client_loop().await,
-            "sync" => sync(client, &cmd_args[..]).await, // TODO change name and use sync to explicitly request syncing of items subscripted to
+            //"sync" => sync(client, &cmd_args[..]).await, // TODO change name and use sync to explicitly request syncing of items subscripted to
             "publish" => todo!(),
             "subscribe" => todo!(),
             _ => {
@@ -260,7 +280,7 @@ pub mod cli {
         .inspect_err(|e| tracing::error!("Fatal: {e}"))
     }
 
-    async fn sync(client: Client<FsStorage>, args: &[String]) -> Result<(), ClientError> {
+    async fn sync(mut client: Client<FsStorage>, args: &[String]) -> Result<(), ClientError> {
         let first = args
             .first()
             .ok_or(ClientError::InvalidArgs(args.to_owned()))?;
@@ -278,6 +298,6 @@ pub mod cli {
         let Ok(path) = PathBuf::from_str(path);
         let Ok(target) = PathBuf::from_str(target.as_str());
 
-        client.sync(&target, &path).await
+        client.sync(&target, &path).await.map(|_| ())
     }
 }

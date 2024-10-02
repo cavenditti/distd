@@ -13,6 +13,7 @@ workspace = true
 tonic = { workspace = true }
 prost = { workspace = true }
 tokio = { workspace = true }
+tokio-stream = { workspace = true }
 
 axum = { version = "0.7.5", features = ["json", "multipart", "http2"] }
 #axum-extra = { version = "0.9.3", features = ["query"] }

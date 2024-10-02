@@ -18,7 +18,11 @@ the (eventually private storage repo) and keep all items deduplicated.
 ## Architecture
 - Every participating node is a peer, they may act both as server and client
 - It's layered, forming a distribution tree basically: clients may act as servers for clients in a lower level
+- Within a layer (i.e. nodes at the same level of the tree with mutual visibility) it works as a p2p network
 - Root server computes BLAKE3 hash trees (and assigns a 64-bit uid to each hash? To reduce overhead)
+
+- Client-server communication uses gRPC, at least for now
+
 
 > [!NOTE]
 > We're computing the full hash-tree of each file, intermediate hashes are different than just calling
@@ -60,6 +64,7 @@ Most important part missing is the "chunk-adapter" to make chunking content-awar
 - [x] Replace some Option with Result to have better visibility on errors (in progress), mostly in chunk storage
 - [x] Logging
 - [x] Minimal client (very minimal :)
+- [ ] **Simplify client-server API**
 - [ ] Ephemeral token for client auth
 - [ ] Server and Client persistence (client uuid, server registered clients and items, etc.)
 - [ ] Config

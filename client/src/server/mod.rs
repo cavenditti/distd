@@ -9,12 +9,11 @@ use tokio::{sync::RwLock, time::Instant};
 //use ring::agreement::PublicKey;
 
 use distd_core::{
-    chunks::OwnedHashTreeNode,
     error::InvalidParameter,
     hash::Hash,
     metadata::Server as ServerMetadata,
-    proto::{distd_client::DistdClient, Hashes},
-    tonic::{service::interceptor::InterceptedService, transport::Channel},
+    proto::{distd_client::DistdClient, Hashes, SerializedTree},
+    tonic::{service::interceptor::InterceptedService, transport::Channel, Streaming},
     utils::grpc::uuid_to_metadata,
     version::VERSION,
     Request,
@@ -121,7 +120,7 @@ impl Server {
     ) -> Result<DistdClient<InterceptedService<Channel, DistdGrpcClient>>, ServerRequest> {
         tracing::debug!("Connecting to server at {url}");
         let grpc_channel = distd_core::tonic::transport::Channel::from_shared(url.to_string())
-            .map_err(InvalidParameter::InvalidUri)?
+            .map_err(InvalidParameter::Uri)?
             .connect()
             .await?;
         Ok(distd_core::Client::with_interceptor(
@@ -200,16 +199,13 @@ impl Server {
     /// Transfer chunks from server, computing diff from local data
     pub async fn transfer_diff(
         &self,
-        hash: &str,
-        from: Vec<Hash>,
-    ) -> Result<OwnedHashTreeNode, ServerRequest> {
-        tracing::trace!("Preparing transfer/diff request: target: {hash}, from:{from:?}");
+        item_path: String,
+        request_version: Option<u32>,
+        from_version: Option<u32>,
+        from: &[Hash],
+    ) -> Result<Streaming<SerializedTree>, ServerRequest> {
+        tracing::trace!("Preparing transfer/diff request: target: '{item_path}', {from_version:?}->{request_version:?}, {from:?}");
         let mut shared = self.shared.write().await;
-
-        let item_root = Hash::from_str(hash)
-            .map_err(InvalidParameter::Hash)?
-            .as_bytes()
-            .to_vec();
 
         // comma separated list of hashes
         let from = from
@@ -217,18 +213,16 @@ impl Server {
             .map(|x| x.as_bytes().to_vec())
             .collect::<Vec<Vec<u8>>>();
 
-        let res = shared
+        Ok(shared
             .grpc_client
             .tree_transfer(Request::new(distd_core::proto::ItemRequest {
-                item_root,
+                item_path,
+                request_version,
+                from_version,
                 hashes: Some(Hashes { hashes: from }),
             }))
             .await?
-            .into_inner();
-
-        // try to deserialize ServerMetadata from body
-        let chunks: OwnedHashTreeNode = bitcode::deserialize(&res.bitcode_hashtree)?;
-        Ok(chunks)
+            .into_inner())
     }
 
     /// Fetch metadata from server in a loop

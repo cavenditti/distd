@@ -58,7 +58,7 @@ impl std::hash::Hash for Item {
 
 impl Item {
     #[must_use]
-    pub fn size(&self) -> u32 {
+    pub fn size(&self) -> u64 {
         self.root.size
     }
 }

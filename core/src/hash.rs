@@ -30,7 +30,7 @@ pub fn hash(data: &[u8]) -> hash::Hash {
         //println!("[HASH-NE] HASH: {}", x);
     }
 
-    let chunks: Vec<&[u8]> = data.chunks(CHUNK_SIZE).collect();
+    let chunks: Vec<&[u8]> = data.chunks(CHUNK_SIZE as usize).collect();
     partial_tree(&chunks)
 }
 
@@ -42,12 +42,13 @@ pub mod hash {
     use std::fmt;
 
     use blake3::OUT_LEN;
+    use serde::{Deserialize, Serialize};
 
     /// Reimplementation of blake3::Hash without constant-time comparisons
     ///
     /// Constant-time equality check is not needed for this use-case and only hurts performance
     /// Code is almost identical to blake3::Hash
-    #[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
+    #[derive(Clone, Copy, Serialize, Deserialize, Hash, PartialEq, Eq, PartialOrd, Ord)]
     pub struct Hash([u8; OUT_LEN]);
 
     impl Hash {

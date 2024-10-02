@@ -1,27 +1,46 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::{create_dir_all, remove_file, File},
-    io::{Read, Seek},
-    os::unix::fs::FileExt,
+    io::{BufWriter, Read, Seek, Write},
     path::{Path, PathBuf},
-    sync::{atomic::AtomicBool, Arc, RwLock},
+    sync::{atomic::AtomicBool, Arc, Mutex},
 };
 
+use tokio_stream::{Stream, StreamExt};
+
 use crate::{
-    chunks::{ChunkInfo, HashTreeNode, OwnedHashTreeNode, CHUNK_SIZE},
-    error::Error,
-    hash::hash as do_hash,
-    hash::Hash,
+    chunk_storage::StorageError,
+    chunks::{ChunkInfo, CHUNK_SIZE},
+    error::{Error, InvalidParameter},
+    hash::{hash as do_hash, Hash},
     item::{Item, Name as ItemName},
+    proto::SerializedTree,
 };
 
 use super::{ChunkStorage, StoredChunkRef};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-/// Path and offset of a chunk in a file
-struct InFileChunkPaths {
-    pub path: PathBuf,
-    pub offset: u64,
+pub fn open_file(path: &Path) -> Result<File, Error> {
+    File::options()
+        .create(true)
+        .write(true)
+        .append(false)
+        .truncate(false)
+        .open(&path)
+        .inspect_err(|e| tracing::error!("Cannot create file at {:?}: {}", path, e))
+        .map_err(Error::IoError)
+}
+
+#[derive(Debug, Clone)]
+struct Handles {
+    pub buf_writer: Arc<Mutex<BufWriter<File>>>,
+}
+
+impl Handles {
+    pub fn new(path: &Path) -> Result<Self, Error> {
+        Ok(Self {
+            buf_writer: Arc::new(Mutex::new(BufWriter::new(open_file(path)?))),
+        })
+    }
 }
 
 /// Chunk stored in multiple files
@@ -29,9 +48,11 @@ struct InFileChunkPaths {
 #[derive(Debug, Clone)]
 struct InFileChunk {
     pub info: ChunkInfo,
-    pub paths: HashSet<InFileChunkPaths>,
+    pub path: PathBuf,
+    pub offset: u64,
     pub populated: Arc<AtomicBool>,
-    //buf_reader: Arc<Mutex<Option<BufReader<File>>>>,
+    //pub cached: Arc<Mutex<Option<Bytes>>>,
+    //buf_reader: Arc<Mutex<Option<BufReader<loadFile>>>>,
 }
 
 impl TryFrom<InFileChunk> for StoredChunkRef {
@@ -44,9 +65,8 @@ impl TryFrom<InFileChunk> for StoredChunkRef {
         if !value.populated.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(Error::MissingData);
         }
-        let first_path = value.paths.iter().next().ok_or(Error::MissingData)?;
-        let mut file = File::open(&first_path.path)?;
-        file.seek(std::io::SeekFrom::Start(first_path.offset))?;
+        let mut file = File::open(&value.path)?;
+        file.seek(std::io::SeekFrom::Start(value.offset))?;
 
         let mut buf = vec![0u8; value.info.size as usize];
 
@@ -82,11 +102,16 @@ impl TryFrom<&mut InFileChunk> for StoredChunkRef {
 
 impl InFileChunk {
     /// Write a chunk to the file at all the registered paths for that chunk
-    pub fn write(&self, hash: &Hash, chunk: &[u8]) -> Result<(), Error> {
-        tracing::debug!(
-            "Writing {hash}, {} bytes at {} locations",
+    pub fn write(
+        &self,
+        hash: &Hash,
+        chunk: &[u8],
+        write_buf: &Mutex<BufWriter<File>>,
+    ) -> Result<(), Error> {
+        tracing::trace!(
+            "Writing {hash}, {} bytes at {}",
             chunk.len(),
-            self.paths.len()
+            self.path.to_string_lossy()
         );
         assert_eq!(&self.info.hash, hash);
 
@@ -97,40 +122,35 @@ impl InFileChunk {
 
         let mut count = 0;
         // write chunk to all associated files (and offsets)
-        self.paths
-            .iter()
-            .try_for_each(|p| {
-                tracing::trace!("Writing InFileChunk for {hash} @ {:?}", p);
-                // TODO this doesn't work with File::create, I'm not sure why
-                File::options()
-                    .create(true)
-                    .write(true)
-                    .append(false)
-                    .truncate(false)
-                    .open(&p.path)
-                    .inspect_err(|e| tracing::error!("Cannot create file at {:?}: {}", p.path, e))?
-                    .write_all_at(chunk, p.offset)
-                    .map(|()| {
-                        self.populated
-                            .swap(true, std::sync::atomic::Ordering::Relaxed);
-                        // TODO investigate:
-                        // I noticed while testing that even calling sync_all doesn't ensure the write actually happens
-                        // right away. I'm not sure why this is the case.
-                        //buffer.sync_all().unwrap();
-                    })
-                    .inspect(|()| count += chunk.len())
+        let mut write_buf = write_buf.lock().unwrap();
+        write_buf.seek(std::io::SeekFrom::Start(self.offset))?;
+        write_buf
+            .write_all(chunk)
+            .map(|()| {
+                self.populated
+                    .swap(true, std::sync::atomic::Ordering::Relaxed);
+                // TODO investigate:
+                // I noticed while testing that even calling sync_all doesn't ensure the write actually happens
+                // right away. I'm not sure why this is the case.
+                //buffer.sync_all().unwrap();
             })
+            .inspect(|()| count += chunk.len())
             .inspect(|()| tracing::trace!("{count} bytes written"))
             .inspect_err(|e| tracing::error!("Failed writing {hash} after {count} bytes: {e}"))
             .map_err(Error::IoError)
     }
 }
 
-/// Shared state pointed to by `FsStorage`
-/// This does Chunks ref-counting on Items to manage chunks availability trought `FsStorage` `ChunkStorage` interfaces.
-/// Removing files may actually be slow.
+/// Storage keeping files in the filesystem instead of stored chunks indipendently
+///
+/// It is useful to actually install files in the filesystem if the root is set to `/`
+///
+/// While it implements `ChunkStorage`, most methods will fail without special care, in particular by providing
+/// relevant items to get their paths.
+///
+/// Most logic is implemented in `InnerFsStorage`, this is mostly a wrapper to provide interior mutability
 #[derive(Default)]
-struct InnerFsStorage {
+pub struct FsStorage {
     /// Items, used to get the paths where to store chunks
     /// Keeping track of all items'paths is important, as we cannot store different items in the same path
     pub root: PathBuf,
@@ -139,22 +159,22 @@ struct InnerFsStorage {
     pub items: HashSet<Item>,
 
     /// Data, used to store `InFileChunks` (stored nodes) and link nodes
-    pub data: HashMap<Hash, InFileChunk>,
-    pub links: HashMap<Hash, Arc<StoredChunkRef>>,
+    data: HashMap<Hash, InFileChunk>,
+    links: HashMap<Hash, Arc<StoredChunkRef>>,
+
+    handles_map: HashMap<PathBuf, Handles>,
 }
 
-impl InnerFsStorage {
-    fn new(root: PathBuf) -> Self {
+impl FsStorage {
+    pub fn new(root: PathBuf) -> Self {
         Self {
             root,
             ..Default::default()
         }
     }
-}
 
-impl InnerFsStorage {
     /// Returns the (eventual) stored path of the item provided
-    fn path(&self, path: &Path) -> PathBuf {
+    pub fn path(&self, path: &Path) -> PathBuf {
         // TODO also create parent?
         if path.starts_with(&self.root) {
             path.to_path_buf()
@@ -177,6 +197,31 @@ impl InnerFsStorage {
             full_path.parent().unwrap_or(&full_path)
         );
         Ok(full_path)
+    }
+
+    /// Pre-allocate a single `ChunkInfo` in the filesystem at a path
+    pub fn pre_allocate_chunk(
+        &mut self,
+        path: &Path,
+        chunk_info: ChunkInfo,
+        offset: u64,
+    ) -> Result<(), Error> {
+        // If already exists do nothing
+        if let Some(_) = self.data.get(&chunk_info.hash) {
+            return Ok(());
+        }
+
+        let ifc = InFileChunk {
+            info: chunk_info,
+            path: path.to_owned(),
+            offset,
+            populated: Arc::default(),
+        };
+        self.data.insert(chunk_info.hash, ifc);
+        if !self.handles_map.contains_key(path) {
+            self.handles_map.insert(path.to_owned(), Handles::new(path)?);
+        }
+        Ok(())
     }
 
     /// Pre-allocate space for multiple `ChunkInfo` in the filesystem at a path
@@ -204,23 +249,19 @@ impl InnerFsStorage {
 
         // Prepare all InFileChunk and add them to self.data
         for chunk in data {
-            let paths = InFileChunkPaths {
-                path: self.path(path),
-                offset,
-            };
-            offset += u64::from(chunk.size);
-            if let Some(infile_chunk) = self.data.get_mut(&chunk.hash) {
-                infile_chunk.paths.insert(paths);
-            } else {
+            if self.data.get(&chunk.hash).is_none() {
                 self.data.insert(
                     chunk.hash,
                     InFileChunk {
                         info: *chunk,
-                        paths: HashSet::from_iter([paths]),
+                        path: self.path(path),
+                        offset,
                         populated: Arc::default(),
+                        //cached: Arc::default(),
                     },
                 );
             }
+            offset += u64::from(chunk.size);
         }
         Ok(())
     }
@@ -232,7 +273,7 @@ impl InnerFsStorage {
             .chunks(CHUNK_SIZE)
             .map(|chunk| ChunkInfo {
                 hash: do_hash(chunk),
-                size: chunk.len() as u32,
+                size: chunk.len() as u64,
             })
             .collect::<Vec<ChunkInfo>>();
 
@@ -267,10 +308,7 @@ impl InnerFsStorage {
             // We may have duplicated hashes in chunks, so we need to check first if it's there and otherwise
             // do nothing (may not be there, or we may have already removed it). HashMap::get/get_mut do it for us.
             if let Some(infile_chunk) = self.data.get_mut(&chunk.hash) {
-                // Remove any chunk referencing the item's path
-                let _ = infile_chunk.paths.extract_if(|infile| infile.path == path);
-                // If there are not references left, outright remove the entry
-                if infile_chunk.paths.is_empty() {
+                if infile_chunk.path == path {
                     self.data.remove(&chunk.hash);
                 }
             }
@@ -287,104 +325,32 @@ impl InnerFsStorage {
     }
 }
 
-/// Storage keeping files in the filesystem instead of stored chunks indipendently
-///
-/// It is useful to actually install files in the filesystem if the root is set to `/`
-///
-/// While it implements `ChunkStorage`, most methods will fail without special care, in particular by providing
-/// relevant items to get their paths.
-///
-/// Most logic is implemented in `InnerFsStorage`, this is mostly a wrapper to provide interior mutability
-#[derive(Clone, Default)]
-pub struct FsStorage {
-    /// Reference to data and some auxiliary maps to keep track of different chunks and paths
-    data: Arc<RwLock<InnerFsStorage>>,
-}
-
-impl FsStorage {
-    pub fn new(root: PathBuf) -> Result<Self, std::io::Error> {
-        create_dir_all(&root)?;
-        Ok(Self {
-            data: Arc::new(RwLock::new(InnerFsStorage::new(root))),
-        })
-    }
-
-    //pub fn load() {}
-
-    /// Call `read()` on self.data lock and unwrap it
-    fn read(&self) -> std::sync::RwLockReadGuard<InnerFsStorage> {
-        self.data.read().expect("Poisoned Lock")
-    }
-
-    /// Call `write()` on self.data lock and unwrap it
-    fn write(&self) -> std::sync::RwLockWriteGuard<InnerFsStorage> {
-        self.data.write().expect("Poisoned Lock")
-    }
-
-    /// Root path for the `FsStorage`
-    #[must_use]
-    pub fn root(&self) -> PathBuf {
-        self.read().root.clone()
-    }
-
-    #[must_use]
-    pub fn items(&self) -> HashSet<Item> {
-        self.read().items.clone()
-    }
-
-    #[must_use]
-    pub fn path(&self, path: &Path) -> PathBuf {
-        self.read().path(path)
-    }
-
-    /// Wrapper around `InnerFsStorage::pre_allocate`
-    pub fn pre_allocate(&self, path: &Path, data: &[ChunkInfo]) -> Result<(), Error> {
-        self.write().pre_allocate(path, data)
-    }
-
-    /// Wrapper around `InnerFsStorage::pre_allocate_bytes`
-    pub fn pre_allocate_bytes(&self, path: &Path, data: &[u8]) -> Result<(), Error> {
-        self.write().pre_allocate_bytes(path, data)
-    }
-
-    /// Wrapper around `InnerFsStorage::pre_allocate_item`
-    pub fn pre_allocate_item(&self, item: &Item) -> Result<(), Error> {
-        self.write().pre_allocate_item(item)
-    }
-
-    /// Remove references to file from `FsStorage`, doesn't actually delete the file from filesystem
-    /// Wrapper around `InnerFsStorage::remove`
-    pub fn remove(&self, item: Item) -> Result<(), Error> {
-        self.write().remove(item)
-    }
-
-    /// Remove references to file from `FsStorage` and deletes the file from filesystem
-    /// Wrapper around `InnerFsStorage::delete`
-    pub fn delete(&self, item: Item) -> Result<(), Error> {
-        self.write().delete(item)
-    }
-}
-
 impl ChunkStorage for FsStorage {
     /// Get a `StoredChunkRef` chunk from storage
     fn get(&self, hash: &Hash) -> Option<Arc<StoredChunkRef>> {
-        let inner = self.read();
-        inner.links.get(hash).cloned().or(inner
+        self.links.get(hash).cloned().or(self
             .data
             .get(hash)
             .and_then(|x| StoredChunkRef::try_from(x).ok())
             .map(Arc::new))
     }
 
-    fn size(&self) -> usize {
+    fn size(&self) -> u64 {
         0 // TODO
     }
 
-    /// May only add chunks by adding items. Dummy implementation always returning None
-    fn _insert_chunk(&self, hash: Hash, chunk: &[u8]) -> Option<Arc<StoredChunkRef>> {
-        self.write().data.get_mut(&hash).and_then(|infile_chunk| {
+    /// Insert chunk into storage, requires an item to have been created with the appropriate chunks to be preallocate
+    fn _insert_chunk(&mut self, hash: Hash, chunk: &[u8]) -> Option<Arc<StoredChunkRef>> {
+        self.data.get_mut(&hash).and_then(|infile_chunk| {
             infile_chunk
-                .write(&hash, chunk)
+                .write(
+                    &hash,
+                    chunk,
+                    self.handles_map
+                        .get(&infile_chunk.path)?
+                        .buf_writer
+                        .as_ref(),
+                )
                 .inspect_err(|e| tracing::error!("Cannot write infile chunk: {e}"))
                 .ok()
 
@@ -402,10 +368,30 @@ impl ChunkStorage for FsStorage {
         }))
     }
 
+    /// May only link chunks by adding items. Dummy implementation always returning None
+    fn _link(
+        &mut self,
+        hash: Hash,
+        left: Arc<StoredChunkRef>,
+        right: Arc<StoredChunkRef>,
+    ) -> Option<Arc<StoredChunkRef>> {
+        let size = left.size() + right.size();
+        let res = self.links.try_insert(
+            hash,
+            Arc::new(StoredChunkRef::Parent {
+                hash,
+                left,
+                right,
+                size,
+            }),
+        );
+        Some(res.map_or_else(|e| (*e.entry.get()).clone(), |x| (*x).clone()))
+    }
+
     /// Create a new Item from its metadata and Bytes
     /// This is the preferred way to create a new Item
     fn create_item(
-        &self,
+        &mut self,
         name: ItemName,
         path: PathBuf,
         revision: u32,
@@ -427,7 +413,7 @@ impl ChunkStorage for FsStorage {
     }
 
     fn build_item(
-        &self,
+        &mut self,
         name: ItemName,
         path: PathBuf,
         revision: u32,
@@ -447,24 +433,67 @@ impl ChunkStorage for FsStorage {
         Some(item)
     }
 
-    /// May only link chunks by adding items. Dummy implementation always returning None
-    fn _link(
-        &self,
-        hash: Hash,
-        left: Arc<StoredChunkRef>,
-        right: Arc<StoredChunkRef>,
-    ) -> Option<Arc<StoredChunkRef>> {
-        let mut l = self.write();
-        let res = l
-            .links
-            .try_insert(hash, Arc::new(StoredChunkRef::Parent { hash, left, right }));
-        Some(res.map_or_else(|e| (*e.entry.get()).clone(), |x| (*x).clone()))
+    /// Build a new Item from its metadata and a streaming of nodes
+    async fn receive_item<T>(
+        &mut self,
+        name: ItemName,
+        path: PathBuf,
+        revision: u32,
+        description: Option<String>,
+        mut stream: T,
+        //) -> Result<Item, crate::error::Error>
+    ) -> Result<Item, crate::error::Error>
+    where
+        Self: Sized,
+        T: Stream<Item = SerializedTree> + std::marker::Unpin,
+    {
+        let path = self.path(&path);
+
+        tracing::trace!("Receiving item at '{}'", path.to_string_lossy());
+        let mut i = 0; // node counter
+        let mut o = 0u64; // offset counter
+
+        // Last inserted node, will be the root at last
+        let mut last: Option<Arc<StoredChunkRef>> = None; // final node
+
+        while let Some(node) = stream.next().await {
+            tracing::trace!(
+                "Received {} bytes (0x{}..{})",
+                node.bitcode_hashtree.len(),
+                &node.bitcode_hashtree[..8].iter().map(|x| format!("{:02x}", x)).collect::<String>(),
+                &node.bitcode_hashtree[node.bitcode_hashtree.len() - 8..].iter().map(|x| format!("{:02x}", x)).collect::<String>(),
+            );
+            let deser: StoredChunkRef =
+                bitcode::deserialize(&node.bitcode_hashtree).map_err(InvalidParameter::Bitcode)?;
+            tracing::trace!("Deserialized: {:?}", deser);
+
+            match deser.clone() {
+                s_n @ StoredChunkRef::Stored { .. } => {
+                    tracing::trace!(
+                        "Preallocating {} bytes in {}@'{}'",
+                        s_n.size(),
+                        o,
+                        path.to_string_lossy()
+                    );
+                    self.pre_allocate_chunk(&path, s_n.chunk_info(), o)?;
+                    o = o + s_n.size(); // FIXME this may be incorrect, should be passed along with the chunk
+                }
+                _ => {}
+
+            }
+            last = self.try_fill_in(&deser);
+            i += 1;
+        }
+
+        let last = last.ok_or(StorageError::TreeReconstruct)?;
+        tracing::info!("Reconstructed {i} nodes with {} bytes total", last.size());
+
+        Ok(Item::new(name, path, revision, description, &last))
     }
 
     /// Get a Vec of all chunks' hashes in storage
     fn chunks(&self) -> Vec<Hash> {
-        tracing::trace!("data: {:?}", self.read().data);
-        self.read().data.keys().copied().collect()
+        self.data.keys().copied().collect()
     }
 
     /*
@@ -495,10 +524,10 @@ mod tests {
             chunks: {:?} \n\
             file chunks: {:?} \n\
             items: {:?}",
-            storage.root(),
+            storage.root,
             storage.chunks(),
-            storage.data.read().unwrap().data.values(),
-            storage.items(),
+            storage.data.values(),
+            storage.items,
         );
     }
 
@@ -509,9 +538,10 @@ mod tests {
         let infile_chunk = InFileChunk {
             info: ChunkInfo {
                 hash,
-                size: SIZE as u32,
+                size: SIZE as u64,
             },
-            paths: HashSet::default(),
+            path: PathBuf::new(),
+            offset: 0,
             populated: Arc::default(),
         };
         (data, hash, infile_chunk)
@@ -524,13 +554,13 @@ mod tests {
     ) -> PathBuf {
         //  Add a temporary path
         let path = std::env::temp_dir().join(PathBuf::from_str("tempfile").unwrap());
-        infile_chunk.paths.insert(InFileChunkPaths {
-            path: path.clone(),
-            offset: 0,
-        });
+        let write_buf = Mutex::new(BufWriter::new(open_file(&path).unwrap()));
+
+        infile_chunk.path = path.clone();
+        infile_chunk.offset = 0;
 
         // write to temp path
-        infile_chunk.write(&hash, data).unwrap();
+        infile_chunk.write(&hash, data, &write_buf).unwrap();
 
         // wait for the file to do actually written. We're calling `sync_all` inside InFileChunk::write,
         // maybe I'm missing something.
@@ -593,7 +623,7 @@ mod tests {
 
         // create storage in a temporary directory
         let tempdir = std::env::temp_dir().join(PathBuf::from_str("in_a_temp_dir").unwrap());
-        let storage = FsStorage::new(tempdir.clone()).unwrap();
+        let mut storage = FsStorage::new(tempdir.clone());
 
         // make an item with a know content, a single chunk of all zeros
         let item = make_ones_item();
@@ -607,7 +637,7 @@ mod tests {
         let itempath = crate::utils::path::join(&tempdir, &item.metadata.path);
         assert!(itempath.exists());
 
-        let path = storage.data.read().unwrap().item_path(&item).unwrap();
+        let path = storage.item_path(&item).unwrap();
         assert_eq!(itempath, path);
         let mut f = File::open(&path).unwrap();
         let mut buffer = vec![0u8; item.size() as usize];
@@ -638,7 +668,7 @@ mod tests {
     fn test_fs_storage_round_trip() {
         // create storage in a temporary directory
         let tempdir = std::env::temp_dir().join(PathBuf::from_str("in_a_temp_dir").unwrap());
-        let storage = FsStorage::new(tempdir.clone()).unwrap();
+        let storage = FsStorage::new(tempdir.clone());
 
         let item = new_dummy_item::<FsStorage, 1u8, 1_000_000>(&storage);
         println!("Created item: {item:?}");

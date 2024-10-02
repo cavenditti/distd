@@ -128,14 +128,14 @@ impl Item {
     /// Recompute total size of the item
     /// Computed as the sum of the sizes of the chunks
     #[must_use]
-    pub fn recompute_size(&self) -> u32 {
+    pub fn recompute_size(&self) -> u64 {
         // useful?
         self.chunks.iter().map(|x| x.size).sum()
     }
 
     /// Total size of the item
     #[must_use]
-    pub fn size(&self) -> u32 {
+    pub fn size(&self) -> u64 {
         self.metadata.size()
     }
 
@@ -144,6 +144,11 @@ impl Item {
     #[must_use]
     pub fn diff(&self, other: &Self) -> HashSet<ChunkInfo> {
         self.hashes.difference(&other.hashes).copied().collect()
+    }
+
+    #[inline(always)]
+    pub fn root(&self) -> &crate::hash::Hash {
+        &self.metadata.root.hash
     }
 }
 
@@ -216,7 +221,7 @@ pub mod tests {
 
     pub fn new_dummy_item<T, const VALUE: u8, const SIZE: usize>(storage: &T) -> Item
     where
-        T: ChunkStorage + Clone,
+        T: ChunkStorage,
     {
         println!("Inserting {SIZE} {VALUE}u8");
 
@@ -250,7 +255,7 @@ pub mod tests {
         let data = Bytes::from_iter([value; CHUNK_SIZE]);
         let chunk = ChunkInfo {
             hash: hash(&data),
-            size: CHUNK_SIZE as u32,
+            size: CHUNK_SIZE as u64,
         };
         Item::make(
             "name".to_string(),

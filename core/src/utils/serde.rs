@@ -1,6 +1,6 @@
 //! Various serde-related utils
 use crate::hash::Hash;
-use serde::{de, Deserialize, Deserializer, Serialize};
+use serde::{de, Deserialize, Deserializer};
 use std::{fmt, str::FromStr};
 
 //pub mod msgpack;
@@ -22,141 +22,88 @@ where
     }
 }
 
-pub mod hashes {
-    use super::{de, Deserialize, Deserializer, FromStr, Hash, Serialize};
+pub mod nodes {
+    use std::fmt;
+    use std::sync::Arc;
 
-    pub fn serialize_hash<S>(v: &Hash, serializer: S) -> Result<S::Ok, S::Error>
+    use serde::de::Visitor;
+    use serde::{de::SeqAccess, ser::SerializeStruct};
+
+    use super::{de, Deserialize, Deserializer, Hash};
+    use crate::chunk_storage::StoredChunkRef;
+
+    pub fn serialize_arc_node<S>(v: &Arc<StoredChunkRef>, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
-        if serializer.is_human_readable() {
-            v.to_string().serialize(serializer)
-        } else {
-            v.as_bytes().serialize(serializer)
-        }
+        let mut state = serializer.serialize_struct("Arc<StoredChunkRef>", 2)?;
+        state.serialize_field("hash", v.hash())?;
+        state.serialize_field("size", &v.size())?;
+        state.end()
     }
 
-    pub fn deserialize_hash<'de, D>(deserializer: D) -> Result<Hash, D::Error>
+    pub fn deserialize_arc_node<'de, D>(deserializer: D) -> Result<Arc<StoredChunkRef>, D::Error>
     where
         D: Deserializer<'de>,
     {
-        if deserializer.is_human_readable() {
-            let s: String = Deserialize::deserialize(deserializer)?;
-            Hash::from_str(&s).map_err(|e| de::Error::custom(e.to_string()))
-        } else {
-            let s: [u8; 32] = Deserialize::deserialize(deserializer)?;
-            Ok(Hash::from_bytes(s))
+        #[derive(Deserialize)]
+        #[serde(field_identifier, rename_all = "lowercase")]
+        enum Field {
+            Hash,
+            Size,
         }
-    }
 
-    pub fn serialize_hash_vec<S>(v: &[Hash], serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        if serializer.is_human_readable() {
-            v.iter()
-                .map(std::string::ToString::to_string)
-                .collect::<Vec<String>>()
-                .serialize(serializer)
-        } else {
-            v.iter()
-                .map(|e| *e.as_bytes())
-                .collect::<Vec<[u8; 32]>>()
-                .serialize(serializer)
+        struct DurationVisitor;
+
+        impl<'de> Visitor<'de> for DurationVisitor {
+            type Value = Arc<StoredChunkRef>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("struct derived from Arc<StoredChunkRef>")
+            }
+
+            fn visit_seq<V>(self, mut seq: V) -> Result<Arc<StoredChunkRef>, V::Error>
+            where
+                V: SeqAccess<'de>,
+            {
+                let hash = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(0, &self))?;
+                let size = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(1, &self))?;
+                Ok(Arc::new(StoredChunkRef::Skipped { hash, size }))
+            }
+
+            fn visit_map<V>(self, mut map: V) -> Result<Self::Value, V::Error>
+            where
+                V: de::MapAccess<'de>,
+            {
+                let mut hash: Option<Hash> = None;
+                let mut size: Option<u64> = None;
+                while let Some(key) = map.next_key()? {
+                    match key {
+                        Field::Hash => {
+                            if hash.is_some() {
+                                return Err(de::Error::duplicate_field("hash"));
+                            }
+                            hash = map.next_value()?;
+                        }
+                        Field::Size => {
+                            if size.is_some() {
+                                return Err(de::Error::duplicate_field("size"));
+                            }
+                            size = map.next_value()?
+                        }
+                    }
+                }
+                let hash = hash.ok_or(de::Error::missing_field("hash"))?;
+                let size = size.ok_or(de::Error::missing_field("size"))?;
+                Ok(Arc::new(StoredChunkRef::Skipped { hash, size }))
+            }
         }
-    }
 
-    pub fn deserialize_hash_vec<'de, D>(deserializer: D) -> Result<Vec<Hash>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        if deserializer.is_human_readable() {
-            let s: Vec<String> = Deserialize::deserialize(deserializer)?;
-            Ok(s.into_iter()
-                .flat_map(|e| Hash::from_str(&e))
-                .collect::<Vec<Hash>>())
-        } else {
-            let s: Vec<[u8; 32]> = Deserialize::deserialize(deserializer)?;
-            Ok(s.into_iter()
-                .map(Hash::from_bytes)
-                .collect::<Vec<Hash>>())
-        }
-    }
-}
-
-pub mod opt_hash_struct {
-    use super::{Deserialize, Deserializer, FromStr, Hash, Serialize};
-
-    pub fn serialize_opt_hash<S>(v: &Option<Hash>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        if serializer.is_human_readable() {
-            Option::<String>::serialize(&v.map(|x| x.to_string()), serializer)
-        } else {
-            Option::<[u8; 32]>::serialize(&v.map(|x| *x.as_bytes()), serializer)
-        }
-    }
-
-    pub fn serialize_opt_2tuple_hash<S>(
-        v: &Option<(Hash, Hash)>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        if serializer.is_human_readable() {
-            Option::<(String, String)>::serialize(
-                &v.map(|(x, y)| (x.to_string(), y.to_string())),
-                serializer,
-            )
-        } else {
-            Option::<([u8; 32], [u8; 32])>::serialize(
-                &v.map(|(x, y)| (*x.as_bytes(), *y.as_bytes())),
-                serializer,
-            )
-        }
-    }
-
-    pub fn deserialize_opt_hash<'de, D>(deserializer: D) -> Result<Option<Hash>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        use serde::de::Error;
-        if deserializer.is_human_readable() {
-            Option::<String>::deserialize(deserializer)
-                .transpose()
-                .map(|x| match x {
-                    Ok(x) => Ok(Hash::from_str(&x).map_err(Error::custom)?),
-                    Err(e) => Err(e),
-                })
-                .transpose()
-        } else {
-            Option::<[u8; 32]>::deserialize(deserializer).map(|x| x.map(Hash::from_bytes))
-        }
-    }
-
-    pub fn deserialize_opt_2tuple_hash<'de, D>(
-        deserializer: D,
-    ) -> Result<Option<(Hash, Hash)>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        use serde::de::Error;
-        if deserializer.is_human_readable() {
-            Option::<(String, String)>::deserialize(deserializer)
-                .transpose()
-                .map(|x| match x {
-                    Ok((x, y)) => Ok((
-                        Hash::from_str(&x).map_err(Error::custom)?,
-                        Hash::from_str(&y).map_err(Error::custom)?,
-                    )),
-                    Err(e) => Err(e),
-                })
-                .transpose()
-        } else {
-            Option::<([u8; 32], [u8; 32])>::deserialize(deserializer)
-                .map(|x| x.map(|(x, y)| (Hash::from_bytes(x), Hash::from_bytes(y))))
-        }
+        const FIELDS: &[&str] = &["hash", "size"];
+        deserializer.deserialize_struct("Duration", FIELDS, DurationVisitor)
     }
 }

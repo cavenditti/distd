@@ -19,14 +19,14 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_target(false)
         .compact()
-        .with_max_level(tracing::Level::DEBUG)
+        .with_max_level(tracing::Level::INFO)
         .init();
 
     tracing::info!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
 
     let server: Server<HashMapStorage> = Server::default();
     let feed = Feed::new("A feed");
-    server.expose_feed(feed).unwrap();
+    server.expose_feed(feed).await.unwrap();
 
     let app = rest_api::make_app(server.clone());
 

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use crate::hash::Hash;
 use crate::chunk_storage::ChunkStorage;
+use crate::hash::Hash;
 
 use super::StoredChunkRef;
 
@@ -17,7 +17,7 @@ impl ChunkStorage for HashMapStorage {
         self.data.read().expect("Poisoned Lock").get(hash).cloned()
     }
 
-    fn _insert_chunk(&self, hash: Hash, chunk: &[u8]) -> Option<Arc<StoredChunkRef>> {
+    fn _insert_chunk(&mut self, hash: Hash, chunk: &[u8]) -> Option<Arc<StoredChunkRef>> {
         let mut data = self.data.write().expect("Poisoned Lock");
 
         //println!("[StorageInsert] Hash: {}, size: {}", hash, size);
@@ -36,7 +36,7 @@ impl ChunkStorage for HashMapStorage {
     }
 
     fn _link(
-        &self,
+        &mut self,
         hash: Hash,
         left: Arc<StoredChunkRef>,
         right: Arc<StoredChunkRef>,
@@ -50,8 +50,17 @@ impl ChunkStorage for HashMapStorage {
         );
         */
         let mut data = self.data.write().expect("Poisoned Lock");
+        let size = left.size() + right.size();
         data.get(&hash).cloned().or(data
-            .try_insert(hash, Arc::new(StoredChunkRef::Parent { hash, left, right }))
+            .try_insert(
+                hash,
+                Arc::new(StoredChunkRef::Parent {
+                    hash,
+                    size,
+                    left,
+                    right,
+                }),
+            )
             .ok()
             .map(|x| x.clone()))
     }
@@ -65,14 +74,14 @@ impl ChunkStorage for HashMapStorage {
             .collect()
     }
 
-    fn size(&self) -> usize {
+    fn size(&self) -> u64 {
         self.data
             .read()
             .expect("Poisoned Lock")
             .values()
             .map(|x| match &**x {
-                StoredChunkRef::Stored { data, .. } => data.len(),
-                StoredChunkRef::Parent { .. } => 0,
+                StoredChunkRef::Stored { data, .. } => data.len() as u64,
+                StoredChunkRef::Parent { .. } | StoredChunkRef::Skipped { .. } => 0,
             })
             .sum()
     }
@@ -84,14 +93,15 @@ mod tests {
 
     use bytes::{Bytes, BytesMut};
     use rand::{self, RngCore};
+    use test_log::test;
 
     use crate::{chunks::CHUNK_SIZE, hash::hash};
 
     #[test]
     fn test_hms_single_chunk_insertion() {
-        let s = HashMapStorage::default();
+        let mut s = HashMapStorage::default();
         let data = Bytes::from_static(b"very few bytes");
-        let len = data.len();
+        let len = data.len() as u64;
         s.insert(data);
         assert_eq!(len, s.size());
     }
@@ -101,7 +111,7 @@ mod tests {
     fn test_hms_insertion() {
         let s = HashMapStorage::default();
         let data = Bytes::from_static(include_bytes!("../../../Cargo.lock"));
-        let len = data.len();
+        let len = data.len() as u64;
         //let root = s.insert(data).unwrap();
         println!("\nOriginal lenght: {}, stored length: {}", len, s.size());
         //print_tree(&*root.to_owned()).unwrap();
@@ -114,12 +124,12 @@ mod tests {
     #[test]
     fn test_hms_deduplicated() {
         const SIZE: usize = CHUNK_SIZE * 3;
-        let s = HashMapStorage::default();
+        let mut s = HashMapStorage::default();
         let data = Bytes::from_static(&[0u8; SIZE]);
         println!("{:?}", data.len());
+
         let root = s.insert(data).unwrap();
-        //print_tree(&*root.to_owned()).unwrap();
-        assert_eq!(CHUNK_SIZE, s.size());
+        assert_eq!(CHUNK_SIZE as u64, s.size());
 
         let root_hash = hash(&[0u8; SIZE]);
         assert_eq!(root.hash(), &root_hash);
@@ -150,11 +160,11 @@ mod tests {
 
     #[test]
     fn test_hms_2mb() {
-        let s = HashMapStorage::default();
+        let mut s = HashMapStorage::default();
         let mut data = BytesMut::with_capacity(2_000_000);
         rand::rngs::OsRng::default().fill_bytes(&mut data);
 
-        let len = data.len();
+        let len = data.len() as u64;
         let root = s.insert(data.clone().into()).unwrap();
         //print_tree(&*root.to_owned()).unwrap();
         assert!(len >= s.size());

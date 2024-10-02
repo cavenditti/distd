@@ -2,14 +2,13 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use axum::body::Bytes;
 use distd_core::chunk_storage::ChunkStorage;
 use distd_core::item::{Item, Name as ItemName};
 use distd_core::metadata::Server as ServerMetadata;
-use distd_core::proto::distd_server::DistdServer;
 use distd_core::utils::grpc::uuid_to_metadata;
 use ring::error::KeyRejected;
 use ring::pkcs8::Document;
@@ -18,8 +17,7 @@ use ring::{
     rand,
     signature::{self},
 };
-use tonic::service::interceptor::InterceptedService;
-use tonic::transport::Channel;
+use tokio::sync::RwLock;
 use tracing::span;
 use uuid::Uuid;
 
@@ -71,7 +69,7 @@ where
     /// global server metadata
     pub metadata: Arc<RwLock<InternalMetadata>>,
     /// A storage implementing ChunkStorage, basically a key-value database of some sort
-    pub storage: T,
+    pub storage: Arc<RwLock<T>>,
     /// Client map
     pub clients: Arc<RwLock<BTreeMap<Uuid, Client>>>,
 
@@ -98,7 +96,7 @@ where
             uuid_nonce,
             metadata: Arc::new(RwLock::new(InternalMetadata::default())),
             clients: Arc::new(RwLock::new(BTreeMap::<Uuid, Client>::new())),
-            storage: T::default(),
+            storage: Arc::default(),
             uuid_interceptor: UuidAuthInterceptor::default(),
         }
     }
@@ -127,7 +125,7 @@ where
     /// This function will insert a new client into the clients map.
     /// The clients map key will be a UUID generated from the client name, the server nonce and the client address.
     #[allow(clippy::missing_panics_doc)]
-    pub fn register_client(
+    pub async fn register_client(
         &self,
         name: ClientName,
         addr: SocketAddr,
@@ -137,11 +135,16 @@ where
         let span = span!(tracing::Level::INFO, "register_client");
         let _entered = span.enter();
 
-        tracing::info!("Got new client: '{}' ver:{:?}, @{}", name, version, addr);
+        tracing::info!("Got new client: \"{}\" ver:{:?}, @{}", name, version, addr);
         let nonced_name = name.clone() + &self.uuid_nonce + &addr.to_string();
         tracing::debug!("Client nonced name: '{}'", nonced_name);
         let uuid = Uuid::new_v5(&Uuid::NAMESPACE_URL, nonced_name.as_bytes());
-        tracing::debug!("client uuid: '{}'", uuid.to_string());
+        tracing::info!(
+            "Assigned client uuid '{}' to \"{}\"@{}",
+            uuid.to_string(),
+            name,
+            addr
+        );
         let client = Client {
             addr,
             name,
@@ -159,7 +162,7 @@ where
 
         self.clients
             .write()
-            .expect("Poisoned Lock")
+            .await
             .try_insert(client.uuid, client)
             .inspect_err(|e| tracing::warn!("{}", e))
             .cloned()
@@ -169,10 +172,10 @@ where
     }
 
     #[allow(clippy::missing_panics_doc)]
-    pub fn expose_feed(&self, feed: Feed) -> Result<FeedName, RegisterError> {
+    pub async fn expose_feed(&self, feed: Feed) -> Result<FeedName, RegisterError> {
         self.metadata
             .write()
-            .expect("Poisoned Lock")
+            .await
             .feeds
             .try_insert(feed.name.clone(), feed)
             .ok()
@@ -190,7 +193,7 @@ where
     ///
     /// Conversion of paths to UTF-8 may panic on some OSes (Windows for sure)
     #[allow(clippy::missing_panics_doc)]
-    pub fn publish_item(
+    pub async fn publish_item(
         &self,
         name: ItemName,
         path: PathBuf,
@@ -201,7 +204,7 @@ where
         let revision = self
             .metadata
             .read()
-            .unwrap()
+            .await
             .items
             .get(&path)
             .map(|i| i.metadata.revision + 1)
@@ -210,7 +213,7 @@ where
         // Check if already exists and if so just return the old one
         // This is doing duplicated hashing calculations, may be improved
         let root = &do_hash(&file);
-        if let Some(old) = self.metadata.read().unwrap().items.get(&path) {
+        if let Some(old) = self.metadata.read().await.items.get(&path) {
             if old.metadata.name == name
                 && old.metadata.path == path
                 && old.metadata.description == description
@@ -223,12 +226,14 @@ where
         // Create item and return it
         let item = self
             .storage
+            .write()
+            .await
             .create_item(name, path, revision, description, file)
             .ok_or(ServerError::ChunkInsertError)?;
 
         self.metadata
             .write()
-            .expect("Poisoned Lock")
+            .await
             .items
             .insert(item.metadata.path.clone(), item.clone());
 
