@@ -117,6 +117,8 @@ where
     Json(
         server
             .storage
+            .read()
+            .unwrap()
             .chunks()
             .into_iter()
             .map(|x| x.to_string())
@@ -129,7 +131,7 @@ async fn get_chunks_size_sum<T>(State(server): State<Server<T>>) -> impl IntoRes
 where
     T: ChunkStorage + Sync + Send + Clone + Default,
 {
-    Json(server.storage.size())
+    Json(server.storage.read().unwrap().size())
 }
 
 /// Get all feeds
@@ -271,6 +273,8 @@ where
     let hash = Hash::from_str(hash.as_str()).map_err(|_| StatusCode::BAD_REQUEST)?;
     server
         .storage
+        .read()
+        .unwrap()
         .get(&hash)
         .ok_or(StatusCode::NOT_FOUND)
         .map(Json)

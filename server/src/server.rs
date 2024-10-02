@@ -68,7 +68,7 @@ where
     /// global server metadata
     pub metadata: Arc<RwLock<InternalMetadata>>,
     /// A storage implementing ChunkStorage, basically a key-value database of some sort
-    pub storage: T,
+    pub storage: Arc<RwLock<T>>,
     /// Client map
     pub clients: Arc<RwLock<BTreeMap<Uuid, Client>>>,
 
@@ -95,7 +95,7 @@ where
             uuid_nonce,
             metadata: Arc::new(RwLock::new(InternalMetadata::default())),
             clients: Arc::new(RwLock::new(BTreeMap::<Uuid, Client>::new())),
-            storage: T::default(),
+            storage: Arc::default(),
             uuid_interceptor: UuidAuthInterceptor::default(),
         }
     }
@@ -220,6 +220,8 @@ where
         // Create item and return it
         let item = self
             .storage
+            .write()
+            .unwrap()
             .create_item(name, path, revision, description, file)
             .ok_or(ServerError::ChunkInsertError)?;
 

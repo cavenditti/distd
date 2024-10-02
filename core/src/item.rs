@@ -221,7 +221,7 @@ pub mod tests {
 
     pub fn new_dummy_item<T, const VALUE: u8, const SIZE: usize>(storage: &T) -> Item
     where
-        T: ChunkStorage + Clone,
+        T: ChunkStorage,
     {
         println!("Inserting {SIZE} {VALUE}u8");
 

@@ -5,7 +5,6 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
 
 use distd_core::chunk_storage::ChunkStorage;
 use distd_core::hash::Hash;
@@ -152,6 +151,8 @@ where
 
         let nodes = self
             .storage
+            .read()
+            .unwrap()
             .get(&hash)
             .ok_or(Status::new(Code::NotFound, "tree not found"))?
             .find_diff(&from)

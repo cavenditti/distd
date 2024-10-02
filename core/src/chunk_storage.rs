@@ -35,9 +35,9 @@ pub enum StorageError {
 /// Defines a backend used to store hashes and chunks ad key-value pairs
 pub trait ChunkStorage {
     fn get(&self, hash: &Hash) -> Option<Arc<StoredChunkRef>>;
-    fn _insert_chunk(&self, hash: Hash, chunk: &[u8]) -> Option<Arc<StoredChunkRef>>;
+    fn _insert_chunk(&mut self, hash: Hash, chunk: &[u8]) -> Option<Arc<StoredChunkRef>>;
     fn _link(
-        &self,
+        &mut self,
         hash: Hash,
         left: Arc<StoredChunkRef>,
         right: Arc<StoredChunkRef>,
@@ -51,7 +51,7 @@ pub trait ChunkStorage {
 
     //fn drop(hash: Hash); // TODO
 
-    fn insert_chunk(&self, chunk: &[u8]) -> Option<Arc<StoredChunkRef>> {
+    fn insert_chunk(&mut self, chunk: &[u8]) -> Option<Arc<StoredChunkRef>> {
         let hash = hash(chunk);
         tracing::trace!("Insert chunk {hash}, {} bytes", chunk.len());
 
@@ -60,7 +60,7 @@ pub trait ChunkStorage {
     }
 
     fn link(
-        &self,
+        &mut self,
         left: Arc<StoredChunkRef>,
         right: Arc<StoredChunkRef>,
     ) -> Option<Arc<StoredChunkRef>> {
@@ -71,12 +71,12 @@ pub trait ChunkStorage {
     }
 
     /// Insert bytes into the storage returning the associated hash tree
-    fn insert(&self, data: Bytes) -> Option<Arc<StoredChunkRef>>
+    fn insert(&mut self, data: Bytes) -> Option<Arc<StoredChunkRef>>
     where
         Self: Sized,
     {
         fn partial_tree(
-            storage: &dyn ChunkStorage,
+            storage: &mut dyn ChunkStorage,
             slices: &[&[u8]],
         ) -> Option<Arc<StoredChunkRef>> {
             /*
@@ -89,10 +89,11 @@ pub trait ChunkStorage {
             match slices.len() {
                 0 => storage.insert_chunk(b""), // Transparently handle empty files too
                 1 => storage.insert_chunk(slices[0]),
-                _ => storage.link(
-                    partial_tree(storage, &slices[..slices.len() / 2])?,
-                    partial_tree(storage, &slices[slices.len() / 2..])?,
-                ),
+                _ => {
+                    let l = partial_tree(storage, &slices[..slices.len() / 2])?;
+                    let r = partial_tree(storage, &slices[slices.len() / 2..])?;
+                    storage.link(l, r)
+                }
             }
         }
 
@@ -124,7 +125,7 @@ pub trait ChunkStorage {
     /// Create a new Item from its metadata and Bytes
     /// This is the preferred way to create a new Item
     fn create_item(
-        &self,
+        &mut self,
         name: ItemName,
         path: PathBuf,
         revision: u32,
@@ -140,7 +141,7 @@ pub trait ChunkStorage {
 
     /// Build a new Item from its metadata and root node
     fn build_item(
-        &self,
+        &mut self,
         name: ItemName,
         path: PathBuf,
         revision: u32,
@@ -154,42 +155,44 @@ pub trait ChunkStorage {
     }
 
     /// Build a new Item from its metadata and a streaming of nodes
-    async fn receive_item<T>(
-        &self,
+    fn receive_item<T>(
+        &mut self,
         name: ItemName,
         path: PathBuf,
         revision: u32,
         description: Option<String>,
         mut stream: T,
         //) -> Result<Item, crate::error::Error>
-    ) -> Result<Item, crate::error::Error>
+    ) -> impl std::future::Future<Output = Result<Item, crate::error::Error>> + Send
     where
-        Self: Sized,
-        T: Stream<Item = SerializedTree> + std::marker::Unpin,
+        Self: Sized + Send,
+        T: Stream<Item = SerializedTree> + std::marker::Unpin + Send,
     {
-        let mut n = None; // final node
-        let mut i = 0; // node counter
-        while let Some(node) = stream.next().await {
-            tracing::trace!(
-                "Received {} bytes ({:x?}..{:x?})",
-                node.bitcode_hashtree.len(),
-                &node.bitcode_hashtree[..8],
-                &node.bitcode_hashtree[..node.bitcode_hashtree.len() - 8]
-            );
-            let deser =
-                bitcode::deserialize(&node.bitcode_hashtree).map_err(InvalidParameter::Bitcode)?;
-            tracing::trace!("Deserialized: {:?}", deser);
-            n = Some(
-                self.try_fill_in(&deser)
-                    .ok_or(StorageError::TreeReconstruct)?,
-            );
-            i += 1;
+        async move {
+            let mut n = None; // final node
+            let mut i = 0; // node counter
+            while let Some(node) = stream.next().await {
+                tracing::trace!(
+                    "Received {} bytes ({:x?}..{:x?})",
+                    node.bitcode_hashtree.len(),
+                    &node.bitcode_hashtree[..8],
+                    &node.bitcode_hashtree[..node.bitcode_hashtree.len() - 8]
+                );
+                let deser = bitcode::deserialize(&node.bitcode_hashtree)
+                    .map_err(InvalidParameter::Bitcode)?;
+                tracing::trace!("Deserialized: {:?}", deser);
+                n = Some(
+                    self.try_fill_in(&deser)
+                        .ok_or(StorageError::TreeReconstruct)?,
+                );
+                i += 1;
+            }
+
+            let n = n.ok_or(StorageError::TreeReconstruct)?;
+            tracing::trace!("Reconstructed {i} nodes with {} bytes total", n.size());
+
+            Ok(Item::new(name, path, revision, description, &n))
         }
-
-        let n = n.ok_or(StorageError::TreeReconstruct)?;
-        tracing::trace!("Reconstructed {i} nodes with {} bytes total", n.size());
-
-        Ok(Item::new(name, path, revision, description, &n))
     }
 
     /// Minimal set of hashes required to reconstruct `target` using `from`
@@ -207,12 +210,13 @@ pub trait ChunkStorage {
     }
 
     /// Take ownership of an `OwnedHashTreeNode` and try to fill in any `Skipped` nodes
-    fn try_fill_in(&self, tree: &StoredChunkRef) -> Option<Arc<StoredChunkRef>> {
-        tracing::trace!("Current chunks in storage: {:?}", self.chunks()); //FIXME remove this
+    fn try_fill_in(&mut self, tree: &StoredChunkRef) -> Option<Arc<StoredChunkRef>> {
         Some(match tree {
             StoredChunkRef::Stored { hash, data } => self._insert_chunk(*hash, &data)?,
             StoredChunkRef::Parent { left, right, .. } => {
-                self.link(self.try_fill_in(left)?, self.try_fill_in(right)?)?
+                let l = self.try_fill_in(left)?;
+                let r = self.try_fill_in(right)?;
+                self.link(l, r)?
             }
             StoredChunkRef::Skipped { hash, .. } => self.get(&hash)?,
         })

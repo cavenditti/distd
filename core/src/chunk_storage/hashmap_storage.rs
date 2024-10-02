@@ -17,7 +17,7 @@ impl ChunkStorage for HashMapStorage {
         self.data.read().expect("Poisoned Lock").get(hash).cloned()
     }
 
-    fn _insert_chunk(&self, hash: Hash, chunk: &[u8]) -> Option<Arc<StoredChunkRef>> {
+    fn _insert_chunk(&mut self, hash: Hash, chunk: &[u8]) -> Option<Arc<StoredChunkRef>> {
         let mut data = self.data.write().expect("Poisoned Lock");
 
         //println!("[StorageInsert] Hash: {}, size: {}", hash, size);
@@ -36,7 +36,7 @@ impl ChunkStorage for HashMapStorage {
     }
 
     fn _link(
-        &self,
+        &mut self,
         hash: Hash,
         left: Arc<StoredChunkRef>,
         right: Arc<StoredChunkRef>,
@@ -99,7 +99,7 @@ mod tests {
 
     #[test]
     fn test_hms_single_chunk_insertion() {
-        let s = HashMapStorage::default();
+        let mut s = HashMapStorage::default();
         let data = Bytes::from_static(b"very few bytes");
         let len = data.len() as u64;
         s.insert(data);
@@ -124,7 +124,7 @@ mod tests {
     #[test]
     fn test_hms_deduplicated() {
         const SIZE: usize = CHUNK_SIZE * 3;
-        let s = HashMapStorage::default();
+        let mut s = HashMapStorage::default();
         let data = Bytes::from_static(&[0u8; SIZE]);
         println!("{:?}", data.len());
 
@@ -160,7 +160,7 @@ mod tests {
 
     #[test]
     fn test_hms_2mb() {
-        let s = HashMapStorage::default();
+        let mut s = HashMapStorage::default();
         let mut data = BytesMut::with_capacity(2_000_000);
         rand::rngs::OsRng::default().fill_bytes(&mut data);
 
