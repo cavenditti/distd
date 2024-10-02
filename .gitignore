@@ -3,5 +3,6 @@
 
 # temporary
 *.random
+*.repeated
 *.zeros
 here/
