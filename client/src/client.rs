@@ -193,11 +193,11 @@ where
             .await?;
 
         tracing::info!(
-            "Got {} v{}, {} bytes after {}s",
+            "Got {} v{}, {} bytes after {:.4}s",
             item.metadata.name,
             item.metadata.revision,
             item.size(),
-            now.elapsed().as_secs()
+            now.elapsed().as_secs_f32()
         );
 
         Ok(item)

@@ -3,7 +3,7 @@ use std::{
     fs::{create_dir_all, remove_file, File},
     io::{BufWriter, Read, Seek, Write},
     path::{Path, PathBuf},
-    sync::{atomic::AtomicBool, Arc, Mutex},
+    sync::{atomic::AtomicBool, Arc},
 };
 
 use tokio_stream::{Stream, StreamExt};
@@ -30,16 +30,21 @@ pub fn open_file(path: &Path) -> Result<File, Error> {
         .map_err(Error::IoError)
 }
 
-#[derive(Debug, Clone)]
-struct Handles {
-    pub buf_writer: Arc<Mutex<BufWriter<File>>>,
+#[derive(Debug)]
+struct Handle {
+    pub buf_writer: BufWriter<File>,
 }
 
-impl Handles {
+impl Handle {
     pub fn new(path: &Path) -> Result<Self, Error> {
         Ok(Self {
-            buf_writer: Arc::new(Mutex::new(BufWriter::new(open_file(path)?))),
+            buf_writer: BufWriter::with_capacity(CHUNK_SIZE * 8, open_file(path)?),
         })
+    }
+
+    pub fn write(&mut self, chunk: &[u8], offset: u64) -> Result<(), Error> {
+        self.buf_writer.seek(std::io::SeekFrom::Start(offset))?;
+        self.buf_writer.write_all(chunk).map_err(Error::IoError)
     }
 }
 
@@ -102,12 +107,7 @@ impl TryFrom<&mut InFileChunk> for Node {
 
 impl InFileChunk {
     /// Write a chunk to the file at all the registered paths for that chunk
-    pub fn write(
-        &self,
-        hash: &Hash,
-        chunk: &[u8],
-        write_buf: &Mutex<BufWriter<File>>,
-    ) -> Result<(), Error> {
+    pub fn write(&self, hash: &Hash, chunk: &[u8], handle: &mut Handle) -> Result<(), Error> {
         tracing::trace!(
             "Writing {hash}, {} bytes at {}",
             chunk.len(),
@@ -121,11 +121,10 @@ impl InFileChunk {
         }
 
         let mut count = 0;
+
         // write chunk to all associated files (and offsets)
-        let mut write_buf = write_buf.lock().unwrap();
-        write_buf.seek(std::io::SeekFrom::Start(self.offset))?;
-        write_buf
-            .write_all(chunk)
+        handle
+            .write(chunk, self.offset)
             .map(|()| {
                 self.populated
                     .swap(true, std::sync::atomic::Ordering::Relaxed);
@@ -137,7 +136,6 @@ impl InFileChunk {
             .inspect(|()| count += chunk.len())
             .inspect(|()| tracing::trace!("{count} bytes written"))
             .inspect_err(|e| tracing::error!("Failed writing {hash} after {count} bytes: {e}"))
-            .map_err(Error::IoError)
     }
 }
 
@@ -162,7 +160,7 @@ pub struct FsStorage {
     data: HashMap<Hash, InFileChunk>,
     links: HashMap<Hash, Arc<Node>>,
 
-    handles_map: HashMap<PathBuf, Handles>,
+    handles_map: HashMap<PathBuf, Handle>,
 }
 
 impl FsStorage {
@@ -219,7 +217,7 @@ impl FsStorage {
         };
         self.data.insert(chunk_info.hash, ifc);
         if !self.handles_map.contains_key(path) {
-            self.handles_map.insert(path.to_owned(), Handles::new(path)?);
+            self.handles_map.insert(path.to_owned(), Handle::new(path)?);
         }
         Ok(())
     }
@@ -343,14 +341,7 @@ impl ChunkStorage for FsStorage {
     fn _insert_chunk(&mut self, hash: Hash, chunk: &[u8]) -> Option<Arc<Node>> {
         self.data.get_mut(&hash).and_then(|infile_chunk| {
             infile_chunk
-                .write(
-                    &hash,
-                    chunk,
-                    self.handles_map
-                        .get(&infile_chunk.path)?
-                        .buf_writer
-                        .as_ref(),
-                )
+                .write(&hash, chunk, self.handles_map.get_mut(&infile_chunk.path)?)
                 .inspect_err(|e| tracing::error!("Cannot write infile chunk: {e}"))
                 .ok()
 
@@ -369,12 +360,7 @@ impl ChunkStorage for FsStorage {
     }
 
     /// May only link chunks by adding items. Dummy implementation always returning None
-    fn _link(
-        &mut self,
-        hash: Hash,
-        left: Arc<Node>,
-        right: Arc<Node>,
-    ) -> Option<Arc<Node>> {
+    fn _link(&mut self, hash: Hash, left: Arc<Node>, right: Arc<Node>) -> Option<Arc<Node>> {
         let size = left.size() + right.size();
         let res = self.links.try_insert(
             hash,
@@ -456,18 +442,28 @@ impl ChunkStorage for FsStorage {
         // Last inserted node, will be the root at last
         let mut last: Option<Arc<Node>> = None; // final node
 
-        while let Some(node) = stream.next().await {
+        let mut stream = stream.map(|node| -> Result<Node, Error> {
             tracing::trace!(
                 "Received {} bytes (0x{}..{})",
                 node.bitcode_hashtree.len(),
-                &node.bitcode_hashtree[..8].iter().map(|x| format!("{:02x}", x)).collect::<String>(),
-                &node.bitcode_hashtree[node.bitcode_hashtree.len() - 8..].iter().map(|x| format!("{:02x}", x)).collect::<String>(),
+                &node.bitcode_hashtree[..8]
+                    .iter()
+                    .map(|x| format!("{:02x}", x))
+                    .collect::<String>(),
+                &node.bitcode_hashtree[node.bitcode_hashtree.len() - 8..]
+                    .iter()
+                    .map(|x| format!("{:02x}", x))
+                    .collect::<String>(),
             );
             let deser: Node =
                 bitcode::deserialize(&node.bitcode_hashtree).map_err(InvalidParameter::Bitcode)?;
             tracing::trace!("Deserialized: {:?}", deser);
+            Ok(deser)
+        });
 
-            match deser.clone() {
+        while let Some(res) = stream.next().await {
+            let node = res?;
+            match &node {
                 s_n @ Node::Stored { .. } => {
                     tracing::trace!(
                         "Preallocating {} bytes in {}@'{}'",
@@ -479,9 +475,8 @@ impl ChunkStorage for FsStorage {
                     o = o + s_n.size(); // FIXME this may be incorrect, should be passed along with the chunk
                 }
                 _ => {}
-
             }
-            last = self.try_fill_in(&deser);
+            last = self.try_fill_in(&node);
             i += 1;
         }
 
