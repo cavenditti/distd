@@ -549,13 +549,13 @@ mod tests {
     ) -> PathBuf {
         //  Add a temporary path
         let path = std::env::temp_dir().join(PathBuf::from_str("tempfile").unwrap());
-        let write_buf = Mutex::new(BufWriter::new(open_file(&path).unwrap()));
+        let mut write_buf = Handle::new(&path).unwrap();
 
         infile_chunk.path = path.clone();
         infile_chunk.offset = 0;
 
         // write to temp path
-        infile_chunk.write(&hash, data, &write_buf).unwrap();
+        infile_chunk.write(&hash, data, &mut write_buf).unwrap();
 
         // wait for the file to do actually written. We're calling `sync_all` inside InFileChunk::write,
         // maybe I'm missing something.
@@ -663,9 +663,9 @@ mod tests {
     fn test_fs_storage_round_trip() {
         // create storage in a temporary directory
         let tempdir = std::env::temp_dir().join(PathBuf::from_str("in_a_temp_dir").unwrap());
-        let storage = FsStorage::new(tempdir.clone());
+        let mut storage = FsStorage::new(tempdir.clone());
 
-        let item = new_dummy_item::<FsStorage, 1u8, 1_000_000>(&storage);
+        let item = new_dummy_item::<FsStorage, 1u8, 1_000_000>(&mut storage);
         println!("Created item: {item:?}");
         print_fsstorage(&storage);
 

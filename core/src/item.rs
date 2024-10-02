@@ -204,7 +204,7 @@ pub mod tests {
      * and messed up
      */
 
-    pub fn new_empty_item<T>(storage: T) -> Item
+    pub fn new_empty_item<T>(storage: &mut T) -> Item
     where
         T: ChunkStorage + Clone,
     {
@@ -219,7 +219,7 @@ pub mod tests {
             .unwrap()
     }
 
-    pub fn new_dummy_item<T, const VALUE: u8, const SIZE: usize>(storage: &T) -> Item
+    pub fn new_dummy_item<T, const VALUE: u8, const SIZE: usize>(storage: &mut T) -> Item
     where
         T: ChunkStorage,
     {
@@ -236,14 +236,14 @@ pub mod tests {
             .unwrap()
     }
 
-    pub fn new_zeros_item<T>(storage: &T) -> Item
+    pub fn new_zeros_item<T>(storage: &mut T) -> Item
     where
         T: ChunkStorage + Clone,
     {
         new_dummy_item::<T, 0u8, 100_000_000>(storage)
     }
 
-    pub fn new_ones_item<T>(storage: &T) -> Item
+    pub fn new_ones_item<T>(storage: &mut T) -> Item
     where
         T: ChunkStorage + Clone,
     {
@@ -292,8 +292,8 @@ pub mod tests {
             mem::size_of::<ItemMetadata>()
         );
         {
-            let storage = HashMapStorage::default();
-            let item = new_empty_item(storage);
+            let mut storage = HashMapStorage::default();
+            let item = new_empty_item(&mut storage);
             let serialized = item.clone().metadata.to_bitcode().unwrap();
             println!("Small Item serialized size: {}", serialized.len());
 
@@ -303,8 +303,8 @@ pub mod tests {
 
         {
             // Same as above but with a larger one
-            let storage = HashMapStorage::default();
-            let item = new_zeros_item(&storage);
+            let mut storage = HashMapStorage::default();
+            let item = new_zeros_item(&mut storage);
             let serialized = item.clone().metadata.to_bitcode().unwrap();
             println!("Small Item serialized size: {}", serialized.len());
 
