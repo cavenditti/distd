@@ -2,7 +2,7 @@ use std::fmt::Write;
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
 use bytes::Bytes;
-pub use stored_chunk_ref::Node;
+pub use node::Node;
 use tokio_stream::{Stream, StreamExt};
 
 use crate::error::InvalidParameter;
@@ -16,7 +16,7 @@ use crate::{
 
 pub mod fs_storage;
 pub mod hashmap_storage;
-pub mod stored_chunk_ref;
+pub mod node;
 
 use thiserror::Error;
 
