@@ -14,7 +14,7 @@ pub type ArcChunk = Arc<Vec<u8>>;
 /// This is the internal representation of the hash-tree
 /// As it contains in-memory references, it is not meant to be serialized
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub enum StoredChunkRef {
+pub enum Node {
     Parent {
         hash: Hash,
         size: u64,
@@ -22,12 +22,12 @@ pub enum StoredChunkRef {
             serialize_with = "serialize_arc_node",
             deserialize_with = "deserialize_arc_node"
         )]
-        left: Arc<StoredChunkRef>,
+        left: Arc<Node>,
         #[serde(
             serialize_with = "serialize_arc_node",
             deserialize_with = "deserialize_arc_node"
         )]
-        right: Arc<StoredChunkRef>,
+        right: Arc<Node>,
     },
     Stored {
         hash: Hash,
@@ -45,20 +45,20 @@ pub enum StoredChunkRef {
 ///
 /// This is the easy way of doing it, not the best one. expecially for large trees probably
 // TODO do this in a better way
-struct StoredChunkRefIterator {
-    stack: Vec<Arc<StoredChunkRef>>,
+struct NodeIterator {
+    stack: Vec<Arc<Node>>,
 }
 
-impl StoredChunkRefIterator {
-    fn new(node: Arc<StoredChunkRef>) -> Self {
+impl NodeIterator {
+    fn new(node: Arc<Node>) -> Self {
         #[inline(always)]
-        fn push_children(node: Arc<StoredChunkRef>, stack: &mut Vec<Arc<StoredChunkRef>>) {
+        fn push_children(node: Arc<Node>, stack: &mut Vec<Arc<Node>>) {
             match node.clone().as_ref() {
-                &StoredChunkRef::Stored { .. } | &StoredChunkRef::Skipped { .. } => {
+                &Node::Stored { .. } | &Node::Skipped { .. } => {
                     // We're at a leaf, just return it
                     stack.push(node)
                 }
-                StoredChunkRef::Parent { left, right, .. } => {
+                Node::Parent { left, right, .. } => {
                     // in this case we keep descending, first pushed get returned last
                     stack.push(node);
                     push_children(right.clone(), stack);
@@ -74,8 +74,8 @@ impl StoredChunkRefIterator {
     }
 }
 
-impl Iterator for StoredChunkRefIterator {
-    type Item = Arc<StoredChunkRef>;
+impl Iterator for NodeIterator {
+    type Item = Arc<Node>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.stack.pop()
@@ -83,7 +83,7 @@ impl Iterator for StoredChunkRefIterator {
 }
 
 
-impl Display for StoredChunkRef {
+impl Display for Node {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let h_str = self.hash().to_string()[..8].to_string() + "…";
         match self {
@@ -105,7 +105,7 @@ impl Display for StoredChunkRef {
     }
 }
 
-impl StoredChunkRef {
+impl Node {
     #[must_use]
     #[inline(always)]
     pub fn hash(&self) -> &Hash {
@@ -151,7 +151,7 @@ impl StoredChunkRef {
 
     /// Get contained data, returns None if is not Parent
     #[must_use]
-    pub fn children(&self) -> Option<(&Arc<StoredChunkRef>, &Arc<StoredChunkRef>)> {
+    pub fn children(&self) -> Option<(&Arc<Node>, &Arc<Node>)> {
         match self {
             Self::Parent { left, right, .. } => Some((left, right)),
             Self::Stored { .. } | Self::Skipped { .. } => None,
@@ -371,12 +371,12 @@ impl StoredChunkRef {
     }
 
     /// Get all unique hashes (`Stored` or `Parent`) referenced by the (sub-)tree, as an HashMap
-    pub fn hash_map(self: &Arc<StoredChunkRef>) -> HashMap<Hash, Arc<StoredChunkRef>> {
+    pub fn hash_map(self: &Arc<Node>) -> HashMap<Hash, Arc<Node>> {
         match self.as_ref() {
-            &StoredChunkRef::Stored { hash, .. } | &StoredChunkRef::Skipped { hash, .. } => {
+            &Node::Stored { hash, .. } | &Node::Skipped { hash, .. } => {
                 HashMap::from([(hash, self.clone())])
             }
-            StoredChunkRef::Parent {
+            Node::Parent {
                 hash, left, right, ..
             } => {
                 let mut left_map = left.clone().hash_map();
@@ -389,9 +389,9 @@ impl StoredChunkRef {
 
     /// Get all unique hashes (`Stored` or `Parent`) referenced by the (sub-)tree, as a HashMap
     pub fn find_diff(
-        self: Arc<StoredChunkRef>,
+        self: Arc<Node>,
         hashes: &[Hash],
-    ) -> impl Iterator<Item = Arc<StoredChunkRef>> {
+    ) -> impl Iterator<Item = Arc<Node>> {
         // prepare hash map
         let mut node_map = self.clone().hash_map();
 
@@ -406,11 +406,11 @@ impl StoredChunkRef {
         // else:
         //  return OwnedHashTreeNode::from(node)
         // O(hashes) + O(tree-nodes) * ~O(1) -> ~O(tree-nodes) (it's actually O(n log(n)), but hash maps pump those log factors down down)
-        StoredChunkRefIterator::new(self).map(move |x| {
+        NodeIterator::new(self).map(move |x| {
             node_map
                 .get(x.hash())
                 .cloned()
-                .unwrap_or(Arc::new(StoredChunkRef::Skipped {
+                .unwrap_or(Arc::new(Node::Skipped {
                     hash: *x.hash(),
                     size: x.size(),
                 }))

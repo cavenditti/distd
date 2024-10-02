@@ -2,7 +2,7 @@ use std::fmt::Write;
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
 use bytes::Bytes;
-pub use stored_chunk_ref::StoredChunkRef;
+pub use stored_chunk_ref::Node;
 use tokio_stream::{Stream, StreamExt};
 
 use crate::error::InvalidParameter;
@@ -34,14 +34,14 @@ pub enum StorageError {
 
 /// Defines a backend used to store hashes and chunks ad key-value pairs
 pub trait ChunkStorage {
-    fn get(&self, hash: &Hash) -> Option<Arc<StoredChunkRef>>;
-    fn _insert_chunk(&mut self, hash: Hash, chunk: &[u8]) -> Option<Arc<StoredChunkRef>>;
+    fn get(&self, hash: &Hash) -> Option<Arc<Node>>;
+    fn _insert_chunk(&mut self, hash: Hash, chunk: &[u8]) -> Option<Arc<Node>>;
     fn _link(
         &mut self,
         hash: Hash,
-        left: Arc<StoredChunkRef>,
-        right: Arc<StoredChunkRef>,
-    ) -> Option<Arc<StoredChunkRef>>;
+        left: Arc<Node>,
+        right: Arc<Node>,
+    ) -> Option<Arc<Node>>;
 
     fn chunks(&self) -> Vec<Hash>;
 
@@ -51,7 +51,7 @@ pub trait ChunkStorage {
 
     //fn drop(hash: Hash); // TODO
 
-    fn insert_chunk(&mut self, chunk: &[u8]) -> Option<Arc<StoredChunkRef>> {
+    fn insert_chunk(&mut self, chunk: &[u8]) -> Option<Arc<Node>> {
         let hash = hash(chunk);
         tracing::trace!("Insert chunk {hash}, {} bytes", chunk.len());
 
@@ -61,9 +61,9 @@ pub trait ChunkStorage {
 
     fn link(
         &mut self,
-        left: Arc<StoredChunkRef>,
-        right: Arc<StoredChunkRef>,
-    ) -> Option<Arc<StoredChunkRef>> {
+        left: Arc<Node>,
+        right: Arc<Node>,
+    ) -> Option<Arc<Node>> {
         let hash = merge_hashes(left.hash(), right.hash());
         tracing::trace!("Link {} {} → {}", left.hash(), right.hash(), hash);
         self._link(hash, left, right)
@@ -71,14 +71,14 @@ pub trait ChunkStorage {
     }
 
     /// Insert bytes into the storage returning the associated hash tree
-    fn insert(&mut self, data: Bytes) -> Option<Arc<StoredChunkRef>>
+    fn insert(&mut self, data: Bytes) -> Option<Arc<Node>>
     where
         Self: Sized,
     {
         fn partial_tree(
             storage: &mut dyn ChunkStorage,
             slices: &[&[u8]],
-        ) -> Option<Arc<StoredChunkRef>> {
+        ) -> Option<Arc<Node>> {
             /*
             tracing::trace!(
                 "{} {:?}",
@@ -146,7 +146,7 @@ pub trait ChunkStorage {
         path: PathBuf,
         revision: u32,
         description: Option<String>,
-        root: Arc<StoredChunkRef>,
+        root: Arc<Node>,
     ) -> Option<Item>
     where
         Self: Sized,
@@ -216,16 +216,16 @@ pub trait ChunkStorage {
     }
 
     /// Take ownership of an `OwnedHashTreeNode` and try to fill in any `Skipped` nodes
-    fn try_fill_in(&mut self, tree: &StoredChunkRef) -> Option<Arc<StoredChunkRef>> {
+    fn try_fill_in(&mut self, tree: &Node) -> Option<Arc<Node>> {
         tracing::trace!("Filling {}", tree.hash());
         Some(match tree {
-            StoredChunkRef::Stored { hash, data } => self._insert_chunk(*hash, &data)?,
-            StoredChunkRef::Parent { left, right, .. } => {
+            Node::Stored { hash, data } => self._insert_chunk(*hash, &data)?,
+            Node::Parent { left, right, .. } => {
                 let l = self.try_fill_in(left)?;
                 let r = self.try_fill_in(right)?;
                 self.link(l, r)?
             }
-            StoredChunkRef::Skipped { hash, .. } => self.get(&hash)?,
+            Node::Skipped { hash, .. } => self.get(&hash)?,
         })
     }
 }

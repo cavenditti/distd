@@ -30,19 +30,19 @@ pub mod nodes {
     use serde::{de::SeqAccess, ser::SerializeStruct};
 
     use super::{de, Deserialize, Deserializer, Hash};
-    use crate::chunk_storage::StoredChunkRef;
+    use crate::chunk_storage::Node;
 
-    pub fn serialize_arc_node<S>(v: &Arc<StoredChunkRef>, serializer: S) -> Result<S::Ok, S::Error>
+    pub fn serialize_arc_node<S>(v: &Arc<Node>, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
-        let mut state = serializer.serialize_struct("Arc<StoredChunkRef>", 2)?;
+        let mut state = serializer.serialize_struct("Arc<Node>", 2)?;
         state.serialize_field("hash", v.hash())?;
         state.serialize_field("size", &v.size())?;
         state.end()
     }
 
-    pub fn deserialize_arc_node<'de, D>(deserializer: D) -> Result<Arc<StoredChunkRef>, D::Error>
+    pub fn deserialize_arc_node<'de, D>(deserializer: D) -> Result<Arc<Node>, D::Error>
     where
         D: Deserializer<'de>,
     {
@@ -56,13 +56,13 @@ pub mod nodes {
         struct DurationVisitor;
 
         impl<'de> Visitor<'de> for DurationVisitor {
-            type Value = Arc<StoredChunkRef>;
+            type Value = Arc<Node>;
 
             fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("struct derived from Arc<StoredChunkRef>")
+                formatter.write_str("struct derived from Arc<Node>")
             }
 
-            fn visit_seq<V>(self, mut seq: V) -> Result<Arc<StoredChunkRef>, V::Error>
+            fn visit_seq<V>(self, mut seq: V) -> Result<Arc<Node>, V::Error>
             where
                 V: SeqAccess<'de>,
             {
@@ -72,7 +72,7 @@ pub mod nodes {
                 let size = seq
                     .next_element()?
                     .ok_or_else(|| de::Error::invalid_length(1, &self))?;
-                Ok(Arc::new(StoredChunkRef::Skipped { hash, size }))
+                Ok(Arc::new(Node::Skipped { hash, size }))
             }
 
             fn visit_map<V>(self, mut map: V) -> Result<Self::Value, V::Error>
@@ -99,7 +99,7 @@ pub mod nodes {
                 }
                 let hash = hash.ok_or(de::Error::missing_field("hash"))?;
                 let size = size.ok_or(de::Error::missing_field("size"))?;
-                Ok(Arc::new(StoredChunkRef::Skipped { hash, size }))
+                Ok(Arc::new(Node::Skipped { hash, size }))
             }
         }
 

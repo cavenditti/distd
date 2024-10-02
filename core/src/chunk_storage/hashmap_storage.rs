@@ -4,20 +4,20 @@ use std::sync::{Arc, RwLock};
 use crate::chunk_storage::ChunkStorage;
 use crate::hash::Hash;
 
-use super::StoredChunkRef;
+use super::Node;
 
 /// Dead simple in-memory global storage
 #[derive(Debug, Default, Clone)]
 pub struct HashMapStorage {
-    data: Arc<RwLock<HashMap<Hash, Arc<StoredChunkRef>>>>,
+    data: Arc<RwLock<HashMap<Hash, Arc<Node>>>>,
 }
 
 impl ChunkStorage for HashMapStorage {
-    fn get(&self, hash: &Hash) -> Option<Arc<StoredChunkRef>> {
+    fn get(&self, hash: &Hash) -> Option<Arc<Node>> {
         self.data.read().expect("Poisoned Lock").get(hash).cloned()
     }
 
-    fn _insert_chunk(&mut self, hash: Hash, chunk: &[u8]) -> Option<Arc<StoredChunkRef>> {
+    fn _insert_chunk(&mut self, hash: Hash, chunk: &[u8]) -> Option<Arc<Node>> {
         let mut data = self.data.write().expect("Poisoned Lock");
 
         //println!("[StorageInsert] Hash: {}, size: {}", hash, size);
@@ -26,7 +26,7 @@ impl ChunkStorage for HashMapStorage {
         }
         data.try_insert(
             hash,
-            Arc::new(StoredChunkRef::Stored {
+            Arc::new(Node::Stored {
                 hash,
                 data: Arc::new(Vec::from(chunk)),
             }),
@@ -38,9 +38,9 @@ impl ChunkStorage for HashMapStorage {
     fn _link(
         &mut self,
         hash: Hash,
-        left: Arc<StoredChunkRef>,
-        right: Arc<StoredChunkRef>,
-    ) -> Option<Arc<StoredChunkRef>> {
+        left: Arc<Node>,
+        right: Arc<Node>,
+    ) -> Option<Arc<Node>> {
         /*
         println!(
             "[Storage Link ]: {}: {} + {}",
@@ -54,7 +54,7 @@ impl ChunkStorage for HashMapStorage {
         data.get(&hash).cloned().or(data
             .try_insert(
                 hash,
-                Arc::new(StoredChunkRef::Parent {
+                Arc::new(Node::Parent {
                     hash,
                     size,
                     left,
@@ -80,8 +80,8 @@ impl ChunkStorage for HashMapStorage {
             .expect("Poisoned Lock")
             .values()
             .map(|x| match &**x {
-                StoredChunkRef::Stored { data, .. } => data.len() as u64,
-                StoredChunkRef::Parent { .. } | StoredChunkRef::Skipped { .. } => 0,
+                Node::Stored { data, .. } => data.len() as u64,
+                Node::Parent { .. } | Node::Skipped { .. } => 0,
             })
             .sum()
     }

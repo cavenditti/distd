@@ -48,9 +48,9 @@ Most important part missing is the "chunk-adapter" to make chunking content-awar
 - [x] ~~Implement merkle-tree computing~~
 - [x] ~~Make tests not independent of CHUNK_SIZE~~
 - [x] ~~Refactor hash-tree computing~~ (may be improved)
-- [x] ~~Give each Item its own tree of hashes instead of Vec~~ (kinda done, we have the Arc to the root StorageChunkRef
+- [x] ~~Give each Item its own tree of hashes instead of Vec~~ (kinda done, we have the Arc to the root Node
     while keeping the list of all the leaf hashes)
-- [x] ~~Make order between ChunkInfo and StoredChunkRef (even just renaming them may be enough)~~
+- [x] ~~Make order between ChunkInfo and Node (even just renaming them may be enough)~~
 - [x] ~~Implement diff algorithm comparing merkle-trees~~ won't do it
     > [!NOTE]
     > We may get away with this, as we have all leaf hashes and their differences. Shouldn't really be needed unless
@@ -64,7 +64,8 @@ Most important part missing is the "chunk-adapter" to make chunking content-awar
 - [x] Replace some Option with Result to have better visibility on errors (in progress), mostly in chunk storage
 - [x] Logging
 - [x] Minimal client (very minimal :)
-- [ ] **Simplify client-server API**
+- [x] ~~Simplify client-server API~~ not really simplified but it's ok
+- [x] Rename `StoredChunkRef` to `Node`
 - [ ] Ephemeral token for client auth
 - [ ] Server and Client persistence (client uuid, server registered clients and items, etc.)
 - [ ] Config

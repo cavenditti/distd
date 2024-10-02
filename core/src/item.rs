@@ -37,7 +37,7 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
-use crate::chunk_storage::StoredChunkRef;
+use crate::chunk_storage::Node;
 use crate::chunks::ChunkInfo;
 use crate::metadata::Item as ItemMetadata;
 use crate::unique_name::UniqueName;
@@ -67,7 +67,7 @@ pub struct Item {
 }
 
 impl Item {
-    /// Create a new Item from its metadata and `StoredChunkRef`
+    /// Create a new Item from its metadata and `Node`
     ///
     /// Calling `create_item` on a `ChunkStorage` object encapsulates this and its the recommended way to create
     /// an Item unless there is an explicit reason not to do so.
@@ -77,7 +77,7 @@ impl Item {
         path: PathBuf,
         revision: u32,
         description: Option<String>,
-        hash_tree: &Arc<StoredChunkRef>,
+        hash_tree: &Arc<Node>,
     ) -> Self {
         let now = SystemTime::now();
         Self {

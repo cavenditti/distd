@@ -70,7 +70,7 @@ impl ChunkInfo {
     }
 }
 
-// TODO move to StoredChunkRef
+// TODO move to Node
 /*
 #[cfg(test)]
 mod tests {

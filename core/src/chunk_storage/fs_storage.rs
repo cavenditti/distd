@@ -17,7 +17,7 @@ use crate::{
     proto::SerializedTree,
 };
 
-use super::{ChunkStorage, StoredChunkRef};
+use super::{ChunkStorage, Node};
 
 pub fn open_file(path: &Path) -> Result<File, Error> {
     File::options()
@@ -55,7 +55,7 @@ struct InFileChunk {
     //buf_reader: Arc<Mutex<Option<BufReader<loadFile>>>>,
 }
 
-impl TryFrom<InFileChunk> for StoredChunkRef {
+impl TryFrom<InFileChunk> for Node {
     type Error = Error;
 
     /// Try to read the chunk from the file at first path
@@ -72,28 +72,28 @@ impl TryFrom<InFileChunk> for StoredChunkRef {
 
         file.read_exact(&mut buf)?;
 
-        Ok(StoredChunkRef::Stored {
+        Ok(Node::Stored {
             hash: value.info.hash,
             data: Arc::new(buf),
         })
     }
 }
 
-impl TryFrom<&Arc<InFileChunk>> for StoredChunkRef {
+impl TryFrom<&Arc<InFileChunk>> for Node {
     type Error = Error;
     fn try_from(value: &Arc<InFileChunk>) -> Result<Self, Self::Error> {
         Self::try_from((**value).clone())
     }
 }
 
-impl TryFrom<&InFileChunk> for StoredChunkRef {
+impl TryFrom<&InFileChunk> for Node {
     type Error = Error;
     fn try_from(value: &InFileChunk) -> Result<Self, Self::Error> {
         Self::try_from(value.clone())
     }
 }
 
-impl TryFrom<&mut InFileChunk> for StoredChunkRef {
+impl TryFrom<&mut InFileChunk> for Node {
     type Error = Error;
     fn try_from(value: &mut InFileChunk) -> Result<Self, Self::Error> {
         Self::try_from(value.clone())
@@ -160,7 +160,7 @@ pub struct FsStorage {
 
     /// Data, used to store `InFileChunks` (stored nodes) and link nodes
     data: HashMap<Hash, InFileChunk>,
-    links: HashMap<Hash, Arc<StoredChunkRef>>,
+    links: HashMap<Hash, Arc<Node>>,
 
     handles_map: HashMap<PathBuf, Handles>,
 }
@@ -326,12 +326,12 @@ impl FsStorage {
 }
 
 impl ChunkStorage for FsStorage {
-    /// Get a `StoredChunkRef` chunk from storage
-    fn get(&self, hash: &Hash) -> Option<Arc<StoredChunkRef>> {
+    /// Get a `Node` chunk from storage
+    fn get(&self, hash: &Hash) -> Option<Arc<Node>> {
         self.links.get(hash).cloned().or(self
             .data
             .get(hash)
-            .and_then(|x| StoredChunkRef::try_from(x).ok())
+            .and_then(|x| Node::try_from(x).ok())
             .map(Arc::new))
     }
 
@@ -340,7 +340,7 @@ impl ChunkStorage for FsStorage {
     }
 
     /// Insert chunk into storage, requires an item to have been created with the appropriate chunks to be preallocate
-    fn _insert_chunk(&mut self, hash: Hash, chunk: &[u8]) -> Option<Arc<StoredChunkRef>> {
+    fn _insert_chunk(&mut self, hash: Hash, chunk: &[u8]) -> Option<Arc<Node>> {
         self.data.get_mut(&hash).and_then(|infile_chunk| {
             infile_chunk
                 .write(
@@ -355,14 +355,14 @@ impl ChunkStorage for FsStorage {
                 .ok()
 
             /*
-                StoredChunkRef::try_from(infile_chunk)
-                    .inspect_err(|e| tracing::error!("Cannot create StoredChunkRef: {e}"))
+                Node::try_from(infile_chunk)
+                    .inspect_err(|e| tracing::error!("Cannot create Node: {e}"))
                     .map(Arc::new)
                     .inspect_err(|e| tracing::error!("Cannot insert chunk: {e}"))
                     .ok()
             */
         });
-        Some(Arc::new(StoredChunkRef::Stored {
+        Some(Arc::new(Node::Stored {
             hash,
             data: Arc::new(chunk.to_vec()),
         }))
@@ -372,13 +372,13 @@ impl ChunkStorage for FsStorage {
     fn _link(
         &mut self,
         hash: Hash,
-        left: Arc<StoredChunkRef>,
-        right: Arc<StoredChunkRef>,
-    ) -> Option<Arc<StoredChunkRef>> {
+        left: Arc<Node>,
+        right: Arc<Node>,
+    ) -> Option<Arc<Node>> {
         let size = left.size() + right.size();
         let res = self.links.try_insert(
             hash,
-            Arc::new(StoredChunkRef::Parent {
+            Arc::new(Node::Parent {
                 hash,
                 left,
                 right,
@@ -418,7 +418,7 @@ impl ChunkStorage for FsStorage {
         path: PathBuf,
         revision: u32,
         description: Option<String>,
-        root: Arc<StoredChunkRef>,
+        root: Arc<Node>,
     ) -> Option<Item>
     where
         Self: Sized,
@@ -454,7 +454,7 @@ impl ChunkStorage for FsStorage {
         let mut o = 0u64; // offset counter
 
         // Last inserted node, will be the root at last
-        let mut last: Option<Arc<StoredChunkRef>> = None; // final node
+        let mut last: Option<Arc<Node>> = None; // final node
 
         while let Some(node) = stream.next().await {
             tracing::trace!(
@@ -463,12 +463,12 @@ impl ChunkStorage for FsStorage {
                 &node.bitcode_hashtree[..8].iter().map(|x| format!("{:02x}", x)).collect::<String>(),
                 &node.bitcode_hashtree[node.bitcode_hashtree.len() - 8..].iter().map(|x| format!("{:02x}", x)).collect::<String>(),
             );
-            let deser: StoredChunkRef =
+            let deser: Node =
                 bitcode::deserialize(&node.bitcode_hashtree).map_err(InvalidParameter::Bitcode)?;
             tracing::trace!("Deserialized: {:?}", deser);
 
             match deser.clone() {
-                s_n @ StoredChunkRef::Stored { .. } => {
+                s_n @ Node::Stored { .. } => {
                     tracing::trace!(
                         "Preallocating {} bytes in {}@'{}'",
                         s_n.size(),
@@ -497,7 +497,7 @@ impl ChunkStorage for FsStorage {
     }
 
     /*
-    fn insert(&self, data: bytes::Bytes) -> Option<Arc<StoredChunkRef>>
+    fn insert(&self, data: bytes::Bytes) -> Option<Arc<Node>>
         where
             Self: Sized, {
 
@@ -605,13 +605,13 @@ mod tests {
 
         assert!(is_populated(&infile_chunk));
 
-        let chunk = StoredChunkRef::try_from(infile_chunk.clone()).unwrap();
+        let chunk = Node::try_from(infile_chunk.clone()).unwrap();
         assert_eq!(do_hash(&chunk.stored_data().unwrap()), do_hash(&data));
         assert_eq!(chunk.hash(), &hash);
         assert_eq!(do_hash(&data), hash);
 
         // Check idempotence
-        let chunk2 = StoredChunkRef::try_from(infile_chunk).unwrap();
+        let chunk2 = Node::try_from(infile_chunk).unwrap();
         assert_eq!(chunk, chunk2);
     }
 
