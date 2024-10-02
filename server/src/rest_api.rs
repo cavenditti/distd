@@ -62,6 +62,7 @@ where
 {
     server
         .register_client(client.name, addr, client.version)
+        .await
         .map(|uuid| uuid.to_string())
         .map_err(|_| StatusCode::CONFLICT)
 }
@@ -80,7 +81,7 @@ where
         server
             .clients
             .read()
-            .expect("Poisoned Lock")
+            .await
             .values()
             .cloned()
             .collect::<Vec<Client>>(),
@@ -95,18 +96,16 @@ async fn get_one_client<T>(
 where
     T: ChunkStorage + Sync + Send + Clone + Default,
 {
-    Uuid::from_str(&uuid)
-        .ok()
-        .and_then(|uuid| {
-            server
-                .clients
-                .read()
-                .expect("Poisoned Lock")
-                .get(&uuid)
-                .cloned()
-        })
-        .ok_or(StatusCode::NOT_FOUND)
+    let uuid = Uuid::from_str(&uuid).ok().ok_or(StatusCode::BAD_REQUEST)?;
+
+    server
+        .clients
+        .read()
+        .await
+        .get(&uuid)
+        .cloned()
         .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 /// Get all chunks
@@ -118,7 +117,7 @@ where
         server
             .storage
             .read()
-            .unwrap()
+            .await
             .chunks()
             .into_iter()
             .map(|x| x.to_string())
@@ -131,7 +130,7 @@ async fn get_chunks_size_sum<T>(State(server): State<Server<T>>) -> impl IntoRes
 where
     T: ChunkStorage + Sync + Send + Clone + Default,
 {
-    Json(server.storage.read().unwrap().size())
+    Json(server.storage.read().await.size())
 }
 
 /// Get all feeds
@@ -143,7 +142,7 @@ where
         server
             .metadata
             .read()
-            .expect("Poisoned Lock")
+            .await
             .feeds
             .values()
             .cloned()
@@ -160,7 +159,7 @@ where
         server
             .metadata
             .read()
-            .expect("Poisoned Lock")
+            .await
             .items
             .keys()
             .cloned()
@@ -182,15 +181,7 @@ async fn get_one_item<T>(
 where
     T: ChunkStorage + Sync + Send + Clone + Default,
 {
-    Json(
-        server
-            .metadata
-            .read()
-            .expect("Poisoned Lock")
-            .items
-            .get(&item.path)
-            .cloned(),
-    )
+    Json(server.metadata.read().await.items.get(&item.path).cloned())
 }
 
 #[derive(Deserialize, Serialize)]
@@ -219,16 +210,18 @@ where
         if field.name().unwrap() != "item" {
             continue;
         }
-        let res = server.publish_item(
-            item_data.name,
-            item_data.path,
-            item_data.description,
-            field
-                .bytes()
-                .await
-                .inspect_err(|e| tracing::warn!("Cannot extract bytes from item field: {e}"))
-                .map_err(|_| StatusCode::BAD_REQUEST)?,
-        );
+        let res = server
+            .publish_item(
+                item_data.name,
+                item_data.path,
+                item_data.description,
+                field
+                    .bytes()
+                    .await
+                    .inspect_err(|e| tracing::warn!("Cannot extract bytes from item field: {e}"))
+                    .map_err(|_| StatusCode::BAD_REQUEST)?,
+            )
+            .await;
         let res = res.map(|x| x.metadata);
         tracing::debug!("{:?}", res);
         return res.map(Json).map_err(|e| match e {
@@ -246,15 +239,7 @@ async fn get_one_feed<T>(
 where
     T: ChunkStorage + Sync + Send + Clone + Default,
 {
-    Json(
-        server
-            .metadata
-            .read()
-            .expect("Poisoned Lock")
-            .feeds
-            .get(&name)
-            .cloned(),
-    )
+    Json(server.metadata.read().await.feeds.get(&name).cloned())
 }
 
 /// Download data associated with an hash
@@ -274,7 +259,7 @@ where
     server
         .storage
         .read()
-        .unwrap()
+        .await
         .get(&hash)
         .ok_or(StatusCode::NOT_FOUND)
         .map(Json)
@@ -290,7 +275,7 @@ async fn get_metadata<T>(State(server): State<Server<T>>) -> impl IntoResponse
 where
     T: ChunkStorage + Sync + Send + Clone + Default,
 {
-    let metadata = (*server.metadata.read().expect("Poisoned Lock")).clone();
+    let metadata = (*server.metadata.read().await).clone();
     Json(ServerMetadata::from(metadata))
 }
 

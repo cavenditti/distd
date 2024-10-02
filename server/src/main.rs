@@ -26,7 +26,7 @@ async fn main() {
 
     let server: Server<HashMapStorage> = Server::default();
     let feed = Feed::new("A feed");
-    server.expose_feed(feed).unwrap();
+    server.expose_feed(feed).await.unwrap();
 
     let app = rest_api::make_app(server.clone());
 

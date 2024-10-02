@@ -52,7 +52,7 @@ struct InFileChunk {
     pub offset: u64,
     pub populated: Arc<AtomicBool>,
     //pub cached: Arc<Mutex<Option<Bytes>>>,
-    //buf_reader: Arc<Mutex<Option<BufReader<File>>>>,
+    //buf_reader: Arc<Mutex<Option<BufReader<loadFile>>>>,
 }
 
 impl TryFrom<InFileChunk> for StoredChunkRef {
@@ -122,15 +122,6 @@ impl InFileChunk {
 
         let mut count = 0;
         // write chunk to all associated files (and offsets)
-        /*
-                        File::options()
-                            .create(true)
-                            .write(true)
-                            .append(false)
-                            .truncate(false)
-                            .open(&p.path)
-                            .inspect_err(|e| tracing::error!("Cannot create file at {:?}: {}", p.path, e))?
-        */
         let mut write_buf = write_buf.lock().unwrap();
         write_buf.seek(std::io::SeekFrom::Start(self.offset))?;
         write_buf
@@ -456,44 +447,48 @@ impl ChunkStorage for FsStorage {
         Self: Sized,
         T: Stream<Item = SerializedTree> + std::marker::Unpin,
     {
+        let path = self.path(&path);
+
         tracing::trace!("Receiving item at '{}'", path.to_string_lossy());
-        let mut n = None; // final node
         let mut i = 0; // node counter
         let mut o = 0u64; // offset counter
+
+        // Last inserted node, will be the root at last
+        let mut last: Option<Arc<StoredChunkRef>> = None; // final node
+
         while let Some(node) = stream.next().await {
             tracing::trace!(
-                "Received {} bytes ({:x?}..{:x?})",
+                "Received {} bytes (0x{}..{})",
                 node.bitcode_hashtree.len(),
-                &node.bitcode_hashtree[..8],
-                &node.bitcode_hashtree[..node.bitcode_hashtree.len() - 8]
+                &node.bitcode_hashtree[..8].iter().map(|x| format!("{:02x}", x)).collect::<String>(),
+                &node.bitcode_hashtree[node.bitcode_hashtree.len() - 8..].iter().map(|x| format!("{:02x}", x)).collect::<String>(),
             );
             let deser: StoredChunkRef =
                 bitcode::deserialize(&node.bitcode_hashtree).map_err(InvalidParameter::Bitcode)?;
             tracing::trace!("Deserialized: {:?}", deser);
+
             match deser.clone() {
-                d @ StoredChunkRef::Stored { .. } => {
+                s_n @ StoredChunkRef::Stored { .. } => {
                     tracing::trace!(
                         "Preallocating {} bytes in {}@'{}'",
-                        d.size(),
+                        s_n.size(),
                         o,
                         path.to_string_lossy()
                     );
-                    self.pre_allocate_chunk(&path, d.chunk_info(), o)?;
-                    o = o + d.size();
+                    self.pre_allocate_chunk(&path, s_n.chunk_info(), o)?;
+                    o = o + s_n.size(); // FIXME this may be incorrect, should be passed along with the chunk
                 }
                 _ => {}
+
             }
-            n = Some(
-                self.try_fill_in(&deser)
-                    .ok_or(StorageError::TreeReconstruct)?,
-            );
+            last = self.try_fill_in(&deser);
             i += 1;
         }
 
-        let n = n.ok_or(StorageError::TreeReconstruct)?;
-        tracing::trace!("Reconstructed {i} nodes with {} bytes total", n.size());
+        let last = last.ok_or(StorageError::TreeReconstruct)?;
+        tracing::info!("Reconstructed {i} nodes with {} bytes total", last.size());
 
-        Ok(Item::new(name, path, revision, description, &n))
+        Ok(Item::new(name, path, revision, description, &last))
     }
 
     /// Get a Vec of all chunks' hashes in storage

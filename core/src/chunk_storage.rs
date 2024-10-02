@@ -173,10 +173,16 @@ pub trait ChunkStorage {
             let mut i = 0; // node counter
             while let Some(node) = stream.next().await {
                 tracing::trace!(
-                    "Received {} bytes ({:x?}..{:x?})",
+                    "Received {} bytes ({}..{})",
                     node.bitcode_hashtree.len(),
-                    &node.bitcode_hashtree[..8],
-                    &node.bitcode_hashtree[..node.bitcode_hashtree.len() - 8]
+                    &node.bitcode_hashtree[..8]
+                        .iter()
+                        .map(|x| format!("{:02x}", x))
+                        .collect::<String>(),
+                    &node.bitcode_hashtree[node.bitcode_hashtree.len() - 8..]
+                        .iter()
+                        .map(|x| format!("{:02x}", x))
+                        .collect::<String>(),
                 );
                 let deser = bitcode::deserialize(&node.bitcode_hashtree)
                     .map_err(InvalidParameter::Bitcode)?;
@@ -211,6 +217,7 @@ pub trait ChunkStorage {
 
     /// Take ownership of an `OwnedHashTreeNode` and try to fill in any `Skipped` nodes
     fn try_fill_in(&mut self, tree: &StoredChunkRef) -> Option<Arc<StoredChunkRef>> {
+        tracing::trace!("Filling {}", tree.hash());
         Some(match tree {
             StoredChunkRef::Stored { hash, data } => self._insert_chunk(*hash, &data)?,
             StoredChunkRef::Parent { left, right, .. } => {

@@ -17,13 +17,13 @@ pub enum Error {
     #[error("{0}")]
     Other(String),
 
-    #[error("Invalid parameter")]
+    #[error("Invalid parameter: '{0}'")]
     InvalidParmeter(#[from] InvalidParameter),
 
-    #[error("Communication error")]
+    #[error("Communication error: '{0}'")]
     Communication(#[from] Communication),
 
-    #[error("Storage error")]
+    #[error("Storage error: '{0}'")]
     Storage(#[from] StorageError),
 }
 

@@ -89,8 +89,9 @@ where
         let addr = addr.ok_or(Status::new(Code::Internal, "Invalid source address"))?;
         let uuid = self
             .register_client(inner.name, addr, Version::from_str(&inner.version).ok())
+            .await
             .map_err(|_| Status::new(Code::Internal, "Cannot assign new UUID"))?;
-        let serialized = ServerMetadataRepr::from(self.metadata.read().unwrap().clone())
+        let serialized = ServerMetadataRepr::from(self.metadata.read().await.clone())
             .to_bitcode()
             .map_err(|_| Status::new(Code::Internal, "Cannot serialize server metadata"))?;
         Ok(Response::new(ServerMetadata {
@@ -103,7 +104,7 @@ where
         &self,
         _request: Request<ClientKeepAlive>,
     ) -> Result<Response<ServerMetadata>, Status> {
-        let serialized = ServerMetadataRepr::from(self.metadata.read().unwrap().clone())
+        let serialized = ServerMetadataRepr::from(self.metadata.read().await.clone())
             .to_bitcode()
             .map_err(|_| Status::new(Code::Internal, "Cannot serialize server metadata"))?;
         Ok(Response::new(ServerMetadata {
@@ -125,7 +126,7 @@ where
         let inner = request.into_inner();
 
         let hash = {
-            let metadata = self.metadata.read().unwrap();
+            let metadata = self.metadata.read().await;
             *PathBuf::from_str(&inner.item_path)
                 .ok()
                 .and_then(|x| metadata.items.get(&x))
@@ -152,7 +153,7 @@ where
         let nodes = self
             .storage
             .read()
-            .unwrap()
+            .await
             .get(&hash)
             .ok_or(Status::new(Code::NotFound, "tree not found"))?
             .find_diff(&from)

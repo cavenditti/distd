@@ -1,21 +1,19 @@
 use std::{
-    collections::HashMap, path::{Path, PathBuf}, sync::Arc, time::Duration
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
 };
 
-use tokio::time::sleep;
+use tokio::time::{sleep, Instant};
 use tokio_stream::StreamExt;
 
-use crate::{
-    error::{Client as ClientError, ServerRequest},
-    server::Server,
-    settings::Settings,
-};
+use crate::{error::Client as ClientError, server::Server, settings::Settings};
 
 use std::{fs::File, io::Read};
 
 use distd_core::{
-    chunk_storage::{fs_storage::FsStorage, ChunkStorage, StoredChunkRef},
-    error::InvalidParameter,
+    chunk_storage::{fs_storage::FsStorage, ChunkStorage},
     hash::Hash,
     item::Item,
     metadata::Item as ItemMetadata,
@@ -103,7 +101,7 @@ where
 }
 
 impl Client<FsStorage> {
-    pub async fn sync(self, target: &Path, path: &Path) -> Result<(), ClientError> {
+    pub async fn sync(&mut self, target: &Path, path: &Path) -> Result<Item, ClientError> {
         tracing::debug!("sync: {target:?} {path:?}");
         let mut buf = vec![];
 
@@ -131,32 +129,20 @@ impl Client<FsStorage> {
             buf.clone().into(),
         );
 
-        let from = self.storage.chunks(); // FIXME this could get very very large (optimize by only sending roots of sub-trees)
-        tracing::trace!("Signalig to server we've got {from:?}");
-
-        let new_item = self
-            .transfer_diff(item_metadata.clone(), None, None, &from) // FIXME pass item versions
-            .await?;
-
-        tracing::debug!(
-            "Updated {} to revision {}",
-            new_item.metadata.path.to_string_lossy(),
-            new_item.metadata.revision
-        );
-        Ok(())
+        self.update(item_metadata).await
     }
 }
 
 impl<T> Client<T>
 where
-    T: ChunkStorage + Clone + Send + 'static,
+    T: ChunkStorage + Send + 'static,
 {
     /// Transfer a diff from the server
     ///
     /// Note: this function is item-agnostic, if using the FsStorage backend one should have already
     /// preallocated an item in order to be able to reconstruct sub-trees
     async fn transfer_diff(
-        &self,
+        &mut self,
         target: ItemMetadata,
         request_version: Option<u32>,
         from_version: Option<u32>,
@@ -192,6 +178,7 @@ where
             new_item_metadata.name,
             new_item_metadata.path.to_string_lossy()
         );
+        let now = Instant::now();
 
         let from = self.storage.chunks(); // FIXME this could get very very large
 
@@ -205,7 +192,13 @@ where
             )
             .await?;
 
-        tracing::info!("Got {} v{}, {} bytes", item.metadata.name, item.metadata.revision, item.size());
+        tracing::info!(
+            "Got {} v{}, {} bytes after {}s",
+            item.metadata.name,
+            item.metadata.revision,
+            item.size(),
+            now.elapsed().as_secs()
+        );
 
         Ok(item)
     }
@@ -220,8 +213,16 @@ where
             tokio::time::sleep(self.server.timeout).await;
             let items = self.server.metadata().await.items;
             for path in &self.settings.client.sync.clone() {
-                if latest.get(path) == self.server.metadata().await.items.get(path).map(|i| &i.root.hash) {
-                    continue
+                if latest.get(path)
+                    == self
+                        .server
+                        .metadata()
+                        .await
+                        .items
+                        .get(path)
+                        .map(|i| &i.root.hash)
+                {
+                    continue;
                 }
 
                 tracing::debug!("Syncing '{}'", path.to_string_lossy());
@@ -237,6 +238,7 @@ pub mod cli {
     use std::{env, path::PathBuf, str::FromStr};
 
     use distd_core::chunk_storage::fs_storage::FsStorage;
+    use distd_core::chunk_storage::hashmap_storage::HashMapStorage;
 
     use crate::client::Client;
     use crate::error::Client as ClientError;
@@ -244,8 +246,8 @@ pub mod cli {
 
     pub async fn main() -> Result<(), ClientError> {
         tracing_subscriber::fmt()
-            .with_target(false)
-            .compact()
+            .with_target(true)
+            //.compact()
             .with_max_level(tracing::Level::INFO)
             .init();
 
@@ -261,12 +263,13 @@ pub mod cli {
         tracing::debug!("Settings: {settings:?}");
 
         let Ok(storage_root) = PathBuf::from_str(&settings.fsstorage.root);
-        let storage = FsStorage::new(storage_root).map_err(|_| ClientError::Storage)?;
-        let client = Client::new(&[0u8; 32], storage.clone(), settings).await?;
+        let storage = FsStorage::new(storage_root);
+        //let storage = HashMapStorage::default();
+        let client = Client::new(&[0u8; 32], storage, settings).await?;
 
         match cmd.as_str() {
             "start" => client.client_loop().await,
-            "sync" => sync(client, &cmd_args[..]).await, // TODO change name and use sync to explicitly request syncing of items subscripted to
+            //"sync" => sync(client, &cmd_args[..]).await, // TODO change name and use sync to explicitly request syncing of items subscripted to
             "publish" => todo!(),
             "subscribe" => todo!(),
             _ => {
@@ -277,7 +280,7 @@ pub mod cli {
         .inspect_err(|e| tracing::error!("Fatal: {e}"))
     }
 
-    async fn sync(client: Client<FsStorage>, args: &[String]) -> Result<(), ClientError> {
+    async fn sync(mut client: Client<FsStorage>, args: &[String]) -> Result<(), ClientError> {
         let first = args
             .first()
             .ok_or(ClientError::InvalidArgs(args.to_owned()))?;
@@ -295,6 +298,6 @@ pub mod cli {
         let Ok(path) = PathBuf::from_str(path);
         let Ok(target) = PathBuf::from_str(target.as_str());
 
-        client.sync(&target, &path).await
+        client.sync(&target, &path).await.map(|_| ())
     }
 }
