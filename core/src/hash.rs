@@ -53,7 +53,7 @@ where
                 partials.pop(); // needed in order to always shrink, otherwise may end stuck with a 2 elements vec
             }
 
-            partials.shrink_to(partials.len() / 2 + partials.len() % 2);
+            partials.truncate(partials.len() / 2 + partials.len() % 2);
         }
         Ok(partials.swap_remove(0).into())
     }
