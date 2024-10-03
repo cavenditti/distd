@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::chunks::{ChunkInfo, CHUNK_SIZE};
 use crate::hash::Hash;
-use crate::utils::serde::nodes::{serialize_arc_node, deserialize_arc_node};
+use crate::utils::serde::nodes::{deserialize_arc_node, serialize_arc_node};
 
 /// Arc reference to a raw byte chunk
 pub type ArcChunk = Arc<Vec<u8>>;
@@ -81,7 +81,6 @@ impl Iterator for NodeIterator {
         self.stack.pop()
     }
 }
-
 
 impl Display for Node {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -344,10 +343,7 @@ impl Node {
     }
 
     /// Get all unique hashes (`Stored` or `Parent`) referenced by the (sub-)tree, as a HashMap
-    pub fn find_diff(
-        self: Arc<Node>,
-        hashes: &[Hash],
-    ) -> impl Iterator<Item = Arc<Node>> {
+    pub fn find_diff(self: Arc<Node>, hashes: &[Hash]) -> impl Iterator<Item = Arc<Node>> {
         // prepare hash map
         let mut node_map = self.clone().hash_map();
 
@@ -360,7 +356,7 @@ impl Node {
         // if node is not in Map:
         //  return Skipped
         // else:
-        //  return OwnedHashTreeNode::from(node)
+        //  return Node::from(node)
         // O(hashes) + O(tree-nodes) * ~O(1) -> ~O(tree-nodes) (it's actually O(n log(n)), but hash maps pump those log factors down down)
         NodeIterator::new(self).map(move |x| {
             node_map
@@ -371,5 +367,188 @@ impl Node {
                     size: x.size(),
                 }))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::{
+        chunks::CHUNK_SIZE,
+        hash::{hash, merge_hashes},
+    };
+    use rand::RngCore;
+
+    use super::Node;
+
+    #[test]
+    fn test_flatten() {
+        const L: usize = 2000;
+        let b1 = Arc::new(vec![0u8; L]);
+        let b2 = Arc::new(vec![1u8; L]);
+        let l1 = b1.len();
+        let l2 = b2.len();
+        let l = Node::Stored {
+            hash: hash(&b1),
+            data: b1,
+        };
+        let r = Node::Stored {
+            hash: hash(&b2),
+            data: b2,
+        };
+        let n = Node::Parent {
+            hash: merge_hashes(l.hash(), r.hash()),
+            size: l.size() + r.size(),
+            left: Arc::new(l),
+            right: Arc::new(r),
+        };
+
+        let flat: Vec<u8> = n.flatten_iter().flat_map(|x| (*x).clone()).collect();
+
+        assert_eq!(flat.len(), l1 + l2);
+
+        for v in &flat[..L] {
+            assert_eq!(*v, 0);
+        }
+
+        for v in &flat[L..] {
+            assert_eq!(*v, 1);
+        }
+    }
+
+    #[test]
+    fn test_node_find_diff_noop() {
+        let data = vec![1u8; 12_000];
+        let h = hash(&data);
+        let node = Node::Stored {
+            hash: h,
+            data: Arc::new(data),
+        };
+        let diff = Arc::new(node).find_diff(&[h]).last().unwrap();
+        assert!(matches!(diff.as_ref(), &Node::Skipped { .. }));
+        assert_eq!(diff.hash(), &h);
+        assert_eq!(diff.size(), 12_000);
+    }
+
+    #[test]
+    fn test_node_find_diff() {
+        let data_size = CHUNK_SIZE * 3 + 4;
+        let mut data = vec![0u8; data_size];
+        rand::rngs::OsRng::default().fill_bytes(&mut data);
+
+        let h1 = hash(&data[..CHUNK_SIZE]);
+        let h2 = hash(&data[CHUNK_SIZE..CHUNK_SIZE * 2]);
+        let h12 = merge_hashes(&h1, &h2);
+        let h3 = hash(&data[CHUNK_SIZE * 2..CHUNK_SIZE * 3]);
+        let h4 = hash(&data[CHUNK_SIZE * 3..]);
+        let h34 = merge_hashes(&h3, &h4);
+        let h = merge_hashes(&h12, &h34);
+
+        // Actually testing the test here
+        assert_eq!(h, hash(&data));
+
+        // Manually create nodes
+        let node = Node::Parent {
+            hash: h,
+            size: data_size as u64,
+            left: Arc::new(Node::Parent {
+                hash: h12,
+                size: (CHUNK_SIZE * 2) as u64,
+                left: Arc::new(Node::Stored {
+                    hash: h1,
+                    data: Arc::new(data[..CHUNK_SIZE].to_vec()),
+                }),
+                right: Arc::new(Node::Stored {
+                    hash: h2,
+                    data: Arc::new(data[CHUNK_SIZE..CHUNK_SIZE * 2].to_vec()),
+                }),
+            }),
+            right: Arc::new(Node::Parent {
+                hash: h34,
+                size: (CHUNK_SIZE + 4) as u64,
+                left: Arc::new(Node::Stored {
+                    hash: h3,
+                    data: Arc::new(data[CHUNK_SIZE * 2..CHUNK_SIZE * 3].to_vec()),
+                }),
+                right: Arc::new(Node::Stored {
+                    hash: h4,
+                    data: Arc::new(data[CHUNK_SIZE * 3..].to_vec()),
+                }),
+            }),
+        };
+
+        let node = Arc::new(node);
+
+        // We now proceed to test all possible combinations of provided hashes to check the results are the expected ones.
+
+        // Single elements
+        for comb in [&[h1], &[h2], &[h3], &[h4]] {
+            // last is always root
+            let diff = node.clone().find_diff(comb).last().unwrap();
+            assert!(matches!(diff.as_ref(), &Node::Parent { .. }));
+            assert_eq!(diff.hash(), &h);
+            assert_eq!(diff.size(), data_size as u64);
+
+            let (left, right) = diff.children().unwrap();
+            assert!(matches!(left.as_ref(), &Node::Parent { .. }));
+            assert!(matches!(right.as_ref(), &Node::Parent { .. }));
+        }
+
+        // Disjoint pairs, i.e. pairs not constituting a sub-tree of their own
+        for comb in [&[h1, h3], &[h2, h3], &[h1, h4], &[h2, h4]] {
+            let diff = node.clone().find_diff(comb).last().unwrap();
+            assert!(matches!(diff.as_ref(), &Node::Parent { .. }));
+            assert_eq!(diff.hash(), &h);
+            assert_eq!(diff.size(), data_size as u64);
+
+            let (left, right) = diff.children().unwrap();
+            assert!(matches!(left.as_ref(), &Node::Parent { .. }));
+            assert!(matches!(right.as_ref(), &Node::Parent { .. }));
+        }
+
+        // Sub-tree pairs
+        for comb in [&[h1, h2], &[h3, h4]] {
+            let diff = node.clone().find_diff(comb).last().unwrap();
+            assert!(matches!(diff.as_ref(), &Node::Parent { .. }));
+            assert_eq!(diff.hash(), &h);
+            assert_eq!(diff.size(), data_size as u64);
+
+            let (left, right) = diff.children().unwrap();
+            println!("{}", left);
+            println!("{}", right);
+            assert!(
+                (matches!(left.as_ref(), &Node::Parent { .. })
+                    && matches!(right.as_ref(), &Node::Skipped { .. }))
+                    || (matches!(left.as_ref(), &Node::Skipped { .. })
+                        && matches!(right.as_ref(), &Node::Parent { .. }))
+            );
+        }
+
+        // Three elements
+        for comb in [&[h1, h2, h3], &[h1, h2, h4], &[h1, h3, h4], &[h2, h3, h4]] {
+            let diff = node.clone().find_diff(comb).last().unwrap();
+            assert!(matches!(diff.as_ref(), &Node::Parent { .. }));
+            assert_eq!(diff.hash(), &h);
+            assert_eq!(diff.size(), data_size as u64);
+
+            let (left, right) = diff.children().unwrap();
+            assert!(
+                (matches!(left.as_ref(), &Node::Parent { .. })
+                    && matches!(right.as_ref(), &Node::Skipped { .. }))
+                    || (matches!(left.as_ref(), &Node::Skipped { .. })
+                        && matches!(right.as_ref(), &Node::Parent { .. }))
+            );
+        }
+
+        let diff = node.clone().find_diff(&[h]).last().unwrap();
+        assert!(matches!(diff.as_ref(), &Node::Skipped { .. }));
+        assert_eq!(diff.hash(), &h);
+        assert_eq!(diff.size(), data_size as u64);
+
+        let diff = node.clone().find_diff(&[h1, h2, h3, h4]).last().unwrap();
+        assert!(matches!(diff.as_ref(), &Node::Skipped { .. }));
+        assert_eq!(diff.hash(), &h);
+        assert_eq!(diff.size(), data_size as u64);
     }
 }
