@@ -17,6 +17,7 @@ use crate::{
 pub mod fs_storage;
 pub mod hashmap_storage;
 pub mod node;
+pub mod node_stream;
 
 use thiserror::Error;
 
@@ -166,29 +167,14 @@ pub trait ChunkStorage {
     ) -> impl std::future::Future<Output = Result<Item, crate::error::Error>> + Send
     where
         Self: Sized + Send,
-        T: Stream<Item = SerializedTree> + std::marker::Unpin + Send,
+        T: Stream<Item = Node> + std::marker::Unpin + Send,
     {
         async move {
             let mut n = None; // final node
             let mut i = 0; // node counter
             while let Some(node) = stream.next().await {
-                tracing::trace!(
-                    "Received {} bytes ({}..{})",
-                    node.bitcode_hashtree.len(),
-                    &node.bitcode_hashtree[..8]
-                        .iter()
-                        .map(|x| format!("{:02x}", x))
-                        .collect::<String>(),
-                    &node.bitcode_hashtree[node.bitcode_hashtree.len() - 8..]
-                        .iter()
-                        .map(|x| format!("{:02x}", x))
-                        .collect::<String>(),
-                );
-                let deser = bitcode::deserialize(&node.bitcode_hashtree)
-                    .map_err(InvalidParameter::Bitcode)?;
-                tracing::trace!("Deserialized: {:?}", deser);
                 n = Some(
-                    self.try_fill_in(&deser)
+                    self.try_fill_in(&node)
                         .ok_or(StorageError::TreeReconstruct)?,
                 );
                 i += 1;

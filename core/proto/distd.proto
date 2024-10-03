@@ -18,7 +18,7 @@ message ItemRequest {
   optional Hashes hashes = 5;
 }
 
-message SerializedTree { bytes bitcode_hashtree = 1; }
+message SerializedTree { bytes payload = 1; }
 
 message Acknowledge { EnumAcknowledge ack = 1; }
 

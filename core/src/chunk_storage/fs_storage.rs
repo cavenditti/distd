@@ -431,7 +431,7 @@ impl ChunkStorage for FsStorage {
     ) -> Result<Item, crate::error::Error>
     where
         Self: Sized,
-        T: Stream<Item = SerializedTree> + std::marker::Unpin,
+        T: Stream<Item = Node> + std::marker::Unpin,
     {
         let path = self.path(&path);
 
@@ -442,27 +442,7 @@ impl ChunkStorage for FsStorage {
         // Last inserted node, will be the root at last
         let mut last: Option<Arc<Node>> = None; // final node
 
-        let mut stream = stream.map(|node| -> Result<Node, Error> {
-            tracing::trace!(
-                "Received {} bytes (0x{}..{})",
-                node.bitcode_hashtree.len(),
-                &node.bitcode_hashtree[..8]
-                    .iter()
-                    .map(|x| format!("{:02x}", x))
-                    .collect::<String>(),
-                &node.bitcode_hashtree[node.bitcode_hashtree.len() - 8..]
-                    .iter()
-                    .map(|x| format!("{:02x}", x))
-                    .collect::<String>(),
-            );
-            let deser: Node =
-                bitcode::deserialize(&node.bitcode_hashtree).map_err(InvalidParameter::Bitcode)?;
-            tracing::trace!("Deserialized: {:?}", deser);
-            Ok(deser)
-        });
-
-        while let Some(res) = stream.next().await {
-            let node = res?;
+        while let Some(node) = stream.next().await {
             match &node {
                 s_n @ Node::Stored { .. } => {
                     tracing::trace!(
@@ -580,6 +560,7 @@ mod tests {
     #[test]
     fn test_infile_chunk() {
         let (data, hash, mut infile_chunk) = make_infile_chunk::<CHUNK_SIZE>();
+        println!("Created infile_chunk");
         assert!(!is_populated(&infile_chunk));
 
         let path = write_data_to_infile_chunk(&data, hash, &mut infile_chunk);

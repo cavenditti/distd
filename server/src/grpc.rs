@@ -5,7 +5,9 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
+use distd_core::chunk_storage::node_stream::sender;
 use distd_core::chunk_storage::ChunkStorage;
 use distd_core::hash::Hash;
 use distd_core::proto::{self, EnumAcknowledge, ItemRequest, SerializedTree};
@@ -13,6 +15,8 @@ use distd_core::utils::grpc::metadata_to_uuid;
 use distd_core::utils::serde::BitcodeSerializable;
 use distd_core::version::Version;
 use tokio::sync::mpsc;
+use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
+
 use tonic::metadata::MetadataValue;
 use tonic::service::Interceptor;
 use tonic::{Code, Request, Response, Status};
@@ -68,8 +72,6 @@ where
         Ok(tonic::transport::Server::builder().add_service(svc))
     }
 }
-
-use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
 
 type ResponseStream = Pin<Box<dyn Stream<Item = Result<SerializedTree, Status>> + Send>>;
 
@@ -157,28 +159,32 @@ where
             .get(&hash)
             .ok_or(Status::new(Code::NotFound, "tree not found"))?
             .find_diff(&from)
-            .inspect(|hs| tracing::trace!("Transferring chunks: {hs}"))
+            .inspect(|hs| tracing::trace!("Transferring chunks: {hs}"));
+        /*
             .map(|n| bitcode::serialize(&n))
             .map(|n| {
                 n.map(|inner| SerializedTree {
-                    bitcode_hashtree: inner,
+                    payload: inner,
                 })
                 .inspect_err(|e| tracing::error!("Cannot serialize chunk {}", e))
                 .map_err(|_| Status::new(Code::Internal, "Cannot serialize"))
             });
         //.flatten(); // FIXME this ignores any error, it's unwrapped down here but equally bad
+        */
 
         //let mut stream = Box::pin(tokio_stream::iter(nodes).throttle(Duration::from_millis(200)));
-        let mut stream = Box::pin(tokio_stream::iter(nodes));
+        // FIXME make serialization fail gracefully instead of panicking
+        // This is due to the Results in the Iterator having to be checked one by one
+        let stream = Box::pin(tokio_stream::iter(nodes));
+        let mut stream =
+            sender(stream, 32, Duration::new(0, 4800)).map(|x| SerializedTree { payload: x });
 
         // spawn and channel are required if you want handle "disconnect" functionality
         // the `out_stream` will not be polled after client disconnect
         let (tx, rx) = mpsc::channel(128);
         tokio::spawn(async move {
             while let Some(item) = stream.next().await {
-                // FIXME make this fail gracefully instead of panicking
-                // This is due to the Results in the Iterator having to be checked one by one
-                match tx.send(Result::<_, Status>::Ok(item.unwrap())).await {
+                match tx.send(Result::<_, Status>::Ok(item)).await {
                     Ok(_) => {
                         // item (serialized tree) was queued to be send to client
                     }

@@ -13,10 +13,10 @@ use crate::{error::Client as ClientError, server::Server, settings::Settings};
 use std::{fs::File, io::Read};
 
 use distd_core::{
-    chunk_storage::{fs_storage::FsStorage, ChunkStorage},
+    chunk_storage::{fs_storage::FsStorage, node_stream::receiver, ChunkStorage},
     hash::Hash,
     item::Item,
-    metadata::Item as ItemMetadata,
+    metadata::Item as ItemMetadata, utils::stream,
 };
 
 #[derive(Debug)]
@@ -158,7 +158,8 @@ where
             )
             .await?;
 
-        let stream = stream.map(|x| x.unwrap()); // FIXME
+        let stream = stream.map(|x| x.unwrap().payload); // FIXME unwraps
+        let stream = receiver(stream, 32, Duration::from_nanos(4800));
 
         self.storage
             .receive_item(
@@ -264,7 +265,7 @@ pub mod cli {
 
         let Ok(storage_root) = PathBuf::from_str(&settings.fsstorage.root);
         let storage = FsStorage::new(storage_root);
-        //let storage = HashMapStorage::default();
+        let storage = HashMapStorage::default(); // use this for benchmarking in order to avoid potential fs-related bottlenecks
         let client = Client::new(&[0u8; 32], storage, settings).await?;
 
         match cmd.as_str() {

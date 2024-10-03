@@ -34,3 +34,4 @@ tonic-build = "0.12"
 [dev-dependencies]
 rand = { version = "0.8.5" }
 test-log = { workspace = true }
+futures = "*"
