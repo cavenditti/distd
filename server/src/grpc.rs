@@ -63,7 +63,7 @@ impl Interceptor for UuidAuthInterceptor {
 
 impl<T> Server<T>
 where
-    T: ChunkStorage + Sync + Send + Clone + Default + Debug + 'static,
+    T: ChunkStorage + Sync + Send + Default + Debug + 'static,
 {
     pub async fn make_grcp_service(self) -> Result<tonic::transport::server::Router, ServerError> {
         let interceptor = self.uuid_interceptor.clone();
@@ -78,7 +78,7 @@ type ResponseStream = Pin<Box<dyn Stream<Item = Result<SerializedTree, Status>> 
 #[tonic::async_trait]
 impl<T> Distd for Server<T>
 where
-    T: ChunkStorage + Sync + Send + Clone + Default + Debug + 'static,
+    T: ChunkStorage + Sync + Send + Default + Debug + 'static,
 {
     type TreeTransferStream = ResponseStream;
 

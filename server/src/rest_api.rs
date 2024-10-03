@@ -58,7 +58,7 @@ async fn register_client<T>(
     State(server): State<Server<T>>,
 ) -> Result<impl IntoResponse, StatusCode>
 where
-    T: ChunkStorage + Sync + Send + Clone + Default + Debug,
+    T: ChunkStorage + Sync + Send + Default + Debug,
 {
     server
         .register_client(client.name, addr, client.version)
@@ -75,7 +75,7 @@ async fn version() -> &'static str {
 /// Get all clients
 async fn get_clients<T>(State(server): State<Server<T>>) -> impl IntoResponse
 where
-    T: ChunkStorage + Sync + Send + Clone + Default,
+    T: ChunkStorage + Sync + Send + Default,
 {
     Json(
         server
@@ -94,7 +94,7 @@ async fn get_one_client<T>(
     State(server): State<Server<T>>,
 ) -> Result<Json<Client>, StatusCode>
 where
-    T: ChunkStorage + Sync + Send + Clone + Default,
+    T: ChunkStorage + Sync + Send + Default,
 {
     let uuid = Uuid::from_str(&uuid).ok().ok_or(StatusCode::BAD_REQUEST)?;
 
@@ -111,7 +111,7 @@ where
 /// Get all chunks
 async fn get_chunks<T>(State(server): State<Server<T>>) -> impl IntoResponse
 where
-    T: ChunkStorage + Sync + Send + Clone + Default,
+    T: ChunkStorage + Sync + Send + Default,
 {
     Json(
         server
@@ -128,7 +128,7 @@ where
 /// Get sum of all chunks sizes
 async fn get_chunks_size_sum<T>(State(server): State<Server<T>>) -> impl IntoResponse
 where
-    T: ChunkStorage + Sync + Send + Clone + Default,
+    T: ChunkStorage + Sync + Send + Default,
 {
     Json(server.storage.read().await.size())
 }
@@ -136,7 +136,7 @@ where
 /// Get all feeds
 async fn get_feeds<T>(State(server): State<Server<T>>) -> impl IntoResponse
 where
-    T: ChunkStorage + Sync + Send + Clone + Default,
+    T: ChunkStorage + Sync + Send + Default,
 {
     Json(
         server
@@ -153,7 +153,7 @@ where
 /// Get all items
 async fn get_items<T>(State(server): State<Server<T>>) -> impl IntoResponse
 where
-    T: ChunkStorage + Sync + Send + Clone + Default,
+    T: ChunkStorage + Sync + Send + Default,
 {
     Json(
         server
@@ -179,7 +179,7 @@ async fn get_one_item<T>(
     State(server): State<Server<T>>,
 ) -> impl IntoResponse
 where
-    T: ChunkStorage + Sync + Send + Clone + Default,
+    T: ChunkStorage + Sync + Send + Default,
 {
     Json(server.metadata.read().await.items.get(&item.path).cloned())
 }
@@ -200,7 +200,7 @@ async fn publish_item<T>(
     mut multipart: Multipart,
 ) -> Result<impl IntoResponse, StatusCode>
 where
-    T: ChunkStorage + Sync + Send + Clone + Default + Debug,
+    T: ChunkStorage + Sync + Send + Default + Debug,
 {
     while let Some(field) = multipart
         .next_field()
@@ -237,7 +237,7 @@ async fn get_one_feed<T>(
     State(server): State<Server<T>>,
 ) -> impl IntoResponse
 where
-    T: ChunkStorage + Sync + Send + Clone + Default,
+    T: ChunkStorage + Sync + Send + Default,
 {
     Json(server.metadata.read().await.feeds.get(&name).cloned())
 }
@@ -253,7 +253,7 @@ async fn get_chunk<T>(
     State(server): State<Server<T>>,
 ) -> Result<impl IntoResponse, StatusCode>
 where
-    T: ChunkStorage + Sync + Send + Clone + Default,
+    T: ChunkStorage + Sync + Send + Default,
 {
     let hash = Hash::from_str(hash.as_str()).map_err(|_| StatusCode::BAD_REQUEST)?;
     server
@@ -273,7 +273,7 @@ struct TransferGetObj {
 /// Download data associated with an hash-tree from its root
 async fn get_metadata<T>(State(server): State<Server<T>>) -> impl IntoResponse
 where
-    T: ChunkStorage + Sync + Send + Clone + Default,
+    T: ChunkStorage + Sync + Send + Default,
 {
     let metadata = (*server.metadata.read().await).clone();
     Json(ServerMetadata::from(metadata))
@@ -282,7 +282,7 @@ where
 /// Create a new `axum::Router` with all the routes
 pub fn make_app<T>(server: RawServer<T>) -> IntoMakeServiceWithConnectInfo<Router, SocketAddr>
 where
-    T: ChunkStorage + Sync + Send + Clone + Default + Debug + 'static,
+    T: ChunkStorage + Sync + Send + Default + Debug + 'static,
 {
     Router::new()
         .route("/", get(version))

@@ -61,7 +61,7 @@ impl From<InternalMetadata> for ServerMetadata {
 #[derive(Debug, Clone)]
 pub struct Server<T>
 where
-    T: ChunkStorage + Sync + Send + Clone + Default,
+    T: ChunkStorage + Sync + Send + Default,
 {
     key_pair: Arc<Ed25519KeyPair>, // needs server restart to be changed
     uuid_nonce: String,            // needs server restart to be changed
@@ -79,7 +79,7 @@ where
 
 impl<T> Default for Server<T>
 where
-    T: ChunkStorage + Sync + Send + Clone + Default,
+    T: ChunkStorage + Sync + Send + Default,
 {
     fn default() -> Self {
         // Generate a key pair in PKCS#8 (v2) format.
@@ -107,7 +107,7 @@ pub struct RegisterError;
 
 impl<T> Server<T>
 where
-    T: ChunkStorage + Sync + Send + Clone + Default + Debug,
+    T: ChunkStorage + Sync + Send + Default + Debug,
 {
     /// Create a new server instance, with a specific key pair and metadata
     pub fn new(pkcs8_bytes: &Document, metadata: InternalMetadata) -> Result<Self, KeyRejected> {
