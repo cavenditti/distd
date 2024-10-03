@@ -1,37 +1,49 @@
 use crate::chunks::CHUNK_SIZE;
 
 #[must_use]
+#[inline(always)]
 pub fn merge_hashes(left: &hash::Hash, right: &hash::Hash) -> hash::Hash {
-    let mut combined_hashes = left.as_bytes().to_vec();
-    combined_hashes.extend(right.as_bytes());
-    blake3::hash(&combined_hashes).into()
+    blake3::hash(
+        &left
+            .as_bytes()
+            .iter()
+            .chain(right.as_bytes().iter())
+            .cloned()
+            .collect::<Vec<u8>>(),
+    ).into()
 }
 
 /// Hashing function. Uses BLAKE3 but without Subtree-freeness
 #[must_use]
 pub fn hash(data: &[u8]) -> hash::Hash {
-    fn partial_tree(slices: &[&[u8]]) -> hash::Hash {
-        /*
-        println!(
-            "[HASH-NE] {}, {:?}",
-            slices.len(),
-            slices.iter().map(|x| x.len()).collect::<Vec<usize>>()
-        );
-        */
-        match slices.len() {
-            //0 => panic!("Requested hash of empty slice: Should never happen"),
-            0 => blake3::hash(b"").into(), // Why it's needed?
-            1 => blake3::hash(slices[0]).into(),
-            _ => merge_hashes(
-                &partial_tree(&slices[..slices.len() / 2]),
-                &partial_tree(&slices[slices.len() / 2..]),
-            ),
-        }
-        //println!("[HASH-NE] HASH: {}", x);
+    if data.len() <= CHUNK_SIZE {
+        return blake3::hash(data).into();
     }
 
-    let chunks: Vec<&[u8]> = data.chunks(CHUNK_SIZE as usize).collect();
-    partial_tree(&chunks)
+    // pre-allocate hash vec
+    let mut partials: Vec<hash::Hash> = Vec::with_capacity(data.len() / CHUNK_SIZE + 1);
+
+    // Compute single chunks hashes
+    for chunk in data.chunks(CHUNK_SIZE as usize) {
+        partials.push(blake3::hash(chunk).into());
+    }
+
+    while partials.len() != 1 {
+        // to is the destination position, i the first hash position
+        for (to, i) in (0..partials.len() - 1).step_by(2).enumerate() {
+            partials[to] = merge_hashes(&partials[i], &partials[i + 1])
+        }
+
+        // if there's an element remaining put it in last position
+        if partials.len() % 2 != 0 {
+            partials.swap_remove(partials.len() / 2 + 1);
+        } else {
+            partials.pop(); // needed in order to always shrink, otherwise may end stuck with a 2 elements vec
+        }
+
+        partials.shrink_to(partials.len() / 2 + 1);
+    }
+    partials[0].into()
 }
 
 pub use hash::Hash;
@@ -190,6 +202,9 @@ pub mod hash {
 
 #[cfg(test)]
 mod tests {
+    use crate::chunks::CHUNK_SIZE;
+    use crate::hash::merge_hashes;
+
     use super::hash;
     use super::Hash;
 
@@ -200,9 +215,40 @@ mod tests {
     }
 
     #[test]
-    /// We're doing it differently, so they should differ
+    /// We're doing it differently, so they should differ (unless blake3 CHUNK_SIZE == our CHUNK_SIZE + 1)
     fn test_blake3_multiple_chunks() {
-        let data = [0u8; 10000];
+        let data = [1u8; CHUNK_SIZE + 1];
         assert_ne!(Hash::from(blake3::hash(&data)), hash(&data));
+    }
+
+    /// Using a known good recursive implementation to validate the newer ones
+    #[test]
+    fn test_blake3_reference() {
+        let data = [1u8; CHUNK_SIZE + 1];
+
+        fn partial_tree(slices: &[&[u8]]) -> hash::Hash {
+            /*
+            println!(
+                "[HASH-NE] {}, {:?}",
+                slices.len(),
+                slices.iter().map(|x| x.len()).collect::<Vec<usize>>()
+            );
+            */
+            match slices.len() {
+                //0 => panic!("Requested hash of empty slice: Should never happen"),
+                0 => blake3::hash(b"").into(), // Why it's needed?
+                1 => blake3::hash(slices[0]).into(),
+                _ => merge_hashes(
+                    &partial_tree(&slices[..slices.len() / 2]),
+                    &partial_tree(&slices[slices.len() / 2..]),
+                ),
+            }
+            //println!("[HASH-NE] HASH: {}", x);
+        }
+
+        let chunks: Vec<&[u8]> = data.chunks(CHUNK_SIZE as usize).collect();
+        let hash1 = partial_tree(&chunks);
+
+        assert_eq!(hash1, hash(&data));
     }
 }
