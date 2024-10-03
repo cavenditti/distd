@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use crate::chunk_storage::ChunkStorage;
 use crate::hash::Hash;
@@ -9,38 +9,32 @@ use super::Node;
 /// Dead simple in-memory global storage
 #[derive(Debug, Default, Clone)]
 pub struct HashMapStorage {
-    data: Arc<RwLock<HashMap<Hash, Arc<Node>>>>,
+    data: HashMap<Hash, Arc<Node>>,
 }
 
 impl ChunkStorage for HashMapStorage {
     fn get(&self, hash: &Hash) -> Option<Arc<Node>> {
-        self.data.read().expect("Poisoned Lock").get(hash).cloned()
+        self.data.get(hash).cloned()
     }
 
     fn _insert_chunk(&mut self, hash: Hash, chunk: &[u8]) -> Option<Arc<Node>> {
-        let mut data = self.data.write().expect("Poisoned Lock");
-
         //println!("[StorageInsert] Hash: {}, size: {}", hash, size);
-        if let Some(raw_chunk) = data.get(&hash.clone()) {
+        if let Some(raw_chunk) = self.data.get(&hash) {
             return Some(raw_chunk.clone());
         }
-        data.try_insert(
-            hash,
-            Arc::new(Node::Stored {
+        self.data
+            .try_insert(
                 hash,
-                data: Arc::new(Vec::from(chunk)),
-            }),
-        )
-        .ok()
-        .map(|x| x.clone())
+                Arc::new(Node::Stored {
+                    hash,
+                    data: Arc::new(Vec::from(chunk)),
+                }),
+            )
+            .ok()
+            .cloned()
     }
 
-    fn _link(
-        &mut self,
-        hash: Hash,
-        left: Arc<Node>,
-        right: Arc<Node>,
-    ) -> Option<Arc<Node>> {
+    fn _link(&mut self, hash: Hash, left: Arc<Node>, right: Arc<Node>) -> Option<Arc<Node>> {
         /*
         println!(
             "[Storage Link ]: {}: {} + {}",
@@ -49,9 +43,9 @@ impl ChunkStorage for HashMapStorage {
             right.hash()
         );
         */
-        let mut data = self.data.write().expect("Poisoned Lock");
         let size = left.size() + right.size();
-        data.get(&hash).cloned().or(data
+        self.data.get(&hash).cloned().or(self
+            .data
             .try_insert(
                 hash,
                 Arc::new(Node::Parent {
@@ -66,18 +60,11 @@ impl ChunkStorage for HashMapStorage {
     }
 
     fn chunks(&self) -> Vec<Hash> {
-        self.data
-            .read()
-            .expect("Poisoned Lock")
-            .keys()
-            .copied()
-            .collect()
+        self.data.keys().copied().collect()
     }
 
     fn size(&self) -> u64 {
         self.data
-            .read()
-            .expect("Poisoned Lock")
             .values()
             .map(|x| match &**x {
                 Node::Stored { data, .. } => data.len() as u64,
