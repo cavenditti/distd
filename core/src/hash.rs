@@ -1,3 +1,5 @@
+use std::convert::Infallible;
+
 use crate::chunks::CHUNK_SIZE;
 
 #[must_use]
@@ -10,40 +12,101 @@ pub fn merge_hashes(left: &hash::Hash, right: &hash::Hash) -> hash::Hash {
             .chain(right.as_bytes().iter())
             .cloned()
             .collect::<Vec<u8>>(),
-    ).into()
+    )
+    .into()
+}
+
+/// Trait to abstract away the structure used to compute hash-tree
+pub trait HashTreeCapable<T, E>
+where
+    E: std::error::Error,
+{
+    fn func(&mut self, data: &[u8]) -> Result<T, E>;
+    fn merge(&mut self, l: &T, r: &T) -> Result<T, E>;
+
+    fn compute_tree(&mut self, data: &[u8]) -> Result<T, E>
+    where
+        Self: Sized,
+    {
+        if data.len() <= CHUNK_SIZE {
+            return Ok(self.func(data)?.into());
+        }
+
+        // pre-allocate partials vec
+        let mut partials: Vec<T> = Vec::with_capacity(data.len() / CHUNK_SIZE + 1);
+
+        // Compute single chunks results
+        for chunk in data.chunks(CHUNK_SIZE as usize) {
+            partials.push(self.func(chunk)?.into());
+        }
+
+        while partials.len() > 1 {
+            // to is the destination position, i the first result position
+            for (to, i) in (0..partials.len() - 1).step_by(2).enumerate() {
+                partials[to] = self.merge(&partials[i], &partials[i + 1])?
+            }
+
+            // if there's an element remaining put it in last position
+            if partials.len() % 2 != 0 {
+                partials.swap_remove(partials.len() / 2 + 1);
+            } else {
+                partials.pop(); // needed in order to always shrink, otherwise may end stuck with a 2 elements vec
+            }
+
+            partials.shrink_to(partials.len() / 2 + partials.len() % 2);
+        }
+        Ok(partials.swap_remove(0).into())
+    }
+}
+
+/// Wrapper to allow dynamic dispatch
+struct DynHashTreeCapable<Func, Merge, T, E>
+where
+    Func: FnMut(&[u8]) -> Result<T, E>,
+    Merge: FnMut(&T, &T) -> Result<T, E>,
+    E: std::error::Error,
+{
+    pub func: Func,
+    pub merge: Merge,
+}
+
+impl<Func, Merge, T, E> HashTreeCapable<T, E> for DynHashTreeCapable<Func, Merge, T, E>
+where
+    Func: FnMut(&[u8]) -> Result<T, E>,
+    Merge: FnMut(&T, &T) -> Result<T, E>,
+    E: std::error::Error,
+{
+    fn func(&mut self, data: &[u8]) -> Result<T, E> {
+        (self.func)(data)
+    }
+
+    fn merge(&mut self, l: &T, r: &T) -> Result<T, E> {
+        (self.merge)(l, r)
+    }
+}
+
+/// Compute hash-tree of data
+///
+/// Used to abstract away the structure used to compute hash-tree, because storage may be doing almost the same
+/// thing but inserting nodes in the process
+pub fn compute_tree<Func, Merge, T, E>(func: Func, merge: Merge, data: &[u8]) -> Result<T, E>
+where
+    Func: FnMut(&[u8]) -> Result<T, E>,
+    Merge: FnMut(&T, &T) -> Result<T, E>,
+    E: std::error::Error,
+{
+    DynHashTreeCapable { func, merge }.compute_tree(data)
 }
 
 /// Hashing function. Uses BLAKE3 but without Subtree-freeness
 #[must_use]
 pub fn hash(data: &[u8]) -> hash::Hash {
-    if data.len() <= CHUNK_SIZE {
-        return blake3::hash(data).into();
-    }
-
-    // pre-allocate hash vec
-    let mut partials: Vec<hash::Hash> = Vec::with_capacity(data.len() / CHUNK_SIZE + 1);
-
-    // Compute single chunks hashes
-    for chunk in data.chunks(CHUNK_SIZE as usize) {
-        partials.push(blake3::hash(chunk).into());
-    }
-
-    while partials.len() != 1 {
-        // to is the destination position, i the first hash position
-        for (to, i) in (0..partials.len() - 1).step_by(2).enumerate() {
-            partials[to] = merge_hashes(&partials[i], &partials[i + 1])
-        }
-
-        // if there's an element remaining put it in last position
-        if partials.len() % 2 != 0 {
-            partials.swap_remove(partials.len() / 2 + 1);
-        } else {
-            partials.pop(); // needed in order to always shrink, otherwise may end stuck with a 2 elements vec
-        }
-
-        partials.shrink_to(partials.len() / 2 + 1);
-    }
-    partials[0].into()
+    compute_tree(
+        |x| -> Result<hash::Hash, Infallible> { Ok(blake3::hash(x).into()) },
+        |l, r| Ok(merge_hashes(l, r)),
+        data,
+    )
+    .unwrap()
 }
 
 pub use hash::Hash;
@@ -219,36 +282,12 @@ mod tests {
     fn test_blake3_multiple_chunks() {
         let data = [1u8; CHUNK_SIZE + 1];
         assert_ne!(Hash::from(blake3::hash(&data)), hash(&data));
-    }
 
-    /// Using a known good recursive implementation to validate the newer ones
-    #[test]
-    fn test_blake3_reference() {
-        let data = [1u8; CHUNK_SIZE + 1];
+        let h = merge_hashes(
+            &blake3::hash(&data[..CHUNK_SIZE]).into(),
+            &blake3::hash(&data[CHUNK_SIZE..]).into(),
+        );
 
-        fn partial_tree(slices: &[&[u8]]) -> hash::Hash {
-            /*
-            println!(
-                "[HASH-NE] {}, {:?}",
-                slices.len(),
-                slices.iter().map(|x| x.len()).collect::<Vec<usize>>()
-            );
-            */
-            match slices.len() {
-                //0 => panic!("Requested hash of empty slice: Should never happen"),
-                0 => blake3::hash(b"").into(), // Why it's needed?
-                1 => blake3::hash(slices[0]).into(),
-                _ => merge_hashes(
-                    &partial_tree(&slices[..slices.len() / 2]),
-                    &partial_tree(&slices[slices.len() / 2..]),
-                ),
-            }
-            //println!("[HASH-NE] HASH: {}", x);
-        }
-
-        let chunks: Vec<&[u8]> = data.chunks(CHUNK_SIZE as usize).collect();
-        let hash1 = partial_tree(&chunks);
-
-        assert_eq!(hash1, hash(&data));
+        assert_eq!(hash(&data), h);
     }
 }

@@ -5,8 +5,8 @@ use bytes::Bytes;
 pub use node::Node;
 use tokio_stream::{Stream, StreamExt};
 
-use crate::error::InvalidParameter;
-use crate::hash::{hash, Hash};
+use crate::error::{Error, InvalidParameter};
+use crate::hash::{compute_tree, hash, Hash, HashTreeCapable};
 use crate::proto::SerializedTree;
 use crate::{
     chunks::CHUNK_SIZE,
@@ -27,22 +27,23 @@ pub enum StorageError {
     UnknownSize,
 
     #[error("Cannot insert chunk in data store")]
+    ChunkInsertError,
+
+    #[error("Cannot insert chunk in data store")]
     UnknownChunkInsertError(#[from] std::io::Error),
+
+    #[error("Cannot create link")]
+    LinkCreation,
 
     #[error("Cannot reconstruct tree from storage")]
     TreeReconstruct,
 }
 
 /// Defines a backend used to store hashes and chunks ad key-value pairs
-pub trait ChunkStorage {
+pub trait ChunkStorage: HashTreeCapable<Arc<Node>, Error> {
     fn get(&self, hash: &Hash) -> Option<Arc<Node>>;
     fn _insert_chunk(&mut self, hash: Hash, chunk: &[u8]) -> Option<Arc<Node>>;
-    fn _link(
-        &mut self,
-        hash: Hash,
-        left: Arc<Node>,
-        right: Arc<Node>,
-    ) -> Option<Arc<Node>>;
+    fn _link(&mut self, hash: Hash, left: Arc<Node>, right: Arc<Node>) -> Option<Arc<Node>>;
 
     fn chunks(&self) -> Vec<Hash>;
 
@@ -57,18 +58,14 @@ pub trait ChunkStorage {
         tracing::trace!("Insert chunk {hash}, {} bytes", chunk.len());
 
         self._insert_chunk(hash, chunk)
-            .inspect(|x| assert!(*x.hash() == hash))
+            .inspect(|x| assert!(x.hash() == &hash))
     }
 
-    fn link(
-        &mut self,
-        left: Arc<Node>,
-        right: Arc<Node>,
-    ) -> Option<Arc<Node>> {
+    fn link(&mut self, left: Arc<Node>, right: Arc<Node>) -> Option<Arc<Node>> {
         let hash = merge_hashes(left.hash(), right.hash());
         tracing::trace!("Link {} {} → {}", left.hash(), right.hash(), hash);
         self._link(hash, left, right)
-            .inspect(|x| assert!(*x.hash() == hash))
+            .inspect(|x| assert!(x.hash() == &hash))
     }
 
     /// Insert bytes into the storage returning the associated hash tree
@@ -76,51 +73,7 @@ pub trait ChunkStorage {
     where
         Self: Sized,
     {
-        fn partial_tree(
-            storage: &mut dyn ChunkStorage,
-            slices: &[&[u8]],
-        ) -> Option<Arc<Node>> {
-            /*
-            tracing::trace!(
-                "{} {:?}",
-                slices.len(),
-                slices.iter().map(|x| x.len()).collect::<Vec<usize>>()
-            );
-            */
-            match slices.len() {
-                0 => storage.insert_chunk(b""), // Transparently handle empty files too
-                1 => storage.insert_chunk(slices[0]),
-                _ => {
-                    let l = partial_tree(storage, &slices[..slices.len() / 2])?;
-                    let r = partial_tree(storage, &slices[slices.len() / 2..])?;
-                    storage.link(l, r)
-                }
-            }
-        }
-
-        if data.len() > 32 {
-            tracing::trace!(
-                "Inserting: {}..{}, {}B",
-                data[..16].iter().fold(String::new(), |mut s, b| {
-                    write!(s, "{b:x}").unwrap();
-                    s
-                }),
-                data[data.len() - 16..]
-                    .iter()
-                    .fold(String::new(), |mut s, b| {
-                        write!(s, "{b:x}").unwrap();
-                        s
-                    }),
-                data.len()
-            );
-        } else {
-            tracing::trace!("Inserting: {:?}, {}B", data, data.len());
-        };
-
-        let chunks = data.chunks(CHUNK_SIZE).collect::<Vec<&[u8]>>();
-
-        tracing::trace!("{} chunks", chunks.len());
-        partial_tree(self, &chunks)
+        self.compute_tree(data.as_ref()).ok()
     }
 
     /// Create a new Item from its metadata and Bytes

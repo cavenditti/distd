@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::chunk_storage::ChunkStorage;
-use crate::hash::Hash;
+use crate::hash::{Hash, HashTreeCapable};
 
-use super::Node;
+use super::{Node, StorageError};
 
 /// Dead simple in-memory global storage
 #[derive(Debug, Default, Clone)]
@@ -74,6 +74,20 @@ impl ChunkStorage for HashMapStorage {
     }
 }
 
+impl HashTreeCapable<Arc<Node>, crate::error::Error> for HashMapStorage {
+    fn func(&mut self, data: &[u8]) -> Result<Arc<Node>, crate::error::Error> {
+        Ok(self
+            .insert_chunk(data)
+            .ok_or(StorageError::ChunkInsertError)?)
+    }
+
+    fn merge(&mut self, l: &Arc<Node>, r: &Arc<Node>) -> Result<Arc<Node>, crate::error::Error> {
+        Ok(self
+            .link(l.clone(), r.clone())
+            .ok_or(StorageError::LinkCreation)?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,23 +120,32 @@ mod tests {
         assert!(len >= s.size());
     }
 
-    //fn test_hms_multi_chunk_insertion() {
-
     #[test]
     fn test_hms_deduplicated() {
-        const SIZE: usize = CHUNK_SIZE * 3;
+        const MULT: usize = 3;
+        const SIZE: usize = CHUNK_SIZE * MULT;
         let mut s = HashMapStorage::default();
         let data = Bytes::from_static(&[0u8; SIZE]);
-        println!("{:?}", data.len());
+        println!(
+            "Using {} bytes: CHUNK_SIZE( {CHUNK_SIZE} B ) x {MULT}",
+            data.len()
+        );
 
         let root = s.insert(data).unwrap();
+        println!("Root node has hash: {}", root.hash());
         assert_eq!(CHUNK_SIZE as u64, s.size());
 
         let root_hash = hash(&[0u8; SIZE]);
         assert_eq!(root.hash(), &root_hash);
 
         let zeros_chunk_hash = hash(&[0u8; CHUNK_SIZE]);
-        let root_children = (zeros_chunk_hash, hash(&[0u8; CHUNK_SIZE * 2]));
+        let root_children = (hash(&[0u8; CHUNK_SIZE * 2]), zeros_chunk_hash);
+        println!(
+            "Root children hashes: {} {}",
+            root.children().unwrap().0.hash(),
+            root.children().unwrap().1.hash()
+        );
+
         assert_eq!(root.children().unwrap().0.hash(), &root_children.0);
         assert_eq!(root.children().unwrap().1.hash(), &root_children.1);
 

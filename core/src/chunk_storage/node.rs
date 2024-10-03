@@ -298,50 +298,6 @@ impl Node {
         }
     }
 
-    /*
-    /// Get diff sub-tree: required tree to reconstruct current node if one has the `hashes`
-    #[must_use]
-    pub fn find_diff(&self, hashes: &[Hash]) -> OwnedHashTreeNode {
-        match self {
-            Self::Parent {
-                hash,
-                size,
-                left,
-                right,
-            } => {
-                // Go down and recursively find diffs
-                let left = left.find_diff(hashes);
-                let right = right.find_diff(hashes);
-
-                // When coming back up skip whole sub-trees if both children are skipped
-                match (&left, &right) {
-                    (OwnedHashTreeNode::Skipped { .. }, OwnedHashTreeNode::Skipped { .. }) => {
-                        OwnedHashTreeNode::Skipped {
-                            hash: *hash,
-                            size: *size,
-                        }
-                    }
-                    _ => OwnedHashTreeNode::Parent {
-                        size: *size,
-                        hash: *hash,
-                        left: Box::new(left),
-                        right: Box::new(right),
-                    },
-                }
-            }
-            Self::Stored { hash, .. } if hashes.contains(hash) => OwnedHashTreeNode::Skipped {
-                hash: *self.hash(),
-                size: self.size() as u32,
-            },
-            node @ Self::Stored { .. } => OwnedHashTreeNode::from(node.clone()),
-            Self::Skipped { hash, size } => OwnedHashTreeNode::Skipped {
-                hash: *hash,
-                size: *size,
-            },
-        }
-    }
-    */
-
     /// Flatten the tree into an iterator on chunks
     ///
     /// This is a recursive function that returns an iterator on the chunks of the tree
@@ -371,7 +327,7 @@ impl Node {
     }
 
     /// Get all unique hashes (`Stored` or `Parent`) referenced by the (sub-)tree, as an HashMap
-    pub fn hash_map(self: &Arc<Node>) -> HashMap<Hash, Arc<Node>> {
+    pub fn hash_map(self: Arc<Node>) -> HashMap<Hash, Arc<Node>> {
         match self.as_ref() {
             &Node::Stored { hash, .. } | &Node::Skipped { hash, .. } => {
                 HashMap::from([(hash, self.clone())])

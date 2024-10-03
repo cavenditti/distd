@@ -11,10 +11,9 @@ use tokio_stream::{Stream, StreamExt};
 use crate::{
     chunk_storage::StorageError,
     chunks::{ChunkInfo, CHUNK_SIZE},
-    error::{Error, InvalidParameter},
-    hash::{hash as do_hash, Hash},
+    error::Error,
+    hash::{hash as do_hash, Hash, HashTreeCapable},
     item::{Item, Name as ItemName},
-    proto::SerializedTree,
 };
 
 use super::{ChunkStorage, Node};
@@ -480,6 +479,20 @@ impl ChunkStorage for FsStorage {
     */
 }
 
+impl HashTreeCapable<Arc<Node>, crate::error::Error> for FsStorage {
+    fn func(&mut self, data: &[u8]) -> Result<Arc<Node>, crate::error::Error> {
+        Ok(self
+            .insert_chunk(data)
+            .ok_or(StorageError::ChunkInsertError)?)
+    }
+
+    fn merge(&mut self, l: &Arc<Node>, r: &Arc<Node>) -> Result<Arc<Node>, crate::error::Error> {
+        Ok(self
+            .link(l.clone(), r.clone())
+            .ok_or(StorageError::LinkCreation)?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{
@@ -652,6 +665,7 @@ mod tests {
 
         let stored = storage.get(&item.metadata.root.hash).unwrap().clone_data();
 
+        // reported storage size is deduplicated
         assert_eq!(stored.len(), 1_000_000);
         for b in stored {
             assert_eq!(b, 1u8);
