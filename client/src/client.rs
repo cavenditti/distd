@@ -8,7 +8,9 @@ use std::{
 use tokio::time::{sleep, Instant};
 use tokio_stream::StreamExt;
 
-use crate::{error::Client as ClientError, server::Server, settings::Settings};
+use crate::{
+    error::Client as ClientError, persistence::ClientState, server::Server, settings::Settings,
+};
 
 use std::{fs::File, io::Read};
 
@@ -16,7 +18,7 @@ use distd_core::{
     chunk_storage::{fs_storage::FsStorage, node_stream::receiver, ChunkStorage},
     hash::Hash,
     item::Item,
-    metadata::Item as ItemMetadata, utils::stream,
+    metadata::Item as ItemMetadata,
 };
 
 #[derive(Debug)]
@@ -30,6 +32,8 @@ where
     /// Client name
     name: String,
 
+    //pub state: ClientState,
+
     /// Associated server
     pub server: Server,
 
@@ -37,6 +41,8 @@ where
     pub storage: T,
 
     pub settings: Arc<Settings>,
+
+    pub state: Arc<ClientState>,
 }
 
 impl<T> Client<T>
@@ -47,6 +53,7 @@ where
         server_public_key: &[u8; 32],
         storage: T,
         settings: Settings,
+        state: ClientState,
     ) -> Result<Self, ClientError> {
         // Wait for server connection to get client uid
         let server = loop {
@@ -92,6 +99,7 @@ where
             server,
             storage,
             settings: Arc::new(settings),
+            state: Arc::new(state),
         })
     }
 
@@ -243,13 +251,14 @@ pub mod cli {
 
     use crate::client::Client;
     use crate::error::Client as ClientError;
+    use crate::persistence::ClientState;
     use crate::settings::Settings;
 
     pub async fn main() -> Result<(), ClientError> {
         tracing_subscriber::fmt()
             .with_target(true)
             //.compact()
-            .with_max_level(tracing::Level::INFO)
+            .with_max_level(tracing::Level::DEBUG)
             .init();
 
         tracing::info!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
@@ -263,10 +272,12 @@ pub mod cli {
         let settings = Settings::new("ClientSettings")?;
         tracing::debug!("Settings: {settings:?}");
 
+        let state = ClientState::default();
+
         let Ok(storage_root) = PathBuf::from_str(&settings.fsstorage.root);
         let storage = FsStorage::new(storage_root);
         let storage = HashMapStorage::default(); // use this for benchmarking in order to avoid potential fs-related bottlenecks
-        let client = Client::new(&[0u8; 32], storage, settings).await?;
+        let client = Client::new(&[0u8; 32], storage, settings, state).await?;
 
         match cmd.as_str() {
             "start" => client.client_loop().await,

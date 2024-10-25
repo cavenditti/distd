@@ -19,6 +19,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 config = { workspace = true }
+dirs = { workspace = true }
 
 rustls = { workspace = true }
 ring = { workspace = true }
