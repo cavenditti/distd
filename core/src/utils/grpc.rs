@@ -3,14 +3,16 @@ use uuid::Uuid;
 
 use crate::error::InvalidParameter;
 
+use super::uuid::bytes_to_uuid;
+
 pub fn uuid_to_metadata(uuid: &Uuid) -> MetadataValue<Binary> {
-    BinaryMetadataValue::from_bytes(uuid.to_bytes_le().as_ref())
+    BinaryMetadataValue::from_bytes(uuid.as_bytes())
 }
 
 pub fn metadata_to_uuid(uuid: &MetadataValue<Binary>) -> Result<Uuid, InvalidParameter> {
     uuid.to_bytes()
         .map_err(InvalidParameter::MetadataBytes)
-        .map(|x| Uuid::from_bytes_le(*x.array_chunks::<16>().collect::<Vec<&[u8; 16]>>()[0]))
+        .map(bytes_to_uuid)
 }
 
 #[cfg(test)]

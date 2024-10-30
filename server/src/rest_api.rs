@@ -38,6 +38,7 @@ struct ClientPostObj {
     #[serde(default, deserialize_with = "empty_string_as_none")]
     pub version: Option<Version>,
     pub name: String,
+    pub uuid: Option<String>,
     //pub realm: Option<Realm>,
 }
 
@@ -61,7 +62,12 @@ where
     T: ChunkStorage + Sync + Send + Default + Debug,
 {
     server
-        .register_client(client.name, addr, client.version)
+        .register_client(
+            client.name,
+            addr,
+            client.version,
+            client.uuid.and_then(|s| Uuid::from_str(&s).ok()),
+        )
         .await
         .map(|uuid| uuid.to_string())
         .map_err(|_| StatusCode::CONFLICT)

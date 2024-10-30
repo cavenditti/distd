@@ -130,45 +130,70 @@ where
         name: ClientName,
         addr: SocketAddr,
         version: Option<Version>,
+        uuid: Option<Uuid>,
     ) -> Result<Uuid, RegisterError> {
         // tracing span
         let span = span!(tracing::Level::INFO, "register_client");
         let _entered = span.enter();
 
-        tracing::info!("Got new client: \"{}\" ver:{:?}, @{}", name, version, addr);
+        tracing::info!("Got new client: \"{}\" ver:{:?}, @{}, {:?}", name, version, addr, uuid);
         let nonced_name = name.clone() + &self.uuid_nonce + &addr.to_string();
         tracing::debug!("Client nonced name: '{}'", nonced_name);
-        let uuid = Uuid::new_v5(&Uuid::NAMESPACE_URL, nonced_name.as_bytes());
-        tracing::info!(
-            "Assigned client uuid '{}' to \"{}\"@{}",
-            uuid.to_string(),
-            name,
-            addr
-        );
-        let client = Client {
-            addr,
-            name,
-            uuid,
-            version,
-            last_heartbeat: SystemTime::now(),
-        };
 
-        // Add uuid to valid list in interceptor
-        self.uuid_interceptor
-            .uuids
-            .write()
-            .unwrap()
-            .insert(uuid_to_metadata(&uuid));
+        match uuid {
+            Some(u) => {
+                if self.clients.read().await.contains_key(&u) {
+                    tracing::info!(
+                        "Got existing uuid '{}' from \"{}\"@{}",
+                        u.to_string(),
+                        name,
+                        addr
+                    );
+                    Ok(u)
+                } else {
+                    tracing::warn!(
+                        "Client reported invalid uuid '{}' from \"{}\"@{}",
+                        u.to_string(),
+                        name,
+                        addr
+                    );
+                    return Err(RegisterError);
+                }
+            },
+            None => {
+                let uuid = Uuid::new_v5(&Uuid::NAMESPACE_URL, nonced_name.as_bytes());
+                tracing::info!(
+                    "Assigned new client uuid '{}' to \"{}\"@{}",
+                    uuid.to_string(),
+                    name,
+                    addr
+                );
+                let client = Client {
+                    addr,
+                    name,
+                    uuid,
+                    version,
+                    last_heartbeat: SystemTime::now(),
+                };
 
-        self.clients
-            .write()
-            .await
-            .try_insert(client.uuid, client)
-            .inspect_err(|e| tracing::warn!("{}", e))
-            .cloned()
-            .ok()
-            .map(|client| client.uuid)
-            .ok_or(RegisterError)
+                // Add uuid to valid list in interceptor
+                self.uuid_interceptor
+                    .uuids
+                    .write()
+                    .unwrap()
+                    .insert(uuid_to_metadata(&uuid));
+
+                self.clients
+                    .write()
+                    .await
+                    .try_insert(client.uuid, client)
+                    .inspect_err(|e| tracing::warn!("{}", e))
+                    .cloned()
+                    .ok()
+                    .map(|client| client.uuid)
+                    .ok_or(RegisterError)
+            },
+        }
     }
 
     #[allow(clippy::missing_panics_doc)]
