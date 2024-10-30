@@ -1,12 +1,14 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    str::FromStr,
     sync::Arc,
     time::Duration,
 };
 
 use tokio::time::{sleep, Instant};
 use tokio_stream::StreamExt;
+use uuid::Uuid;
 
 use crate::{
     error::Client as ClientError, persistence::ClientState, server::Server, settings::Settings,
@@ -33,7 +35,6 @@ where
     name: String,
 
     //pub state: ClientState,
-
     /// Associated server
     pub server: Server,
 
@@ -53,13 +54,20 @@ where
         server_public_key: &[u8; 32],
         storage: T,
         settings: Settings,
-        state: ClientState,
+        mut state: ClientState,
     ) -> Result<Self, ClientError> {
+        let client_uuid = state
+            .persistent
+            .client_uuid
+            .as_ref()
+            .and_then(|uuid_str| Uuid::from_str(&uuid_str).ok());
+
         // Wait for server connection to get client uid
         let server = loop {
             match Server::new(
                 &settings.server.url,
                 &settings.client.name,
+                client_uuid,
                 server_public_key,
             )
             .await
@@ -72,6 +80,9 @@ where
                 }
             }
         };
+
+        state.persistent.client_uuid = Some(server.client_uuid().to_string());
+        state.persistent.commit().unwrap();
 
         // Check for missing paths on server
         let items = server.metadata().await.items;
@@ -91,7 +102,8 @@ where
                     .collect::<Vec<String>>()
                     .join(",")
             );
-            return Err(ClientError::MissingItem);
+            // It probably shouldn't exit in this case
+            //return Err(ClientError::MissingItem);
         }
 
         Ok(Self {

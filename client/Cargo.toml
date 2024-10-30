@@ -26,6 +26,7 @@ ring = { workspace = true }
 blake3 = { workspace = true }
 
 serde = { workspace = true }
+serde_json = "1.0"
 uuid = { workspace = true }
 percent-encoding = { workspace = true }
 bitcode = { workspace = true }

@@ -381,6 +381,7 @@ dependencies = [
  "ring",
  "rustls",
  "serde",
+ "serde_json",
  "test-log",
  "thiserror",
  "tokio",

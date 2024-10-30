@@ -1,7 +1,7 @@
 //use std::{net::SocketAddr
 use crate::{error::ServerRequest, grpc::DistdGrpcClient};
 
-use std::{fmt::Debug, str::FromStr, sync::Arc, time::Duration};
+use std::{fmt::Debug, sync::Arc, time::Duration};
 use uuid::Uuid;
 
 use tokio::{sync::RwLock, time::Instant};
@@ -82,6 +82,7 @@ impl Server {
         url: &str,
         //pub_key: &PublicKey,
         client_name: &str,
+        client_uuid: Option<Uuid>,
         pub_key: &[u8; 32],
     ) -> Result<Self, ServerRequest> {
         let grpc_client = Self::make_grpc_client(url, &Uuid::nil()).await?;
@@ -95,7 +96,7 @@ impl Server {
                 .try_into()
                 .map_err(|_| ServerRequest::BadPubKey)?,
             url: url.to_string(),
-            client_uuid: None,
+            client_uuid,
             client_name: client_name.to_string(),
             shared: Arc::new(RwLock::new(SharedServer {
                 metadata: ServerMetadata::default(),
@@ -110,7 +111,8 @@ impl Server {
         Ok(server)
     }
 
-    fn uuid(&self) -> Uuid {
+    /// Get the client uuid
+    pub fn client_uuid(&self) -> Uuid {
         self.client_uuid.unwrap_or(Uuid::nil())
     }
 
@@ -141,6 +143,7 @@ impl Server {
             .register(Request::new(distd_core::proto::ClientRegister {
                 name: self.client_name.to_string(),
                 version: VERSION.to_string(),
+                uuid: self.client_uuid.map(|uuid| uuid.as_bytes().to_vec()),
             }))
             .await?
             .into_inner();
@@ -153,7 +156,7 @@ impl Server {
 
         // Update client_uuid and create a new gRPC connection setting it in the metadata
         self.client_uuid = Some(uuid);
-        shared.grpc_client = Self::make_grpc_client(&self.url, &self.uuid()).await?;
+        shared.grpc_client = Self::make_grpc_client(&self.url, &self.client_uuid()).await?;
 
         Ok(uuid)
     }
@@ -231,7 +234,7 @@ impl Server {
             tokio::time::sleep(self.timeout).await;
             if self.fetch().await.is_err() {
                 // try to re-establish connection to server
-                if let Ok(client) = Self::make_grpc_client(&self.url, &self.uuid()).await {
+                if let Ok(client) = Self::make_grpc_client(&self.url, &self.client_uuid()).await {
                     tracing::info!("Connected to server");
                     self.shared.write().await.grpc_client = client;
                 } else {

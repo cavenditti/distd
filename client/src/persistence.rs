@@ -5,23 +5,55 @@ use std::{
     str::FromStr,
 };
 
+use serde::{Deserialize, Serialize};
+
 use crate::settings::cache_dir;
 
+#[inline(always)]
+pub fn state_path() -> PathBuf {
+    cache_dir().join("state.json")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientPersistentState {
+    /// Client Uuid assigned to client from server, as a string
+    pub client_uuid: Option<String>,
+}
+
+impl ClientPersistentState {
+    pub fn commit(&self) -> Option<()> {
+        std::fs::File::create(state_path())
+            .map(|file| std::io::BufWriter::new(file))
+            .ok()
+            .and_then(|file| serde_json::to_writer(file, self).ok())
+    }
+}
+
+impl Default for ClientPersistentState {
+    fn default() -> Self {
+        std::fs::File::open(state_path())
+            .map(|file| std::io::BufReader::new(file))
+            .ok()
+            .and_then(|file| serde_json::from_reader(file).ok())
+            .unwrap_or(ClientPersistentState { client_uuid: None })
+    }
+}
+
 #[derive(Debug, Clone)]
-pub struct ClientState {
+pub struct ClientPid {
     /// The path to the lock file.
     /// If the path exists a client is running.
     /// The file contains only the pid of the client process
     pub pid_path: PathBuf,
 }
 
-impl ClientState {
+impl ClientPid {
     fn pidfile_cleanup(pid_path: &Path) {
         std::fs::remove_file(pid_path).unwrap()
     }
 }
 
-impl Default for ClientState {
+impl Default for ClientPid {
     fn default() -> Self {
         let pid_path = cache_dir().join("pid");
         tracing::debug!("Pidfile: {}", pid_path.to_string_lossy());
@@ -51,8 +83,16 @@ impl Default for ClientState {
         Self { pid_path }
     }
 }
-impl Drop for ClientState {
+impl Drop for ClientPid {
     fn drop(&mut self) {
         Self::pidfile_cleanup(&self.pid_path);
     }
+}
+#[derive(Debug, Default, Clone)]
+pub struct ClientState {
+    /// Pid-lock of the client process
+    pub pid: ClientPid,
+
+    /// Persistent state of the client
+    pub persistent: ClientPersistentState,
 }

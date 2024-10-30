@@ -6,6 +6,7 @@ use std::{env, path::PathBuf};
 use crate::error::Client as ClientError;
 
 /// Returns the path to the configuration directory.
+#[inline(always)]
 pub fn config_dir() -> PathBuf {
     let d = user_config_dir()
         .expect("Cannot find config directory")
@@ -20,6 +21,7 @@ pub fn config_dir() -> PathBuf {
 /// Returns the path to the cache directory.
 ///
 /// This is used for storing both temporary and persistent files.
+#[inline(always)]
 pub fn cache_dir() -> PathBuf {
     let d = user_cache_dir()
         .expect("Cannot find config directory")
