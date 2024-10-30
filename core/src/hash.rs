@@ -49,8 +49,10 @@ where
             // if there's an element remaining put it in last position
             if partials.len() % 2 != 0 {
                 partials.swap_remove(partials.len() / 2 + 1);
+                partials.truncate(partials.len() / 2 + 1);
+            } else {
+                partials.truncate(partials.len() / 2);
             }
-            partials.truncate(partials.len() / 2 + partials.len() % 2);
         }
         Ok(partials.swap_remove(0).into())
     }
