@@ -42,9 +42,6 @@ pub enum Node {
 }
 
 /// Depth-first Iterator over the references of the chunks in the tree
-///
-/// This is the easy way of doing it, not the best one. expecially for large trees probably
-// TODO do this in a better way
 struct NodeIterator {
     stack: Vec<Arc<Node>>,
 }
@@ -71,6 +68,44 @@ impl NodeIterator {
 
         push_children(node, &mut stack);
         Self { stack }
+    }
+
+    /// Create a new iterator skipping some hashes
+    fn new_skipping(node: Arc<Node>, skip: HashSet<Hash>) -> Self {
+        #[inline(always)]
+        fn iterate_children(node: Arc<Node>, skip: &HashSet<Hash>) -> Arc<Node> {
+            if skip.contains(node.hash()) {
+                Arc::new(Node::Skipped {
+                    hash: *node.hash(),
+                    size: node.size(),
+                })
+            } else {
+                match node.clone().as_ref() {
+                    &Node::Stored { .. } | &Node::Skipped { .. } => {
+                        // We're at a leaf, just return it
+                        node
+                    }
+                    Node::Parent {
+                        left,
+                        right,
+                        hash,
+                        size,
+                    } => {
+                        // in this case we keep descending, first pushed get returned last
+                        let l = iterate_children(left.clone(), skip);
+                        let r = iterate_children(right.clone(), skip);
+                        Arc::new(Node::Parent {
+                            hash: *hash,
+                            size: *size,
+                            left: l,
+                            right: r,
+                        })
+                    }
+                }
+            }
+        }
+
+        Self::new(iterate_children(node, &skip))
     }
 }
 
@@ -342,37 +377,36 @@ impl Node {
         }
     }
 
+    /// From a subset of hashes, get all hashes completely dependent on those
+    pub fn fill_hashes(self: &Arc<Node>, hashes: &mut HashSet<Hash>) {
+        match self.as_ref() {
+            &Node::Stored { .. } | &Node::Skipped { .. } => {}
+            Node::Parent {
+                hash, left, right, ..
+            } => {
+                left.fill_hashes(hashes);
+                right.fill_hashes(hashes);
+                if hashes.contains(left.hash()) && hashes.contains(right.hash()) {
+                    hashes.insert(*hash);
+                }
+            }
+        }
+    }
+
     /// Get all unique hashes (`Stored` or `Parent`) referenced by the (sub-)tree, as a HashMap
     pub fn find_diff(self: Arc<Node>, hashes: &[Hash]) -> impl Iterator<Item = Arc<Node>> {
-        // prepare hash map
-        let mut node_map = self.clone().hash_map();
-
-        // Remove hashes from node_map keys
-        for h in hashes {
-            node_map.remove(h);
-        }
-
-        // Do a DFS-iteration on the tree from the root:
-        // if node is not in Map:
-        //  return Skipped
-        // else:
-        //  return Node::from(node)
-        // O(hashes) + O(tree-nodes) * ~O(1) -> ~O(tree-nodes) (it's actually O(n log(n)), but hash maps pump those log factors down down)
-        NodeIterator::new(self).map(move |x| {
-            node_map
-                .get(x.hash())
-                .cloned()
-                .unwrap_or(Arc::new(Node::Skipped {
-                    hash: *x.hash(),
-                    size: x.size(),
-                }))
-        })
+        let mut hashes = HashSet::from_iter(hashes.into_iter().cloned());
+        self.fill_hashes(&mut hashes);
+        NodeIterator::new_skipping(self, hashes)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::Arc,
+    };
 
     use crate::{
         chunks::CHUNK_SIZE,
@@ -432,6 +466,70 @@ mod tests {
     }
 
     #[test]
+    fn test_node_fill_hashes() {
+        let data_size = CHUNK_SIZE * 3 + 4;
+        let mut data = vec![0u8; data_size];
+        rand::rngs::OsRng::default().fill_bytes(&mut data);
+
+        let h1 = hash(&data[..CHUNK_SIZE]);
+        let h2 = hash(&data[CHUNK_SIZE..CHUNK_SIZE * 2]);
+        let h12 = merge_hashes(&h1, &h2);
+        let h3 = hash(&data[CHUNK_SIZE * 2..CHUNK_SIZE * 3]);
+        let h4 = hash(&data[CHUNK_SIZE * 3..]);
+        let h34 = merge_hashes(&h3, &h4);
+        let h = merge_hashes(&h12, &h34);
+
+        // Actually testing the test here
+        assert_eq!(h, hash(&data));
+
+        // Manually create nodes
+        let node = Node::Parent {
+            hash: h,
+            size: data_size as u64,
+            left: Arc::new(Node::Parent {
+                hash: h12,
+                size: (CHUNK_SIZE * 2) as u64,
+                left: Arc::new(Node::Stored {
+                    hash: h1,
+                    data: Arc::new(data[..CHUNK_SIZE].to_vec()),
+                }),
+                right: Arc::new(Node::Stored {
+                    hash: h2,
+                    data: Arc::new(data[CHUNK_SIZE..CHUNK_SIZE * 2].to_vec()),
+                }),
+            }),
+            right: Arc::new(Node::Parent {
+                hash: h34,
+                size: (CHUNK_SIZE + 4) as u64,
+                left: Arc::new(Node::Stored {
+                    hash: h3,
+                    data: Arc::new(data[CHUNK_SIZE * 2..CHUNK_SIZE * 3].to_vec()),
+                }),
+                right: Arc::new(Node::Stored {
+                    hash: h4,
+                    data: Arc::new(data[CHUNK_SIZE * 3..].to_vec()),
+                }),
+            }),
+        };
+
+        let node = Arc::new(node);
+
+        let mut hashes = HashSet::from([h1, h3, h4]);
+        node.fill_hashes(&mut hashes);
+
+        assert!(hashes.contains(&h34));
+        assert!(!hashes.contains(&h12));
+        assert!(!hashes.contains(&h));
+
+        let mut hashes = HashSet::from([h1, h2, h3, h4]);
+        node.fill_hashes(&mut hashes);
+
+        assert!(hashes.contains(&h34));
+        assert!(hashes.contains(&h12));
+        assert!(hashes.contains(&h));
+    }
+
+    #[test]
     fn test_node_find_diff() {
         let data_size = CHUNK_SIZE * 3 + 4;
         let mut data = vec![0u8; data_size];
@@ -444,6 +542,19 @@ mod tests {
         let h4 = hash(&data[CHUNK_SIZE * 3..]);
         let h34 = merge_hashes(&h3, &h4);
         let h = merge_hashes(&h12, &h34);
+
+        /*
+        let all_hashes = HashMap::from([
+            (h1, "h1"),
+            (h2, "h2"),
+            (h12, "h12"),
+            (h3, "h3"),
+            (h4, "h4"),
+            (h34, "h34"),
+            (h, "h"),
+        ]);
+        println!("{:?}", all_hashes);
+        */
 
         // Actually testing the test here
         assert_eq!(h, hash(&data));
@@ -510,13 +621,23 @@ mod tests {
         // Sub-tree pairs
         for comb in [&[h1, h2], &[h3, h4]] {
             let diff = node.clone().find_diff(comb).last().unwrap();
+            /*
+            println!("{:?}", diff.clone().hash_map().keys());
+            println!(
+                "{:?}",
+                diff.clone()
+                    .hash_map()
+                    .keys()
+                    .map(|h| all_hashes.get(h).unwrap())
+                    .map(|x| x.to_string())
+                    .collect::<Vec<String>>()
+            );
+            */
             assert!(matches!(diff.as_ref(), &Node::Parent { .. }));
             assert_eq!(diff.hash(), &h);
             assert_eq!(diff.size(), data_size as u64);
 
             let (left, right) = diff.children().unwrap();
-            println!("{}", left);
-            println!("{}", right);
             assert!(
                 (matches!(left.as_ref(), &Node::Parent { .. })
                     && matches!(right.as_ref(), &Node::Skipped { .. }))
