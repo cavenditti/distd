@@ -7,7 +7,7 @@
     "url": "http://localhost:50051"
   },
   "log": {
-    "level": "DEBUG"
+    "level": "INFO"
   },
   "client": {
     "name": "",
