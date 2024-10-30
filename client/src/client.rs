@@ -267,22 +267,23 @@ pub mod cli {
     use crate::settings::Settings;
 
     pub async fn main() -> Result<(), ClientError> {
+        let settings = Settings::new("ClientSettings")?;
+
         tracing_subscriber::fmt()
             .with_target(true)
             //.compact()
-            .with_max_level(tracing::Level::DEBUG)
+            .with_max_level(tracing::Level::from_str(&settings.log.level).unwrap())
             .init();
 
         tracing::info!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+        tracing::debug!("Settings: {settings:?}");
 
         let cmd = std::env::args().nth(1).ok_or(ClientError::MissingCmd)?;
         let mut i = std::env::args();
         i.advance_by(2).map_err(|_| ClientError::MissingCmd)?; // FIXME may not be the right type
         let cmd_args = i.collect::<Vec<String>>();
-        tracing::debug!("Running \"{cmd}\" {cmd_args:?}");
 
-        let settings = Settings::new("ClientSettings")?;
-        tracing::debug!("Settings: {settings:?}");
+        tracing::debug!("Running \"{cmd}\" {cmd_args:?}");
 
         let state = ClientState::default();
 
