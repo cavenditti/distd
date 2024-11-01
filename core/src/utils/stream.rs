@@ -4,8 +4,8 @@ use std::{
     task::{Context, Poll},
 };
 
-use tokio_stream::Stream;
 use tokio::time::{Duration, Instant};
+use tokio_stream::Stream;
 
 /// A stream that batches items from an inner stream.
 ///
@@ -48,15 +48,15 @@ where
     type Item = Vec<S::Item>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let mut this = self.get_mut();
+        let this = self.get_mut();
 
         loop {
-            if this.buffer.len() >= this.batch_size || this.last_emit.elapsed() >= this.timeout {
-                if !this.buffer.is_empty() {
-                    let batch = std::mem::replace(&mut this.buffer, VecDeque::new());
-                    this.last_emit = Instant::now();
-                    return Poll::Ready(Some(batch.into()));
-                }
+            if (this.buffer.len() >= this.batch_size || this.last_emit.elapsed() >= this.timeout)
+                && !this.buffer.is_empty()
+            {
+                let batch = std::mem::take(&mut this.buffer);
+                this.last_emit = Instant::now();
+                return Poll::Ready(Some(batch.into()));
             }
 
             match Pin::new(&mut this.stream).poll_next(cx) {
@@ -64,22 +64,22 @@ where
                     this.buffer.push_back(item);
                 }
                 Poll::Ready(None) => {
-                    if !this.buffer.is_empty() {
-                        let batch = std::mem::replace(&mut this.buffer, VecDeque::new());
-                        return Poll::Ready(Some(batch.into()));
+                    return if !this.buffer.is_empty() {
+                        let batch = std::mem::take(&mut this.buffer);
+                        Poll::Ready(Some(batch.into()))
                     } else {
-                        return Poll::Ready(None);
+                        Poll::Ready(None)
                     }
                 }
                 Poll::Pending => {
-                    if this.buffer.is_empty() {
-                        return Poll::Pending;
+                    return if this.buffer.is_empty() {
+                        Poll::Pending
                     } else if this.last_emit.elapsed() >= this.timeout {
-                        let batch = std::mem::replace(&mut this.buffer, VecDeque::new());
+                        let batch = std::mem::take(&mut this.buffer);
                         this.last_emit = Instant::now();
-                        return Poll::Ready(Some(batch.into()));
+                        Poll::Ready(Some(batch.into()))
                     } else {
-                        return Poll::Pending;
+                        Poll::Pending
                     }
                 }
             }
@@ -125,14 +125,14 @@ where
     type Item = I;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let mut this = self.get_mut();
+        let this = self.get_mut();
 
         loop {
-            if this.buffer.len() >= this.batch_size || this.last_emit.elapsed() >= this.timeout {
-                if !this.buffer.is_empty() {
-                    this.last_emit = Instant::now();
-                    return Poll::Ready(this.buffer.pop_front());
-                }
+            if (this.buffer.len() >= this.batch_size || this.last_emit.elapsed() >= this.timeout)
+                && !this.buffer.is_empty()
+            {
+                this.last_emit = Instant::now();
+                return Poll::Ready(this.buffer.pop_front());
             }
 
             match Pin::new(&mut this.stream).poll_next(cx) {
@@ -142,20 +142,20 @@ where
                     }
                 }
                 Poll::Ready(None) => {
-                    if !this.buffer.is_empty() {
-                        return Poll::Ready(this.buffer.pop_front());
+                    return if !this.buffer.is_empty() {
+                        Poll::Ready(this.buffer.pop_front())
                     } else {
-                        return Poll::Ready(None);
+                        Poll::Ready(None)
                     }
                 }
                 Poll::Pending => {
-                    if this.buffer.is_empty() {
-                        return Poll::Pending;
+                    return if this.buffer.is_empty() {
+                        Poll::Pending
                     } else if this.last_emit.elapsed() >= this.timeout {
                         this.last_emit = Instant::now();
-                        return Poll::Ready(this.buffer.pop_front());
+                        Poll::Ready(this.buffer.pop_front())
                     } else {
-                        return Poll::Pending;
+                        Poll::Pending
                     }
                 }
             }

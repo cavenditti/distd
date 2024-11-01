@@ -230,9 +230,7 @@ where
             .await;
         let res = res.map(|x| x.metadata);
         tracing::debug!("{:?}", res);
-        return res.map(Json).map_err(|e| match e {
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
-        });
+        return res.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
     }
     Err(StatusCode::BAD_REQUEST)
 }

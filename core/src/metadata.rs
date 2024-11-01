@@ -23,7 +23,7 @@ pub struct Server {
     pub items: HashMap<PathBuf, Item>,
 }
 
-impl<'a> BitcodeSerializable<'a, Server> for Server {}
+impl BitcodeSerializable<'_, Server> for Server {}
 
 /// A compact subset of the fields in an Item
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -63,7 +63,7 @@ impl Item {
     }
 }
 
-impl<'a> BitcodeSerializable<'a, Item> for Item {}
+impl BitcodeSerializable<'_, Item> for Item {}
 
 //Will be used in future to handle server-side tracking of clients for p2p distribution
 #[derive(Debug, Clone, Deserialize, Serialize)]

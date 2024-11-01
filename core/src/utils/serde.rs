@@ -93,7 +93,7 @@ pub mod nodes {
                             if size.is_some() {
                                 return Err(de::Error::duplicate_field("size"));
                             }
-                            size = map.next_value()?
+                            size = map.next_value()?;
                         }
                     }
                 }

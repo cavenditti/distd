@@ -172,7 +172,7 @@ mod tests {
     fn test_hms_2mb() {
         let mut s = HashMapStorage::default();
         let mut data = BytesMut::with_capacity(2_000_000);
-        rand::rngs::OsRng::default().fill_bytes(&mut data);
+        rand::rngs::OsRng.fill_bytes(&mut data);
 
         let len = data.len() as u64;
         let root = s.insert(data.clone().into()).unwrap();

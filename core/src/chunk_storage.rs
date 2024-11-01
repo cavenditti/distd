@@ -1,15 +1,12 @@
-use std::fmt::Write;
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
 use bytes::Bytes;
 pub use node::Node;
 use tokio_stream::{Stream, StreamExt};
 
-use crate::error::{Error, InvalidParameter};
-use crate::hash::{compute_tree, hash, Hash, HashTreeCapable};
-use crate::proto::SerializedTree;
+use crate::error::Error;
+use crate::hash::{hash, Hash, HashTreeCapable};
 use crate::{
-    chunks::CHUNK_SIZE,
     hash::merge_hashes,
     item::{Item, Name as ItemName},
 };
@@ -158,13 +155,13 @@ pub trait ChunkStorage: HashTreeCapable<Arc<Node>, Error> {
     fn try_fill_in(&mut self, tree: &Node) -> Option<Arc<Node>> {
         tracing::trace!("Filling {}", tree.hash());
         Some(match tree {
-            Node::Stored { hash, data } => self._insert_chunk(*hash, &data)?,
+            Node::Stored { hash, data } => self._insert_chunk(*hash, data)?,
             Node::Parent { left, right, .. } => {
                 let l = self.try_fill_in(left)?;
                 let r = self.try_fill_in(right)?;
                 self.link(l, r)?
             }
-            Node::Skipped { hash, .. } => self.get(&hash)?,
+            Node::Skipped { hash, .. } => self.get(hash)?,
         })
     }
 }

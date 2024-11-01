@@ -6,14 +6,21 @@ use std::{env, path::PathBuf};
 use crate::error::Client as ClientError;
 
 /// Returns the path to the configuration directory.
-#[inline(always)]
+///
+/// This is the directory used for reading and storing configuration files.
+/// The directory is created if it does not exist.
+///
+/// # Panics
+///
+/// This function will panic if the directory cannot be created.
+#[inline]
 pub fn config_dir() -> PathBuf {
     let d = user_config_dir()
         .expect("Cannot find config directory")
         .join(env!("CARGO_PKG_NAME"));
     tracing::debug!("Config dir: {}", d.to_string_lossy());
     if !d.is_dir() {
-        std::fs::create_dir_all(&d).unwrap()
+        std::fs::create_dir_all(&d).unwrap();
     }
     d
 }
@@ -21,14 +28,18 @@ pub fn config_dir() -> PathBuf {
 /// Returns the path to the cache directory.
 ///
 /// This is used for storing both temporary and persistent files.
-#[inline(always)]
+///
+/// # Panics
+///
+/// This function will panic if the directory cannot be created.
+#[inline]
 pub fn cache_dir() -> PathBuf {
     let d = user_cache_dir()
         .expect("Cannot find config directory")
         .join(env!("CARGO_PKG_NAME"));
     tracing::debug!("Cache dir: {}", d.to_string_lossy());
     if !d.is_dir() {
-        std::fs::create_dir_all(&d).unwrap()
+        std::fs::create_dir_all(&d).unwrap();
     }
     d
 }

@@ -146,8 +146,8 @@ impl Item {
         self.hashes.difference(&other.hashes).copied().collect()
     }
 
-    #[inline(always)]
-    pub fn root(&self) -> &crate::hash::Hash {
+    #[inline]
+    #[must_use] pub fn root(&self) -> &crate::hash::Hash {
         &self.metadata.root.hash
     }
 }

@@ -9,6 +9,7 @@ use crate::hash::Hash;
 /// It may useful to increase this in order to print hash tree when debugging
 //pub const CHUNK_SIZE: usize = blake3::guts::CHUNK_LEN;
 pub const CHUNK_SIZE: usize = 256 * 1024;
+pub const CHUNK_SIZE_U64: u64 = CHUNK_SIZE as u64;
 
 /// Owned chunk
 pub type OwnedChunk = Vec<u8>;

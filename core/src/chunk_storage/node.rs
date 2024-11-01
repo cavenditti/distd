@@ -4,7 +4,7 @@ use std::{collections::HashSet, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 
-use crate::chunks::{ChunkInfo, CHUNK_SIZE};
+use crate::chunks::{ChunkInfo, CHUNK_SIZE_U64};
 use crate::hash::Hash;
 use crate::utils::serde::nodes::{deserialize_arc_node, serialize_arc_node};
 
@@ -48,12 +48,11 @@ struct NodeIterator {
 
 impl NodeIterator {
     fn new(node: Arc<Node>) -> Self {
-        #[inline(always)]
         fn push_children(node: Arc<Node>, stack: &mut Vec<Arc<Node>>) {
             match node.clone().as_ref() {
                 &Node::Stored { .. } | &Node::Skipped { .. } => {
                     // We're at a leaf, just return it
-                    stack.push(node)
+                    stack.push(node);
                 }
                 Node::Parent { left, right, .. } => {
                     // in this case we keep descending, first pushed get returned last
@@ -64,15 +63,17 @@ impl NodeIterator {
             }
         }
 
-        let mut stack = Vec::with_capacity((2 * node.size()) as usize / CHUNK_SIZE); // The very dumb heuristic™
+        // TODO should be safe for any reasonable CHUNK_SIZE but needs to be restricted somehow
+        #[allow(clippy::cast_possible_truncation)]
+        let mut stack = Vec::with_capacity(((2 * node.size()) / CHUNK_SIZE_U64) as usize);
+        // The very dumb heuristic™
 
         push_children(node, &mut stack);
         Self { stack }
     }
 
     /// Create a new iterator skipping some hashes
-    fn new_skipping(node: Arc<Node>, skip: HashSet<Hash>) -> Self {
-        #[inline(always)]
+    fn new_skipping(node: Arc<Node>, skip: &HashSet<Hash>) -> Self {
         fn iterate_children(node: Arc<Node>, skip: &HashSet<Hash>) -> Arc<Node> {
             if skip.contains(node.hash()) {
                 Arc::new(Node::Skipped {
@@ -141,7 +142,6 @@ impl Display for Node {
 
 impl Node {
     #[must_use]
-    #[inline(always)]
     pub fn hash(&self) -> &Hash {
         match self {
             Self::Stored { hash, .. } | Self::Parent { hash, .. } | Self::Skipped { hash, .. } => {
@@ -152,7 +152,6 @@ impl Node {
 
     /// Compute sum size in bytes of all descending chunks
     #[must_use]
-    #[inline(always)]
     pub fn size(&self) -> u64 {
         match self {
             Self::Stored { data, .. } => data.len() as u64,
@@ -254,7 +253,7 @@ impl Node {
     #[must_use]
     pub fn all_hashes(&self) -> HashSet<Hash> {
         match self {
-            Self::Stored { hash, .. } => HashSet::from([*hash]),
+            Self::Stored { hash, .. } | Self::Skipped { hash, .. } => HashSet::from([*hash]),
             Self::Parent {
                 hash, left, right, ..
             } => {
@@ -262,7 +261,6 @@ impl Node {
                 left_vec.insert(*hash);
                 left_vec.union(&right.all_hashes()).copied().collect()
             }
-            Self::Skipped { hash, .. } => HashSet::from([*hash]),
         }
     }
 
@@ -360,7 +358,8 @@ impl Node {
         }
     }
 
-    /// Get all unique hashes (`Stored` or `Parent`) referenced by the (sub-)tree, as an HashMap
+    /// Get all unique hashes (`Stored` or `Parent`) referenced by the (sub-)tree, as an `HashMap`
+    #[must_use]
     pub fn hash_map(self: Arc<Node>) -> HashMap<Hash, Arc<Node>> {
         match self.as_ref() {
             &Node::Stored { hash, .. } | &Node::Skipped { hash, .. } => {
@@ -393,20 +392,17 @@ impl Node {
         }
     }
 
-    /// Get all unique hashes (`Stored` or `Parent`) referenced by the (sub-)tree, as a HashMap
+    /// Get all unique hashes (`Stored` or `Parent`) referenced by the (sub-)tree, as a `HashMap`
     pub fn find_diff(self: Arc<Node>, hashes: &[Hash]) -> impl Iterator<Item = Arc<Node>> {
-        let mut hashes = HashSet::from_iter(hashes.into_iter().cloned());
+        let mut hashes = hashes.iter().copied().collect();
         self.fill_hashes(&mut hashes);
-        NodeIterator::new_skipping(self, hashes)
+        NodeIterator::new_skipping(self, &hashes)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::{HashMap, HashSet},
-        sync::Arc,
-    };
+    use std::{collections::HashSet, sync::Arc};
 
     use crate::{
         chunks::CHUNK_SIZE,
@@ -469,7 +465,7 @@ mod tests {
     fn test_node_fill_hashes() {
         let data_size = CHUNK_SIZE * 3 + 4;
         let mut data = vec![0u8; data_size];
-        rand::rngs::OsRng::default().fill_bytes(&mut data);
+        rand::rngs::OsRng.fill_bytes(&mut data);
 
         let h1 = hash(&data[..CHUNK_SIZE]);
         let h2 = hash(&data[CHUNK_SIZE..CHUNK_SIZE * 2]);
@@ -533,7 +529,7 @@ mod tests {
     fn test_node_find_diff() {
         let data_size = CHUNK_SIZE * 3 + 4;
         let mut data = vec![0u8; data_size];
-        rand::rngs::OsRng::default().fill_bytes(&mut data);
+        rand::rngs::OsRng.fill_bytes(&mut data);
 
         let h1 = hash(&data[..CHUNK_SIZE]);
         let h2 = hash(&data[CHUNK_SIZE..CHUNK_SIZE * 2]);

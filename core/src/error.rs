@@ -5,11 +5,14 @@ use tonic::metadata::errors::{InvalidMetadataValue, InvalidMetadataValueBytes};
 
 use crate::{chunk_storage::StorageError, GrpcError, TransportError};
 
-/// Generic distd_core error
+/// Generic `distd_core` error
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("Generic IO error")]
     IoError(#[from] std::io::Error),
+
+    #[error("Integrer conversion error")]
+    IntError(#[from] std::num::TryFromIntError),
 
     #[error("Missing data")]
     MissingData,

@@ -5,14 +5,14 @@ use crate::error::InvalidParameter;
 
 use super::uuid::bytes_to_uuid;
 
-pub fn uuid_to_metadata(uuid: &Uuid) -> MetadataValue<Binary> {
+#[must_use] pub fn uuid_to_metadata(uuid: &Uuid) -> MetadataValue<Binary> {
     BinaryMetadataValue::from_bytes(uuid.as_bytes())
 }
 
 pub fn metadata_to_uuid(uuid: &MetadataValue<Binary>) -> Result<Uuid, InvalidParameter> {
     uuid.to_bytes()
         .map_err(InvalidParameter::MetadataBytes)
-        .map(bytes_to_uuid)
+        .map(|x| bytes_to_uuid(&x))
 }
 
 #[cfg(test)]

@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::settings::cache_dir;
 
-#[inline(always)]
-pub fn state_path() -> PathBuf {
+#[inline]
+#[must_use] pub fn state_path() -> PathBuf {
     cache_dir().join("state.json")
 }
 
@@ -21,9 +21,9 @@ pub struct ClientPersistentState {
 }
 
 impl ClientPersistentState {
-    pub fn commit(&self) -> Option<()> {
+    #[must_use] pub fn commit(&self) -> Option<()> {
         std::fs::File::create(state_path())
-            .map(|file| std::io::BufWriter::new(file))
+            .map(std::io::BufWriter::new)
             .ok()
             .and_then(|file| serde_json::to_writer(file, self).ok())
     }
@@ -32,7 +32,7 @@ impl ClientPersistentState {
 impl Default for ClientPersistentState {
     fn default() -> Self {
         std::fs::File::open(state_path())
-            .map(|file| std::io::BufReader::new(file))
+            .map(std::io::BufReader::new)
             .ok()
             .and_then(|file| serde_json::from_reader(file).ok())
             .unwrap_or(ClientPersistentState { client_uuid: None })
@@ -49,7 +49,7 @@ pub struct ClientPid {
 
 impl ClientPid {
     fn pidfile_cleanup(pid_path: &Path) {
-        std::fs::remove_file(pid_path).unwrap()
+        std::fs::remove_file(pid_path).unwrap();
     }
 }
 

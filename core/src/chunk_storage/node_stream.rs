@@ -9,6 +9,11 @@ use super::Node;
 /// Create a sender stream that serializes nodes into bitcode
 ///
 /// The sender stream will batch nodes into `batch_size`, at most every `duration`.
+/// The serialization is done using the bitcode format.
+///
+/// # Panics
+///
+/// This function will panic if serialization fails. This should not happen unless there is a bug in the bitcode
 pub fn sender<S>(
     stream: S,
     batch_size: usize,
@@ -31,6 +36,10 @@ where
 /// Create a receiver stream that deserializes nodes from bitcode
 ///
 /// The receiver stream will de-batch nodes into `batch_size`, at most every `duration`.
+///
+/// # Panics
+///
+/// This function will panic if serialization fails. This should not happen unless there is a bug in the bitcode
 pub fn receiver<S>(
     stream: S,
     batch_size: usize,

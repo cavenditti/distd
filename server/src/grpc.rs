@@ -7,14 +7,13 @@ use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use axum::extract::FromRef;
 use distd_core::chunk_storage::node_stream::sender;
 use distd_core::chunk_storage::ChunkStorage;
 use distd_core::hash::Hash;
 use distd_core::proto::{self, EnumAcknowledge, ItemRequest, SerializedTree};
 use distd_core::utils::grpc::metadata_to_uuid;
 use distd_core::utils::serde::BitcodeSerializable;
-use distd_core::utils::uuid::{bytes_to_uuid, slice_to_uuid};
+use distd_core::utils::uuid::slice_to_uuid;
 use distd_core::version::Version;
 use tokio::sync::mpsc;
 use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
@@ -88,7 +87,7 @@ where
         &self,
         request: Request<ClientRegister>,
     ) -> Result<Response<ServerMetadata>, Status> {
-        let addr = request.remote_addr().clone();
+        let addr = request.remote_addr();
         let inner = request.into_inner();
         let addr = addr.ok_or(Status::new(Code::Internal, "Invalid source address"))?;
         let uuid = self
@@ -192,7 +191,7 @@ where
         tokio::spawn(async move {
             while let Some(item) = stream.next().await {
                 match tx.send(Result::<_, Status>::Ok(item)).await {
-                    Ok(_) => {
+                    Ok(()) => {
                         // item (serialized tree) was queued to be send to client
                     }
                     Err(_item) => {

@@ -68,7 +68,7 @@ where
 
     /// global server metadata
     pub metadata: Arc<RwLock<InternalMetadata>>,
-    /// A storage implementing ChunkStorage, basically a key-value database of some sort
+    /// A storage implementing `ChunkStorage`, basically a key-value database of some sort
     pub storage: Arc<RwLock<T>>,
     /// Client map
     pub clients: Arc<RwLock<BTreeMap<Uuid, Client>>>,
@@ -140,59 +140,56 @@ where
         let nonced_name = name.clone() + &self.uuid_nonce + &addr.to_string();
         tracing::debug!("Client nonced name: '{}'", nonced_name);
 
-        match uuid {
-            Some(u) => {
-                if self.clients.read().await.contains_key(&u) {
-                    tracing::info!(
-                        "Got existing uuid '{}' from \"{}\"@{}",
-                        u.to_string(),
-                        name,
-                        addr
-                    );
-                    Ok(u)
-                } else {
-                    tracing::warn!(
-                        "Client reported invalid uuid '{}' from \"{}\"@{}",
-                        u.to_string(),
-                        name,
-                        addr
-                    );
-                    return Err(RegisterError);
-                }
-            },
-            None => {
-                let uuid = Uuid::new_v5(&Uuid::NAMESPACE_URL, nonced_name.as_bytes());
+        if let Some(u) = uuid {
+            if self.clients.read().await.contains_key(&u) {
                 tracing::info!(
-                    "Assigned new client uuid '{}' to \"{}\"@{}",
-                    uuid.to_string(),
+                    "Got existing uuid '{}' from \"{}\"@{}",
+                    u.to_string(),
                     name,
                     addr
                 );
-                let client = Client {
-                    addr,
+                Ok(u)
+            } else {
+                tracing::warn!(
+                    "Client reported invalid uuid '{}' from \"{}\"@{}",
+                    u.to_string(),
                     name,
-                    uuid,
-                    version,
-                    last_heartbeat: SystemTime::now(),
-                };
+                    addr
+                );
+                Err(RegisterError)
+            }
+        } else {
+            let uuid = Uuid::new_v5(&Uuid::NAMESPACE_URL, nonced_name.as_bytes());
+            tracing::info!(
+                "Assigned new client uuid '{}' to \"{}\"@{}",
+                uuid.to_string(),
+                name,
+                addr
+            );
+            let client = Client {
+                addr,
+                name,
+                uuid,
+                version,
+                last_heartbeat: SystemTime::now(),
+            };
 
-                // Add uuid to valid list in interceptor
-                self.uuid_interceptor
-                    .uuids
-                    .write()
-                    .unwrap()
-                    .insert(uuid_to_metadata(&uuid));
+            // Add uuid to valid list in interceptor
+            self.uuid_interceptor
+                .uuids
+                .write()
+                .unwrap()
+                .insert(uuid_to_metadata(&uuid));
 
-                self.clients
-                    .write()
-                    .await
-                    .try_insert(client.uuid, client)
-                    .inspect_err(|e| tracing::warn!("{}", e))
-                    .cloned()
-                    .ok()
-                    .map(|client| client.uuid)
-                    .ok_or(RegisterError)
-            },
+            self.clients
+                .write()
+                .await
+                .try_insert(client.uuid, client)
+                .inspect_err(|e| tracing::warn!("{}", e))
+                .cloned()
+                .ok()
+                .map(|client| client.uuid)
+                .ok_or(RegisterError)
         }
     }
 
@@ -266,7 +263,7 @@ where
     }
 
     /// Get the public key of the server
-    pub fn public_key(&self) -> &[u8] {
+    #[must_use] pub fn public_key(&self) -> &[u8] {
         self.key_pair.public_key().as_ref()
     }
 }

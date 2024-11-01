@@ -21,6 +21,7 @@ pub mod version;
 
 pub mod benchmarks;
 
+#[allow(clippy::all)]
 pub mod proto {
     tonic::include_proto!("distd");
 }

@@ -112,7 +112,7 @@ impl Server {
     }
 
     /// Get the client uuid
-    pub fn client_uuid(&self) -> Uuid {
+    #[must_use] pub fn client_uuid(&self) -> Uuid {
         self.client_uuid.unwrap_or(Uuid::nil())
     }
 
@@ -128,7 +128,7 @@ impl Server {
         Ok(distd_core::Client::with_interceptor(
             grpc_channel,
             DistdGrpcClient {
-                uuid: uuid_to_metadata(&uuid),
+                uuid: uuid_to_metadata(uuid),
             },
         ))
     }
@@ -212,7 +212,7 @@ impl Server {
 
         // comma separated list of hashes
         let from = from
-            .into_iter()
+            .iter()
             .map(|x| x.as_bytes().to_vec())
             .collect::<Vec<Vec<u8>>>();
 

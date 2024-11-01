@@ -60,7 +60,7 @@ where
             .persistent
             .client_uuid
             .as_ref()
-            .and_then(|uuid_str| Uuid::from_str(&uuid_str).ok());
+            .and_then(|uuid_str| Uuid::from_str(uuid_str).ok());
 
         // Wait for server connection to get client uid
         let server = loop {
@@ -159,7 +159,7 @@ where
 {
     /// Transfer a diff from the server
     ///
-    /// Note: this function is item-agnostic, if using the FsStorage backend one should have already
+    /// Note: this function is item-agnostic, if using the `FsStorage` backend one should have already
     /// preallocated an item in order to be able to reconstruct sub-trees
     async fn transfer_diff(
         &mut self,

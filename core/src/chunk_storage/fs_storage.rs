@@ -24,7 +24,7 @@ pub fn open_file(path: &Path) -> Result<File, Error> {
         .write(true)
         .append(false)
         .truncate(false)
-        .open(&path)
+        .open(path)
         .inspect_err(|e| tracing::error!("Cannot create file at {:?}: {}", path, e))
         .map_err(Error::IoError)
 }
@@ -75,7 +75,7 @@ impl TryFrom<InFileChunk> for Node {
         let mut file = File::open(&value.path)?;
         file.seek(std::io::SeekFrom::Start(value.offset))?;
 
-        let mut buf = vec![0u8; value.info.size as usize];
+        let mut buf = vec![0u8; usize::try_from(value.info.size)?];
 
         file.read_exact(&mut buf)?;
 
@@ -162,7 +162,7 @@ pub struct FsStorage {
 }
 
 impl FsStorage {
-    pub fn new(root: PathBuf) -> Self {
+    #[must_use] pub fn new(root: PathBuf) -> Self {
         Self {
             root,
             ..Default::default()
@@ -170,7 +170,7 @@ impl FsStorage {
     }
 
     /// Returns the (eventual) stored path of the item provided
-    pub fn path(&self, path: &Path) -> PathBuf {
+    #[must_use] pub fn path(&self, path: &Path) -> PathBuf {
         // TODO also create parent?
         if path.starts_with(&self.root) {
             path.to_path_buf()
@@ -203,7 +203,7 @@ impl FsStorage {
         offset: u64,
     ) -> Result<(), Error> {
         // If already exists do nothing
-        if let Some(_) = self.data.get(&chunk_info.hash) {
+        if self.data.contains_key(&chunk_info.hash) {
             return Ok(());
         }
 
@@ -225,7 +225,7 @@ impl FsStorage {
         tracing::debug!(
             "Preallocating {} chunks at {path:?}, for a total of {} bytes",
             data.len(),
-            data.iter().map(|x| u64::from(x.size)).sum::<u64>()
+            data.iter().map(|x| x.size).sum::<u64>()
         );
         tracing::trace!(
             "Preallocating [{}] at {path:?}",
@@ -240,7 +240,7 @@ impl FsStorage {
         // Prepare all InFileChunk and add them to self.data
         for chunk in data {
             self.pre_allocate_chunk(path, chunk, offset)?;
-            offset += u64::from(chunk.size);
+            offset += chunk.size;
         }
         Ok(())
     }
@@ -336,7 +336,7 @@ impl ChunkStorage for FsStorage {
                         .ok()
                 */
             })
-            .map(|_| {
+            .map(|()| {
                 Arc::new(Node::Stored {
                     hash,
                     data: Arc::new(chunk.to_vec()),
@@ -432,18 +432,15 @@ impl ChunkStorage for FsStorage {
         let mut last: Option<Arc<Node>> = None; // final node
 
         while let Some(node) = stream.next().await {
-            match &node {
-                s_n @ Node::Stored { .. } => {
-                    tracing::trace!(
-                        "Preallocating {} bytes in {}@'{}'",
-                        s_n.size(),
-                        o,
-                        path.to_string_lossy()
-                    );
-                    self.pre_allocate_chunk(&path, &s_n.chunk_info(), o)?;
-                    o = o + s_n.size(); // FIXME this may be incorrect, should be passed along with the chunk
-                }
-                _ => {}
+            if let s_n @ Node::Stored { .. } = &node {
+                tracing::trace!(
+                    "Preallocating {} bytes in {}@'{}'",
+                    s_n.size(),
+                    o,
+                    path.to_string_lossy()
+                );
+                self.pre_allocate_chunk(&path, &s_n.chunk_info(), o)?;
+                o += s_n.size(); // FIXME this may be incorrect, should be passed along with the chunk
             }
             last = self.try_fill_in(&node);
             i += 1;

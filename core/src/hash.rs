@@ -3,14 +3,14 @@ use std::convert::Infallible;
 use crate::chunks::CHUNK_SIZE;
 
 #[must_use]
-#[inline(always)]
+#[inline]
 pub fn merge_hashes(left: &hash::Hash, right: &hash::Hash) -> hash::Hash {
     blake3::hash(
         &left
             .as_bytes()
             .iter()
             .chain(right.as_bytes().iter())
-            .cloned()
+            .copied()
             .collect::<Vec<u8>>(),
     )
     .into()
@@ -29,21 +29,21 @@ where
         Self: Sized,
     {
         if data.len() <= CHUNK_SIZE {
-            return Ok(self.func(data)?.into());
+            return self.func(data);
         }
 
         // pre-allocate partials vec
         let mut partials: Vec<T> = Vec::with_capacity(data.len() / CHUNK_SIZE + 1);
 
         // Compute single chunks results
-        for chunk in data.chunks(CHUNK_SIZE as usize) {
-            partials.push(self.func(chunk)?.into());
+        for chunk in data.chunks(CHUNK_SIZE) {
+            partials.push(self.func(chunk)?);
         }
 
         while partials.len() > 1 {
             // to is the destination position, i the first result position
             for (to, i) in (0..partials.len() - 1).step_by(2).enumerate() {
-                partials[to] = self.merge(&partials[i], &partials[i + 1])?
+                partials[to] = self.merge(&partials[i], &partials[i + 1])?;
             }
 
             // if there's an element remaining put it in last position
@@ -54,7 +54,7 @@ where
                 partials.truncate(partials.len() / 2);
             }
         }
-        Ok(partials.swap_remove(0).into())
+        Ok(partials.swap_remove(0))
     }
 }
 
@@ -118,10 +118,10 @@ pub mod hash {
     use blake3::OUT_LEN;
     use serde::{Deserialize, Serialize};
 
-    /// Reimplementation of blake3::Hash without constant-time comparisons
+    /// Reimplementation of `blake3::Hash` without constant-time comparisons
     ///
     /// Constant-time equality check is not needed for this use-case and only hurts performance
-    /// Code is almost identical to blake3::Hash
+    /// Code is almost identical to `blake3::Hash`
     #[derive(Clone, Copy, Serialize, Deserialize, Hash, PartialEq, Eq, PartialOrd, Ord)]
     pub struct Hash([u8; OUT_LEN]);
 
@@ -130,17 +130,17 @@ pub mod hash {
         /// constant-time equality checking, so if  you need to compare hashes,
         /// prefer the `Hash` type.
         #[inline]
-        pub const fn as_bytes(&self) -> &[u8; OUT_LEN] {
+        #[must_use] pub const fn as_bytes(&self) -> &[u8; OUT_LEN] {
             &self.0
         }
 
         /// Create a `Hash` from its raw bytes representation.
-        pub const fn from_bytes(bytes: [u8; OUT_LEN]) -> Self {
+        #[must_use] pub const fn from_bytes(bytes: [u8; OUT_LEN]) -> Self {
             Self(bytes)
         }
 
         /// Convert to `blake3::Hash`
-        pub fn to_blake3_hash(self) -> blake3::Hash {
+        #[must_use] pub fn to_blake3_hash(self) -> blake3::Hash {
             blake3::Hash::from_bytes(self.into())
         }
 
@@ -248,11 +248,11 @@ pub mod hash {
                     if byte < 128 {
                         write!(f, "invalid hex character: {:?}", byte as char)
                     } else {
-                        write!(f, "invalid hex character: 0x{:x}", byte)
+                        write!(f, "invalid hex character: 0x{byte:x}")
                     }
                 }
                 HexErrorInner::InvalidLen(len) => {
-                    write!(f, "expected 64 hex bytes, received {}", len)
+                    write!(f, "expected 64 hex bytes, received {len}")
                 }
             }
         }
@@ -277,7 +277,7 @@ mod tests {
     }
 
     #[test]
-    /// We're doing it differently, so they should differ (unless blake3 CHUNK_SIZE == our CHUNK_SIZE + 1)
+    /// We're doing it differently, so they should differ (unless blake3 `CHUNK_SIZE` == our `CHUNK_SIZE` + 1)
     fn test_blake3_multiple_chunks() {
         let data = [1u8; CHUNK_SIZE + 1];
         assert_ne!(Hash::from(blake3::hash(&data)), hash(&data));
