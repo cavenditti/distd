@@ -121,7 +121,7 @@ where
 }
 
 impl Client<FsStorage> {
-    pub async fn sync(&mut self, target: &Path, path: &Path) -> Result<Item, ClientError> {
+    pub async fn get(&mut self, target: &Path, path: &Path) -> Result<Item, ClientError> {
         tracing::debug!("sync: {target:?} {path:?}");
         let mut buf = vec![];
 
@@ -247,7 +247,7 @@ where
                 }
 
                 tracing::debug!("Syncing '{}'", path.to_string_lossy());
-                let old_item = items.get(path).ok_or(ClientError::Storage)?; //FIXME should fail on missing on server or sync other files anyway?
+                let old_item = items.get(path).ok_or(ClientError::Storage)?; //TODO should fail on missing on server or sync other files anyway?
                 let item = self.update(old_item).await?;
                 latest.insert(path.clone(), *item.root());
             }
@@ -259,7 +259,6 @@ pub mod cli {
     use std::{env, path::PathBuf, str::FromStr};
 
     use distd_core::chunk_storage::fs_storage::FsStorage;
-    use distd_core::chunk_storage::hashmap_storage::HashMapStorage;
 
     use crate::client::Client;
     use crate::error::Client as ClientError;
@@ -289,12 +288,13 @@ pub mod cli {
 
         let Ok(storage_root) = PathBuf::from_str(&settings.fsstorage.root);
         let storage = FsStorage::new(storage_root);
-        let storage = HashMapStorage::default(); // use this for benchmarking in order to avoid potential fs-related bottlenecks
+        //let storage = HashMapStorage::default(); // use this for benchmarking in order to avoid potential fs-related bottlenecks
         let client = Client::new(&[0u8; 32], storage, settings, state).await?;
 
         match cmd.as_str() {
             "start" => client.client_loop().await,
-            //"sync" => sync(client, &cmd_args[..]).await, // TODO change name and use sync to explicitly request syncing of items subscripted to
+            "get" => get(client, &cmd_args[..]).await,
+            // TODO add "sync: to explicitly request syncing of items subscripted to?
             "publish" => todo!(),
             "subscribe" => todo!(),
             _ => {
@@ -305,7 +305,7 @@ pub mod cli {
         .inspect_err(|e| tracing::error!("Fatal: {e}"))
     }
 
-    async fn sync(mut client: Client<FsStorage>, args: &[String]) -> Result<(), ClientError> {
+    async fn get(mut client: Client<FsStorage>, args: &[String]) -> Result<(), ClientError> {
         let first = args
             .first()
             .ok_or(ClientError::InvalidArgs(args.to_owned()))?;
@@ -323,6 +323,6 @@ pub mod cli {
         let Ok(path) = PathBuf::from_str(path);
         let Ok(target) = PathBuf::from_str(target.as_str());
 
-        client.sync(&target, &path).await.map(|_| ())
+        client.get(&target, &path).await.map(|_| ())
     }
 }
