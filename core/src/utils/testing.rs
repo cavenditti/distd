@@ -11,6 +11,12 @@ use uuid::Uuid;
 // Random path to avoid confliting file creation from mutliple concurrent tests
 #[must_use]
 pub fn random_path() -> PathBuf {
+    PathBuf::from_str(&Uuid::new_v4().to_string()).unwrap()
+}
+
+// Random path in a subdir to avoid confliting file creation from mutliple concurrent tests
+#[must_use]
+pub fn random_path_subdir() -> PathBuf {
     PathBuf::from_str(&format!("random/unique/path/{}", Uuid::new_v4())).unwrap()
 }
 
@@ -48,7 +54,7 @@ impl Deref for SelfDeletingPath {
 }
 
 impl SelfDeletingPath {
-    fn new(path: PathBuf) -> Self {
+    pub fn new(path: PathBuf) -> Self {
         SelfDeletingPath { path }
     }
 }

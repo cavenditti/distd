@@ -188,7 +188,7 @@ pub mod tests {
     use crate::chunks::CHUNK_SIZE;
     use crate::hash::hash;
     use crate::utils::serde::BitcodeSerializable;
-    use crate::utils::testing::random_path;
+    use crate::utils::testing::random_path_subdir;
 
     use super::*;
 
@@ -204,7 +204,7 @@ pub mod tests {
         storage
             .create_item(
                 "name".to_string(),
-                random_path(),
+                random_path_subdir(),
                 0,
                 None,
                 Bytes::from_static(b""),
@@ -220,7 +220,7 @@ pub mod tests {
         storage
             .create_item(
                 "name".to_string(),
-                random_path(),
+                random_path_subdir(),
                 0,
                 Some("Some description for the larger item".to_string()),
                 Bytes::from_static(&[VALUE; SIZE]),
@@ -250,7 +250,7 @@ pub mod tests {
         };
         Item::make(
             "name".to_string(),
-            random_path(),
+            random_path_subdir(),
             0,
             Some("Some description for the larger item".to_string()),
             chunk,
