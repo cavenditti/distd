@@ -16,6 +16,9 @@ pub mod hashmap_storage;
 pub mod node;
 pub mod node_stream;
 
+#[cfg(feature = "redb")]
+pub mod redb;
+
 use thiserror::Error;
 
 #[derive(Error, Debug)]

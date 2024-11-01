@@ -26,11 +26,10 @@ ring = { workspace = true }
 blake3 = { workspace = true }
 
 serde = { workspace = true }
-serde_json = "1.0"
+serde_json = { workspace = true }
 uuid = { workspace = true }
 percent-encoding = { workspace = true }
 bitcode = { workspace = true }
-#lru = { version = "0.12.4" }
 
 distd_core = { path = "../core" }
 

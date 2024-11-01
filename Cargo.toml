@@ -35,11 +35,14 @@ ring = "0.17"
 blake3 = "1.5.3"
 
 serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = { version = "1.0" }
 bytes = { version = "1.7.0" }
 bitcode = { version = "0", features = ["derive", "serde"], default-features = false }
 uuid = { version = "1.10.0", features = [ "v4", "v5", "fast-rng", "macro-diagnostics" ] }
 percent-encoding = "2.3.1"
 base64 = { version = "0.22.1" }
+
+redb = { version = "2.2.0" }
 
 [profile.release]
 #opt-level = 's'     # Optimize for size

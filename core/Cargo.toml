@@ -28,6 +28,11 @@ bitcode = { workspace = true }
 base64 = { workspace = true }
 uuid = { workspace = true }
 
+redb = { workspace = true, optional = true }
+
+[features]
+redb = ["dep:redb"]
+
 [build-dependencies]
 tonic-build = "0.12"
 

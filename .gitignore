@@ -6,3 +6,5 @@
 *.repeated
 *.zeros
 here/
+
+**/*.test

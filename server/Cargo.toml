@@ -37,3 +37,7 @@ uuid = { workspace = true }
 percent-encoding = { workspace = true }
 
 distd_core = { path = "../core" }
+
+[features]
+default = ["redb"]
+redb = ["distd_core/redb"]
