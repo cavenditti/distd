@@ -151,19 +151,18 @@ impl HashTreeCapable<Arc<Node>, crate::error::Error> for RedbStorage {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
 
     use bytes::{Bytes, BytesMut};
     use rand::{self, RngCore};
     use test_log::test;
 
-    use crate::{chunks::CHUNK_SIZE, hash::hash};
+    use crate::{chunks::CHUNK_SIZE, hash::hash, utils::testing::selfdel_path};
 
     #[test]
     fn test_redb_single_chunk_insertion() {
-        let mut s = RedbStorage::new(&PathBuf::from("redb.1.test")).unwrap();
+        let p = selfdel_path("redb.1.test");
+        let mut s = RedbStorage::new(&p).unwrap();
         let data = Bytes::from_static(b"very few bytes");
         let len = data.len() as u64;
         s.insert(data);
@@ -173,7 +172,8 @@ mod tests {
     #[test]
     /// Multiple chunks, not aligned with `CHUNK_SIZE`
     fn test_redb_insertion() {
-        let s = RedbStorage::new(&PathBuf::from("redb.2.test")).unwrap();
+        let p = selfdel_path("redb.2.test");
+        let s = RedbStorage::new(&p).unwrap();
         let data = Bytes::from_static(include_bytes!("../../../Cargo.lock"));
         let len = data.len() as u64;
         //let root = s.insert(data).unwrap();
@@ -187,7 +187,8 @@ mod tests {
     fn test_redb_deduplicated() {
         const MULT: usize = 3;
         const SIZE: usize = CHUNK_SIZE * MULT;
-        let mut s = RedbStorage::new(&PathBuf::from("redb.3.test")).unwrap();
+        let p = selfdel_path("redb.3.test");
+        let mut s = RedbStorage::new(&p).unwrap();
         let data = Bytes::from_static(&[0u8; SIZE]);
         println!(
             "Using {} bytes: CHUNK_SIZE( {CHUNK_SIZE} B ) x {MULT}",
@@ -233,7 +234,8 @@ mod tests {
 
     #[test]
     fn test_redb_2mb() {
-        let mut s = RedbStorage::new(&PathBuf::from("redb.4.test")).unwrap();
+        let p = selfdel_path("redb.4.test");
+        let mut s = RedbStorage::new(&p).unwrap();
         let mut data = BytesMut::with_capacity(2_000_000);
         rand::rngs::OsRng.fill_bytes(&mut data);
 

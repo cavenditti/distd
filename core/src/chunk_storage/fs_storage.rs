@@ -485,7 +485,7 @@ mod tests {
     use crate::{
         chunks::CHUNK_SIZE,
         hash::hash as do_hash,
-        item::tests::{make_ones_item, new_dummy_item, random_path},
+        item::tests::{make_ones_item, new_dummy_item},
     };
     use std::{str::FromStr, thread::sleep, time::Duration};
 
@@ -548,13 +548,6 @@ mod tests {
         infile_chunk
             .populated
             .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Creates a random path in /tmp, ensuring its parent directory exists
-    fn temp_path() -> PathBuf {
-        let path = std::env::temp_dir().join(random_path());
-        create_dir_all(path.parent().unwrap_or(&path)).unwrap();
-        path
     }
 
     #[test]

@@ -180,24 +180,17 @@ impl Display for Item {
 #[cfg(test)]
 pub mod tests {
     use std::mem;
-    use std::str::FromStr;
 
     use bytes::Bytes;
-    use uuid::Uuid;
 
     use crate::chunk_storage::hashmap_storage::HashMapStorage;
     use crate::chunk_storage::ChunkStorage;
     use crate::chunks::CHUNK_SIZE;
     use crate::hash::hash;
     use crate::utils::serde::BitcodeSerializable;
+    use crate::utils::testing::random_path;
 
     use super::*;
-
-    // Using a random path to avoid confliting file creation from mutliple concurrent tests
-    #[must_use]
-    pub fn random_path() -> PathBuf {
-        PathBuf::from_str(&format!("random/unique/path/{}", Uuid::new_v4())).unwrap()
-    }
 
     /*
      * Most of these tests are bad. I wasn't sure about Item interfaces at first and their spaghettified
