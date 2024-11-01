@@ -92,97 +92,11 @@ impl HashTreeCapable<Arc<Node>, crate::error::Error> for HashMapStorage {
 mod tests {
     use super::*;
 
-    use bytes::{Bytes, BytesMut};
-    use rand::{self, RngCore};
     use test_log::test;
 
-    use crate::{chunks::CHUNK_SIZE, hash::hash};
-
-    #[test]
-    fn test_hms_single_chunk_insertion() {
-        let mut s = HashMapStorage::default();
-        let data = Bytes::from_static(b"very few bytes");
-        let len = data.len() as u64;
-        s.insert(data);
-        assert_eq!(len, s.size());
+    fn make_hashmap_storage() -> HashMapStorage {
+        HashMapStorage::default()
     }
 
-    #[test]
-    /// Multiple chunks, not aligned with `CHUNK_SIZE`
-    fn test_hms_insertion() {
-        let s = HashMapStorage::default();
-        let data = Bytes::from_static(include_bytes!("../../../Cargo.lock"));
-        let len = data.len() as u64;
-        //let root = s.insert(data).unwrap();
-        println!("\nOriginal lenght: {}, stored length: {}", len, s.size());
-        //print_tree(&*root.to_owned()).unwrap();
-        println!();
-        assert!(len >= s.size());
-    }
-
-    #[test]
-    fn test_hms_deduplicated() {
-        const MULT: usize = 3;
-        const SIZE: usize = CHUNK_SIZE * MULT;
-        let mut s = HashMapStorage::default();
-        let data = Bytes::from_static(&[0u8; SIZE]);
-        println!(
-            "Using {} bytes: CHUNK_SIZE( {CHUNK_SIZE} B ) x {MULT}",
-            data.len()
-        );
-
-        let root = s.insert(data).unwrap();
-        println!("Root node has hash: {}", root.hash());
-        assert_eq!(CHUNK_SIZE as u64, s.size());
-
-        let root_hash = hash(&[0u8; SIZE]);
-        assert_eq!(root.hash(), &root_hash);
-
-        let zeros_chunk_hash = hash(&[0u8; CHUNK_SIZE]);
-        let root_children = (hash(&[0u8; CHUNK_SIZE * 2]), zeros_chunk_hash);
-        println!(
-            "Root children hashes: {} {}",
-            root.children().unwrap().0.hash(),
-            root.children().unwrap().1.hash()
-        );
-
-        assert_eq!(root.children().unwrap().0.hash(), &root_children.0);
-        assert_eq!(root.children().unwrap().1.hash(), &root_children.1);
-
-        let hash_vec = root.flatten();
-        assert_eq!(hash_vec.len(), 3);
-        assert_eq!(hash_vec[0], zeros_chunk_hash);
-        assert_eq!(hash_vec[1], zeros_chunk_hash);
-        assert_eq!(hash_vec[2], zeros_chunk_hash);
-
-        let hash_set = root.hashes();
-        assert_eq!(hash_set.len(), 1);
-        for i in hash_set {
-            assert_eq!(i, zeros_chunk_hash);
-        }
-
-        let cloned = root.clone_data();
-        assert_eq!(cloned.len(), SIZE);
-        for b in cloned {
-            assert_eq!(b, 0u8);
-        }
-    }
-
-    #[test]
-    fn test_hms_2mb() {
-        let mut s = HashMapStorage::default();
-        let mut data = BytesMut::with_capacity(2_000_000);
-        rand::rngs::OsRng.fill_bytes(&mut data);
-
-        let len = data.len() as u64;
-        let root = s.insert(data.clone().into()).unwrap();
-        //print_tree(&*root.to_owned()).unwrap();
-        assert!(len >= s.size());
-
-        let cloned = root.clone_data();
-        for (i, b) in cloned.iter().enumerate() {
-            //println!("{} {} {}", i, data[i], *b);
-            assert_eq!(data[i], *b);
-        }
-    }
+    crate::chunk_storage::tests::chunk_storage_tests!(HashMapStorage, make_hashmap_storage);
 }
