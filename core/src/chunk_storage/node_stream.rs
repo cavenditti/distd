@@ -101,7 +101,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_batched_node_roundtrip_1() {
+    async fn batched_node_roundtrip_1() {
         let nodes = vec![Node::Stored {
             hash: do_hash(b""),
             data: Arc::default(),
@@ -111,7 +111,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_batched_node_roundtrip_some() {
+    async fn batched_node_roundtrip_some() {
         let l = Node::Stored {
             hash: do_hash(b""),
             data: Arc::default(),

@@ -270,12 +270,12 @@ pub mod tests {
     }
 
     #[test]
-    fn test_make_item() {
+    fn make_item() {
         let _ = make_zeros_item();
     }
 
     #[test]
-    fn test_item_size() {
+    fn item_size() {
         println!("In-memory size of Item:         {}", mem::size_of::<Item>());
         println!(
             "In-memory size of ItemMetadata: {}",

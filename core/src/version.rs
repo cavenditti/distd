@@ -74,7 +74,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_from_str() {
+    fn from_str() {
         let v = Version::from_str("1.2.3").unwrap();
         assert_eq!(v.major, 1);
         assert_eq!(v.minor, 2);
@@ -82,7 +82,7 @@ mod tests {
     }
 
     #[test]
-    fn test_from_str_invalid() {
+    fn from_str_invalid() {
         assert!(Version::from_str("1.2invalid.3").is_err());
     }
 }

@@ -3,7 +3,7 @@ use blake3::guts::{parent_cv, ChunkState, CHUNK_LEN};
 use blake3::Hasher;
 
 #[test]
-fn test_parents() {
+fn parents() {
     let mut hasher = Hasher::new();
     let mut buf = [0; CHUNK_LEN];
 

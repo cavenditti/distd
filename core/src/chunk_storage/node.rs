@@ -413,7 +413,7 @@ mod tests {
     use super::Node;
 
     #[test]
-    fn test_flatten() {
+    fn flatten() {
         const L: usize = 2000;
         let b1 = Arc::new(vec![0u8; L]);
         let b2 = Arc::new(vec![1u8; L]);
@@ -448,7 +448,7 @@ mod tests {
     }
 
     #[test]
-    fn test_node_find_diff_noop() {
+    fn node_find_diff_noop() {
         let data = vec![1u8; 12_000];
         let h = hash(&data);
         let node = Node::Stored {
@@ -462,7 +462,7 @@ mod tests {
     }
 
     #[test]
-    fn test_node_fill_hashes() {
+    fn node_fill_hashes() {
         let data_size = CHUNK_SIZE * 3 + 4;
         let mut data = vec![0u8; data_size];
         rand::rngs::OsRng.fill_bytes(&mut data);
@@ -526,7 +526,7 @@ mod tests {
     }
 
     #[test]
-    fn test_node_find_diff() {
+    fn node_find_diff() {
         let data_size = CHUNK_SIZE * 3 + 4;
         let mut data = vec![0u8; data_size];
         rand::rngs::OsRng.fill_bytes(&mut data);

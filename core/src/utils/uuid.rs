@@ -20,7 +20,7 @@ mod tests {
     use super::slice_to_uuid;
 
     #[test]
-    fn test_bytes_to_uuid() {
+    fn bytes_to_uuid_random() {
         let uuid = Uuid::new_v4();
         let slice = uuid.as_bytes().as_slice();
         let bytes = Bytes::copy_from_slice(slice);

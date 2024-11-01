@@ -551,7 +551,7 @@ mod tests {
     }
 
     #[test]
-    fn test_infile_chunk() {
+    fn infile_chunk() {
         let (data, hash, mut infile_chunk) = make_infile_chunk::<CHUNK_SIZE>();
         println!("Created infile_chunk");
         assert!(!is_populated(&infile_chunk));
@@ -568,7 +568,7 @@ mod tests {
     }
 
     #[test]
-    fn test_infile_chunk_conversion() {
+    fn infile_chunk_conversion() {
         let (data, hash, mut infile_chunk) = make_infile_chunk::<CHUNK_SIZE>();
         let _path = write_data_to_infile_chunk(&data, hash, &mut infile_chunk);
 
@@ -585,7 +585,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fs_storage() {
+    fn fs_storage() {
         // check default doesn't panics, just in case
         let storage = FsStorage::default();
         print_fsstorage(&storage);
@@ -638,7 +638,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fs_storage_round_trip() {
+    fn fs_storage_round_trip() {
         // create storage in a temporary directory
         let tempdir = std::env::temp_dir().join(PathBuf::from_str("in_a_temp_dir").unwrap());
         let mut storage = FsStorage::new(tempdir.clone());

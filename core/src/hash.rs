@@ -271,14 +271,14 @@ mod tests {
     use super::Hash;
 
     #[test]
-    fn test_blake3_one_chunk() {
+    fn blake3_one_chunk() {
         let data = b"some random data";
         assert_eq!(Hash::from(blake3::hash(data)), hash(data));
     }
 
     #[test]
     /// We're doing it differently, so they should differ (unless blake3 `CHUNK_SIZE` == our `CHUNK_SIZE` + 1)
-    fn test_blake3_multiple_chunks() {
+    fn blake3_multiple_chunks() {
         let data = [1u8; CHUNK_SIZE + 1];
         assert_ne!(Hash::from(blake3::hash(&data)), hash(&data));
 

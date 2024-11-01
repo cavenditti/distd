@@ -48,7 +48,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_feed() {
+    fn feed() {
         let feed = Feed::new("A feed");
         assert_eq!("A feed", feed.name);
     }

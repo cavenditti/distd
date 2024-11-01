@@ -64,8 +64,8 @@ pub fn selfdel_path(path: &str) -> SelfDeletingPath {
 }
 
 #[test]
-fn test_self_deleting_path() {
-    let path = PathBuf::from("test_self_delete_path.test");
+fn self_deleting_path() {
+    let path = PathBuf::from("self_delete_path.test");
     File::create(&path).unwrap().write(b"ok").unwrap();
     {
         let p = SelfDeletingPath::new(path.clone());
