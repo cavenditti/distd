@@ -204,7 +204,7 @@ pub mod tests {
      * and messed up
      */
 
-    pub fn new_empty_item<T>(storage: &mut T) -> Item
+    pub fn new_empty_item<T>(storage: &mut T) -> Option<Item>
     where
         T: ChunkStorage + Clone,
     {
@@ -216,10 +216,9 @@ pub mod tests {
                 None,
                 Bytes::from_static(b""),
             )
-            .unwrap()
     }
 
-    pub fn new_dummy_item<T, const VALUE: u8, const SIZE: usize>(storage: &mut T) -> Item
+    pub fn new_dummy_item<T, const VALUE: u8, const SIZE: usize>(storage: &mut T) -> Option<Item>
     where
         T: ChunkStorage,
     {
@@ -233,17 +232,16 @@ pub mod tests {
                 Some("Some description for the larger item".to_string()),
                 Bytes::from_static(&[VALUE; SIZE]),
             )
-            .unwrap()
     }
 
-    pub fn new_zeros_item<T>(storage: &mut T) -> Item
+    pub fn new_zeros_item<T>(storage: &mut T) -> Option<Item>
     where
         T: ChunkStorage + Clone,
     {
         new_dummy_item::<T, 0u8, 100_000_000>(storage)
     }
 
-    pub fn new_ones_item<T>(storage: &mut T) -> Item
+    pub fn new_ones_item<T>(storage: &mut T) -> Option<Item>
     where
         T: ChunkStorage + Clone,
     {
@@ -251,7 +249,7 @@ pub mod tests {
     }
 
     #[must_use]
-    pub fn make_repeated_item(value: u8) -> Item {
+    pub fn make_repeated_item(value: u8) -> Option<Item> {
         let data = Bytes::from_iter([value; CHUNK_SIZE]);
         let chunk = ChunkInfo {
             hash: hash(&data),
@@ -265,17 +263,16 @@ pub mod tests {
             chunk,
             vec![chunk],
             HashSet::from_iter(vec![chunk]),
-        )
-        .unwrap()
+        ).ok()
     }
 
     #[must_use]
-    pub fn make_zeros_item() -> Item {
+    pub fn make_zeros_item() -> Option<Item> {
         make_repeated_item(0)
     }
 
     #[must_use]
-    pub fn make_ones_item() -> Item {
+    pub fn make_ones_item() -> Option<Item> {
         make_repeated_item(1)
     }
 
@@ -293,7 +290,7 @@ pub mod tests {
         );
         {
             let mut storage = HashMapStorage::default();
-            let item = new_empty_item(&mut storage);
+            let item = new_empty_item(&mut storage).unwrap();
             let serialized = item.clone().metadata.to_bitcode().unwrap();
             println!("Small Item serialized size: {}", serialized.len());
 
@@ -304,7 +301,7 @@ pub mod tests {
         {
             // Same as above but with a larger one
             let mut storage = HashMapStorage::default();
-            let item = new_zeros_item(&mut storage);
+            let item = new_zeros_item(&mut storage).unwrap();
             let serialized = item.clone().metadata.to_bitcode().unwrap();
             println!("Small Item serialized size: {}", serialized.len());
 
