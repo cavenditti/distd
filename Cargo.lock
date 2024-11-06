@@ -399,6 +399,7 @@ dependencies = [
  "bitcode",
  "blake3",
  "bytes",
+ "dirs",
  "futures",
  "http",
  "prost",
