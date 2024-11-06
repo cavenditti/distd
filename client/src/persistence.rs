@@ -11,7 +11,7 @@ use crate::settings::cache_dir;
 
 #[inline]
 #[must_use] pub fn state_path() -> PathBuf {
-    cache_dir().join("state.json")
+    cache_dir().join(format!("{}_state.json", env!("CARGO_PKG_NAME")))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,7 +55,7 @@ impl ClientPid {
 
 impl Default for ClientPid {
     fn default() -> Self {
-        let pid_path = cache_dir().join("pid");
+        let pid_path = cache_dir().join(format!("{}_pid", env!("CARGO_PKG_NAME")));
         tracing::debug!("Pidfile: {}", pid_path.to_string_lossy());
 
         // FIXME linux-specific and fragile

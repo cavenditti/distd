@@ -14,7 +14,7 @@ use dirs::{cache_dir as user_cache_dir, config_dir as user_config_dir};
 pub fn config_dir() -> PathBuf {
     let d = user_config_dir()
         .expect("Cannot find config directory")
-        .join(env!("CARGO_PKG_NAME"));
+        .join("distd");
     tracing::debug!("Config dir: {}", d.to_string_lossy());
     if !d.is_dir() {
         std::fs::create_dir_all(&d).unwrap();
@@ -33,7 +33,7 @@ pub fn config_dir() -> PathBuf {
 pub fn cache_dir() -> PathBuf {
     let d = user_cache_dir()
         .expect("Cannot find config directory")
-        .join(env!("CARGO_PKG_NAME"));
+        .join("distd");
     tracing::debug!("Cache dir: {}", d.to_string_lossy());
     if !d.is_dir() {
         std::fs::create_dir_all(&d).unwrap();
