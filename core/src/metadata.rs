@@ -71,3 +71,66 @@ pub struct Clients {
     pub feed_subscriptions: HashMap<FeedName, Feed>,
     pub item_subscriptions: HashMap<ItemName, Item>,
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::hash::Hash;
+
+    use super::*;
+
+    #[test]
+    fn item() {
+        let _ = Item {
+            name: "An item".to_string(),
+            description: Some("A description".to_string()),
+            revision: 0,
+            path: PathBuf::from("path/to/item"),
+            root: ChunkInfo {
+                hash: Hash::from_bytes([0; 32]),
+                size: 0,
+            },
+            created: SystemTime::now(),
+            updated: SystemTime::now(),
+            created_by: "distd".to_string(),
+            format: ItemFormat::V1,
+        };
+    }
+
+    #[test]
+    fn item_comparison() {
+        let item = Item {
+            name: "An item".to_string(),
+            description: Some("A description".to_string()),
+            revision: 0,
+            path: PathBuf::from("path/to/item"),
+            root: ChunkInfo {
+                hash: Hash::from_bytes([0; 32]),
+                size: 0,
+            },
+            created: SystemTime::now(),
+            updated: SystemTime::now(),
+            created_by: "distd".to_string(),
+            format: ItemFormat::V1,
+        };
+        let item2 = item.clone();
+        assert_eq!(item, item2);
+
+        let item3 = Item {
+            name: "Another item".to_string(),
+            description: Some("A description".to_string()),
+            revision: 0,
+            path: PathBuf::from("path/to/item"),
+            root: ChunkInfo {
+                hash: Hash::from_bytes([0; 32]),
+                size: 0,
+            },
+            created: SystemTime::now(),
+            updated: SystemTime::now(),
+            created_by: "distd".to_string(),
+            format: ItemFormat::V1,
+        };
+        assert_ne!(item, item3);
+
+    }
+
+}
