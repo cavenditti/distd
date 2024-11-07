@@ -1,19 +1,21 @@
 use std::{
     collections::{HashMap, HashSet},
-    fs::{create_dir_all, remove_file, File},
+    fs::{self, create_dir_all, remove_file, File},
     io::{BufWriter, Read, Seek, Write},
     path::{Path, PathBuf},
     sync::{atomic::AtomicBool, Arc},
 };
 
+use multimap::MultiMap;
 use tokio_stream::{Stream, StreamExt};
 
 use crate::{
     chunk_storage::StorageError,
     chunks::{ChunkInfo, CHUNK_SIZE},
-    error::Error,
+    error::{Error, InvalidParameter},
     hash::{hash as do_hash, Hash, HashTreeCapable},
     item::{Item, Name as ItemName},
+    utils::settings::cache_dir,
 };
 
 use super::{ChunkStorage, Node};
@@ -75,7 +77,7 @@ impl TryFrom<InFileChunk> for Node {
         let mut file = File::open(&value.path)?;
         file.seek(std::io::SeekFrom::Start(value.offset))?;
 
-        let mut buf = vec![0u8; usize::try_from(value.info.size)?];
+        let mut buf = vec![0u8; usize::try_from(value.info.size).map_err(InvalidParameter::from)?];
 
         file.read_exact(&mut buf)?;
 
@@ -111,9 +113,10 @@ impl InFileChunk {
     /// Write a chunk to the file at all the registered paths for that chunk
     pub fn write(&self, hash: &Hash, chunk: &[u8], handle: &mut Handle) -> Result<(), Error> {
         tracing::trace!(
-            "Writing {hash}, {} bytes at {}",
+            "Writing {hash}, {} bytes at {}, {} offset",
             chunk.len(),
-            self.path.to_string_lossy()
+            self.path.to_string_lossy(),
+            self.offset,
         );
         assert_eq!(&self.info.hash, hash);
 
@@ -154,23 +157,46 @@ pub struct FsStorage {
     /// Items, used to get the paths where to store chunks
     pub items: HashSet<Item>,
 
+    /// Path where to store items data
+    persistance_path: PathBuf,
+
     /// Data, used to store `InFileChunks` (stored nodes) and link nodes
-    data: HashMap<Hash, InFileChunk>,
+    data: MultiMap<Hash, InFileChunk>,
     links: HashMap<Hash, Arc<Node>>,
 
     handles_map: HashMap<PathBuf, Handle>,
 }
 
 impl FsStorage {
-    #[must_use] pub fn new(root: PathBuf) -> Self {
-        Self {
+    #[must_use]
+    pub fn new(root: PathBuf) -> Self {
+        // Use a well-known directory to store items info
+        let persistance_dir = cache_dir().join("chunk_storage").join("fs_storage");
+        let persistance_path = persistance_dir.join(root.to_string_lossy().replace("/", "___"));
+        create_dir_all(persistance_dir).unwrap();
+        let items = {
+            if let Ok(file) = std::fs::read(&persistance_path) {
+                bitcode::deserialize(&file).unwrap()
+            } else {
+                HashSet::<Item>::default()
+            }
+        };
+
+        let mut created = Self {
             root,
+            persistance_path,
+            items,
             ..Default::default()
-        }
+        };
+
+        // eventually reload items
+        created.reload();
+        created
     }
 
     /// Returns the (eventual) stored path of the item provided
-    #[must_use] pub fn path(&self, path: &Path) -> PathBuf {
+    #[must_use]
+    pub fn path(&self, path: &Path) -> PathBuf {
         // TODO also create parent?
         if path.starts_with(&self.root) {
             path.to_path_buf()
@@ -195,6 +221,43 @@ impl FsStorage {
         Ok(full_path)
     }
 
+    /// Persist items to the filesystem
+    fn persist_items(&mut self) -> Result<(), Error> {
+        let buf = bitcode::serialize(&self.items).map_err(InvalidParameter::from)?;
+        fs::File::create(&self.persistance_path)?.write_all(&buf)?;
+        Ok(())
+    }
+
+    fn reload(&mut self) -> Option<()> {
+        tracing::info!("Reloading items from filesystem for FsStorage");
+        // get items and clean the one in the struct
+        let items = self.items.clone();
+        self.items = HashSet::<Item>::default();
+
+        for i in &items {
+            tracing::debug!("processing {}", i.metadata.path.to_string_lossy());
+            let path = &i.metadata.path;
+            let file = fs::read(path).unwrap();
+            println!("{:?}", file.len());
+            println!("{:?}", file.iter().map(|v| *v as u32).sum::<u32>());
+
+            // TODO make this less ugly
+            // This is a bit of a hack, I'm creating a new Item and then making it like the old one
+            let mut new_i = self.create_item(
+                i.metadata.name.clone(),
+                i.metadata.path.clone(),
+                i.metadata.revision.clone(),
+                i.metadata.description.clone(),
+                bytes::Bytes::from(file),
+            )?;
+            self.items.remove(&new_i);
+            new_i.metadata.created = i.metadata.created;
+            new_i.metadata.updated = i.metadata.updated;
+            self.items.insert(new_i);
+        }
+        Some(())
+    }
+
     /// Pre-allocate a single `ChunkInfo` in the filesystem at a path
     pub fn pre_allocate_chunk(
         &mut self,
@@ -202,9 +265,14 @@ impl FsStorage {
         chunk_info: &ChunkInfo,
         offset: u64,
     ) -> Result<(), Error> {
-        // If already exists do nothing
-        if self.data.contains_key(&chunk_info.hash) {
-            return Ok(());
+        // TODO is there a way to improve this?
+        // If already exists do nothing, kinda slow
+        if let Some(ifcs) = self.data.get_vec(&chunk_info.hash) {
+            for ifc in ifcs {
+                if path == ifc.path && offset == ifc.offset {
+                    return Ok(());
+                }
+            }
         }
 
         let ifc = InFileChunk {
@@ -213,6 +281,7 @@ impl FsStorage {
             offset,
             populated: Arc::default(),
         };
+        tracing::trace!("Created infile chunk: {ifc:?}");
         self.data.insert(chunk_info.hash, ifc);
         if !self.handles_map.contains_key(path) {
             self.handles_map.insert(path.to_owned(), Handle::new(path)?);
@@ -227,18 +296,17 @@ impl FsStorage {
             data.len(),
             data.iter().map(|x| x.size).sum::<u64>()
         );
-        tracing::trace!(
-            "Preallocating [{}] at {path:?}",
-            data.iter()
-                .map(|chunk| chunk.hash)
-                .map(|h| h.to_string() + ", ")
-                .collect::<String>(),
-        );
 
         let mut offset = 0;
 
         // Prepare all InFileChunk and add them to self.data
         for chunk in data {
+            tracing::trace!(
+                "Preallocating {}, {} bytes, {} offset",
+                chunk.hash,
+                chunk.size,
+                offset
+            );
             self.pre_allocate_chunk(path, chunk, offset)?;
             offset += chunk.size;
         }
@@ -270,6 +338,9 @@ impl FsStorage {
         self.pre_allocate(&path, &item.chunks[..])?;
 
         self.items.insert(item.clone());
+
+        // Then store items to persistence_path
+        self.persist_items()?;
         Ok(())
     }
 
@@ -283,12 +354,16 @@ impl FsStorage {
             .then_some(item)
             .ok_or(Error::MissingData)?;
 
+        // Then store items to persistence_path
+        self.persist_items()?;
+
         for chunk in &item.chunks {
-            // We may have duplicated hashes in chunks, so we need to check first if it's there and otherwise
-            // do nothing (may not be there, or we may have already removed it). HashMap::get/get_mut do it for us.
-            if let Some(infile_chunk) = self.data.get_mut(&chunk.hash) {
-                if infile_chunk.path == path {
-                    self.data.remove(&chunk.hash);
+            if let Some(infile_chunks) = self.data.clone().get_vec(&chunk.hash) {
+                // FIXME should not clone
+                for infile_chunk in infile_chunks {
+                    if infile_chunk.path == path {
+                        self.data.remove(&chunk.hash);
+                    }
                 }
             }
             continue;
@@ -320,28 +395,29 @@ impl ChunkStorage for FsStorage {
 
     /// Insert chunk into storage, requires an item to have been created with the appropriate chunks to be preallocate
     fn _insert_chunk(&mut self, hash: Hash, chunk: &[u8]) -> Option<Arc<Node>> {
-        self.data
-            .get_mut(&hash)
-            .and_then(|infile_chunk| {
-                infile_chunk
-                    .write(&hash, chunk, self.handles_map.get_mut(&infile_chunk.path)?)
-                    .inspect_err(|e| tracing::error!("Cannot write infile chunk: {e}"))
-                    .ok()
-
-                /*
-                    Node::try_from(infile_chunk)
-                        .inspect_err(|e| tracing::error!("Cannot create Node: {e}"))
-                        .map(Arc::new)
-                        .inspect_err(|e| tracing::error!("Cannot insert chunk: {e}"))
-                        .ok()
-                */
-            })
-            .map(|()| {
-                Arc::new(Node::Stored {
-                    hash,
-                    data: Arc::new(chunk.to_vec()),
+        let infile_chunks = self.data.get_vec_mut(&hash)?;
+        for infile_chunk in infile_chunks {
+            tracing::trace!("infile chunk {infile_chunk:?}");
+            infile_chunk
+                .write(&hash, chunk, self.handles_map.get_mut(&infile_chunk.path)?)
+                .inspect(|_| {
+                    tracing::trace!(
+                        "Written infile chunk {hash} to {}",
+                        infile_chunk.path.to_string_lossy()
+                    )
                 })
-            })
+                .inspect_err(|e| {
+                    tracing::error!(
+                        "Cannot write infile chunk to {}: {e} ",
+                        infile_chunk.path.to_string_lossy()
+                    )
+                })
+                .ok()?
+        }
+        Some(Arc::new(Node::Stored {
+            hash,
+            data: Arc::new(chunk.to_vec()),
+        }))
     }
 
     /// May only link chunks by adding items. Dummy implementation always returning None
@@ -375,12 +451,16 @@ impl ChunkStorage for FsStorage {
         tracing::debug!("Create item {name} with path {path:?}");
         // respect storage root
         let path = self.path(&path);
+        create_dir_all(&path.parent()?).ok()?;
         self.pre_allocate_bytes(&path, &file).ok()?;
         tracing::info!("Preallocated on disk {:?}", path);
 
         let hash_tree = self.insert(file)?;
         let item = Item::new(name, path, revision, description, &hash_tree);
         tracing::debug!("New item: {item}");
+
+        self.items.insert(item.clone());
+        self.persist_items().ok()?;
 
         Some(item)
     }
@@ -486,6 +566,7 @@ mod tests {
         chunks::CHUNK_SIZE,
         hash::hash as do_hash,
         item::tests::{make_ones_item, new_dummy_item},
+        utils::testing::temp_path,
     };
     use std::{str::FromStr, thread::sleep, time::Duration};
 
@@ -501,7 +582,7 @@ mod tests {
             items: {:?}",
             storage.root,
             storage.chunks(),
-            storage.data.values(),
+            storage.data.iter_all(),
             storage.items,
         );
     }
@@ -591,7 +672,7 @@ mod tests {
         print_fsstorage(&storage);
 
         // create storage in a temporary directory
-        let tempdir = std::env::temp_dir().join(PathBuf::from_str("in_a_temp_dir").unwrap());
+        let tempdir = temp_path();
         let mut storage = FsStorage::new(tempdir.clone());
 
         // make an item with a know content, a single chunk of all zeros
@@ -640,9 +721,10 @@ mod tests {
     #[test]
     fn fs_storage_round_trip() {
         // create storage in a temporary directory
-        let tempdir = std::env::temp_dir().join(PathBuf::from_str("in_a_temp_dir").unwrap());
+        let tempdir = temp_path();
         let mut storage = FsStorage::new(tempdir.clone());
 
+        // TODO replace this with data including both a deterministic non-chunk_size-aligned pattern and repeated chunks
         let item = new_dummy_item::<FsStorage, 1u8, 1_000_000>(&mut storage).unwrap();
         println!("Created item: {item:?}");
         print_fsstorage(&storage);
@@ -653,6 +735,62 @@ mod tests {
         assert_eq!(stored.len(), 1_000_000);
         for b in stored {
             assert_eq!(b, 1u8);
+        }
+
+        // check for data on disk to match the expected one
+        let file = std::fs::read(item.metadata.path).unwrap();
+        assert_eq!(file.len(), 1_000_000);
+        for b in file {
+            assert_eq!(b, 1u8);
+        }
+    }
+
+    #[test]
+    fn fs_storage_persistance() {
+        // create storage in a temporary directory
+        let tempdir = temp_path();
+
+        let item: Option<Item>;
+        let item_hash: Option<Hash>;
+
+        // create storage and let it go out of scope
+        {
+            let mut storage = FsStorage::new(tempdir.clone());
+
+            // save item and hash
+            item = Some(new_dummy_item::<FsStorage, 1u8, 1_000_000>(&mut storage).unwrap());
+            item_hash = Some(item.as_ref().unwrap().metadata.root.hash);
+            println!("Created item: {item:?}");
+            println!("Item hash: {}", item_hash.unwrap().to_string());
+
+            print_fsstorage(&storage);
+        }
+
+        // Then re-create storage and retrieve the data
+        println!("Reloading storage");
+        let storage = FsStorage::new(tempdir.clone());
+        print_fsstorage(&storage);
+
+        // Check for contained item
+        {
+            assert_eq!(storage.items.len(), 1);
+            let retrieved = storage.items.iter().next().unwrap();
+            let item = item.unwrap();
+            assert_eq!(retrieved.metadata, item.metadata);
+            assert_eq!(retrieved.chunks, item.chunks);
+            assert_eq!(retrieved.hashes, item.hashes);
+        }
+
+        // Check data: same as fs_storage_roundtrip
+        {
+            println!("{:?}", storage.chunks());
+            let stored = storage.get(&item_hash.unwrap()).unwrap().clone_data();
+
+            // reported storage size is deduplicated
+            assert_eq!(stored.len(), 1_000_000);
+            for b in stored {
+                assert_eq!(b, 1u8);
+            }
         }
     }
 }

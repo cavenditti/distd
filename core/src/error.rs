@@ -11,9 +11,6 @@ pub enum Error {
     #[error("Generic IO error")]
     IoError(#[from] std::io::Error),
 
-    #[error("Integrer conversion error")]
-    IntError(#[from] std::num::TryFromIntError),
-
     #[error("Missing data")]
     MissingData,
 
@@ -59,6 +56,9 @@ pub enum InvalidParameter {
 
     #[error("Invalid UUID")]
     Uuid(#[from] uuid::Error),
+
+    #[error("Integrer conversion error")]
+    IntError(#[from] std::num::TryFromIntError),
 }
 
 /// Communication error
