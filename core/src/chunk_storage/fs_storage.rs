@@ -7,6 +7,7 @@ use std::{
 };
 
 use multimap::MultiMap;
+use serde::{Deserialize, Serialize};
 use tokio_stream::{Stream, StreamExt};
 
 use crate::{
@@ -54,7 +55,7 @@ impl Handle {
 
 /// Chunk stored in multiple files
 /// Basically ref-counting on items paths
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct InFileChunk {
     pub info: ChunkInfo,
     pub path: PathBuf,
@@ -148,7 +149,7 @@ impl InFileChunk {
 /// relevant items to get their paths.
 ///
 /// Most logic is implemented in `InnerFsStorage`, this is mostly a wrapper to provide interior mutability
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct FsStorage {
     /// Items, used to get the paths where to store chunks
     /// Keeping track of all items'paths is important, as we cannot store different items in the same path
@@ -157,13 +158,16 @@ pub struct FsStorage {
     /// Items, used to get the paths where to store chunks
     pub items: HashSet<Item>,
 
-    /// Path where to store items data
+    /// Path where to store persistent data
     persistance_path: PathBuf,
 
     /// Data, used to store `InFileChunks` (stored nodes) and link nodes
     data: MultiMap<Hash, InFileChunk>,
     links: HashMap<Hash, Arc<Node>>,
 
+    #[serde(default)]
+    #[serde(skip_serializing)]
+    #[serde(skip_deserializing)]
     handles_map: HashMap<PathBuf, Handle>,
 }
 
@@ -174,24 +178,59 @@ impl FsStorage {
         let persistance_dir = cache_dir().join("chunk_storage").join("fs_storage");
         let persistance_path = persistance_dir.join(root.to_string_lossy().replace("/", "___"));
         create_dir_all(persistance_dir).unwrap();
-        let items = {
-            if let Ok(file) = std::fs::read(&persistance_path) {
-                bitcode::deserialize(&file).unwrap()
-            } else {
-                HashSet::<Item>::default()
+
+        if let Ok(file) = std::fs::read(&persistance_path) {
+            let mut s: Self = bitcode::deserialize(&file).unwrap();
+
+            // fill in the old links
+            fn node_relink(
+                s: &mut FsStorage,
+                already_processed: &mut HashMap<Hash, Arc<Node>>,
+                node: &Arc<Node>,
+            ) -> Option<Arc<Node>> {
+                if already_processed.contains_key(node.hash()) {
+                    return already_processed.get(node.hash()).cloned();
+                }
+                match node.as_ref() {
+                    Node::Parent {
+                        hash, left, right, ..
+                    } => {
+                        let n = Arc::new(Node::Parent {
+                            hash: *node.hash(),
+                            size: node.size(),
+                            left: node_relink(s, already_processed, left)?,
+                            right: node_relink(s, already_processed, right)?,
+                        });
+                        s.links.insert(*hash, n.clone());
+                        already_processed.insert(*hash, n.clone());
+                        Some(n)
+                    }
+                    Node::Skipped { hash, .. } => {
+                        let n = s.get_data(&hash)?;
+                        already_processed.insert(*hash, n.clone());
+                        Some(n)
+                    }
+                    _ => panic!("Nodes in links should never be Stored"),
+                }
             }
-        };
 
-        let mut created = Self {
-            root,
-            persistance_path,
-            items,
-            ..Default::default()
-        };
+            let mut already_processed = HashMap::new();
+            let mut old_links = s.links.clone();
+            while !old_links.is_empty() {
+                for (_, n) in old_links.clone().iter() {
+                    node_relink(&mut s, &mut already_processed, n).map(|n| old_links.remove(n.hash()));
+                }
+            }
 
-        // eventually reload items
-        created.reload();
-        created
+            // return the recreated storage
+            s
+        } else {
+            Self {
+                root,
+                persistance_path,
+                ..Default::default()
+            }
+        }
     }
 
     /// Returns the (eventual) stored path of the item provided
@@ -221,41 +260,25 @@ impl FsStorage {
         Ok(full_path)
     }
 
-    /// Persist items to the filesystem
-    fn persist_items(&mut self) -> Result<(), Error> {
-        let buf = bitcode::serialize(&self.items).map_err(InvalidParameter::from)?;
-        fs::File::create(&self.persistance_path)?.write_all(&buf)?;
+    /// Persist data to the filesystem
+    fn persist(&self) -> Result<(), Error> {
+        let buf = bitcode::serialize(&self)
+            .inspect_err(|e| tracing::error!("{}", e))
+            .map_err(InvalidParameter::from)?;
+        fs::File::create(&self.persistance_path)
+            .inspect_err(|e| tracing::error!("{}", e))?
+            .write_all(&buf)?;
         Ok(())
     }
 
-    fn reload(&mut self) -> Option<()> {
-        tracing::info!("Reloading items from filesystem for FsStorage");
-        // get items and clean the one in the struct
-        let items = self.items.clone();
-        self.items = HashSet::<Item>::default();
-
-        for i in &items {
-            tracing::debug!("processing {}", i.metadata.path.to_string_lossy());
-            let path = &i.metadata.path;
-            let file = fs::read(path).unwrap();
-            println!("{:?}", file.len());
-            println!("{:?}", file.iter().map(|v| *v as u32).sum::<u32>());
-
-            // TODO make this less ugly
-            // This is a bit of a hack, I'm creating a new Item and then making it like the old one
-            let mut new_i = self.create_item(
-                i.metadata.name.clone(),
-                i.metadata.path.clone(),
-                i.metadata.revision.clone(),
-                i.metadata.description.clone(),
-                bytes::Bytes::from(file),
-            )?;
-            self.items.remove(&new_i);
-            new_i.metadata.created = i.metadata.created;
-            new_i.metadata.updated = i.metadata.updated;
-            self.items.insert(new_i);
-        }
-        Some(())
+    /// Retrieve a Stored Node
+    fn get_data(&self, hash: &Hash) -> Option<Arc<Node>> {
+        // TODO implement caching here, avoid creating duplicated Node from the same InFileChunk
+        // Probably requires a new Node map to be used for both links and stored, with a periodic clean up
+        self.data
+            .get(hash)
+            .and_then(|x| Node::try_from(x).ok())
+            .map(Arc::new)
     }
 
     /// Pre-allocate a single `ChunkInfo` in the filesystem at a path
@@ -340,7 +363,7 @@ impl FsStorage {
         self.items.insert(item.clone());
 
         // Then store items to persistence_path
-        self.persist_items()?;
+        self.persist()?;
         Ok(())
     }
 
@@ -355,7 +378,7 @@ impl FsStorage {
             .ok_or(Error::MissingData)?;
 
         // Then store items to persistence_path
-        self.persist_items()?;
+        self.persist()?;
 
         for chunk in &item.chunks {
             if let Some(infile_chunks) = self.data.clone().get_vec(&chunk.hash) {
@@ -382,11 +405,7 @@ impl FsStorage {
 impl ChunkStorage for FsStorage {
     /// Get a `Node` chunk from storage
     fn get(&self, hash: &Hash) -> Option<Arc<Node>> {
-        self.links.get(hash).cloned().or(self
-            .data
-            .get(hash)
-            .and_then(|x| Node::try_from(x).ok())
-            .map(Arc::new))
+        self.links.get(hash).cloned().or(self.get_data(hash))
     }
 
     fn size(&self) -> u64 {
@@ -414,6 +433,7 @@ impl ChunkStorage for FsStorage {
                 })
                 .ok()?
         }
+        self.persist().ok()?;
         Some(Arc::new(Node::Stored {
             hash,
             data: Arc::new(chunk.to_vec()),
@@ -423,16 +443,20 @@ impl ChunkStorage for FsStorage {
     /// May only link chunks by adding items. Dummy implementation always returning None
     fn _link(&mut self, hash: Hash, left: Arc<Node>, right: Arc<Node>) -> Option<Arc<Node>> {
         let size = left.size() + right.size();
-        let res = self.links.try_insert(
-            hash,
-            Arc::new(Node::Parent {
+        let res = self
+            .links
+            .try_insert(
                 hash,
-                left,
-                right,
-                size,
-            }),
-        );
-        Some(res.map_or_else(|e| (*e.entry.get()).clone(), |x| (*x).clone()))
+                Arc::new(Node::Parent {
+                    hash,
+                    left,
+                    right,
+                    size,
+                }),
+            )
+            .map_or_else(|e| (*e.entry.get()).clone(), |x| (*x).clone());
+        self.persist().ok()?;
+        Some(res)
     }
 
     /// Create a new Item from its metadata and Bytes
@@ -460,7 +484,7 @@ impl ChunkStorage for FsStorage {
         tracing::debug!("New item: {item}");
 
         self.items.insert(item.clone());
-        self.persist_items().ok()?;
+        self.persist().ok()?;
 
         Some(item)
     }
@@ -484,6 +508,8 @@ impl ChunkStorage for FsStorage {
 
         let item = Item::new(name, path, revision, description, &root);
         tracing::debug!("New item: {item}");
+
+        self.persist().ok()?;
 
         Some(item)
     }
@@ -528,6 +554,8 @@ impl ChunkStorage for FsStorage {
 
         let last = last.ok_or(StorageError::TreeReconstruct)?;
         tracing::info!("Reconstructed {i} nodes with {} bytes total", last.size());
+
+        self.persist()?;
 
         Ok(Item::new(name, path, revision, description, &last))
     }
@@ -791,6 +819,14 @@ mod tests {
             for b in stored {
                 assert_eq!(b, 1u8);
             }
+        }
+    }
+
+    #[test]
+    fn fs_storage_persistance_10x() {
+        // repeated test to check determinism
+        for _ in 0..10 {
+            fs_storage_persistance()
         }
     }
 }
