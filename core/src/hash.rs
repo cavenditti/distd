@@ -4,7 +4,7 @@ use crate::chunks::CHUNK_SIZE;
 
 #[must_use]
 #[inline]
-pub fn merge_hashes(left: &hash::Hash, right: &hash::Hash) -> hash::Hash {
+pub fn merge_hashes(left: &blake3_hash::Hash, right: &blake3_hash::Hash) -> blake3_hash::Hash {
     blake3::hash(
         &left
             .as_bytes()
@@ -99,20 +99,20 @@ where
 
 /// Hashing function. Uses BLAKE3 but without Subtree-freeness
 #[must_use]
-pub fn hash(data: &[u8]) -> hash::Hash {
+pub fn hash(data: &[u8]) -> blake3_hash::Hash {
     compute_tree(
-        |x| -> Result<hash::Hash, Infallible> { Ok(blake3::hash(x).into()) },
+        |x| -> Result<blake3_hash::Hash, Infallible> { Ok(blake3::hash(x).into()) },
         |l, r| Ok(merge_hashes(l, r)),
         data,
     )
     .unwrap()
 }
 
-pub use hash::Hash;
-pub use hash::HexError;
+pub use blake3_hash::Hash;
+pub use blake3_hash::HexError;
 
-/// Code taken from blake3 crate with minor changes
-pub mod hash {
+/// Code taken from `blake3::hash` with minor changes
+pub mod blake3_hash {
     use std::fmt;
 
     use blake3::OUT_LEN;
