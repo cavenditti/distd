@@ -17,7 +17,7 @@ impl ChunkStorage for HashMapStorage {
         self.data.get(hash).cloned()
     }
 
-    fn _insert_chunk(&mut self, hash: Hash, chunk: &[u8]) -> Option<Arc<Node>> {
+    fn store_chunk(&mut self, hash: Hash, chunk: &[u8]) -> Option<Arc<Node>> {
         //println!("[StorageInsert] Hash: {}, size: {}", hash, size);
         if let Some(raw_chunk) = self.data.get(&hash) {
             return Some(raw_chunk.clone());

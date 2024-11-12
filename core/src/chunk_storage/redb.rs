@@ -69,7 +69,7 @@ impl ChunkStorage for RedbStorage {
             .map(Arc::new)
     }
 
-    fn _insert_chunk(&mut self, hash: Hash, chunk: &[u8]) -> Option<Arc<Node>> {
+    fn store_chunk(&mut self, hash: Hash, chunk: &[u8]) -> Option<Arc<Node>> {
         let write_txn = self.db.begin_write().ok()?;
         {
             let mut table = write_txn.open_table(CHUNK_TABLE).ok()?;

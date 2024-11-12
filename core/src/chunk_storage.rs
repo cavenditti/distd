@@ -42,7 +42,7 @@ pub enum StorageError {
 /// Defines a backend used to store hashes and chunks ad key-value pairs
 pub trait ChunkStorage: HashTreeCapable<Arc<Node>, Error> {
     fn get(&self, hash: &Hash) -> Option<Arc<Node>>;
-    fn _insert_chunk(&mut self, hash: Hash, chunk: &[u8]) -> Option<Arc<Node>>;
+    fn store_chunk(&mut self, hash: Hash, chunk: &[u8]) -> Option<Arc<Node>>;
     fn _link(&mut self, hash: Hash, left: Arc<Node>, right: Arc<Node>) -> Option<Arc<Node>>;
 
     fn chunks(&self) -> Vec<Hash>;
@@ -57,7 +57,7 @@ pub trait ChunkStorage: HashTreeCapable<Arc<Node>, Error> {
         let hash = hash(chunk);
         tracing::trace!("Insert chunk {hash}, {} bytes", chunk.len());
 
-        self._insert_chunk(hash, chunk)
+        self.store_chunk(hash, chunk)
             .inspect(|x| assert!(x.hash() == &hash))
     }
 
@@ -158,7 +158,7 @@ pub trait ChunkStorage: HashTreeCapable<Arc<Node>, Error> {
     fn try_fill_in(&mut self, tree: &Node) -> Option<Arc<Node>> {
         tracing::trace!("Filling {}", tree.hash());
         Some(match tree {
-            Node::Stored { hash, data } => self._insert_chunk(*hash, data)?,
+            Node::Stored { hash, data } => self.store_chunk(*hash, data)?,
             Node::Parent { left, right, .. } => {
                 let l = self.try_fill_in(left)?;
                 let r = self.try_fill_in(right)?;

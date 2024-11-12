@@ -430,7 +430,7 @@ impl ChunkStorage for FsStorage {
     }
 
     /// Insert chunk into storage, requires an item to have been created with the appropriate chunks to be preallocate
-    fn _insert_chunk(&mut self, hash: Hash, chunk: &[u8]) -> Option<Arc<Node>> {
+    fn store_chunk(&mut self, hash: Hash, chunk: &[u8]) -> Option<Arc<Node>> {
         let infile_chunks = self.data.get_vec_mut(&hash)?;
         for infile_chunk in infile_chunks {
             tracing::trace!("infile chunk {infile_chunk:?}");
