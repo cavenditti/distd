@@ -6,6 +6,9 @@ use crate::utils::stream::{BatchingStream, DeBatchingStream};
 
 use super::Node;
 
+type NodeBatchingStream<S, Fn> = tokio_stream::adapters::Map<BatchingStream<S>, Fn>;
+type NodeDeBatchingStream<S, Fn> = DeBatchingStream<Node, tokio_stream::adapters::Map<S, Fn>>;
+
 /// Create a sender stream that serializes nodes into bitcode
 ///
 /// The sender stream will batch nodes into `batch_size`, at most every `duration`.
@@ -18,10 +21,7 @@ pub fn sender<S>(
     stream: S,
     batch_size: usize,
     duration: Duration,
-) -> tokio_stream::adapters::Map<
-    BatchingStream<S>,
-    impl FnMut(<BatchingStream<S> as Stream>::Item) -> Vec<u8>,
->
+) -> NodeBatchingStream<S, impl FnMut(<BatchingStream<S> as Stream>::Item) -> Vec<u8>>
 where
     S: Stream<Item = Arc<Node>>,
     BatchingStream<S>: StreamExt,
@@ -44,7 +44,7 @@ pub fn receiver<S>(
     stream: S,
     batch_size: usize,
     duration: Duration,
-) -> DeBatchingStream<Node, tokio_stream::adapters::Map<S, impl FnMut(Vec<u8>) -> Vec<Node>>>
+) -> NodeDeBatchingStream<S, impl FnMut(Vec<u8>) -> Vec<Node>>
 where
     S: Stream<Item = Vec<u8>>,
 {
