@@ -106,7 +106,7 @@ impl NodeIterator {
             }
         }
 
-        Self::new(iterate_children(node, &skip))
+        Self::new(iterate_children(node, skip))
     }
 }
 

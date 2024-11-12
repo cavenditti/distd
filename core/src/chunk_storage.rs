@@ -189,7 +189,7 @@ mod tests {
         let data = Bytes::from_static(b"very few bytes");
         let len = data.len() as u64;
         s.insert(data);
-        assert_eq!(len, s.size())
+        assert_eq!(len, s.size());
     }
 
     /// Multiple chunks, not aligned with `CHUNK_SIZE`

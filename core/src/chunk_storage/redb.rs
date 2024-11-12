@@ -111,8 +111,8 @@ impl ChunkStorage for RedbStorage {
             .unwrap()
             .iter()
             .unwrap()
-            .map(|v| v.unwrap().0.value().clone())
-            .map(|v| Hash::from_bytes(v))
+            .map(|v| *v.unwrap().0.value())
+            .map(Hash::from_bytes)
             .collect()
     }
 

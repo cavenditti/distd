@@ -176,7 +176,7 @@ impl FsStorage {
     pub fn new(root: PathBuf) -> Self {
         // Use a well-known directory to store items info
         let persistance_dir = cache_dir().join("chunk_storage").join("fs_storage");
-        let persistance_path = persistance_dir.join(root.to_string_lossy().replace("/", "___"));
+        let persistance_path = persistance_dir.join(root.to_string_lossy().replace('/', "___"));
         create_dir_all(persistance_dir).unwrap();
 
         if let Ok(file) = std::fs::read(&persistance_path) {
@@ -206,7 +206,7 @@ impl FsStorage {
                         Some(n)
                     }
                     Node::Skipped { hash, .. } => {
-                        let n = s.get_data(&hash)?;
+                        let n = s.get_data(hash)?;
                         already_processed.insert(*hash, n.clone());
                         Some(n)
                     }
@@ -217,7 +217,7 @@ impl FsStorage {
             let mut already_processed = HashMap::new();
             let mut old_links = s.links.clone();
             while !old_links.is_empty() {
-                for (_, n) in old_links.clone().iter() {
+                for n in old_links.clone().values() {
                     node_relink(&mut s, &mut already_processed, n).map(|n| old_links.remove(n.hash()));
                 }
             }
@@ -419,19 +419,19 @@ impl ChunkStorage for FsStorage {
             tracing::trace!("infile chunk {infile_chunk:?}");
             infile_chunk
                 .write(&hash, chunk, self.handles_map.get_mut(&infile_chunk.path)?)
-                .inspect(|_| {
+                .inspect(|()| {
                     tracing::trace!(
                         "Written infile chunk {hash} to {}",
                         infile_chunk.path.to_string_lossy()
-                    )
+                    );
                 })
                 .inspect_err(|e| {
                     tracing::error!(
                         "Cannot write infile chunk to {}: {e} ",
                         infile_chunk.path.to_string_lossy()
-                    )
+                    );
                 })
-                .ok()?
+                .ok()?;
         }
         self.persist().ok()?;
         Some(Arc::new(Node::Stored {
@@ -475,7 +475,7 @@ impl ChunkStorage for FsStorage {
         tracing::debug!("Create item {name} with path {path:?}");
         // respect storage root
         let path = self.path(&path);
-        create_dir_all(&path.parent()?).ok()?;
+        create_dir_all(path.parent()?).ok()?;
         self.pre_allocate_bytes(&path, &file).ok()?;
         tracing::info!("Preallocated on disk {:?}", path);
 
@@ -789,7 +789,7 @@ mod tests {
             item = Some(new_dummy_item::<FsStorage, 1u8, 1_000_000>(&mut storage).unwrap());
             item_hash = Some(item.as_ref().unwrap().metadata.root.hash);
             println!("Created item: {item:?}");
-            println!("Item hash: {}", item_hash.unwrap().to_string());
+            println!("Item hash: {}", item_hash.unwrap());
 
             print_fsstorage(&storage);
         }
@@ -826,7 +826,7 @@ mod tests {
     fn fs_storage_persistance_10x() {
         // repeated test to check determinism
         for _ in 0..10 {
-            fs_storage_persistance()
+            fs_storage_persistance();
         }
     }
 }

@@ -54,13 +54,13 @@ impl Deref for SelfDeletingPath {
 }
 
 impl SelfDeletingPath {
-    pub fn new(path: PathBuf) -> Self {
+    #[must_use] pub fn new(path: PathBuf) -> Self {
         SelfDeletingPath { path }
     }
 }
 
-pub fn selfdel_path(path: &str) -> SelfDeletingPath {
-    return SelfDeletingPath::new(PathBuf::from(path));
+#[must_use] pub fn selfdel_path(path: &str) -> SelfDeletingPath {
+    SelfDeletingPath::new(PathBuf::from(path))
 }
 
 #[test]
