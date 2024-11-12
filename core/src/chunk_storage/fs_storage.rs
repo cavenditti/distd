@@ -172,6 +172,22 @@ pub struct FsStorage {
 }
 
 impl FsStorage {
+    /// Create a new `FsStorage` with a root path
+    ///
+    /// The root path is used to store items in the filesystem
+    /// The root path is not checked, it is assumed to exist and be a valid writable directory.
+    ///
+    /// The persistent data is stored in a well-known directory, which is created if it does not exist,
+    /// as a file named after the root path, with slashes replaced by `___`
+    ///
+    ///
+    /// # Panics
+    ///
+    /// Panics if the root path is not a directory
+    /// Panics if the persistent data directory cannot be created
+    /// Panics if the persistent data file cannot be deserialized
+    /// Panics if the deserialize persistent data contains `Node::Stored` as link,
+    ///     they're assumed to be all `Node::Parent`
     #[must_use]
     pub fn new(root: PathBuf) -> Self {
         // Use a well-known directory to store items info
@@ -180,9 +196,7 @@ impl FsStorage {
         create_dir_all(persistance_dir).unwrap();
 
         if let Ok(file) = std::fs::read(&persistance_path) {
-            let mut s: Self = bitcode::deserialize(&file).unwrap();
-
-            // fill in the old links
+            // function to fill in the old links
             fn node_relink(
                 s: &mut FsStorage,
                 already_processed: &mut HashMap<Hash, Arc<Node>>,
@@ -210,15 +224,18 @@ impl FsStorage {
                         already_processed.insert(*hash, n.clone());
                         Some(n)
                     }
-                    _ => panic!("Nodes in links should never be Stored"),
+                    Node::Stored { .. } => panic!("Nodes in links should never be Stored"),
                 }
             }
+            // deserialize storage
+            let mut s: Self = bitcode::deserialize(&file).unwrap();
 
             let mut already_processed = HashMap::new();
             let mut old_links = s.links.clone();
             while !old_links.is_empty() {
                 for n in old_links.clone().values() {
-                    node_relink(&mut s, &mut already_processed, n).map(|n| old_links.remove(n.hash()));
+                    node_relink(&mut s, &mut already_processed, n)
+                        .map(|n| old_links.remove(n.hash()));
                 }
             }
 
@@ -670,6 +687,7 @@ mod tests {
 
         // Check written data
         let mut f = File::open(&path).unwrap();
+        #[allow(clippy::large_stack_arrays)]
         let mut buffer = [0u8; CHUNK_SIZE];
         let n = f.read(&mut buffer[..]).unwrap();
         assert_eq!(n, CHUNK_SIZE);
@@ -708,6 +726,7 @@ mod tests {
         storage.pre_allocate_item(&item).unwrap();
 
         // Actually store the item chunk
+        #[allow(clippy::large_stack_arrays)]
         storage.insert_chunk(&[1u8; CHUNK_SIZE]).unwrap();
         print_fsstorage(&storage);
 
@@ -729,7 +748,7 @@ mod tests {
         // read from file
         let n = f.read(&mut buffer[..]).unwrap();
 
-        assert_eq!(n, item.size() as usize);
+        assert_eq!(n, usize::try_from(item.size()).unwrap());
         assert_eq!(do_hash(&buffer), item.metadata.root.hash);
 
         // retrieve chunk from storage
