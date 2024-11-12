@@ -43,7 +43,7 @@ pub enum StorageError {
 pub trait ChunkStorage: HashTreeCapable<Arc<Node>, Error> {
     fn get(&self, hash: &Hash) -> Option<Arc<Node>>;
     fn store_chunk(&mut self, hash: Hash, chunk: &[u8]) -> Option<Arc<Node>>;
-    fn _link(&mut self, hash: Hash, left: Arc<Node>, right: Arc<Node>) -> Option<Arc<Node>>;
+    fn store_link(&mut self, hash: Hash, left: Arc<Node>, right: Arc<Node>) -> Option<Arc<Node>>;
 
     fn chunks(&self) -> Vec<Hash>;
 
@@ -64,7 +64,7 @@ pub trait ChunkStorage: HashTreeCapable<Arc<Node>, Error> {
     fn link(&mut self, left: Arc<Node>, right: Arc<Node>) -> Option<Arc<Node>> {
         let hash = merge_hashes(left.hash(), right.hash());
         tracing::trace!("Link {} {} → {}", left.hash(), right.hash(), hash);
-        self._link(hash, left, right)
+        self.store_link(hash, left, right)
             .inspect(|x| assert!(x.hash() == &hash))
     }
 

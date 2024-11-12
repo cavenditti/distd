@@ -34,7 +34,7 @@ impl ChunkStorage for HashMapStorage {
             .cloned()
     }
 
-    fn _link(&mut self, hash: Hash, left: Arc<Node>, right: Arc<Node>) -> Option<Arc<Node>> {
+    fn store_link(&mut self, hash: Hash, left: Arc<Node>, right: Arc<Node>) -> Option<Arc<Node>> {
         /*
         println!(
             "[Storage Link ]: {}: {} + {}",

@@ -458,7 +458,7 @@ impl ChunkStorage for FsStorage {
     }
 
     /// May only link chunks by adding items. Dummy implementation always returning None
-    fn _link(&mut self, hash: Hash, left: Arc<Node>, right: Arc<Node>) -> Option<Arc<Node>> {
+    fn store_link(&mut self, hash: Hash, left: Arc<Node>, right: Arc<Node>) -> Option<Arc<Node>> {
         let size = left.size() + right.size();
         let res = self
             .links
