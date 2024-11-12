@@ -64,11 +64,11 @@ where
                     this.buffer.push_back(item);
                 }
                 Poll::Ready(None) => {
-                    return if !this.buffer.is_empty() {
+                    return if this.buffer.is_empty() {
+                        Poll::Ready(None)
+                    } else {
                         let batch = std::mem::take(&mut this.buffer);
                         Poll::Ready(Some(batch.into()))
-                    } else {
-                        Poll::Ready(None)
                     }
                 }
                 Poll::Pending => {
@@ -142,10 +142,10 @@ where
                     }
                 }
                 Poll::Ready(None) => {
-                    return if !this.buffer.is_empty() {
-                        Poll::Ready(this.buffer.pop_front())
-                    } else {
+                    return if this.buffer.is_empty() {
                         Poll::Ready(None)
+                    } else {
+                        Poll::Ready(this.buffer.pop_front())
                     }
                 }
                 Poll::Pending => {
