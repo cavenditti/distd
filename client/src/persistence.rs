@@ -11,7 +11,9 @@ use crate::settings::cache_dir;
 
 #[inline]
 #[must_use] pub fn state_path() -> PathBuf {
-    cache_dir().join(format!("{}_state.json", env!("CARGO_PKG_NAME")))
+    let p = cache_dir().join(format!("{}_state.json", env!("CARGO_PKG_NAME")));
+    tracing::trace!("State path: {}", p.to_string_lossy());
+    p
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +37,7 @@ impl Default for ClientPersistentState {
             .map(std::io::BufReader::new)
             .ok()
             .and_then(|file| serde_json::from_reader(file).ok())
+            .inspect(|state| tracing::trace!("Client persistent state: {:?}", state))
             .unwrap_or(ClientPersistentState { client_uuid: None })
     }
 }

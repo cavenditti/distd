@@ -20,9 +20,11 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 
 dirs = { workspace = true }
+rustc-hash = { workspace = true }
 
 blake3 = { workspace = true }
 ring = { workspace = true }
+rand = { workspace = true }
 
 bytes = { workspace = true }
 serde = { workspace = true }

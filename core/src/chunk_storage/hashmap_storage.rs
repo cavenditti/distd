@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
 use crate::chunk_storage::ChunkStorage;
@@ -9,7 +9,7 @@ use super::{Node, StorageError};
 /// Dead simple in-memory global storage
 #[derive(Debug, Default, Clone)]
 pub struct HashMapStorage {
-    data: HashMap<Hash, Arc<Node>>,
+    data: FxHashMap<Hash, Arc<Node>>,
 }
 
 impl ChunkStorage for HashMapStorage {

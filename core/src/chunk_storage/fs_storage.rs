@@ -1,5 +1,4 @@
 use std::{
-    collections::{HashMap, HashSet},
     fs::{self, create_dir_all, remove_file, File},
     io::{BufWriter, Read, Seek, Write},
     path::{Path, PathBuf},
@@ -9,6 +8,8 @@ use std::{
 use multimap::MultiMap;
 use serde::{Deserialize, Serialize};
 use tokio_stream::{Stream, StreamExt};
+
+use rustc_hash::{FxBuildHasher, FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::{
     chunk_storage::StorageError,
@@ -61,8 +62,6 @@ struct InFileChunk {
     pub path: PathBuf,
     pub offset: u64,
     pub populated: Arc<AtomicBool>,
-    //pub cached: Arc<Mutex<Option<Bytes>>>,
-    //buf_reader: Arc<Mutex<Option<BufReader<loadFile>>>>,
 }
 
 impl TryFrom<InFileChunk> for Node {
@@ -162,7 +161,7 @@ pub struct FsStorage {
     persistance_path: PathBuf,
 
     /// Data, used to store `InFileChunks` (stored nodes) and link nodes
-    data: MultiMap<Hash, InFileChunk>,
+    data: MultiMap<Hash, InFileChunk, FxBuildHasher>,
     links: HashMap<Hash, Arc<Node>>,
 
     #[serde(default)]
@@ -194,6 +193,11 @@ impl FsStorage {
         let persistance_dir = cache_dir().join("chunk_storage").join("fs_storage");
         let persistance_path = persistance_dir.join(root.to_string_lossy().replace('/', "___"));
         create_dir_all(persistance_dir).unwrap();
+
+        // Create root directory if needed
+        create_dir_all(&root)
+            .inspect(|()| tracing::info!("Created root path '{}'", root.to_string_lossy()))
+            .unwrap();
 
         if let Ok(file) = std::fs::read(&persistance_path) {
             // function to fill in the old links
@@ -227,26 +231,41 @@ impl FsStorage {
                     Node::Stored { .. } => panic!("Nodes in links should never be Stored"),
                 }
             }
+            tracing::debug!("FsStorage data found, loading…");
+
             // deserialize storage
             let mut s: Self = bitcode::deserialize(&file).unwrap();
 
-            let mut already_processed = HashMap::new();
+            let mut already_processed = HashMap::default();
             let mut old_links = s.links.clone();
-            while !old_links.is_empty() {
+            const MAX_ITER: u32 = 10;
+            let mut i: u32 = 0;
+            while !old_links.is_empty() && i <= MAX_ITER {
+                if i % 5 == 0 {
+                    tracing::trace!(
+                        "Trying to fill-in old nodes: {} nodes remaining",
+                        old_links.len()
+                    );
+                }
+                i = i + 1;
                 for n in old_links.clone().values() {
                     node_relink(&mut s, &mut already_processed, n)
                         .map(|n| old_links.remove(n.hash()));
                 }
             }
-
-            // return the recreated storage
-            s
-        } else {
-            Self {
-                root,
-                persistance_path,
-                ..Default::default()
+            if !old_links.is_empty() {
+                tracing::debug!("Cannot reload FsStorage");
+            } else {
+                tracing::debug!("Loaded FsStorage.");
+                // return the recreated storage
+                return s;
             }
+        }
+        tracing::debug!("No previous valid FsStorage data found, creating a new one");
+        Self {
+            root,
+            persistance_path,
+            ..Default::default()
         }
     }
 

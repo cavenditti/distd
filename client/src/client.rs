@@ -285,11 +285,15 @@ pub mod cli {
         tracing::debug!("Running \"{cmd}\" {cmd_args:?}");
 
         let state = ClientState::default();
+        tracing::trace!("Client state initialized");
 
         let Ok(storage_root) = PathBuf::from_str(&settings.fsstorage.root);
+        tracing::trace!("Storage root: {}", storage_root.to_string_lossy());
         let storage = FsStorage::new(storage_root);
         //let storage = HashMapStorage::default(); // use this for benchmarking in order to avoid potential fs-related bottlenecks
+        tracing::trace!("Client storage initialized");
         let client = Client::new(&[0u8; 32], storage, settings, state).await?;
+        tracing::trace!("Client initialized");
 
         match cmd.as_str() {
             "start" => client.client_loop().await,

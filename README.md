@@ -67,9 +67,12 @@ Most important part missing is the "chunk-adapter" to make chunking content-awar
 - [x] ~~Simplify client-server API~~ not really simplified but it's ok
 - [x] Rename `StoredChunkRef` to `Node`
 - [ ] Ephemeral token for client auth
-- [ ] Server and Client persistence (client uuid, server registered clients and items, etc.)
+- [~] Server and Client persistence (client uuid, server registered clients and items, etc.)
+    - [x] FsStorage persistance (for client)
+    - [x] Client internal persistance
+    - [ ] Server persistance
 - [ ] Config
-- [ ] Evaluate whether to assign a 64-bit uid to each hash to reduce network overhead or not
+- [x] Evaluate whether to assign a 64-bit uid to each hash to reduce network overhead or not (won't do now :)
 
 ### Medium term:
 - [ ] Doc comments
