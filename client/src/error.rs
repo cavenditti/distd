@@ -12,7 +12,7 @@ pub enum ServerConnection {
     StreamCreation(#[from] std::io::Error),
 
     #[error("Invalid parameter")]
-    InvalidParmeter(#[from] InvalidParameter),
+    InvalidParameter(#[from] InvalidParameter),
 }
 
 #[derive(Error, Debug)]
@@ -42,7 +42,7 @@ pub enum ServerRequest {
     Uuid(#[from] uuid::Error),
 
     #[error("Invalid parameter")]
-    InvalidParmeter(#[from] InvalidParameter),
+    InvalidParameter(#[from] InvalidParameter),
 
     #[error("Cannot connect to server")]
     Connection(#[from] ServerConnection),
@@ -87,7 +87,7 @@ pub enum Client {
     TreeReconstruct,
 
     #[error("Invalid parameter")]
-    InvalidParmeter(#[from] InvalidParameter),
+    InvalidParameter(#[from] InvalidParameter),
 
     #[error("User terminated")]
     Terminated,

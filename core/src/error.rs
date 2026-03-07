@@ -18,7 +18,7 @@ pub enum Error {
     Other(String),
 
     #[error("Invalid parameter: '{0}'")]
-    InvalidParmeter(#[from] InvalidParameter),
+    InvalidParameter(#[from] InvalidParameter),
 
     #[error("Communication error: '{0}'")]
     Communication(#[from] Communication),
@@ -77,7 +77,7 @@ pub enum Communication {
     Transport(#[from] TransportError),
 
     #[error("Invalid parameter")]
-    InvalidParmeter(#[from] InvalidParameter),
+    InvalidParameter(#[from] InvalidParameter),
 
     #[error("Invalid format for provided public key")]
     BadPubKey,
