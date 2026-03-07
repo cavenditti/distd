@@ -21,10 +21,10 @@ pub trait HashTreeCapable<T, E>
 where
     E: std::error::Error,
 {
-    fn func(&mut self, data: &[u8]) -> Result<T, E>;
-    fn merge(&mut self, l: &T, r: &T) -> Result<T, E>;
+    fn func(&self, data: &[u8]) -> Result<T, E>;
+    fn merge(&self, l: &T, r: &T) -> Result<T, E>;
 
-    fn compute_tree(&mut self, data: &[u8]) -> Result<T, E>
+    fn compute_tree(&self, data: &[u8]) -> Result<T, E>
     where
         Self: Sized,
     {
@@ -61,8 +61,8 @@ where
 /// Wrapper to allow dynamic dispatch
 struct DynHashTreeCapable<Func, Merge, T, E>
 where
-    Func: FnMut(&[u8]) -> Result<T, E>,
-    Merge: FnMut(&T, &T) -> Result<T, E>,
+    Func: Fn(&[u8]) -> Result<T, E>,
+    Merge: Fn(&T, &T) -> Result<T, E>,
     E: std::error::Error,
 {
     pub func: Func,
@@ -71,15 +71,15 @@ where
 
 impl<Func, Merge, T, E> HashTreeCapable<T, E> for DynHashTreeCapable<Func, Merge, T, E>
 where
-    Func: FnMut(&[u8]) -> Result<T, E>,
-    Merge: FnMut(&T, &T) -> Result<T, E>,
+    Func: Fn(&[u8]) -> Result<T, E>,
+    Merge: Fn(&T, &T) -> Result<T, E>,
     E: std::error::Error,
 {
-    fn func(&mut self, data: &[u8]) -> Result<T, E> {
+    fn func(&self, data: &[u8]) -> Result<T, E> {
         (self.func)(data)
     }
 
-    fn merge(&mut self, l: &T, r: &T) -> Result<T, E> {
+    fn merge(&self, l: &T, r: &T) -> Result<T, E> {
         (self.merge)(l, r)
     }
 }
@@ -90,8 +90,8 @@ where
 /// thing but inserting nodes in the process
 pub fn compute_tree<Func, Merge, T, E>(func: Func, merge: Merge, data: &[u8]) -> Result<T, E>
 where
-    Func: FnMut(&[u8]) -> Result<T, E>,
-    Merge: FnMut(&T, &T) -> Result<T, E>,
+    Func: Fn(&[u8]) -> Result<T, E>,
+    Merge: Fn(&T, &T) -> Result<T, E>,
     E: std::error::Error,
 {
     DynHashTreeCapable { func, merge }.compute_tree(data)
