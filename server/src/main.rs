@@ -1,7 +1,3 @@
-#![feature(map_try_insert)]
-#![feature(array_chunks)]
-#![feature(iterator_try_collect)]
-
 use distd_core::chunk_storage::hashmap_storage::HashMapStorage;
 use distd_core::feed::Feed;
 
@@ -24,7 +20,8 @@ async fn main() {
 
     tracing::info!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
 
-    let server: Server<HashMapStorage> = Server::default();
+    // TODO: load key from disk; for now generate an ephemeral key (data is lost on restart)
+    let server: Server<HashMapStorage> = Server::new_ephemeral(HashMapStorage::default());
     let feed = Feed::new("A feed");
     server.expose_feed(feed).await.unwrap();
 
