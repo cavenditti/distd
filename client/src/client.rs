@@ -155,7 +155,7 @@ impl Client<FsStorage> {
 
 impl<T> Client<T>
 where
-    T: ChunkStorage + Send + 'static,
+    T: ChunkStorage + Send + Sync + 'static,
 {
     /// Transfer a diff from the server
     ///
@@ -278,9 +278,7 @@ pub mod cli {
         tracing::debug!("Settings: {settings:?}");
 
         let cmd = std::env::args().nth(1).ok_or(ClientError::MissingCmd)?;
-        let mut i = std::env::args();
-        i.advance_by(2).map_err(|_| ClientError::MissingCmd)?; // FIXME may not be the right type
-        let cmd_args = i.collect::<Vec<String>>();
+        let cmd_args = std::env::args().skip(2).collect::<Vec<String>>();
 
         tracing::debug!("Running \"{cmd}\" {cmd_args:?}");
 
