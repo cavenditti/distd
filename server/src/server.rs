@@ -61,15 +61,15 @@ impl From<InternalMetadata> for ServerMetadata {
 #[derive(Debug, Clone)]
 pub struct Server<T>
 where
-    T: ChunkStorage + Sync + Send + Default,
+    T: ChunkStorage + Sync + Send,
 {
     key_pair: Arc<Ed25519KeyPair>, // needs server restart to be changed
     uuid_nonce: String,            // needs server restart to be changed
 
     /// global server metadata
     pub metadata: Arc<RwLock<InternalMetadata>>,
-    /// A storage implementing `ChunkStorage`, basically a key-value database of some sort
-    pub storage: Arc<RwLock<T>>,
+    /// A storage implementing `ChunkStorage`; owns its own concurrency internally.
+    pub storage: Arc<T>,
     /// Client map
     pub clients: Arc<RwLock<BTreeMap<Uuid, Client>>>,
 
@@ -77,26 +77,42 @@ where
     pub uuid_interceptor: UuidAuthInterceptor,
 }
 
-impl<T> Default for Server<T>
+impl<T> Server<T>
 where
-    T: ChunkStorage + Sync + Send + Default,
+    T: ChunkStorage + Sync + Send + Debug,
 {
-    fn default() -> Self {
-        // Generate a key pair in PKCS#8 (v2) format.
-        let rng = rand::SystemRandom::new();
-        let pkcs8_bytes = signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
-        let uuid_nonce = blake3::hash(pkcs8_bytes.as_ref()).to_string();
-
-        // Normally the application would store the PKCS#8 file persistently. Later
-        // it would read the PKCS#8 file from persistent storage to use it.
-        let key_pair = signature::Ed25519KeyPair::from_pkcs8(pkcs8_bytes.as_ref()).unwrap();
-
-        Self {
+    /// Create a new server instance with a loaded key pair, initial metadata and storage.
+    ///
+    /// The `uuid_nonce` is derived from a random UUID (not from the key bytes) so that it
+    /// remains unique across restarts even when the same key is reused.
+    pub fn new(pkcs8_bytes: &Document, storage: T, metadata: InternalMetadata) -> Result<Self, KeyRejected> {
+        let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8_bytes.as_ref())?;
+        // Use a cryptographically random nonce – never derived from key material.
+        let uuid_nonce = Uuid::new_v4().to_string();
+        Ok(Self {
             key_pair: Arc::new(key_pair),
             uuid_nonce,
+            metadata: Arc::new(RwLock::new(metadata)),
+            storage: Arc::new(storage),
+            clients: Arc::new(RwLock::new(BTreeMap::new())),
+            uuid_interceptor: UuidAuthInterceptor::default(),
+        })
+    }
+
+    /// Create a server with a freshly generated ephemeral key pair and a default storage.
+    ///
+    /// **Not recommended for production.** In production use [`Server::new`] and persist the key
+    /// on disk so that the server identity is stable across restarts.
+    pub fn new_ephemeral(storage: T) -> Self {
+        let rng = rand::SystemRandom::new();
+        let pkcs8_bytes = signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let key_pair = signature::Ed25519KeyPair::from_pkcs8(pkcs8_bytes.as_ref()).unwrap();
+        Self {
+            key_pair: Arc::new(key_pair),
+            uuid_nonce: Uuid::new_v4().to_string(),
             metadata: Arc::new(RwLock::new(InternalMetadata::default())),
-            clients: Arc::new(RwLock::new(BTreeMap::<Uuid, Client>::new())),
-            storage: Arc::default(),
+            storage: Arc::new(storage),
+            clients: Arc::new(RwLock::new(BTreeMap::new())),
             uuid_interceptor: UuidAuthInterceptor::default(),
         }
     }
@@ -107,19 +123,8 @@ pub struct RegisterError;
 
 impl<T> Server<T>
 where
-    T: ChunkStorage + Sync + Send + Default + Debug,
+    T: ChunkStorage + Sync + Send + Debug,
 {
-    /// Create a new server instance, with a specific key pair and metadata
-    pub fn new(pkcs8_bytes: &Document, metadata: InternalMetadata) -> Result<Self, KeyRejected> {
-        let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8_bytes.as_ref())?;
-        Ok(Self {
-            key_pair: Arc::new(key_pair),
-            uuid_nonce: blake3::hash(pkcs8_bytes.as_ref()).to_string(),
-            metadata: Arc::new(RwLock::new(metadata)),
-            ..Default::default()
-        })
-    }
-
     /// Register a new client
     ///
     /// This function will insert a new client into the clients map.
@@ -181,29 +186,32 @@ where
                 .unwrap()
                 .insert(uuid_to_metadata(&uuid));
 
-            self.clients
-                .write()
-                .await
-                .try_insert(client.uuid, client)
-                .inspect_err(|e| tracing::warn!("{}", e))
-                .cloned()
-                .ok()
-                .map(|client| client.uuid)
-                .ok_or(RegisterError)
+            let mut clients = self.clients.write().await;
+            let uuid = client.uuid;
+            match clients.entry(uuid) {
+                std::collections::btree_map::Entry::Vacant(e) => {
+                    e.insert(client);
+                    Ok(uuid)
+                }
+                std::collections::btree_map::Entry::Occupied(e) => {
+                    tracing::warn!("Client {} already registered", e.key());
+                    Err(RegisterError)
+                }
+            }
         }
     }
 
     #[allow(clippy::missing_panics_doc)]
     pub async fn expose_feed(&self, feed: Feed) -> Result<FeedName, RegisterError> {
-        self.metadata
-            .write()
-            .await
-            .feeds
-            .try_insert(feed.name.clone(), feed)
-            .ok()
-            .cloned()
-            .map(|feed| feed.name.clone())
-            .ok_or(RegisterError)
+        let mut metadata = self.metadata.write().await;
+        let name = feed.name.clone();
+        match metadata.feeds.entry(name.clone()) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(feed);
+                Ok(name)
+            }
+            std::collections::hash_map::Entry::Occupied(_) => Err(RegisterError),
+        }
     }
 
     /// Publish a new item
@@ -248,10 +256,11 @@ where
         // Create item and return it
         let item = self
             .storage
-            .write()
-            .await
             .create_item(name, path, revision, description, file)
-            .ok_or(ServerError::ChunkInsertError)?;
+            .map_err(|e| {
+                tracing::error!("Storage error: {e}");
+                ServerError::ChunkInsertError
+            })?;
 
         self.metadata
             .write()
