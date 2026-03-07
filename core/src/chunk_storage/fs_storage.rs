@@ -867,4 +867,20 @@ mod tests {
             fs_storage_persistance();
         }
     }
+
+    extern crate test;
+
+    #[bench]
+    fn bench_fs_storage(b: &mut test::Bencher) {
+        let tempdir = temp_path();
+        let mut storage = FsStorage::new(tempdir.clone());
+        b.iter(|| {
+            let item = new_dummy_item::<FsStorage, 1u8, 1_000_000>(&mut storage).unwrap();
+            let stored = storage.get(&item.metadata.root.hash).unwrap().clone_data();
+            assert_eq!(stored.len(), 1_000_000);
+            for b in stored {
+                assert_eq!(b, 1u8);
+            }
+        });
+    }
 }
