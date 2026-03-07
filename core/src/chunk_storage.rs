@@ -29,8 +29,8 @@ pub enum StorageError {
     #[error("Cannot insert chunk in data store")]
     ChunkInsertError,
 
-    #[error("Cannot insert chunk in data store")]
-    UnknownChunkInsertError(#[from] std::io::Error),
+    #[error("IO error in chunk store")]
+    Io(#[from] std::io::Error),
 
     #[error("Cannot create link")]
     LinkCreation,
@@ -42,8 +42,8 @@ pub enum StorageError {
 /// Defines a backend used to store hashes and chunks ad key-value pairs
 pub trait ChunkStorage: HashTreeCapable<Arc<Node>, Error> {
     fn get(&self, hash: &Hash) -> Option<Arc<Node>>;
-    fn store_chunk(&mut self, hash: Hash, chunk: &[u8]) -> Option<Arc<Node>>;
-    fn store_link(&mut self, hash: Hash, left: Arc<Node>, right: Arc<Node>) -> Option<Arc<Node>>;
+    fn store_chunk(&self, hash: Hash, chunk: &[u8]) -> Result<Arc<Node>, StorageError>;
+    fn store_link(&self, hash: Hash, left: Arc<Node>, right: Arc<Node>) -> Result<Arc<Node>, StorageError>;
 
     fn chunks(&self) -> Vec<Hash>;
 
@@ -53,7 +53,7 @@ pub trait ChunkStorage: HashTreeCapable<Arc<Node>, Error> {
 
     //fn drop(hash: Hash); // TODO
 
-    fn insert_chunk(&mut self, chunk: &[u8]) -> Option<Arc<Node>> {
+    fn insert_chunk(&self, chunk: &[u8]) -> Result<Arc<Node>, StorageError> {
         let hash = hash(chunk);
         tracing::trace!("Insert chunk {hash}, {} bytes", chunk.len());
 
@@ -61,7 +61,7 @@ pub trait ChunkStorage: HashTreeCapable<Arc<Node>, Error> {
             .inspect(|x| assert!(x.hash() == &hash))
     }
 
-    fn link(&mut self, left: Arc<Node>, right: Arc<Node>) -> Option<Arc<Node>> {
+    fn link(&self, left: Arc<Node>, right: Arc<Node>) -> Result<Arc<Node>, StorageError> {
         let hash = merge_hashes(left.hash(), right.hash());
         tracing::trace!("Link {} {} → {}", left.hash(), right.hash(), hash);
         self.store_link(hash, left, right)
@@ -69,67 +69,63 @@ pub trait ChunkStorage: HashTreeCapable<Arc<Node>, Error> {
     }
 
     /// Insert bytes into the storage returning the associated hash tree
-    fn insert(&mut self, data: Bytes) -> Option<Arc<Node>>
+    fn insert(&self, data: Bytes) -> Result<Arc<Node>, Error>
     where
         Self: Sized,
     {
-        self.compute_tree(data.as_ref()).ok()
+        self.compute_tree(data.as_ref())
     }
 
     /// Create a new Item from its metadata and Bytes
     /// This is the preferred way to create a new Item
     fn create_item(
-        &mut self,
+        &self,
         name: ItemName,
         path: PathBuf,
         revision: u32,
         description: Option<String>,
         file: Bytes,
-    ) -> Option<Item>
+    ) -> Result<Item, Error>
     where
         Self: Sized,
     {
         let hash_tree = self.insert(file)?;
-        Some(Item::new(name, path, revision, description, &hash_tree))
+        Ok(Item::new(name, path, revision, description, &hash_tree))
     }
 
     /// Build a new Item from its metadata and root node
     fn build_item(
-        &mut self,
+        &self,
         name: ItemName,
         path: PathBuf,
         revision: u32,
         description: Option<String>,
         root: Arc<Node>,
-    ) -> Option<Item>
+    ) -> Result<Item, Error>
     where
         Self: Sized,
     {
-        Some(Item::new(name, path, revision, description, &root))
+        Ok(Item::new(name, path, revision, description, &root))
     }
 
     /// Build a new Item from its metadata and a streaming of nodes
     fn receive_item<T>(
-        &mut self,
+        &self,
         name: ItemName,
         path: PathBuf,
         revision: u32,
         description: Option<String>,
         mut stream: T,
-        //) -> Result<Item, crate::error::Error>
     ) -> impl std::future::Future<Output = Result<Item, crate::error::Error>> + Send
     where
-        Self: Sized + Send,
+        Self: Sized + Send + Sync,
         T: Stream<Item = Node> + std::marker::Unpin + Send,
     {
         async move {
             let mut n = None; // final node
             let mut i = 0; // node counter
             while let Some(node) = stream.next().await {
-                n = Some(
-                    self.try_fill_in(&node)
-                        .ok_or(StorageError::TreeReconstruct)?,
-                );
+                n = Some(self.try_fill_in(&node)?);
                 i += 1;
             }
 
@@ -155,16 +151,16 @@ pub trait ChunkStorage: HashTreeCapable<Arc<Node>, Error> {
     }
 
     /// Take ownership of an `OwnedHashTreeNode` and try to fill in any `Skipped` nodes
-    fn try_fill_in(&mut self, tree: &Node) -> Option<Arc<Node>> {
+    fn try_fill_in(&self, tree: &Node) -> Result<Arc<Node>, StorageError> {
         tracing::trace!("Filling {}", tree.hash());
-        Some(match tree {
+        Ok(match tree {
             Node::Stored { hash, data } => self.store_chunk(*hash, data)?,
             Node::Parent { left, right, .. } => {
                 let l = self.try_fill_in(left)?;
                 let r = self.try_fill_in(right)?;
                 self.link(l, r)?
             }
-            Node::Skipped { hash, .. } => self.get(hash)?,
+            Node::Skipped { hash, .. } => self.get(hash).ok_or(StorageError::TreeReconstruct)?,
         })
     }
 }
@@ -182,31 +178,29 @@ mod tests {
 
     use crate::{chunks::CHUNK_SIZE, hash::hash};
 
-    pub fn single_chunk_insertion<S>(s: &mut S)
+    pub fn single_chunk_insertion<S>(s: &S)
     where
         S: ChunkStorage,
     {
         let data = Bytes::from_static(b"very few bytes");
         let len = data.len() as u64;
-        s.insert(data);
+        s.insert(data).unwrap();
         assert_eq!(len, s.size());
     }
 
     /// Multiple chunks, not aligned with `CHUNK_SIZE`
-    pub fn multiple_chunks_insertion<S>(s: &mut S)
+    pub fn multiple_chunks_insertion<S>(s: &S)
     where
         S: ChunkStorage,
     {
         let data = Bytes::from_static(include_bytes!("../../Cargo.lock"));
         let len = data.len() as u64;
-        //let root = s.insert(data).unwrap();
         println!("\nOriginal lenght: {}, stored length: {}", len, s.size());
-        //print_tree(&*root.to_owned()).unwrap();
         println!();
         assert!(len >= s.size());
     }
 
-    pub fn chunks_deduplication<S>(s: &mut S)
+    pub fn chunks_deduplication<S>(s: &S)
     where
         S: ChunkStorage,
     {
@@ -255,7 +249,7 @@ mod tests {
         }
     }
 
-    pub fn storage_2mb<S>(s: &mut S)
+    pub fn storage_2mb<S>(s: &S)
     where
         S: ChunkStorage,
     {
@@ -285,7 +279,7 @@ mod tests {
         ($t:ty, $name:ident, $builder:ident) => {
             #[test]
             fn $name() {
-                $crate::chunk_storage::tests::$name::<$t>(&mut $builder());
+                $crate::chunk_storage::tests::$name::<$t>(&$builder());
             }
         };
     }
