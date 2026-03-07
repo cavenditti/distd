@@ -69,33 +69,33 @@ impl ChunkStorage for RedbStorage {
             .map(Arc::new)
     }
 
-    fn store_chunk(&mut self, hash: Hash, chunk: &[u8]) -> Option<Arc<Node>> {
-        let write_txn = self.db.begin_write().ok()?;
+    fn store_chunk(&self, hash: Hash, chunk: &[u8]) -> Result<Arc<Node>, StorageError> {
+        let write_txn = self.db.begin_write().map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
         {
-            let mut table = write_txn.open_table(CHUNK_TABLE).ok()?;
-            table.insert(hash.as_bytes(), Vec::from(chunk)).ok()?;
+            let mut table = write_txn.open_table(CHUNK_TABLE).map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
+            table.insert(hash.as_bytes(), Vec::from(chunk)).map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
         }
-        write_txn.commit().ok()?;
-        Some(Arc::new(Node::Stored {
+        write_txn.commit().map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
+        Ok(Arc::new(Node::Stored {
             hash,
             data: Arc::new(Vec::from(chunk)),
         }))
     }
 
-    fn store_link(&mut self, hash: Hash, left: Arc<Node>, right: Arc<Node>) -> Option<Arc<Node>> {
+    fn store_link(&self, hash: Hash, left: Arc<Node>, right: Arc<Node>) -> Result<Arc<Node>, StorageError> {
         let size = left.size() + right.size();
-        let write_txn = self.db.begin_write().ok()?;
+        let write_txn = self.db.begin_write().map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
         {
-            let mut table = write_txn.open_table(LINK_TABLE).ok()?;
+            let mut table = write_txn.open_table(LINK_TABLE).map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
             table
                 .insert(
                     hash.as_bytes(),
                     (*left.hash().as_bytes(), *right.hash().as_bytes()),
                 )
-                .ok()?;
+                .map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
         }
-        write_txn.commit().ok()?;
-        Some(Arc::new(Node::Parent {
+        write_txn.commit().map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
+        Ok(Arc::new(Node::Parent {
             hash,
             size,
             left,
@@ -104,15 +104,11 @@ impl ChunkStorage for RedbStorage {
     }
 
     fn chunks(&self) -> Vec<Hash> {
-        self.db
-            .begin_read()
-            .unwrap()
-            .open_table(CHUNK_TABLE)
-            .unwrap()
-            .iter()
-            .unwrap()
-            .map(|v| *v.unwrap().0.value())
-            .map(Hash::from_bytes)
+        let Ok(read_txn) = self.db.begin_read() else { return Vec::new() };
+        let Ok(table) = read_txn.open_table(CHUNK_TABLE) else { return Vec::new() };
+        let Ok(iter) = table.iter() else { return Vec::new() };
+        iter.filter_map(|v| v.ok())
+            .map(|v| Hash::from_bytes(*v.0.value()))
             .collect()
     }
 
@@ -136,16 +132,12 @@ impl ChunkStorage for RedbStorage {
 }
 
 impl HashTreeCapable<Arc<Node>, crate::error::Error> for RedbStorage {
-    fn func(&mut self, data: &[u8]) -> Result<Arc<Node>, crate::error::Error> {
-        Ok(self
-            .insert_chunk(data)
-            .ok_or(StorageError::ChunkInsertError)?)
+    fn func(&self, data: &[u8]) -> Result<Arc<Node>, crate::error::Error> {
+        self.insert_chunk(data).map_err(Into::into)
     }
 
-    fn merge(&mut self, l: &Arc<Node>, r: &Arc<Node>) -> Result<Arc<Node>, crate::error::Error> {
-        Ok(self
-            .link(l.clone(), r.clone())
-            .ok_or(StorageError::LinkCreation)?)
+    fn merge(&self, l: &Arc<Node>, r: &Arc<Node>) -> Result<Arc<Node>, crate::error::Error> {
+        self.link(l.clone(), r.clone()).map_err(Into::into)
     }
 }
 
