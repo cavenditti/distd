@@ -186,6 +186,7 @@ pub mod tests {
     use crate::chunk_storage::hashmap_storage::HashMapStorage;
     use crate::chunk_storage::ChunkStorage;
     use crate::chunks::CHUNK_SIZE;
+    use crate::error::Error;
     use crate::hash::hash;
     use crate::utils::serde::BitcodeSerializable;
     use crate::utils::testing::random_path_subdir;
@@ -197,9 +198,9 @@ pub mod tests {
      * and messed up
      */
 
-    pub fn new_empty_item<T>(storage: &mut T) -> Option<Item>
+    pub fn new_empty_item<T>(storage: &T) -> Result<Item, Error>
     where
-        T: ChunkStorage + Clone,
+        T: ChunkStorage,
     {
         storage
             .create_item(
@@ -211,7 +212,7 @@ pub mod tests {
             )
     }
 
-    pub fn new_dummy_item<T, const VALUE: u8, const SIZE: usize>(storage: &mut T) -> Option<Item>
+    pub fn new_dummy_item<T, const VALUE: u8, const SIZE: usize>(storage: &T) -> Result<Item, Error>
     where
         T: ChunkStorage,
     {
@@ -227,16 +228,16 @@ pub mod tests {
             )
     }
 
-    pub fn new_zeros_item<T>(storage: &mut T) -> Option<Item>
+    pub fn new_zeros_item<T>(storage: &T) -> Result<Item, Error>
     where
-        T: ChunkStorage + Clone,
+        T: ChunkStorage,
     {
         new_dummy_item::<T, 0u8, 100_000_000>(storage)
     }
 
-    pub fn new_ones_item<T>(storage: &mut T) -> Option<Item>
+    pub fn new_ones_item<T>(storage: &T) -> Result<Item, Error>
     where
-        T: ChunkStorage + Clone,
+        T: ChunkStorage,
     {
         new_dummy_item::<T, 1u8, 100_000_000>(storage)
     }

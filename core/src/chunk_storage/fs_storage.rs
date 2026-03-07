@@ -881,8 +881,10 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "nightly-bench")]
     extern crate test;
 
+    #[cfg(feature = "nightly-bench")]
     #[bench]
     fn bench_fs_storage(b: &mut test::Bencher) {
         let tempdir = temp_path();

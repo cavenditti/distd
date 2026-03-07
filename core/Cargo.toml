@@ -36,6 +36,7 @@ multimap = "0.10.0"
 redb = { workspace = true, optional = true }
 
 [features]
+nightly-bench = []
 redb = ["dep:redb"]
 
 [build-dependencies]
