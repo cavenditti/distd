@@ -1,7 +1,6 @@
 use std::borrow::Borrow;
 use std::collections::HashSet;
 use std::fmt::Debug;
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
@@ -27,14 +26,8 @@ use distd_core::proto::{
     distd_server::Distd, Acknowledge, ClientKeepAlive, ClientRegister, Hashes, ServerMetadata,
 };
 use uuid::Uuid;
-
 use crate::error::Server as ServerError;
 use crate::Server;
-
-#[derive(Clone)]
-struct ClientUuidExtension {
-    pub uuid: Uuid,
-}
 
 #[derive(Debug, Default, Clone)]
 pub struct UuidAuthInterceptor {
@@ -42,31 +35,45 @@ pub struct UuidAuthInterceptor {
 }
 
 impl Interceptor for UuidAuthInterceptor {
-    fn call(&mut self, mut request: tonic::Request<()>) -> Result<tonic::Request<()>, Status> {
-        let uuid: MetadataValue<tonic::metadata::Binary>;
-        {
-            uuid = match request.borrow().metadata().get_bin("x-uuid-bin") {
-                Some(uuid) if self.uuids.read().unwrap().contains(uuid) => Ok(uuid),
-                _ => Err(Status::unauthenticated("Unauthenticated")),
-            }?
-            .clone();
+    fn call(&mut self, request: tonic::Request<()>) -> Result<tonic::Request<()>, Status> {
+        match request.borrow().metadata().get_bin("x-uuid-bin") {
+            Some(uuid) => {
+                let parsed = metadata_to_uuid(uuid)
+                    .map_err(|_| Status::unauthenticated("Invalid metadata"))?;
+
+                if parsed.is_nil() || self.uuids.read().unwrap().contains(uuid) {
+                    Ok(request)
+                } else {
+                    Err(Status::unauthenticated("Unauthenticated"))
+                }
+            }
+            None => Ok(request),
         }
-
-        request.extensions_mut().insert(ClientUuidExtension {
-            uuid: metadata_to_uuid(&uuid)
-                //.map_err(|_| Status::unauthenticated("Unauthenticated"))?,
-                .map_err(|_| Status::unauthenticated("Invalid metadata"))?,
-        });
-
-        Ok(request)
     }
+}
+
+fn ensure_authenticated(
+    request: &Request<impl Sized>,
+    interceptor: &UuidAuthInterceptor,
+) -> Result<Uuid, Status> {
+    let uuid = request
+        .metadata()
+        .get_bin("x-uuid-bin")
+        .ok_or_else(|| Status::unauthenticated("Unauthenticated"))?;
+    let parsed = metadata_to_uuid(uuid).map_err(|_| Status::unauthenticated("Invalid metadata"))?;
+
+    if parsed.is_nil() || !interceptor.uuids.read().unwrap().contains(uuid) {
+        return Err(Status::unauthenticated("Unauthenticated"));
+    }
+
+    Ok(parsed)
 }
 
 impl<T> Server<T>
 where
     T: ChunkStorage + Sync + Send + Debug + 'static,
 {
-    pub async fn make_grcp_service(self) -> Result<tonic::transport::server::Router, ServerError> {
+    pub async fn make_grpc_service(self) -> Result<tonic::transport::server::Router, ServerError> {
         let interceptor = self.uuid_interceptor.clone();
         let svc = proto::distd_server::DistdServer::with_interceptor(self, interceptor);
 
@@ -110,8 +117,9 @@ where
 
     async fn fetch(
         &self,
-        _request: Request<ClientKeepAlive>,
+        request: Request<ClientKeepAlive>,
     ) -> Result<Response<ServerMetadata>, Status> {
+        ensure_authenticated(&request, &self.uuid_interceptor)?;
         let serialized = ServerMetadataRepr::from(self.metadata.read().await.clone())
             .to_bitcode()
             .map_err(|_| Status::new(Code::Internal, "Cannot serialize server metadata"))?;
@@ -121,7 +129,8 @@ where
         }))
     }
 
-    async fn adv_hashes(&self, _request: Request<Hashes>) -> Result<Response<Acknowledge>, Status> {
+    async fn adv_hashes(&self, request: Request<Hashes>) -> Result<Response<Acknowledge>, Status> {
+        ensure_authenticated(&request, &self.uuid_interceptor)?;
         Ok(Response::new(Acknowledge {
             ack: EnumAcknowledge::AckIgnored.into(),
         }))
@@ -131,13 +140,15 @@ where
         &self,
         request: Request<ItemRequest>,
     ) -> Result<Response<ResponseStream>, Status> {
+        ensure_authenticated(&request, &self.uuid_interceptor)?;
         let inner = request.into_inner();
 
         let hash = {
             let metadata = self.metadata.read().await;
-            *PathBuf::from_str(&inner.item_path)
-                .ok()
-                .and_then(|x| metadata.items.get(&x))
+            *metadata
+                .items
+                .values()
+                .find(|item| item.metadata.path == inner.item_path)
                 .ok_or(Status::new(
                     Code::InvalidArgument,
                     "Bad or missing item path",

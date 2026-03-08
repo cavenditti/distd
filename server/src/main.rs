@@ -28,9 +28,8 @@ async fn main() {
     let app = rest_api::make_app(server.clone());
 
     let addr_grpc = "[::1]:50051".parse().unwrap();
-    tokio::spawn( tonic::transport::Server::builder()
-        .add_service(distd_core::proto::distd_server::DistdServer::new(server))
-        .serve(addr_grpc));
+    let grpc_service = server.clone().make_grpc_service().await.unwrap();
+    tokio::spawn(grpc_service.serve(addr_grpc));
     tracing::info!("listening on {} for gRPC", addr_grpc);
 
     // run our app with hyper, listening globally on port 3000
