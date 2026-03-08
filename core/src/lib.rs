@@ -9,12 +9,9 @@ pub mod feed;
 pub mod hash;
 pub mod item;
 pub mod metadata;
-pub mod peer;
 pub mod unique_name;
 pub mod utils;
 pub mod version;
-
-pub mod benchmarks;
 
 #[allow(clippy::all)]
 #[allow(warnings)]
