@@ -5,11 +5,10 @@ use std::{
     sync::{atomic::AtomicBool, Arc, Mutex, RwLock},
 };
 
-use multimap::MultiMap;
 use serde::{Deserialize, Serialize};
 use tokio_stream::{Stream, StreamExt};
 
-use rustc_hash::{FxBuildHasher, FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::{
     chunk_storage::StorageError,
@@ -164,7 +163,7 @@ struct FsStorageState {
     /// Path where to store persistent data
     persistance_path: PathBuf,
     /// Per-chunk location on disk
-    data: MultiMap<Hash, InFileChunk, FxBuildHasher>,
+    data: HashMap<Hash, Vec<Arc<InFileChunk>>>,
     /// Parent (link) nodes re-constructed in memory
     links: HashMap<Hash, Arc<Node>>,
     #[serde(default)]
@@ -204,6 +203,7 @@ impl FsStorageState {
     fn get_data(&self, hash: &Hash) -> Option<Arc<Node>> {
         self.data
             .get(hash)
+            .and_then(|entries| entries.first())
             .and_then(|x| Node::try_from(x).ok())
             .map(Arc::new)
     }
@@ -230,7 +230,7 @@ impl FsStorageState {
         offset: u64,
     ) -> Result<(), Error> {
         // If already registered for this path/offset, skip
-        if let Some(ifcs) = self.data.get_vec(&chunk_info.hash) {
+        if let Some(ifcs) = self.data.get(&chunk_info.hash) {
             for ifc in ifcs {
                 if path == ifc.path && offset == ifc.offset {
                     return Ok(());
@@ -245,7 +245,7 @@ impl FsStorageState {
             populated: Arc::default(),
         };
         tracing::trace!("Created infile chunk: {ifc:?}");
-        self.data.insert(chunk_info.hash, ifc);
+        self.data.entry(chunk_info.hash).or_default().push(Arc::new(ifc));
         self.mark_dirty();
         Ok(())
     }
@@ -329,7 +329,7 @@ impl FsStorage {
             .read()
             .unwrap()
             .data
-            .get_vec(hash)
+            .get(hash)
             .map(|entries| {
                 entries
                     .iter()
@@ -412,7 +412,7 @@ impl FsStorage {
                 Ok(mut s) => {
                     let mut handles_map = HashMap::default();
                     for hash in s.data.keys().copied().collect::<Vec<_>>() {
-                        if let Some(entries) = s.data.get_vec(&hash) {
+                        if let Some(entries) = s.data.get(&hash) {
                             for entry in entries {
                                 handles_map
                                     .entry(entry.path.clone())
@@ -557,7 +557,7 @@ impl FsStorage {
             .then_some(item)
             .ok_or(Error::MissingData)?;
         for chunk in &item.chunks {
-            let remove_key = if let Some(infile_chunks) = inner.data.get_vec_mut(&chunk.hash) {
+            let remove_key = if let Some(infile_chunks) = inner.data.get_mut(&chunk.hash) {
                 infile_chunks.retain(|infile_chunk| infile_chunk.path != path);
                 infile_chunks.is_empty()
             } else {
@@ -603,7 +603,7 @@ impl ChunkStorage for FsStorage {
             .copied()
             .collect::<HashSet<_>>()
             .into_iter()
-            .filter_map(|hash| inner.data.get_vec(&hash).and_then(|entries| entries.first()))
+            .filter_map(|hash| inner.data.get(&hash).and_then(|entries| entries.first()))
             .filter(|entry| entry.populated.load(std::sync::atomic::Ordering::Relaxed))
             .map(|entry| entry.info.size)
             .sum()
@@ -614,7 +614,7 @@ impl ChunkStorage for FsStorage {
             let inner = self.inner.read().unwrap();
             inner
                 .data
-                .get_vec(&hash)
+                .get(&hash)
                 .cloned()
                 .ok_or(StorageError::ChunkInsertError)?
         };
@@ -796,7 +796,7 @@ mod tests {
             items: {:?}",
             inner.root,
             inner.data.keys().collect::<Vec<_>>(),
-            inner.data.iter_all().collect::<Vec<_>>(),
+            inner.data.iter().collect::<Vec<_>>(),
             inner.items,
         );
     }
