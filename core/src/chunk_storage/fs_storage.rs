@@ -167,11 +167,6 @@ struct FsStorageState {
     data: MultiMap<Hash, InFileChunk, FxBuildHasher>,
     /// Parent (link) nodes re-constructed in memory
     links: HashMap<Hash, Arc<Node>>,
-    /// Open file handles (not serialised)
-    #[serde(default)]
-    #[serde(skip_serializing)]
-    #[serde(skip_deserializing)]
-    handles_map: HashMap<PathBuf, Handle>,
     #[serde(default)]
     #[serde(skip_serializing)]
     #[serde(skip_deserializing)]
@@ -181,22 +176,6 @@ struct FsStorageState {
 impl FsStorageState {
     fn mark_dirty(&mut self) {
         self.dirty = true;
-    }
-
-    fn flush_handle(&mut self, path: &Path) -> Result<(), Error> {
-        if let Some(handle) = self.handles_map.get_mut(path) {
-            handle.flush()?;
-        }
-        Ok(())
-    }
-
-    fn flush_handles(&mut self) -> Result<(), Error> {
-        for (path, handle) in &mut self.handles_map {
-            handle
-                .flush()
-                .inspect_err(|e| tracing::error!("Cannot flush handle {}: {e}", path.to_string_lossy()))?;
-        }
-        Ok(())
     }
 
     /// Returns the stored path of any path relative to root
@@ -236,7 +215,6 @@ impl FsStorageState {
 
     /// Atomically persist state to disk (write to *.tmp then rename)
     fn persist(&mut self) -> Result<(), Error> {
-        self.flush_handles()?;
         let buf = bitcode::serialize(self)
             .inspect_err(|e| tracing::error!("Serialization error: {}", e))
             .map_err(InvalidParameter::from)?;
@@ -273,9 +251,6 @@ impl FsStorageState {
         };
         tracing::trace!("Created infile chunk: {ifc:?}");
         self.data.insert(chunk_info.hash, ifc);
-        if !self.handles_map.contains_key(path) {
-            self.handles_map.insert(path.to_owned(), Handle::new(path)?);
-        }
         self.mark_dirty();
         Ok(())
     }
@@ -314,36 +289,6 @@ impl FsStorageState {
         self.pre_allocate(path, &chunks)
     }
 
-    /// Store a raw chunk, writing it to all pre-allocated positions
-    fn store_chunk(&mut self, hash: Hash, chunk: &[u8]) -> Result<Arc<Node>, StorageError> {
-        let mut touched_paths = HashSet::default();
-        {
-            let infile_chunks = self.data.get_vec_mut(&hash)
-                .ok_or(StorageError::ChunkInsertError)?;
-            for infile_chunk in infile_chunks {
-                tracing::trace!("infile chunk {infile_chunk:?}");
-                let handle = self.handles_map.get_mut(&infile_chunk.path)
-                    .ok_or(StorageError::ChunkInsertError)?;
-                infile_chunk
-                    .write(&hash, chunk, handle)
-                    .inspect(|()| tracing::trace!("Written infile chunk {hash} to {}", infile_chunk.path.to_string_lossy()))
-                    .inspect_err(|e| tracing::error!("Cannot write infile chunk to {}: {e}", infile_chunk.path.to_string_lossy()))
-                    .map_err(|_| StorageError::ChunkInsertError)?;
-                touched_paths.insert(infile_chunk.path.clone());
-            }
-        }
-        for path in touched_paths {
-            self.flush_handle(&path)
-                .inspect_err(|e| tracing::error!("Cannot flush infile chunk handle {}: {e}", path.to_string_lossy()))
-                .map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
-        }
-        self.mark_dirty();
-        Ok(Arc::new(Node::Stored {
-            hash,
-            data: Arc::new(chunk.to_vec()),
-        }))
-    }
-
     /// Store a parent (link) node
     fn store_link(&mut self, hash: Hash, left: Arc<Node>, right: Arc<Node>) -> Result<Arc<Node>, StorageError> {
         let size = left.size() + right.size();
@@ -354,20 +299,6 @@ impl FsStorageState {
             .clone();
         self.mark_dirty();
         Ok(res)
-    }
-
-    /// Fill in `Skipped` nodes by looking up existing stored data
-    fn try_fill_in(&mut self, tree: &Node) -> Result<Arc<Node>, StorageError> {
-        tracing::trace!("Filling {}", tree.hash());
-        Ok(match tree {
-            Node::Stored { hash, data } => self.store_chunk(*hash, data)?,
-            Node::Parent { left, right, .. } => {
-                let l = self.try_fill_in(left)?;
-                let r = self.try_fill_in(right)?;
-                self.store_link(crate::hash::merge_hashes(l.hash(), r.hash()), l, r)?
-            }
-            Node::Skipped { hash, .. } => self.get(hash).ok_or(StorageError::TreeReconstruct)?,
-        })
     }
 }
 
@@ -381,17 +312,42 @@ impl FsStorageState {
 /// providing interior mutability so that `ChunkStorage` methods can take `&self`.
 pub struct FsStorage {
     inner: Mutex<FsStorageState>,
+    handles: Mutex<HashMap<PathBuf, Handle>>,
 }
 
 impl Default for FsStorage {
     fn default() -> Self {
         Self {
             inner: Mutex::new(FsStorageState::default()),
+            handles: Mutex::new(HashMap::default()),
         }
     }
 }
 
 impl FsStorage {
+    fn ensure_handle(&self, path: &Path) -> Result<(), Error> {
+        let mut handles = self.handles.lock().unwrap();
+        if !handles.contains_key(path) {
+            handles.insert(path.to_owned(), Handle::new(path)?);
+        }
+        Ok(())
+    }
+
+    fn flush_handles(&self) -> Result<(), Error> {
+        let mut handles = self.handles.lock().unwrap();
+        for (path, handle) in &mut *handles {
+            handle
+                .flush()
+                .inspect_err(|e| tracing::error!("Cannot flush handle {}: {e}", path.to_string_lossy()))?;
+        }
+        Ok(())
+    }
+
+    fn persist(&self) -> Result<(), Error> {
+        self.flush_handles()?;
+        self.inner.lock().unwrap().persist()
+    }
+
     /// Create a new `FsStorage` with a root path.
     ///
     /// If persistence data exists it will be reloaded; otherwise an empty storage is created.
@@ -413,18 +369,15 @@ impl FsStorage {
                     tracing::warn!("Cannot deserialize FsStorage persistence data: {e}; starting fresh");
                 }
                 Ok(mut s) => {
-                    let mut handle_paths = Vec::new();
+                    let mut handles_map = HashMap::default();
                     for hash in s.data.keys().copied().collect::<Vec<_>>() {
                         if let Some(entries) = s.data.get_vec(&hash) {
                             for entry in entries {
-                                handle_paths.push(entry.path.clone());
+                                handles_map
+                                    .entry(entry.path.clone())
+                                    .or_insert(Handle::new(&entry.path).unwrap());
                             }
                         }
-                    }
-                    for path in handle_paths {
-                        s.handles_map
-                            .entry(path.clone())
-                            .or_insert(Handle::new(&path).unwrap());
                     }
 
                     // Re-link parent nodes after deserialization
@@ -477,7 +430,10 @@ impl FsStorage {
 
                     if old_links.is_empty() {
                         tracing::debug!("Loaded FsStorage.");
-                        return Self { inner: Mutex::new(s) };
+                        return Self {
+                            inner: Mutex::new(s),
+                            handles: Mutex::new(handles_map),
+                        };
                     }
                     tracing::debug!("Cannot reload FsStorage; starting fresh");
                 }
@@ -492,6 +448,7 @@ impl FsStorage {
                 persistance_path,
                 ..Default::default()
             }),
+            handles: Mutex::new(HashMap::default()),
         }
     }
 
@@ -513,17 +470,20 @@ impl FsStorage {
         chunk_info: &ChunkInfo,
         offset: u64,
     ) -> Result<(), Error> {
-        self.inner.lock().unwrap().pre_allocate_chunk(path, chunk_info, offset)
+        self.inner.lock().unwrap().pre_allocate_chunk(path, chunk_info, offset)?;
+        self.ensure_handle(path)
     }
 
     /// Pre-allocate space for multiple `ChunkInfo` slots on disk
     pub fn pre_allocate(&self, path: &Path, data: &[ChunkInfo]) -> Result<(), Error> {
-        self.inner.lock().unwrap().pre_allocate(path, data)
+        self.inner.lock().unwrap().pre_allocate(path, data)?;
+        self.ensure_handle(path)
     }
 
     /// Pre-allocate space for raw bytes on disk
     pub fn pre_allocate_bytes(&self, path: &Path, data: &[u8]) -> Result<(), Error> {
-        self.inner.lock().unwrap().pre_allocate_bytes(path, data)
+        self.inner.lock().unwrap().pre_allocate_bytes(path, data)?;
+        self.ensure_handle(path)
     }
 
     /// Pre-allocate space for an item in the filesystem
@@ -536,8 +496,9 @@ impl FsStorage {
         tracing::debug!("Preallocating item to {:?}", path);
         inner.pre_allocate(&path, &item.chunks[..])?;
         inner.items.insert(item.clone());
-        inner.persist()?;
-        Ok(())
+        drop(inner);
+        self.ensure_handle(&path)?;
+        self.persist()
     }
 
     /// Remove references to a file from storage (does not delete the file from disk)
@@ -561,9 +522,9 @@ impl FsStorage {
                 inner.data.remove(&chunk.hash);
             }
         }
-        inner.handles_map.remove(&path);
-        inner.persist()?;
-        Ok(())
+        drop(inner);
+        self.handles.lock().unwrap().remove(&path);
+        self.persist()
     }
 
     /// Remove references to a file from storage and delete the file from disk
@@ -594,7 +555,46 @@ impl ChunkStorage for FsStorage {
     }
 
     fn store_chunk(&self, hash: Hash, chunk: &[u8]) -> Result<Arc<Node>, StorageError> {
-        self.inner.lock().unwrap().store_chunk(hash, chunk)
+        let infile_chunks = {
+            let inner = self.inner.lock().unwrap();
+            inner
+                .data
+                .get_vec(&hash)
+                .cloned()
+                .ok_or(StorageError::ChunkInsertError)?
+        };
+
+        let mut touched_paths = HashSet::default();
+        {
+            let mut handles = self.handles.lock().unwrap();
+            for infile_chunk in &infile_chunks {
+                tracing::trace!("infile chunk {infile_chunk:?}");
+                let handle = handles
+                    .get_mut(&infile_chunk.path)
+                    .ok_or(StorageError::ChunkInsertError)?;
+                infile_chunk
+                    .write(&hash, chunk, handle)
+                    .inspect(|()| tracing::trace!("Written infile chunk {hash} to {}", infile_chunk.path.to_string_lossy()))
+                    .inspect_err(|e| tracing::error!("Cannot write infile chunk to {}: {e}", infile_chunk.path.to_string_lossy()))
+                    .map_err(|_| StorageError::ChunkInsertError)?;
+                touched_paths.insert(infile_chunk.path.clone());
+            }
+
+            for path in touched_paths {
+                if let Some(handle) = handles.get_mut(&path) {
+                    handle
+                        .flush()
+                        .inspect_err(|e| tracing::error!("Cannot flush infile chunk handle {}: {e}", path.to_string_lossy()))
+                        .map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
+                }
+            }
+        }
+
+        self.inner.lock().unwrap().mark_dirty();
+        Ok(Arc::new(Node::Stored {
+            hash,
+            data: Arc::new(chunk.to_vec()),
+        }))
     }
 
     fn store_link(&self, hash: Hash, left: Arc<Node>, right: Arc<Node>) -> Result<Arc<Node>, StorageError> {
@@ -617,18 +617,18 @@ impl ChunkStorage for FsStorage {
         let path = inner.path(&path);
         create_dir_all(path.parent().ok_or(Error::MissingData)?)?;
         inner.pre_allocate_bytes(&path, &file)?;
+        drop(inner);
+        self.ensure_handle(&path)?;
         tracing::info!("Preallocated on disk {:?}", path);
 
         // Build the hash tree using interior HashTreeCapable
-        let hash_tree = {
-            drop(inner); // release lock while doing the tree computation
-            self.compute_tree(file.as_ref())?
-        };
+        let hash_tree = self.compute_tree(file.as_ref())?;
         let mut inner = self.inner.lock().unwrap();
         let item = Item::new(name, path, revision, description, &hash_tree);
         tracing::debug!("New item: {item}");
         inner.items.insert(item.clone());
-        inner.persist()?;
+        drop(inner);
+        self.persist()?;
         Ok(item)
     }
 
@@ -647,11 +647,15 @@ impl ChunkStorage for FsStorage {
         let mut inner = self.inner.lock().unwrap();
         let path = inner.path(&path);
         inner.pre_allocate(&path, &root.flatten_with_sizes()?)?;
+        drop(inner);
+        self.ensure_handle(&path)?;
         tracing::info!("Preallocated on disk {:?}", path);
+        let mut inner = self.inner.lock().unwrap();
         let item = Item::new(name, path, revision, description, &root);
         tracing::debug!("New item: {item}");
         inner.items.insert(item.clone());
-        inner.persist()?;
+        drop(inner);
+        self.persist()?;
         Ok(item)
     }
 
@@ -669,14 +673,13 @@ impl ChunkStorage for FsStorage {
         T: Stream<Item = Node> + std::marker::Unpin,
     {
         let path = self.path(&path);
+        self.ensure_handle(&path)?;
         tracing::trace!("Receiving item at '{}'", path.to_string_lossy());
         let mut i = 0;
         let mut o = 0u64;
         let mut last: Option<Arc<Node>> = None;
 
         while let Some(node) = stream.next().await {
-            // Acquire lock per iteration – do not hold across `.await`
-            let mut inner = self.inner.lock().unwrap();
             if let s_n @ Node::Stored { .. } = &node {
                 tracing::trace!(
                     "Preallocating {} bytes in {}@'{}'",
@@ -684,10 +687,10 @@ impl ChunkStorage for FsStorage {
                     o,
                     path.to_string_lossy()
                 );
-                inner.pre_allocate_chunk(&path, &s_n.chunk_info(), o)?;
+                self.pre_allocate_chunk(&path, &s_n.chunk_info(), o)?;
                 o += s_n.size();
             }
-            last = Some(inner.try_fill_in(&node)?);
+            last = Some(self.try_fill_in(&node)?);
             i += 1;
         }
 
@@ -696,7 +699,8 @@ impl ChunkStorage for FsStorage {
         let item = Item::new(name, path, revision, description, &last);
         let mut inner = self.inner.lock().unwrap();
         inner.items.insert(item.clone());
-        inner.persist()?;
+        drop(inner);
+        self.persist()?;
         Ok(item)
     }
 
@@ -717,12 +721,12 @@ impl HashTreeCapable<Arc<Node>, crate::error::Error> for FsStorage {
 
 impl Drop for FsStorage {
     fn drop(&mut self) {
-        let mut inner = self.inner.lock().unwrap();
-        if inner.dirty {
-            if let Err(e) = inner.persist() {
+        let dirty = self.inner.lock().unwrap().dirty;
+        if dirty {
+            if let Err(e) = self.persist() {
                 tracing::error!("Cannot persist FsStorage on drop: {e}");
             }
-        } else if let Err(e) = inner.flush_handles() {
+        } else if let Err(e) = self.flush_handles() {
             tracing::error!("Cannot flush FsStorage handles on drop: {e}");
         }
     }
