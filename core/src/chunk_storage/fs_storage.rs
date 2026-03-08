@@ -2,7 +2,7 @@ use std::{
     fs::{self, create_dir_all, remove_file, File},
     io::{BufWriter, Read, Seek, Write},
     path::{Path, PathBuf},
-    sync::{atomic::AtomicBool, Arc, Mutex},
+    sync::{atomic::AtomicBool, Arc, Mutex, RwLock},
 };
 
 use multimap::MultiMap;
@@ -152,7 +152,7 @@ impl InFileChunk {
 
 // ─── Inner serialisable state ─────────────────────────────────────────────────
 
-/// All mutable state for [`FsStorage`], kept behind a `Mutex` for interior mutability.
+/// All mutable state for [`FsStorage`], kept behind an `RwLock` for interior mutability.
 ///
 /// This is the type that is persisted to disk; [`FsStorage`] itself is a thin wrapper.
 #[derive(Default, Serialize, Deserialize)]
@@ -308,17 +308,17 @@ impl FsStorageState {
 ///
 /// It is useful to actually install files in the filesystem if the root is set to `/`.
 ///
-/// Most logic is implemented in [`FsStorageState`]; this type is a `Mutex`-guarded handle
+/// Most logic is implemented in [`FsStorageState`]; this type is an `RwLock`-guarded handle
 /// providing interior mutability so that `ChunkStorage` methods can take `&self`.
 pub struct FsStorage {
-    inner: Mutex<FsStorageState>,
+    inner: RwLock<FsStorageState>,
     handles: Mutex<HashMap<PathBuf, Handle>>,
 }
 
 impl Default for FsStorage {
     fn default() -> Self {
         Self {
-            inner: Mutex::new(FsStorageState::default()),
+            inner: RwLock::new(FsStorageState::default()),
             handles: Mutex::new(HashMap::default()),
         }
     }
@@ -345,7 +345,7 @@ impl FsStorage {
 
     fn persist(&self) -> Result<(), Error> {
         self.flush_handles()?;
-        self.inner.lock().unwrap().persist()
+        self.inner.write().unwrap().persist()
     }
 
     /// Create a new `FsStorage` with a root path.
@@ -431,7 +431,7 @@ impl FsStorage {
                     if old_links.is_empty() {
                         tracing::debug!("Loaded FsStorage.");
                         return Self {
-                            inner: Mutex::new(s),
+                            inner: RwLock::new(s),
                             handles: Mutex::new(handles_map),
                         };
                     }
@@ -443,7 +443,7 @@ impl FsStorage {
         }
 
         Self {
-            inner: Mutex::new(FsStorageState {
+            inner: RwLock::new(FsStorageState {
                 root,
                 persistance_path,
                 ..Default::default()
@@ -455,12 +455,12 @@ impl FsStorage {
     /// Returns the stored path of any path relative to root
     #[must_use]
     pub fn path(&self, path: &Path) -> PathBuf {
-        self.inner.lock().unwrap().path(path)
+        self.inner.read().unwrap().path(path)
     }
 
     /// Full on-disk path for an item
     pub fn item_path(&self, item: &Item) -> Result<PathBuf, Error> {
-        self.inner.lock().unwrap().item_path(item)
+        self.inner.read().unwrap().item_path(item)
     }
 
     /// Pre-allocate a single `ChunkInfo` slot on disk
@@ -470,25 +470,25 @@ impl FsStorage {
         chunk_info: &ChunkInfo,
         offset: u64,
     ) -> Result<(), Error> {
-        self.inner.lock().unwrap().pre_allocate_chunk(path, chunk_info, offset)?;
+        self.inner.write().unwrap().pre_allocate_chunk(path, chunk_info, offset)?;
         self.ensure_handle(path)
     }
 
     /// Pre-allocate space for multiple `ChunkInfo` slots on disk
     pub fn pre_allocate(&self, path: &Path, data: &[ChunkInfo]) -> Result<(), Error> {
-        self.inner.lock().unwrap().pre_allocate(path, data)?;
+        self.inner.write().unwrap().pre_allocate(path, data)?;
         self.ensure_handle(path)
     }
 
     /// Pre-allocate space for raw bytes on disk
     pub fn pre_allocate_bytes(&self, path: &Path, data: &[u8]) -> Result<(), Error> {
-        self.inner.lock().unwrap().pre_allocate_bytes(path, data)?;
+        self.inner.write().unwrap().pre_allocate_bytes(path, data)?;
         self.ensure_handle(path)
     }
 
     /// Pre-allocate space for an item in the filesystem
     pub fn pre_allocate_item(&self, item: &Item) -> Result<(), Error> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.write().unwrap();
         if inner.items.contains(item) {
             return Ok(());
         }
@@ -503,7 +503,7 @@ impl FsStorage {
 
     /// Remove references to a file from storage (does not delete the file from disk)
     pub fn remove(&self, item: Item) -> Result<(), Error> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.write().unwrap();
         let path = inner.item_path(&item)?;
         let item = inner
             .items
@@ -537,11 +537,11 @@ impl FsStorage {
 
 impl ChunkStorage for FsStorage {
     fn get(&self, hash: &Hash) -> Option<Arc<Node>> {
-        self.inner.lock().unwrap().get(hash)
+        self.inner.read().unwrap().get(hash)
     }
 
     fn size(&self) -> u64 {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.read().unwrap();
         inner
             .data
             .keys()
@@ -556,7 +556,7 @@ impl ChunkStorage for FsStorage {
 
     fn store_chunk(&self, hash: Hash, chunk: &[u8]) -> Result<Arc<Node>, StorageError> {
         let infile_chunks = {
-            let inner = self.inner.lock().unwrap();
+            let inner = self.inner.read().unwrap();
             inner
                 .data
                 .get_vec(&hash)
@@ -590,7 +590,7 @@ impl ChunkStorage for FsStorage {
             }
         }
 
-        self.inner.lock().unwrap().mark_dirty();
+        self.inner.write().unwrap().mark_dirty();
         Ok(Arc::new(Node::Stored {
             hash,
             data: Arc::new(chunk.to_vec()),
@@ -598,7 +598,7 @@ impl ChunkStorage for FsStorage {
     }
 
     fn store_link(&self, hash: Hash, left: Arc<Node>, right: Arc<Node>) -> Result<Arc<Node>, StorageError> {
-        self.inner.lock().unwrap().store_link(hash, left, right)
+        self.inner.write().unwrap().store_link(hash, left, right)
     }
 
     fn create_item(
@@ -613,7 +613,7 @@ impl ChunkStorage for FsStorage {
         Self: Sized,
     {
         tracing::debug!("Create item {name} with path {path:?}");
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.write().unwrap();
         let path = inner.path(&path);
         create_dir_all(path.parent().ok_or(Error::MissingData)?)?;
         inner.pre_allocate_bytes(&path, &file)?;
@@ -623,7 +623,7 @@ impl ChunkStorage for FsStorage {
 
         // Build the hash tree using interior HashTreeCapable
         let hash_tree = self.compute_tree(file.as_ref())?;
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.write().unwrap();
         let item = Item::new(name, path, revision, description, &hash_tree);
         tracing::debug!("New item: {item}");
         inner.items.insert(item.clone());
@@ -644,13 +644,13 @@ impl ChunkStorage for FsStorage {
         Self: Sized,
     {
         tracing::debug!("Create item {name} with path {path:?}");
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.write().unwrap();
         let path = inner.path(&path);
         inner.pre_allocate(&path, &root.flatten_with_sizes()?)?;
         drop(inner);
         self.ensure_handle(&path)?;
         tracing::info!("Preallocated on disk {:?}", path);
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.write().unwrap();
         let item = Item::new(name, path, revision, description, &root);
         tracing::debug!("New item: {item}");
         inner.items.insert(item.clone());
@@ -697,7 +697,7 @@ impl ChunkStorage for FsStorage {
         let last = last.ok_or(StorageError::TreeReconstruct)?;
         tracing::info!("Reconstructed {i} nodes with {} bytes total", last.size());
         let item = Item::new(name, path, revision, description, &last);
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.write().unwrap();
         inner.items.insert(item.clone());
         drop(inner);
         self.persist()?;
@@ -705,7 +705,7 @@ impl ChunkStorage for FsStorage {
     }
 
     fn chunks(&self) -> Vec<Hash> {
-        self.inner.lock().unwrap().data.keys().copied().collect()
+        self.inner.read().unwrap().data.keys().copied().collect()
     }
 }
 
@@ -721,7 +721,7 @@ impl HashTreeCapable<Arc<Node>, crate::error::Error> for FsStorage {
 
 impl Drop for FsStorage {
     fn drop(&mut self) {
-        let dirty = self.inner.lock().unwrap().dirty;
+        let dirty = self.inner.read().unwrap().dirty;
         if dirty {
             if let Err(e) = self.persist() {
                 tracing::error!("Cannot persist FsStorage on drop: {e}");
@@ -747,7 +747,7 @@ mod tests {
     use super::*;
 
     fn print_fsstorage(storage: &FsStorage) {
-        let inner = storage.inner.lock().unwrap();
+        let inner = storage.inner.read().unwrap();
         println!(
             "root: {:?} \n\
             chunks: {:?} \n\
@@ -944,7 +944,7 @@ mod tests {
 
         // Check for contained item
         {
-            let inner = storage.inner.lock().unwrap();
+            let inner = storage.inner.read().unwrap();
             assert_eq!(inner.items.len(), 1);
             let retrieved = inner.items.iter().next().unwrap();
             let item = item.unwrap();
