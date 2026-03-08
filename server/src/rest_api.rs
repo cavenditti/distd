@@ -265,11 +265,6 @@ where
         .map(Json)
 }
 
-#[derive(Deserialize, Serialize)]
-struct TransferGetObj {
-    got: String,
-}
-
 /// Download data associated with an hash-tree from its root
 async fn get_metadata<T>(State(server): State<Server<T>>) -> impl IntoResponse
 where
@@ -288,14 +283,14 @@ where
         .route("/", get(version))
         .route("/version", get(version))
         .route("/clients", get(get_clients).post(register_client))
-        .route("/clients/:uuid", get(get_one_client))
+        .route("/clients/{uuid}", get(get_one_client))
         .route("/items/all", get(get_items))
         .route("/items", get(get_one_item).post(publish_item))
         .route("/chunks", get(get_chunks))
         .route("/chunks/size-sum", get(get_chunks_size_sum))
-        .route("/chunks/get/:hash", get(get_chunk))
+        .route("/chunks/get/{hash}", get(get_chunk))
         .route("/feeds", get(get_feeds))
-        .route("/feeds/:feed_name", get(get_one_feed))
+        .route("/feeds/{feed_name}", get(get_one_feed))
         .route("/metadata", get(get_metadata))
         .with_state(Arc::new(server))
         .layer(DefaultBodyLimit::max(1024 * 1024 * 1024 * 48))
