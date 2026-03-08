@@ -22,8 +22,6 @@ use crate::{
 
 use super::{ChunkStorage, Node};
 
-const PERSIST_BATCH_SIZE: usize = 256;
-
 pub fn open_file(path: &Path) -> Result<File, Error> {
     File::options()
         .create(true)
@@ -178,16 +176,11 @@ struct FsStorageState {
     #[serde(skip_serializing)]
     #[serde(skip_deserializing)]
     dirty: bool,
-    #[serde(default)]
-    #[serde(skip_serializing)]
-    #[serde(skip_deserializing)]
-    pending_persist_ops: usize,
 }
 
 impl FsStorageState {
     fn mark_dirty(&mut self) {
         self.dirty = true;
-        self.pending_persist_ops += 1;
     }
 
     fn flush_handle(&mut self, path: &Path) -> Result<(), Error> {
@@ -253,14 +246,6 @@ impl FsStorageState {
         fs::rename(&tmp, &self.persistance_path)
             .inspect_err(|e| tracing::error!("Cannot rename persistence file: {}", e))?;
         self.dirty = false;
-        self.pending_persist_ops = 0;
-        Ok(())
-    }
-
-    fn persist_if_needed(&mut self) -> Result<(), Error> {
-        if self.dirty && self.pending_persist_ops >= PERSIST_BATCH_SIZE {
-            self.persist()?;
-        }
         Ok(())
     }
 
@@ -353,8 +338,6 @@ impl FsStorageState {
                 .map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
         }
         self.mark_dirty();
-        self.persist_if_needed()
-            .map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
         Ok(Arc::new(Node::Stored {
             hash,
             data: Arc::new(chunk.to_vec()),
@@ -370,8 +353,6 @@ impl FsStorageState {
             .or_insert_with(|| Arc::new(Node::Parent { hash, left, right, size }))
             .clone();
         self.mark_dirty();
-        self.persist_if_needed()
-            .map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
         Ok(res)
     }
 
