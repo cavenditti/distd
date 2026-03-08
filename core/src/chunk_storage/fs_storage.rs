@@ -208,11 +208,6 @@ impl FsStorageState {
             .map(Arc::new)
     }
 
-    /// Get a node from links or disk
-    fn get(&self, hash: &Hash) -> Option<Arc<Node>> {
-        self.links.get(hash).cloned().or_else(|| self.get_data(hash))
-    }
-
     /// Atomically persist state to disk (write to *.tmp then rename)
     fn persist(&mut self) -> Result<(), Error> {
         let buf = bitcode::serialize(self)
@@ -329,6 +324,23 @@ impl FsStorage {
         self.handles.read().unwrap().get(path).cloned()
     }
 
+    fn data_paths_for_hash(&self, hash: &Hash) -> Vec<PathBuf> {
+        self.inner
+            .read()
+            .unwrap()
+            .data
+            .get_vec(hash)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|entry| entry.path.clone())
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn ensure_handle(&self, path: &Path) -> Result<(), Error> {
         if self.handle_for_path(path).is_some() {
             return Ok(());
@@ -355,6 +367,19 @@ impl FsStorage {
                 .unwrap()
                 .flush()
                 .inspect_err(|e| tracing::error!("Cannot flush handle {}: {e}", path.to_string_lossy()))?;
+        }
+        Ok(())
+    }
+
+    fn flush_data_for_hash(&self, hash: &Hash) -> Result<(), Error> {
+        for path in self.data_paths_for_hash(hash) {
+            if let Some(handle) = self.handle_for_path(&path) {
+                handle
+                    .lock()
+                    .unwrap()
+                    .flush()
+                    .inspect_err(|e| tracing::error!("Cannot flush infile chunk handle {}: {e}", path.to_string_lossy()))?;
+            }
         }
         Ok(())
     }
@@ -558,7 +583,16 @@ impl FsStorage {
 
 impl ChunkStorage for FsStorage {
     fn get(&self, hash: &Hash) -> Option<Arc<Node>> {
-        self.inner.read().unwrap().get(hash)
+        let linked = self.inner.read().unwrap().links.get(hash).cloned();
+        if linked.is_some() {
+            return linked;
+        }
+
+        self.flush_data_for_hash(hash)
+            .inspect_err(|e| tracing::error!("Cannot flush chunk data for {hash}: {e}"))
+            .ok()?;
+
+        self.inner.read().unwrap().get_data(hash)
     }
 
     fn size(&self) -> u64 {
@@ -585,7 +619,6 @@ impl ChunkStorage for FsStorage {
                 .ok_or(StorageError::ChunkInsertError)?
         };
 
-        let mut touched_paths = HashSet::default();
         for infile_chunk in &infile_chunks {
             tracing::trace!("infile chunk {infile_chunk:?}");
             let handle = self
@@ -596,18 +629,6 @@ impl ChunkStorage for FsStorage {
                 .inspect(|()| tracing::trace!("Written infile chunk {hash} to {}", infile_chunk.path.to_string_lossy()))
                 .inspect_err(|e| tracing::error!("Cannot write infile chunk to {}: {e}", infile_chunk.path.to_string_lossy()))
                 .map_err(|_| StorageError::ChunkInsertError)?;
-            touched_paths.insert(infile_chunk.path.clone());
-        }
-
-        for path in touched_paths {
-            if let Some(handle) = self.handle_for_path(&path) {
-                handle
-                    .lock()
-                    .unwrap()
-                    .flush()
-                    .inspect_err(|e| tracing::error!("Cannot flush infile chunk handle {}: {e}", path.to_string_lossy()))
-                    .map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
-            }
         }
 
         self.inner.write().unwrap().mark_dirty();
