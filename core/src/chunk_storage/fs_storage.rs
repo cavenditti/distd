@@ -312,31 +312,47 @@ impl FsStorageState {
 /// providing interior mutability so that `ChunkStorage` methods can take `&self`.
 pub struct FsStorage {
     inner: RwLock<FsStorageState>,
-    handles: Mutex<HashMap<PathBuf, Handle>>,
+    handles: RwLock<HashMap<PathBuf, Arc<Mutex<Handle>>>>,
 }
 
 impl Default for FsStorage {
     fn default() -> Self {
         Self {
             inner: RwLock::new(FsStorageState::default()),
-            handles: Mutex::new(HashMap::default()),
+            handles: RwLock::new(HashMap::default()),
         }
     }
 }
 
 impl FsStorage {
+    fn handle_for_path(&self, path: &Path) -> Option<Arc<Mutex<Handle>>> {
+        self.handles.read().unwrap().get(path).cloned()
+    }
+
     fn ensure_handle(&self, path: &Path) -> Result<(), Error> {
-        let mut handles = self.handles.lock().unwrap();
+        if self.handle_for_path(path).is_some() {
+            return Ok(());
+        }
+
+        let mut handles = self.handles.write().unwrap();
         if !handles.contains_key(path) {
-            handles.insert(path.to_owned(), Handle::new(path)?);
+            handles.insert(path.to_owned(), Arc::new(Mutex::new(Handle::new(path)?)));
         }
         Ok(())
     }
 
     fn flush_handles(&self) -> Result<(), Error> {
-        let mut handles = self.handles.lock().unwrap();
-        for (path, handle) in &mut *handles {
+        let handles = self
+            .handles
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(path, handle)| (path.clone(), handle.clone()))
+            .collect::<Vec<_>>();
+        for (path, handle) in handles {
             handle
+                .lock()
+                .unwrap()
                 .flush()
                 .inspect_err(|e| tracing::error!("Cannot flush handle {}: {e}", path.to_string_lossy()))?;
         }
@@ -432,7 +448,12 @@ impl FsStorage {
                         tracing::debug!("Loaded FsStorage.");
                         return Self {
                             inner: RwLock::new(s),
-                            handles: Mutex::new(handles_map),
+                            handles: RwLock::new(
+                                handles_map
+                                    .into_iter()
+                                    .map(|(path, handle)| (path, Arc::new(Mutex::new(handle))))
+                                    .collect(),
+                            ),
                         };
                     }
                     tracing::debug!("Cannot reload FsStorage; starting fresh");
@@ -448,7 +469,7 @@ impl FsStorage {
                 persistance_path,
                 ..Default::default()
             }),
-            handles: Mutex::new(HashMap::default()),
+            handles: RwLock::new(HashMap::default()),
         }
     }
 
@@ -523,7 +544,7 @@ impl FsStorage {
             }
         }
         drop(inner);
-        self.handles.lock().unwrap().remove(&path);
+        self.handles.write().unwrap().remove(&path);
         self.persist()
     }
 
@@ -565,28 +586,27 @@ impl ChunkStorage for FsStorage {
         };
 
         let mut touched_paths = HashSet::default();
-        {
-            let mut handles = self.handles.lock().unwrap();
-            for infile_chunk in &infile_chunks {
-                tracing::trace!("infile chunk {infile_chunk:?}");
-                let handle = handles
-                    .get_mut(&infile_chunk.path)
-                    .ok_or(StorageError::ChunkInsertError)?;
-                infile_chunk
-                    .write(&hash, chunk, handle)
-                    .inspect(|()| tracing::trace!("Written infile chunk {hash} to {}", infile_chunk.path.to_string_lossy()))
-                    .inspect_err(|e| tracing::error!("Cannot write infile chunk to {}: {e}", infile_chunk.path.to_string_lossy()))
-                    .map_err(|_| StorageError::ChunkInsertError)?;
-                touched_paths.insert(infile_chunk.path.clone());
-            }
+        for infile_chunk in &infile_chunks {
+            tracing::trace!("infile chunk {infile_chunk:?}");
+            let handle = self
+                .handle_for_path(&infile_chunk.path)
+                .ok_or(StorageError::ChunkInsertError)?;
+            infile_chunk
+                .write(&hash, chunk, &mut handle.lock().unwrap())
+                .inspect(|()| tracing::trace!("Written infile chunk {hash} to {}", infile_chunk.path.to_string_lossy()))
+                .inspect_err(|e| tracing::error!("Cannot write infile chunk to {}: {e}", infile_chunk.path.to_string_lossy()))
+                .map_err(|_| StorageError::ChunkInsertError)?;
+            touched_paths.insert(infile_chunk.path.clone());
+        }
 
-            for path in touched_paths {
-                if let Some(handle) = handles.get_mut(&path) {
-                    handle
-                        .flush()
-                        .inspect_err(|e| tracing::error!("Cannot flush infile chunk handle {}: {e}", path.to_string_lossy()))
-                        .map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
-                }
+        for path in touched_paths {
+            if let Some(handle) = self.handle_for_path(&path) {
+                handle
+                    .lock()
+                    .unwrap()
+                    .flush()
+                    .inspect_err(|e| tracing::error!("Cannot flush infile chunk handle {}: {e}", path.to_string_lossy()))
+                    .map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
             }
         }
 
