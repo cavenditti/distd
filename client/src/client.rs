@@ -178,7 +178,13 @@ where
             )
             .await?;
 
-        let stream = stream.map(|x| x.unwrap().payload); // FIXME unwraps
+        let stream = stream.filter_map(|x| match x {
+            Ok(tree) => Some(tree.payload),
+            Err(e) => {
+                tracing::error!("gRPC stream error during transfer: {e}");
+                None
+            }
+        });
         let stream = receiver(stream, 32, Duration::from_nanos(4800));
 
         self.storage

@@ -7,16 +7,15 @@ use crate::utils::stream::{BatchingStream, DeBatchingStream};
 use super::Node;
 
 type NodeBatchingStream<S, Fn> = tokio_stream::adapters::Map<BatchingStream<S>, Fn>;
-type NodeDeBatchingStream<S, Fn> = DeBatchingStream<Node, tokio_stream::adapters::Map<S, Fn>>;
 
 /// Create a sender stream that serializes nodes into bitcode
 ///
 /// The sender stream will batch nodes into `batch_size`, at most every `duration`.
 /// The serialization is done using the bitcode format.
 ///
-/// # Panics
+/// # Errors
 ///
-/// This function will panic if serialization fails. This should not happen unless there is a bug in the bitcode
+/// Serialization errors are logged and the batch is skipped (yielding no output for that batch).
 pub fn sender<S>(
     stream: S,
     batch_size: usize,
@@ -28,28 +27,35 @@ where
     <BatchingStream<S> as Stream>::Item: serde::Serialize,
 {
     let s = BatchingStream::new(stream, batch_size, duration);
-    // TODO find whether this may fail if not for a programming error in the bitcode library (assuming the rest of
-    // the code here is sound)
-    s.map(|x| bitcode::serialize(&x).unwrap())
+    s.map(|x| {
+        bitcode::serialize(&x)
+            .inspect_err(|e| tracing::error!("Cannot serialize node batch: {e}"))
+            .unwrap_or_default()
+    })
 }
 
 /// Create a receiver stream that deserializes nodes from bitcode
 ///
 /// The receiver stream will de-batch nodes into `batch_size`, at most every `duration`.
 ///
-/// # Panics
+/// # Errors
 ///
-/// This function will panic if serialization fails. This should not happen unless there is a bug in the bitcode
+/// Deserialization errors are logged and the malformed batch is dropped (skipped).
 pub fn receiver<S>(
     stream: S,
     batch_size: usize,
     duration: Duration,
-) -> NodeDeBatchingStream<S, impl FnMut(Vec<u8>) -> Vec<Node>>
+) -> DeBatchingStream<Node, impl Stream<Item = Vec<Node>>>
 where
     S: Stream<Item = Vec<u8>>,
 {
-    // FIXME this may actually fail (partial transmission or whatever) and should be properly handled
-    let stream = stream.map(|x| -> Vec<Node> { bitcode::deserialize(&x).unwrap() });
+    let stream = stream
+        .map(|x| -> Option<Vec<Node>> {
+            bitcode::deserialize(&x)
+                .inspect_err(|e| tracing::error!("Cannot deserialize node batch: {e}"))
+                .ok()
+        })
+        .filter_map(|x| x);
     DeBatchingStream::new(stream, batch_size, duration)
 }
 
