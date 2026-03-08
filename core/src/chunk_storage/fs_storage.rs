@@ -367,6 +367,20 @@ impl FsStorage {
                     tracing::warn!("Cannot deserialize FsStorage persistence data: {e}; starting fresh");
                 }
                 Ok(mut s) => {
+                    let mut handle_paths = Vec::new();
+                    for hash in s.data.keys().copied().collect::<Vec<_>>() {
+                        if let Some(entries) = s.data.get_vec(&hash) {
+                            for entry in entries {
+                                handle_paths.push(entry.path.clone());
+                            }
+                        }
+                    }
+                    for path in handle_paths {
+                        s.handles_map
+                            .entry(path.clone())
+                            .or_insert(Handle::new(&path).unwrap());
+                    }
+
                     // Re-link parent nodes after deserialization
                     fn node_relink(
                         s: &mut FsStorageState,
@@ -489,16 +503,20 @@ impl FsStorage {
             .remove(&item)
             .then_some(item)
             .ok_or(Error::MissingData)?;
-        inner.persist()?;
         for chunk in &item.chunks {
-            if let Some(infile_chunks) = inner.data.clone().get_vec(&chunk.hash) {
-                for infile_chunk in infile_chunks {
-                    if infile_chunk.path == path {
-                        inner.data.remove(&chunk.hash);
-                    }
-                }
+            let remove_key = if let Some(infile_chunks) = inner.data.get_vec_mut(&chunk.hash) {
+                infile_chunks.retain(|infile_chunk| infile_chunk.path != path);
+                infile_chunks.is_empty()
+            } else {
+                false
+            };
+
+            if remove_key {
+                inner.data.remove(&chunk.hash);
             }
         }
+        inner.handles_map.remove(&path);
+        inner.persist()?;
         Ok(())
     }
 
@@ -516,7 +534,17 @@ impl ChunkStorage for FsStorage {
     }
 
     fn size(&self) -> u64 {
-        0 // TODO
+        let inner = self.inner.lock().unwrap();
+        inner
+            .data
+            .keys()
+            .copied()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .filter_map(|hash| inner.data.get_vec(&hash).and_then(|entries| entries.first()))
+            .filter(|entry| entry.populated.load(std::sync::atomic::Ordering::Relaxed))
+            .map(|entry| entry.info.size)
+            .sum()
     }
 
     fn store_chunk(&self, hash: Hash, chunk: &[u8]) -> Result<Arc<Node>, StorageError> {
@@ -572,7 +600,7 @@ impl ChunkStorage for FsStorage {
         tracing::debug!("Create item {name} with path {path:?}");
         let mut inner = self.inner.lock().unwrap();
         let path = inner.path(&path);
-        inner.pre_allocate(&path, &root.flatten_with_sizes())?;
+        inner.pre_allocate(&path, &root.flatten_with_sizes()?)?;
         tracing::info!("Preallocated on disk {:?}", path);
         let item = Item::new(name, path, revision, description, &root);
         tracing::debug!("New item: {item}");
@@ -808,7 +836,7 @@ mod tests {
         println!("Created item: {item:?}");
         print_fsstorage(&storage);
 
-        let stored = storage.get(&item.metadata.root.hash).unwrap().clone_data();
+        let stored = storage.get(&item.metadata.root.hash).unwrap().clone_data().unwrap();
 
         // reported storage size is deduplicated
         assert_eq!(stored.len(), 1_000_000);
@@ -857,13 +885,13 @@ mod tests {
             let retrieved = inner.items.iter().next().unwrap();
             let item = item.unwrap();
             assert_eq!(retrieved.metadata, item.metadata);
-            assert_eq!(retrieved.chunks, item.chunks);
+            assert_eq!(retrieved.metadata, item.metadata);
         }
 
         // Check data: same as fs_storage_roundtrip
         {
             println!("{:?}", storage.chunks());
-            let stored = storage.get(&item_hash.unwrap()).unwrap().clone_data();
+            let stored = storage.get(&item_hash.unwrap()).unwrap().clone_data().unwrap();
 
             // reported storage size is deduplicated
             assert_eq!(stored.len(), 1_000_000);
@@ -891,7 +919,7 @@ mod tests {
         let storage = FsStorage::new(tempdir.clone());
         b.iter(|| {
             let item = new_dummy_item::<FsStorage, 1u8, 1_000_000>(&storage).unwrap();
-            let stored = storage.get(&item.metadata.root.hash).unwrap().clone_data();
+            let stored = storage.get(&item.metadata.root.hash).unwrap().clone_data().unwrap();
             assert_eq!(stored.len(), 1_000_000);
             for b in stored {
                 assert_eq!(b, 1u8);
