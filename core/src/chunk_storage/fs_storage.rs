@@ -22,6 +22,8 @@ use crate::{
 
 use super::{ChunkStorage, Node};
 
+const PERSIST_BATCH_SIZE: usize = 256;
+
 pub fn open_file(path: &Path) -> Result<File, Error> {
     File::options()
         .create(true)
@@ -36,21 +38,31 @@ pub fn open_file(path: &Path) -> Result<File, Error> {
 #[derive(Debug)]
 struct Handle {
     pub buf_writer: BufWriter<File>,
+    pub position: u64,
 }
 
 impl Handle {
     pub fn new(path: &Path) -> Result<Self, Error> {
         Ok(Self {
             buf_writer: BufWriter::with_capacity(CHUNK_SIZE * 8, open_file(path)?),
+            position: 0,
         })
     }
 
     pub fn write(&mut self, chunk: &[u8], offset: u64) -> Result<(), Error> {
-        self.buf_writer.seek(std::io::SeekFrom::Start(offset))?;
+        if self.position != offset {
+            self.buf_writer.seek(std::io::SeekFrom::Start(offset))?;
+            self.position = offset;
+        }
         self.buf_writer
             .write_all(chunk)
-            .map_err(Error::IoError)
-            .and(self.buf_writer.flush().map_err(Error::IoError))
+            .map_err(Error::IoError)?;
+        self.position += u64::try_from(chunk.len()).map_err(InvalidParameter::from)?;
+        Ok(())
+    }
+
+    pub fn flush(&mut self) -> Result<(), Error> {
+        self.buf_writer.flush().map_err(Error::IoError)
     }
 }
 
@@ -162,9 +174,38 @@ struct FsStorageState {
     #[serde(skip_serializing)]
     #[serde(skip_deserializing)]
     handles_map: HashMap<PathBuf, Handle>,
+    #[serde(default)]
+    #[serde(skip_serializing)]
+    #[serde(skip_deserializing)]
+    dirty: bool,
+    #[serde(default)]
+    #[serde(skip_serializing)]
+    #[serde(skip_deserializing)]
+    pending_persist_ops: usize,
 }
 
 impl FsStorageState {
+    fn mark_dirty(&mut self) {
+        self.dirty = true;
+        self.pending_persist_ops += 1;
+    }
+
+    fn flush_handle(&mut self, path: &Path) -> Result<(), Error> {
+        if let Some(handle) = self.handles_map.get_mut(path) {
+            handle.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush_handles(&mut self) -> Result<(), Error> {
+        for (path, handle) in &mut self.handles_map {
+            handle
+                .flush()
+                .inspect_err(|e| tracing::error!("Cannot flush handle {}: {e}", path.to_string_lossy()))?;
+        }
+        Ok(())
+    }
+
     /// Returns the stored path of any path relative to root
     fn path(&self, path: &Path) -> PathBuf {
         if path.starts_with(&self.root) {
@@ -201,7 +242,8 @@ impl FsStorageState {
     }
 
     /// Atomically persist state to disk (write to *.tmp then rename)
-    fn persist(&self) -> Result<(), Error> {
+    fn persist(&mut self) -> Result<(), Error> {
+        self.flush_handles()?;
         let buf = bitcode::serialize(self)
             .inspect_err(|e| tracing::error!("Serialization error: {}", e))
             .map_err(InvalidParameter::from)?;
@@ -210,6 +252,15 @@ impl FsStorageState {
             .inspect_err(|e| tracing::error!("Cannot write persistence tmp file: {}", e))?;
         fs::rename(&tmp, &self.persistance_path)
             .inspect_err(|e| tracing::error!("Cannot rename persistence file: {}", e))?;
+        self.dirty = false;
+        self.pending_persist_ops = 0;
+        Ok(())
+    }
+
+    fn persist_if_needed(&mut self) -> Result<(), Error> {
+        if self.dirty && self.pending_persist_ops >= PERSIST_BATCH_SIZE {
+            self.persist()?;
+        }
         Ok(())
     }
 
@@ -240,6 +291,7 @@ impl FsStorageState {
         if !self.handles_map.contains_key(path) {
             self.handles_map.insert(path.to_owned(), Handle::new(path)?);
         }
+        self.mark_dirty();
         Ok(())
     }
 
@@ -279,19 +331,30 @@ impl FsStorageState {
 
     /// Store a raw chunk, writing it to all pre-allocated positions
     fn store_chunk(&mut self, hash: Hash, chunk: &[u8]) -> Result<Arc<Node>, StorageError> {
-        let infile_chunks = self.data.get_vec_mut(&hash)
-            .ok_or(StorageError::ChunkInsertError)?;
-        for infile_chunk in infile_chunks {
-            tracing::trace!("infile chunk {infile_chunk:?}");
-            let handle = self.handles_map.get_mut(&infile_chunk.path)
+        let mut touched_paths = HashSet::default();
+        {
+            let infile_chunks = self.data.get_vec_mut(&hash)
                 .ok_or(StorageError::ChunkInsertError)?;
-            infile_chunk
-                .write(&hash, chunk, handle)
-                .inspect(|()| tracing::trace!("Written infile chunk {hash} to {}", infile_chunk.path.to_string_lossy()))
-                .inspect_err(|e| tracing::error!("Cannot write infile chunk to {}: {e}", infile_chunk.path.to_string_lossy()))
-                .map_err(|_| StorageError::ChunkInsertError)?;
+            for infile_chunk in infile_chunks {
+                tracing::trace!("infile chunk {infile_chunk:?}");
+                let handle = self.handles_map.get_mut(&infile_chunk.path)
+                    .ok_or(StorageError::ChunkInsertError)?;
+                infile_chunk
+                    .write(&hash, chunk, handle)
+                    .inspect(|()| tracing::trace!("Written infile chunk {hash} to {}", infile_chunk.path.to_string_lossy()))
+                    .inspect_err(|e| tracing::error!("Cannot write infile chunk to {}: {e}", infile_chunk.path.to_string_lossy()))
+                    .map_err(|_| StorageError::ChunkInsertError)?;
+                touched_paths.insert(infile_chunk.path.clone());
+            }
         }
-        self.persist().map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
+        for path in touched_paths {
+            self.flush_handle(&path)
+                .inspect_err(|e| tracing::error!("Cannot flush infile chunk handle {}: {e}", path.to_string_lossy()))
+                .map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
+        }
+        self.mark_dirty();
+        self.persist_if_needed()
+            .map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
         Ok(Arc::new(Node::Stored {
             hash,
             data: Arc::new(chunk.to_vec()),
@@ -306,7 +369,9 @@ impl FsStorageState {
             .entry(hash)
             .or_insert_with(|| Arc::new(Node::Parent { hash, left, right, size }))
             .clone();
-        self.persist().map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
+        self.mark_dirty();
+        self.persist_if_needed()
+            .map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
         Ok(res)
     }
 
@@ -604,6 +669,7 @@ impl ChunkStorage for FsStorage {
         tracing::info!("Preallocated on disk {:?}", path);
         let item = Item::new(name, path, revision, description, &root);
         tracing::debug!("New item: {item}");
+        inner.items.insert(item.clone());
         inner.persist()?;
         Ok(item)
     }
@@ -646,8 +712,11 @@ impl ChunkStorage for FsStorage {
 
         let last = last.ok_or(StorageError::TreeReconstruct)?;
         tracing::info!("Reconstructed {i} nodes with {} bytes total", last.size());
-        self.inner.lock().unwrap().persist()?;
-        Ok(Item::new(name, path, revision, description, &last))
+        let item = Item::new(name, path, revision, description, &last);
+        let mut inner = self.inner.lock().unwrap();
+        inner.items.insert(item.clone());
+        inner.persist()?;
+        Ok(item)
     }
 
     fn chunks(&self) -> Vec<Hash> {
@@ -665,6 +734,19 @@ impl HashTreeCapable<Arc<Node>, crate::error::Error> for FsStorage {
     }
 }
 
+impl Drop for FsStorage {
+    fn drop(&mut self) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.dirty {
+            if let Err(e) = inner.persist() {
+                tracing::error!("Cannot persist FsStorage on drop: {e}");
+            }
+        } else if let Err(e) = inner.flush_handles() {
+            tracing::error!("Cannot flush FsStorage handles on drop: {e}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{
@@ -673,7 +755,7 @@ mod tests {
         item::tests::{make_ones_item, new_dummy_item},
         utils::testing::temp_path,
     };
-    use std::{str::FromStr, thread::sleep, time::Duration};
+    use std::str::FromStr;
 
     use test_log::test;
 
@@ -723,10 +805,7 @@ mod tests {
 
         // write to temp path
         infile_chunk.write(&hash, data, &mut write_buf).unwrap();
-
-        // wait for the file to do actually written. We're calling `sync_all` inside InFileChunk::write,
-        // maybe I'm missing something.
-        sleep(Duration::from_secs(2));
+        write_buf.flush().unwrap();
 
         path
     }
