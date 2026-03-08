@@ -230,7 +230,7 @@ mod tests {
         assert_eq!(root.children().unwrap().0.hash(), &root_children.0);
         assert_eq!(root.children().unwrap().1.hash(), &root_children.1);
 
-        let hash_vec = root.flatten();
+        let hash_vec = root.flatten().unwrap();
         assert_eq!(hash_vec.len(), 3);
         assert_eq!(hash_vec[0], zeros_chunk_hash);
         assert_eq!(hash_vec[1], zeros_chunk_hash);
@@ -242,7 +242,7 @@ mod tests {
             assert_eq!(i, zeros_chunk_hash);
         }
 
-        let cloned = root.clone_data();
+        let cloned = root.clone_data().unwrap();
         assert_eq!(cloned.len(), SIZE);
         for b in cloned {
             assert_eq!(b, 0u8);
@@ -261,7 +261,7 @@ mod tests {
         //print_tree(&*root.to_owned()).unwrap();
         assert!(len >= s.size());
 
-        let cloned = root.clone_data();
+        let cloned = root.clone_data().unwrap();
         for (i, b) in cloned.iter().enumerate() {
             //println!("{} {} {}", i, data[i], *b);
             assert_eq!(data[i], *b);

@@ -207,32 +207,28 @@ impl Node {
 
     /// Get contained data, recursing across all children
     /// This method may be slow and produce (copying) a large result, pay attention when using it
-    #[must_use]
-    pub fn clone_data(&self) -> Vec<u8> {
+    pub fn clone_data(&self) -> Result<Vec<u8>, crate::error::Error> {
         match self {
-            Self::Stored { data, .. } => (*data.clone()).clone(),
+            Self::Stored { data, .. } => Ok((*data.clone()).clone()),
             Self::Parent { left, right, .. } => {
-                let mut left_vec = left.clone_data();
-                left_vec.extend(right.clone_data());
-                left_vec
+                let mut left_vec = left.clone_data()?;
+                left_vec.extend(right.clone_data()?);
+                Ok(left_vec)
             }
-            Self::Skipped { .. } => vec![], // FIXME should fail
+            Self::Skipped { hash, .. } => Err(crate::error::Error::IncompleteTree(*hash)),
         }
     }
 
     /// Get flatten representation of `Stored` hashes, eventually repeating hashes
-    #[must_use]
-    pub fn flatten(&self) -> Vec<Hash> {
+    pub fn flatten(&self) -> Result<Vec<Hash>, crate::error::Error> {
         match self {
-            Self::Stored { hash, .. } => {
-                vec![*hash]
-            }
+            Self::Stored { hash, .. } => Ok(vec![*hash]),
             Self::Parent { left, right, .. } => {
-                let mut left_vec = left.flatten();
-                left_vec.extend(right.flatten());
-                left_vec
+                let mut left_vec = left.flatten()?;
+                left_vec.extend(right.flatten()?);
+                Ok(left_vec)
             }
-            Self::Skipped { .. } => vec![], // FIXME should fail
+            Self::Skipped { hash, .. } => Err(crate::error::Error::IncompleteTree(*hash)),
         }
     }
 
@@ -312,49 +308,36 @@ impl Node {
     }
 
     /// Get flatten representation of `Stored` hashes with sizes, eventually repeating hashes
-    #[must_use]
-    pub fn flatten_with_sizes(&self) -> Vec<ChunkInfo> {
+    pub fn flatten_with_sizes(&self) -> Result<Vec<ChunkInfo>, crate::error::Error> {
         match self {
-            Self::Stored { hash, .. } => {
-                vec![ChunkInfo {
-                    size: self.size(),
-                    hash: *hash,
-                }]
-            }
+            Self::Stored { hash, .. } => Ok(vec![ChunkInfo {
+                size: self.size(),
+                hash: *hash,
+            }]),
             Self::Parent { left, right, .. } => {
-                let mut left_vec = left.flatten_with_sizes();
-                left_vec.extend(right.flatten_with_sizes());
-                left_vec
+                let mut left_vec = left.flatten_with_sizes()?;
+                left_vec.extend(right.flatten_with_sizes()?);
+                Ok(left_vec)
             }
-            Self::Skipped { .. } => vec![],
+            Self::Skipped { hash, .. } => Err(crate::error::Error::IncompleteTree(*hash)),
         }
     }
 
-    /// Flatten the tree into an iterator on chunks
+    /// Flatten the tree into a collected vector of chunks
     ///
-    /// This is a recursive function that returns an iterator on the chunks of the tree
+    /// This is a recursive function that collects all chunks of the tree.
     ///
-    /// # Returns
-    /// An iterator on the chunks of the tree
-    ///
-    /// # Panics
-    /// If the tree contains a `Skipped` node
-    #[must_use]
-    pub fn flatten_iter(&self) -> Box<dyn Iterator<Item = Arc<Vec<u8>>>> {
+    /// # Errors
+    /// Returns `Error::IncompleteTree` if the tree contains a `Skipped` node
+    pub fn flatten_iter(&self) -> Result<Vec<Arc<Vec<u8>>>, crate::error::Error> {
         match self {
-            Self::Stored { data, .. } => Box::new([data.clone()].into_iter()),
+            Self::Stored { data, .. } => Ok(vec![data.clone()]),
             Self::Parent { left, right, .. } => {
-                Box::new(left.flatten_iter().chain(right.flatten_iter()))
+                let mut left_vec = left.flatten_iter()?;
+                left_vec.extend(right.flatten_iter()?);
+                Ok(left_vec)
             }
-            Self::Skipped { .. } => Box::new([].into_iter()), //FIXME should fail
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        match self {
-            Self::Stored { .. } => true,
-            Self::Skipped { .. } => false,
-            Self::Parent { left, right, .. } => left.is_complete() && right.is_complete(),
+            Self::Skipped { hash, .. } => Err(crate::error::Error::IncompleteTree(*hash)),
         }
     }
 
@@ -434,7 +417,7 @@ mod tests {
             right: Arc::new(r),
         };
 
-        let flat: Vec<u8> = n.flatten_iter().flat_map(|x| (*x).clone()).collect();
+        let flat: Vec<u8> = n.flatten_iter().unwrap().into_iter().flat_map(|x| (*x).clone()).collect();
 
         assert_eq!(flat.len(), l1 + l2);
 

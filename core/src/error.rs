@@ -3,7 +3,7 @@ use std::str::Utf8Error;
 use thiserror::Error;
 use tonic::metadata::errors::{InvalidMetadataValue, InvalidMetadataValueBytes};
 
-use crate::{chunk_storage::StorageError, GrpcError, TransportError};
+use crate::{chunk_storage::StorageError, hash::Hash, GrpcError, TransportError};
 
 /// Generic `distd_core` error
 #[derive(Error, Debug)]
@@ -13,6 +13,9 @@ pub enum Error {
 
     #[error("Missing data")]
     MissingData,
+
+    #[error("Incomplete tree: missing subtree for hash {0}")]
+    IncompleteTree(Hash),
 
     #[error("{0}")]
     Other(String),

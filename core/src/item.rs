@@ -92,7 +92,7 @@ impl Item {
                 created_by: env!("CARGO_PKG_VERSION").to_owned(),
                 format: Format::V1,
             },
-            chunks: hash_tree.flatten_with_sizes(),
+            chunks: hash_tree.flatten_with_sizes().unwrap_or_default(),
             hashes: hash_tree.all_hashes_with_sizes(),
         }
     }
