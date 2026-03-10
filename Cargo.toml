@@ -1,5 +1,5 @@
 [workspace]
-members = ["core", "server", "client"]
+members = ["core", "server", "client", "bench"]
 #members = ["core", "server", "client", "ppspp-rs"]
 resolver = "2"
 
