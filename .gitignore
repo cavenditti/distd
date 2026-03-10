@@ -6,6 +6,7 @@
 *.repeated
 *.zeros
 here/
+bench_results/
 
 **/*.test
 ISSUES*.md
