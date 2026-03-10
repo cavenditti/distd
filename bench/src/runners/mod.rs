@@ -5,6 +5,7 @@ pub mod zsync;
 pub mod casync;
 pub mod ostree;
 pub mod distd;
+pub mod http;
 
 use std::path::Path;
 use std::process::Child;
@@ -88,7 +89,7 @@ pub trait ToolRunner: Send + Sync {
 
 /// All known tool names, in comparison order.
 pub fn all_tool_names() -> &'static [&'static str] {
-    &["distd", "rsync", "zsync", "casync", "ostree"]
+    &["distd", "rsync", "zsync", "http", "casync", "ostree"]
 }
 
 /// Check if a tool binary is available on PATH.
@@ -100,6 +101,7 @@ pub fn is_tool_available(name: &str) -> bool {
         }
         "rsync" => which("rsync"),
         "zsync" => which("zsync") || which("zsyncmake"),
+        "http" => which("python3") && which("curl"),
         "casync" => which("casync"),
         "ostree" => which("ostree"),
         _ => false,
@@ -112,6 +114,7 @@ pub fn make_runner(name: &str, work_dir: &Path) -> Option<Box<dyn ToolRunner>> {
         "distd" => Some(Box::new(distd::DistdRunner::new(work_dir))),
         "rsync" => Some(Box::new(rsync::RsyncRunner::new(work_dir))),
         "zsync" => Some(Box::new(zsync::ZsyncRunner::new(work_dir))),
+        "http" => Some(Box::new(http::HttpRunner::new(work_dir))),
         "casync" => Some(Box::new(casync::CasyncRunner::new(work_dir))),
         "ostree" => Some(Box::new(ostree::OstreeRunner::new(work_dir))),
         _ => None,

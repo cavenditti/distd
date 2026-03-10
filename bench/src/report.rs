@@ -1,8 +1,15 @@
 //! Result reporting — CSV, JSON, and terminal summary output.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
+use comfy_table::modifiers::UTF8_ROUND_CORNERS;
+use comfy_table::presets::UTF8_FULL;
+use comfy_table::{Attribute, Cell, CellAlignment, Color, ContentArrangement, Table};
+
 use crate::metrics::RunMetrics;
+
+// ── Serialisation ───────────────────────────────────────────────────────────
 
 /// Write results as CSV.
 pub fn write_csv(results: &[RunMetrics], path: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -23,38 +30,82 @@ pub fn write_json(results: &[RunMetrics], path: &Path) -> Result<(), Box<dyn std
     Ok(())
 }
 
-/// Print a human-readable summary table to stdout.
+// ── Terminal output ─────────────────────────────────────────────────────────
+
+/// Print the full terminal report: detail table, averages with speed-up, caveats.
 pub fn print_summary(results: &[RunMetrics]) {
     println!();
-    println!("╔══════════════════════════════════════════════════════════════════════════════════════════════════════════════╗");
-    println!("║                                    BENCHMARK RESULTS SUMMARY                                              ║");
-    println!("╠════════════╦══════════════════════╦════════╦══════════╦═══════════╦══════════╦════════════╦════════╦════════╣");
-    println!("║ Tool       ║ Workload             ║ Cache  ║ Time (s) ║ MiB/s     ║ Xferred  ║ Dest Size  ║ RSS MB ║ Valid  ║");
-    println!("╠════════════╬══════════════════════╬════════╬══════════╬═══════════╬══════════╬════════════╬════════╬════════╣");
-
-    for r in results {
-        let xferred = format_bytes(r.bytes_transferred);
-        let dest = format_bytes(r.dest_size_bytes);
-        let rss = format!("{:.1}", r.peak_rss_bytes as f64 / (1024.0 * 1024.0));
-        let valid = if r.correct { "✓" } else { "✗" };
-
-        println!(
-            "║ {:<10} ║ {:<20} ║ {:<6} ║ {:>8.3} ║ {:>9.2} ║ {:>8} ║ {:>10} ║ {:>6} ║ {:<6} ║",
-            r.tool, r.workload, r.cache_state, r.wall_clock_secs, r.throughput_mibs,
-            xferred, dest, rss, valid,
-        );
-    }
-
-    println!("╚════════════╩══════════════════════╩════════╩══════════╩═══════════╩══════════╩════════════╩════════╩════════╝");
+    print_detail_table(results);
     println!();
-
-    // Grouped summary: average per tool+workload
-    print_grouped_averages(results);
+    print_averages_table(results);
 }
 
-fn print_grouped_averages(results: &[RunMetrics]) {
-    use std::collections::BTreeMap;
+// ── Detail table ────────────────────────────────────────────────────────────
 
+fn print_detail_table(results: &[RunMetrics]) {
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL)
+        .apply_modifier(UTF8_ROUND_CORNERS)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec![
+            Cell::new("Tool").add_attribute(Attribute::Bold),
+            Cell::new("Workload").add_attribute(Attribute::Bold),
+            Cell::new("Cache").add_attribute(Attribute::Bold),
+            Cell::new("Time (s)").add_attribute(Attribute::Bold),
+            Cell::new("MiB/s").add_attribute(Attribute::Bold),
+            Cell::new("Transferred").add_attribute(Attribute::Bold),
+            Cell::new("Dest Size").add_attribute(Attribute::Bold),
+            Cell::new("RSS MB").add_attribute(Attribute::Bold),
+            Cell::new("OK").add_attribute(Attribute::Bold),
+        ]);
+
+    // right-align numeric columns
+    for col_idx in [3usize, 4, 5, 6, 7] {
+        if let Some(col) = table.column_mut(col_idx) {
+            col.set_cell_alignment(CellAlignment::Right);
+        }
+    }
+
+    for r in results {
+        let valid = if r.correct {
+            Cell::new("✓").fg(Color::Green)
+        } else {
+            Cell::new("✗").fg(Color::Red).add_attribute(Attribute::Bold)
+        };
+
+        table.add_row(vec![
+            Cell::new(&r.tool),
+            Cell::new(&r.workload),
+            Cell::new(&r.cache_state),
+            Cell::new(format!("{:.3}", r.wall_clock_secs)),
+            Cell::new(format!("{:.2}", r.throughput_mibs)),
+            Cell::new(format_bytes(r.bytes_transferred)),
+            Cell::new(format_bytes(r.dest_size_bytes)),
+            Cell::new(format!("{:.1}", r.peak_rss_bytes as f64 / (1024.0 * 1024.0))),
+            valid,
+        ]);
+    }
+
+    println!("\x1b[1;4mBENCHMARK RESULTS\x1b[0m");
+    println!();
+    println!("{table}");
+}
+
+// ── Averages + speed-up ─────────────────────────────────────────────────────
+
+struct AvgRow {
+    tool: String,
+    workload: String,
+    runs: usize,
+    avg_time: f64,
+    avg_mibs: f64,
+    correct: usize,
+    total: usize,
+}
+
+fn print_averages_table(results: &[RunMetrics]) {
+    // Group by (tool, workload).
     let mut groups: BTreeMap<(String, String), Vec<&RunMetrics>> = BTreeMap::new();
     for r in results {
         groups
@@ -63,32 +114,134 @@ fn print_grouped_averages(results: &[RunMetrics]) {
             .push(r);
     }
 
-    println!("Averages by tool × workload:");
-    println!("┌────────────┬──────────────────────┬───────┬──────────┬───────────┬──────────┐");
-    println!("│ Tool       │ Workload             │ Runs  │ Avg (s)  │ Avg MiB/s │ Correct  │");
-    println!("├────────────┼──────────────────────┼───────┼──────────┼───────────┼──────────┤");
+    let rows: Vec<AvgRow> = groups
+        .iter()
+        .map(|((tool, workload), runs)| {
+            let n = runs.len();
+            AvgRow {
+                tool: tool.clone(),
+                workload: workload.clone(),
+                runs: n,
+                avg_time: runs.iter().map(|r| r.wall_clock_secs).sum::<f64>() / n as f64,
+                avg_mibs: runs.iter().map(|r| r.throughput_mibs).sum::<f64>() / n as f64,
+                correct: runs.iter().filter(|r| r.correct).count(),
+                total: n,
+            }
+        })
+        .collect();
 
-    for ((tool, workload), runs) in &groups {
-        let n = runs.len();
-        let avg_time: f64 = runs.iter().map(|r| r.wall_clock_secs).sum::<f64>() / n as f64;
-        let avg_throughput: f64 = runs.iter().map(|r| r.throughput_mibs).sum::<f64>() / n as f64;
-        let all_correct = runs.iter().all(|r| r.correct);
-        let correct_str = if all_correct {
-            format!("{n}/{n} ✓")
-        } else {
-            let ok = runs.iter().filter(|r| r.correct).count();
-            format!("{ok}/{n}")
-        };
-
-        println!(
-            "│ {:<10} │ {:<20} │ {:>5} │ {:>8.3} │ {:>9.2} │ {:>8} │",
-            tool, workload, n, avg_time, avg_throughput, correct_str,
-        );
+    // Compute per-workload worst (slowest) throughput for the speed-up column.
+    let mut worst_by_workload: BTreeMap<&str, f64> = BTreeMap::new();
+    for r in &rows {
+        let entry = worst_by_workload.entry(&r.workload).or_insert(f64::MAX);
+        if r.avg_mibs > 0.0 && r.avg_mibs < *entry {
+            *entry = r.avg_mibs;
+        }
     }
 
-    println!("└────────────┴──────────────────────┴───────┴──────────┴───────────┴──────────┘");
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL)
+        .apply_modifier(UTF8_ROUND_CORNERS)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec![
+            Cell::new("Tool").add_attribute(Attribute::Bold),
+            Cell::new("Workload").add_attribute(Attribute::Bold),
+            Cell::new("Runs").add_attribute(Attribute::Bold),
+            Cell::new("Avg (s)").add_attribute(Attribute::Bold),
+            Cell::new("Avg MiB/s").add_attribute(Attribute::Bold),
+            Cell::new("vs Slow").add_attribute(Attribute::Bold),
+            Cell::new("Correct").add_attribute(Attribute::Bold),
+        ]);
+
+    // right-align numeric columns
+    for col_idx in [2usize, 3, 4, 5, 6] {
+        if let Some(col) = table.column_mut(col_idx) {
+            col.set_cell_alignment(CellAlignment::Right);
+        }
+    }
+
+    for r in &rows {
+        let speedup = worst_by_workload
+            .get(r.workload.as_str())
+            .filter(|&&w| w > 0.0 && r.avg_mibs > 0.0)
+            .map(|w| r.avg_mibs / w)
+            .unwrap_or(1.0);
+
+        let speedup_cell = if speedup >= 1.5 {
+            Cell::new(format!("{speedup:.1}×"))
+                .fg(Color::Green)
+                .add_attribute(Attribute::Bold)
+        } else if (speedup - 1.0).abs() < 0.05 {
+            Cell::new("base").fg(Color::DarkGrey)
+        } else {
+            Cell::new(format!("{speedup:.1}×"))
+        };
+
+        let correct_str = if r.correct == r.total {
+            format!("{}/{} ✓", r.correct, r.total)
+        } else {
+            format!("{}/{}", r.correct, r.total)
+        };
+
+        let correct_cell = if r.correct == r.total {
+            Cell::new(&correct_str).fg(Color::Green)
+        } else {
+            Cell::new(&correct_str)
+                .fg(Color::Red)
+                .add_attribute(Attribute::Bold)
+        };
+
+        table.add_row(vec![
+            Cell::new(&r.tool),
+            Cell::new(&r.workload),
+            Cell::new(r.runs),
+            Cell::new(format!("{:.3}", r.avg_time)),
+            Cell::new(format!("{:.2}", r.avg_mibs)),
+            speedup_cell,
+            correct_cell,
+        ]);
+    }
+
+    println!("\x1b[1;4mAVERAGES BY TOOL × WORKLOAD\x1b[0m");
     println!();
+    println!("{table}");
 }
+
+// ── Fairness caveats ────────────────────────────────────────────────────────
+
+/// Print fairness caveats about the benchmark setup.
+pub fn print_fairness_caveats() {
+    let caveats = [
+        "distd uses fixed 256 KiB chunking (no content-defined chunking yet)",
+        "distd current server uses ephemeral in-memory storage (HashMapStorage)",
+        "distd item model is single-file; multi-file workloads are partial",
+        "distd client sends ALL known chunk hashes as diff basis (not per-item)",
+        "http is a naïve baseline — full-file download with no delta support",
+        "rsync is measured via local filesystem (no actual network I/O)",
+        "zsync requires single-file input; multi-file workloads use first file",
+        "casync/ostree store overhead includes metadata beyond raw content",
+        "Cold-cache tests require root (purge) on macOS; may silently skip",
+        "All transfers are loopback; real network latency would change results",
+    ];
+
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL)
+        .apply_modifier(UTF8_ROUND_CORNERS)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec![Cell::new("FAIRNESS CAVEATS")
+            .add_attribute(Attribute::Bold)
+            .fg(Color::Yellow)]);
+
+    for c in &caveats {
+        table.add_row(vec![Cell::new(format!("• {c}"))]);
+    }
+
+    println!("{table}");
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn format_bytes(bytes: u64) -> String {
     if bytes >= 1024 * 1024 * 1024 {
@@ -100,22 +253,4 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{bytes} B")
     }
-}
-
-/// Print fairness caveats about the benchmark setup.
-pub fn print_fairness_caveats() {
-    println!("╔══════════════════════════════════════════════════════════════════════════════╗");
-    println!("║                             FAIRNESS CAVEATS                                ║");
-    println!("╠══════════════════════════════════════════════════════════════════════════════╣");
-    println!("║ • distd uses fixed 256 KiB chunking (no content-defined chunking yet)       ║");
-    println!("║ • distd current server uses ephemeral in-memory storage (HashMapStorage)     ║");
-    println!("║ • distd item model is single-file; multi-file workloads are partial          ║");
-    println!("║ • distd client sends ALL known chunk hashes as diff basis (not per-item)     ║");
-    println!("║ • rsync is measured via local filesystem (no actual network I/O)             ║");
-    println!("║ • zsync requires single-file input; multi-file workloads use first file      ║");
-    println!("║ • casync/ostree store overhead includes metadata beyond raw content          ║");
-    println!("║ • Cold-cache tests require root (purge) on macOS; may silently skip          ║");
-    println!("║ • All transfers are loopback; real network latency would change results      ║");
-    println!("╚══════════════════════════════════════════════════════════════════════════════╝");
-    println!();
 }
