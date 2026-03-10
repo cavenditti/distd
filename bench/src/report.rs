@@ -144,6 +144,19 @@ fn print_averages_table(results: &[RunMetrics]) {
         }
     }
 
+    // Compute per-workload fastest (highest throughput) tool for bolding.
+    let mut fastest_by_workload: BTreeMap<&str, &str> = BTreeMap::new();
+    {
+        let mut best_mibs: BTreeMap<&str, f64> = BTreeMap::new();
+        for r in &rows {
+            let entry = best_mibs.entry(&r.workload).or_insert(0.0_f64);
+            if r.avg_mibs > *entry {
+                *entry = r.avg_mibs;
+                fastest_by_workload.insert(&r.workload, &r.tool);
+            }
+        }
+    }
+
     let mut table = Table::new();
     table
         .load_preset(UTF8_FULL)
@@ -167,6 +180,11 @@ fn print_averages_table(results: &[RunMetrics]) {
     }
 
     for r in &rows {
+        let is_fastest = fastest_by_workload
+            .get(r.workload.as_str())
+            .map(|&t| t == r.tool)
+            .unwrap_or(false);
+
         let speedup = baseline_by_workload
             .get(r.workload.as_str())
             .filter(|&&w| w > 0.0 && r.avg_mibs > 0.0)
@@ -202,12 +220,20 @@ fn print_averages_table(results: &[RunMetrics]) {
                 .add_attribute(Attribute::Bold)
         };
 
+        let bold = |c: Cell| -> Cell {
+            if is_fastest {
+                c.add_attribute(Attribute::Bold)
+            } else {
+                c
+            }
+        };
+
         table.add_row(vec![
-            Cell::new(&r.tool),
-            Cell::new(&r.workload),
-            Cell::new(r.runs),
-            Cell::new(format!("{:.3}", r.avg_time)),
-            Cell::new(format!("{:.2}", r.avg_mibs)),
+            bold(Cell::new(&r.tool)),
+            bold(Cell::new(&r.workload)),
+            bold(Cell::new(r.runs)),
+            bold(Cell::new(format!("{:.3}", r.avg_time))),
+            bold(Cell::new(format!("{:.2}", r.avg_mibs))),
             speedup_cell,
             correct_cell,
         ]);
