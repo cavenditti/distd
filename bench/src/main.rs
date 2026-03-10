@@ -68,6 +68,10 @@ struct Cli {
     /// List available workloads and exit
     #[arg(long)]
     list_workloads: bool,
+
+    /// Group result tables by "tool" (default) or "workload"
+    #[arg(long, default_value = "tool")]
+    group_by: String,
 }
 
 #[tokio::main]
@@ -114,6 +118,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .unwrap_or_else(WorkloadKind::all);
 
+    let group_by_workload = cli.group_by == "workload" || cli.group_by == "benchmark";
+
     let orchestrator = BenchmarkOrchestrator::new(
         data_dir,
         cli.output,
@@ -127,6 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli.small_file_count,
         cli.small_file_kib,
         cli.delta_fraction,
+        group_by_workload,
     );
 
     orchestrator.run().await?;

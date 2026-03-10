@@ -18,6 +18,7 @@ pub struct BenchmarkOrchestrator {
     cold_cache: bool,
     resume: bool,
     params: WorkloadParams,
+    group_by_workload: bool,
 }
 
 impl BenchmarkOrchestrator {
@@ -35,6 +36,7 @@ impl BenchmarkOrchestrator {
         small_file_count: u32,
         small_file_kib: u64,
         delta_fraction: f64,
+        group_by_workload: bool,
     ) -> Self {
         Self {
             data_dir,
@@ -52,6 +54,7 @@ impl BenchmarkOrchestrator {
                 delta_fraction,
                 smoke,
             },
+            group_by_workload,
         }
     }
 
@@ -144,7 +147,7 @@ impl BenchmarkOrchestrator {
         tracing::info!("Writing results to {}", self.output_dir.display());
         report::write_csv(&all_results, &self.output_dir.join("results.csv"))?;
         report::write_json(&all_results, &self.output_dir.join("results.json"))?;
-        report::print_summary(&all_results);
+        report::print_summary(&all_results, self.group_by_workload);
 
         // 5. Fairness notes
         report::print_fairness_caveats();

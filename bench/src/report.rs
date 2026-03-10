@@ -33,16 +33,24 @@ pub fn write_json(results: &[RunMetrics], path: &Path) -> Result<(), Box<dyn std
 // ── Terminal output ─────────────────────────────────────────────────────────
 
 /// Print the full terminal report: detail table, averages with speed-up, caveats.
-pub fn print_summary(results: &[RunMetrics]) {
+pub fn print_summary(results: &[RunMetrics], group_by_workload: bool) {
     println!();
-    print_detail_table(results);
+    print_detail_table(results, group_by_workload);
     println!();
-    print_averages_table(results);
+    print_averages_table(results, group_by_workload);
 }
 
 // ── Detail table ────────────────────────────────────────────────────────────
 
-fn print_detail_table(results: &[RunMetrics]) {
+fn print_detail_table(results: &[RunMetrics], group_by_workload: bool) {
+    // Sort results by the chosen grouping.
+    let mut sorted: Vec<&RunMetrics> = results.iter().collect();
+    if group_by_workload {
+        sorted.sort_by(|a, b| (&a.workload, &a.tool).cmp(&(&b.workload, &b.tool)));
+    } else {
+        sorted.sort_by(|a, b| (&a.tool, &a.workload).cmp(&(&b.tool, &b.workload)));
+    }
+
     let mut table = Table::new();
     table
         .load_preset(UTF8_FULL)
@@ -67,7 +75,7 @@ fn print_detail_table(results: &[RunMetrics]) {
         }
     }
 
-    for r in results {
+    for r in &sorted {
         let valid = if r.correct {
             Cell::new("✓").fg(Color::Green)
         } else {
@@ -104,7 +112,7 @@ struct AvgRow {
     total: usize,
 }
 
-fn print_averages_table(results: &[RunMetrics]) {
+fn print_averages_table(results: &[RunMetrics], group_by_workload: bool) {
     // Group by (tool, workload).
     let mut groups: BTreeMap<(String, String), Vec<&RunMetrics>> = BTreeMap::new();
     for r in results {
@@ -114,7 +122,7 @@ fn print_averages_table(results: &[RunMetrics]) {
             .push(r);
     }
 
-    let rows: Vec<AvgRow> = groups
+    let mut rows: Vec<AvgRow> = groups
         .iter()
         .map(|((tool, workload), runs)| {
             let n = runs.len();
@@ -129,6 +137,13 @@ fn print_averages_table(results: &[RunMetrics]) {
             }
         })
         .collect();
+
+    // Sort rows according to the chosen grouping.
+    if group_by_workload {
+        rows.sort_by(|a, b| (&a.workload, &a.tool).cmp(&(&b.workload, &b.tool)));
+    } else {
+        rows.sort_by(|a, b| (&a.tool, &a.workload).cmp(&(&b.tool, &b.workload)));
+    }
 
     // Compute per-workload baseline throughput for the speed-up column.
     // distd is never the baseline — if it is the slowest, use the second-slowest
