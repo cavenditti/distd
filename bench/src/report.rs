@@ -130,11 +130,16 @@ fn print_averages_table(results: &[RunMetrics]) {
         })
         .collect();
 
-    // Compute per-workload worst (slowest) throughput for the speed-up column.
-    let mut worst_by_workload: BTreeMap<&str, f64> = BTreeMap::new();
+    // Compute per-workload baseline throughput for the speed-up column.
+    // distd is never the baseline — if it is the slowest, use the second-slowest
+    // non-distd tool instead and show distd with a red multiplier (< 1.0×).
+    let mut baseline_by_workload: BTreeMap<&str, f64> = BTreeMap::new();
     for r in &rows {
-        let entry = worst_by_workload.entry(&r.workload).or_insert(f64::MAX);
-        if r.avg_mibs > 0.0 && r.avg_mibs < *entry {
+        if r.tool == "distd" || r.avg_mibs <= 0.0 {
+            continue;
+        }
+        let entry = baseline_by_workload.entry(&r.workload).or_insert(f64::MAX);
+        if r.avg_mibs < *entry {
             *entry = r.avg_mibs;
         }
     }
@@ -162,17 +167,22 @@ fn print_averages_table(results: &[RunMetrics]) {
     }
 
     for r in &rows {
-        let speedup = worst_by_workload
+        let speedup = baseline_by_workload
             .get(r.workload.as_str())
             .filter(|&&w| w > 0.0 && r.avg_mibs > 0.0)
             .map(|w| r.avg_mibs / w)
             .unwrap_or(1.0);
 
-        let speedup_cell = if speedup >= 1.5 {
+        let speedup_cell = if r.tool == "distd" && speedup < 1.0 {
+            // distd is slower than the baseline — highlight in red
+            Cell::new(format!("{speedup:.2}×"))
+                .fg(Color::Red)
+                .add_attribute(Attribute::Bold)
+        } else if speedup >= 1.5 {
             Cell::new(format!("{speedup:.1}×"))
                 .fg(Color::Green)
                 .add_attribute(Attribute::Bold)
-        } else if (speedup - 1.0).abs() < 0.05 {
+        } else if r.tool != "distd" && (speedup - 1.0).abs() < 0.05 {
             Cell::new("base").fg(Color::DarkGrey)
         } else {
             Cell::new(format!("{speedup:.1}×"))
