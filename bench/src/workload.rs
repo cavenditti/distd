@@ -55,10 +55,14 @@ impl std::str::FromStr for WorkloadKind {
             "single-large-file" => Ok(Self::SingleLargeFile),
             "many-small-files" => Ok(Self::ManySmallFiles),
             "packed-archive" => Ok(Self::PackedArchive),
+            "low-delta" => Ok(Self::LowDeltaRevision),
             "low-delta-revision" => Ok(Self::LowDeltaRevision),
+            "high-delta" => Ok(Self::HighDeltaRevision),
             "high-delta-revision" => Ok(Self::HighDeltaRevision),
             "dedup-heavy" => Ok(Self::DedupHeavy),
-            _ => Err(format!("Unknown workload kind: {s}")),
+            _ => Err(format!(
+                "unknown workload kind '{s}' (valid: single-large-file, many-small-files, packed-archive, low-delta, low-delta-revision, high-delta, high-delta-revision, dedup-heavy)"
+            )),
         }
     }
 }

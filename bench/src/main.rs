@@ -10,6 +10,10 @@ use clap::Parser;
 use orchestrator::BenchmarkOrchestrator;
 use workload::WorkloadKind;
 
+fn parse_workloads(names: Vec<String>) -> Result<Vec<WorkloadKind>, String> {
+    names.into_iter().map(|name| name.parse()).collect()
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "distd-bench", about = "Benchmark suite for distd transfer performance")]
 struct Cli {
@@ -112,11 +116,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect()
     });
 
-    let requested_workloads: Vec<WorkloadKind> = cli.workloads
-        .map(|names| {
-            names.iter().filter_map(|n| n.parse().ok()).collect()
-        })
-        .unwrap_or_else(WorkloadKind::all);
+    let requested_workloads: Vec<WorkloadKind> = match cli.workloads {
+        Some(names) => parse_workloads(names)
+            .map_err(|err| format!("invalid --workload value: {err}"))?,
+        None => WorkloadKind::all(),
+    };
 
     let group_by_workload = cli.group_by == "workload" || cli.group_by == "benchmark";
 
@@ -138,4 +142,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     orchestrator.run().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_workloads;
+    use crate::workload::WorkloadKind;
+
+    #[test]
+    fn parses_multiple_workloads() {
+        let workloads = parse_workloads(vec![
+            "low-delta".to_string(),
+            "high-delta".to_string(),
+            "many-small-files".to_string(),
+        ])
+        .expect("workloads should parse");
+
+        assert_eq!(
+            workloads,
+            vec![
+                WorkloadKind::LowDeltaRevision,
+                WorkloadKind::HighDeltaRevision,
+                WorkloadKind::ManySmallFiles,
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_workload() {
+        let err = parse_workloads(vec!["low-delta".to_string(), "bogus".to_string()])
+            .expect_err("unknown workload should fail");
+
+        assert!(err.contains("bogus"));
+    }
 }
