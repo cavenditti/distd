@@ -441,7 +441,7 @@ impl ToolRunner for DistdRunner {
         // Start server
         let server_pid = self.start_server()?;
 
-        // --- Phase 1: publish v1 and fetch it (setup) ---
+        // --- Phase 1: publish v1 so the server has a base revision ---
         let v1_files = workload::walkdir_files(&workload.source_dir);
         if v1_files.is_empty() {
             self.stop_server();
@@ -463,30 +463,13 @@ impl ToolRunner for DistdRunner {
             .map_err(|e| { self.stop_server(); e })?;
 
         std::fs::create_dir_all(dest_dir).map_err(|e| { self.stop_server(); e.to_string() })?;
-
-        // Fetch v1 (setup — not measured)
-        let (mut setup_child, _) = self.client_get(item_path, dest_dir)
-            .map_err(|e| { self.stop_server(); e })?;
-        let setup_pid = setup_child.id();
-        let mut setup_monitor = ProcessMonitor::new(&[server_pid, setup_pid]);
-        let setup_timeout = if workload.total_bytes_v1 < 1024 * 1024 {
-            SMOKE_CHILD_TIMEOUT
-        } else {
-            DEFAULT_CHILD_TIMEOUT
-        };
-        match wait_child_with_timeout(&mut setup_child, &mut setup_monitor, setup_timeout) {
-            Ok(_) => {
-                if let Ok(status) = setup_child.wait() {
-                    if !status.success() {
-                        self.stop_server();
-                        return Err("v1 setup transfer failed".to_string());
-                    }
-                }
-            }
-            Err(e) => {
-                self.stop_server();
-                return Err(format!("v1 setup timed out: {e}"));
-            }
+        let dest_file = dest_dir.join(item_path);
+        if !dest_file.exists() {
+            self.stop_server();
+            return Err(format!(
+                "Update benchmark requires an existing v1 destination at {}",
+                dest_file.display()
+            ));
         }
 
         // --- Phase 2: publish v2 to the SAME item path (triggers revision bump) ---
@@ -569,7 +552,6 @@ impl ToolRunner for DistdRunner {
         }
 
         // Validate v2 output hash
-        let dest_file = dest_dir.join(item_path);
         if dest_file.exists() {
             let src_hash = metrics::hash_file(&v2_publish_file);
             let dst_hash = metrics::hash_file(&dest_file);
