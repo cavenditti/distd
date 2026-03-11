@@ -18,7 +18,7 @@ use std::{fs::File, io::Read};
 
 use distd_core::{
     chunk_storage::{fs_storage::FsStorage, node_stream::receiver, ChunkStorage},
-    hash::Hash,
+    hash::{Hash, HashTreeCapable},
     item::Item,
     metadata::Item as ItemMetadata,
 };
@@ -122,6 +122,18 @@ where
 }
 
 impl Client<FsStorage> {
+    fn local_diff_basis(&self, path: &Path) -> (Option<u32>, Vec<Hash>) {
+        self.storage
+            .item_for_path(path)
+            .map(|item| {
+                (
+                    Some(item.metadata.revision),
+                    item.chunks.iter().map(|chunk| chunk.hash).collect(),
+                )
+            })
+            .unwrap_or_default()
+    }
+
     pub async fn get(&mut self, target: &Path, path: &Path) -> Result<Item, ClientError> {
         tracing::debug!("sync: {target:?} {path:?}");
         let mut buf = vec![];
@@ -144,19 +156,17 @@ impl Client<FsStorage> {
             .get(&target_str)
             .ok_or(ClientError::FileNotFound(target_str.clone()))?;
 
-        // Create local item from existing content (side-effect: pre-allocates in FsStorage).
-        // Only send this item's chunk hashes, not the entire storage — avoids O(n) over all
-        // previously stored items when the storage has accumulated state.
+        // Derive the local diff basis from the bytes currently on disk without mutating storage.
         let from: Vec<Hash> = self
             .storage
-            .create_item(
-                item_metadata.name.clone(),
-                path.clone(),
-                item_metadata.revision,
-                item_metadata.description.clone(),
-                buf.clone().into(),
-            )
-            .map(|item| item.chunks.iter().map(|c| c.hash).collect())
+            .compute_tree(&buf)
+            .map(|tree| {
+                tree.flatten_with_sizes()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|chunk| chunk.hash)
+                    .collect()
+            })
             .unwrap_or_default();
 
         tracing::info!(
@@ -181,53 +191,6 @@ impl Client<FsStorage> {
 
         Ok(item)
     }
-}
-
-impl<T> Client<T>
-where
-    T: ChunkStorage + Send + Sync + 'static,
-{
-    /// Transfer a diff from the server
-    ///
-    /// Note: this function is item-agnostic, if using the `FsStorage` backend one should have already
-    /// preallocated an item in order to be able to reconstruct sub-trees
-    async fn transfer_diff(
-        &mut self,
-        target: ItemMetadata,
-        request_version: Option<u32>,
-        from_version: Option<u32>,
-        from: &[Hash],
-    ) -> Result<Item, ClientError> {
-        let stream = self
-            .server
-            .transfer_diff(
-                target.artifact_id.clone(),
-                request_version,
-                from_version,
-                from,
-            )
-            .await?;
-
-        let stream = stream.filter_map(|x| match x {
-            Ok(tree) => Some(tree.payload),
-            Err(e) => {
-                tracing::error!("gRPC stream error during transfer: {e}");
-                None
-            }
-        });
-        let stream = receiver(stream, 32, Duration::from_nanos(4800));
-
-        self.storage
-            .receive_item(
-                target.name,
-                target.path,
-                target.revision,
-                target.description,
-                stream,
-            )
-            .await
-            .map_err(ClientError::Core)
-    }
 
     async fn update(&mut self, new_item_metadata: &ItemMetadata) -> Result<Item, ClientError> {
         tracing::info!(
@@ -237,14 +200,21 @@ where
         );
         let now = Instant::now();
 
-        let from = self.storage.chunks(); // FIXME this could get very very large
+        let local_path = self.storage.path(&new_item_metadata.path);
+        let (from_version, from) = self.local_diff_basis(&local_path);
+
+        tracing::info!(
+            "Requesting revision {} from local revision {:?} with {} known chunks",
+            new_item_metadata.revision,
+            from_version,
+            from.len()
+        );
 
         let item = self
             .transfer_diff(
-                // FIXME pass item versions
                 new_item_metadata.clone(),
-                None,
-                None,
+                Some(new_item_metadata.revision),
+                from_version,
                 &from,
             )
             .await?;
@@ -286,6 +256,62 @@ where
             }
         }
     }
+}
+
+impl<T> Client<T>
+where
+    T: ChunkStorage + Send + Sync + 'static,
+{
+    /// Transfer a diff from the server
+    ///
+    /// Note: this function is item-agnostic, if using the `FsStorage` backend one should have already
+    /// preallocated an item in order to be able to reconstruct sub-trees
+    async fn transfer_diff(
+        &mut self,
+        target: ItemMetadata,
+        request_version: Option<u32>,
+        from_version: Option<u32>,
+        from: &[Hash],
+    ) -> Result<Item, ClientError> {
+        let mut payload_bytes = 0u64;
+        let stream = self
+            .server
+            .transfer_diff(
+                target.artifact_id.clone(),
+                request_version,
+                from_version,
+                from,
+            )
+            .await?;
+
+        let stream = stream.filter_map(|x| match x {
+            Ok(tree) => {
+                payload_bytes += tree.payload.len() as u64;
+                Some(tree.payload)
+            }
+            Err(e) => {
+                tracing::error!("gRPC stream error during transfer: {e}");
+                None
+            }
+        });
+        let stream = receiver(stream, 32, Duration::from_nanos(4800));
+
+        let item = self.storage
+            .receive_item(
+                target.name,
+                target.path,
+                target.revision,
+                target.description,
+                stream,
+            )
+            .await
+            .map_err(ClientError::Core)?;
+
+        tracing::info!("distd_payload_bytes={payload_bytes}");
+
+        Ok(item)
+    }
+
 }
 
 pub mod cli {

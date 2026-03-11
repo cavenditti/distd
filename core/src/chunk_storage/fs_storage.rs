@@ -509,6 +509,19 @@ impl FsStorage {
         self.inner.read().unwrap().item_path(item)
     }
 
+    /// Return the most recent item tracked for the given local path.
+    #[must_use]
+    pub fn item_for_path(&self, path: &Path) -> Option<Item> {
+        let inner = self.inner.read().unwrap();
+        let full_path = inner.path(path);
+        inner
+            .items
+            .iter()
+            .filter(|item| inner.path(&item.metadata.path) == full_path)
+            .cloned()
+            .max_by_key(|item| (item.metadata.revision, item.chunks.len(), item.size()))
+    }
+
     /// Pre-allocate a single `ChunkInfo` slot on disk
     pub fn pre_allocate_chunk(
         &self,
@@ -721,15 +734,27 @@ impl ChunkStorage for FsStorage {
         let mut last: Option<Arc<Node>> = None;
 
         while let Some(node) = stream.next().await {
-            if let s_n @ Node::Stored { .. } = &node {
-                tracing::trace!(
-                    "Preallocating {} bytes in {}@'{}'",
-                    s_n.size(),
-                    o,
-                    path.to_string_lossy()
-                );
-                self.pre_allocate_chunk(&path, &s_n.chunk_info(), o)?;
-                o += s_n.size();
+            match &node {
+                s_n @ Node::Stored { .. } => {
+                    tracing::trace!(
+                        "Preallocating {} bytes in {}@'{}'",
+                        s_n.size(),
+                        o,
+                        path.to_string_lossy()
+                    );
+                    self.pre_allocate_chunk(&path, &s_n.chunk_info(), o)?;
+                    o += s_n.size();
+                }
+                skipped @ Node::Skipped { .. } => {
+                    tracing::trace!(
+                        "Skipping {} bytes already present at {}@'{}'",
+                        skipped.size(),
+                        o,
+                        path.to_string_lossy()
+                    );
+                    o += skipped.size();
+                }
+                Node::Parent { .. } => {}
             }
             last = Some(self.try_fill_in(&node)?);
             i += 1;
