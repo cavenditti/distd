@@ -155,7 +155,7 @@ impl InFileChunk {
 /// All mutable state for [`FsStorage`], kept behind an `RwLock` for interior mutability.
 ///
 /// This is the type that is persisted to disk; [`FsStorage`] itself is a thin wrapper.
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct FsStorageState {
     /// Root directory where items are stored
     pub root: PathBuf,
@@ -335,6 +335,7 @@ impl FsStorageState {
 ///
 /// Most logic is implemented in [`FsStorageState`]; this type is an `RwLock`-guarded handle
 /// providing interior mutability so that `ChunkStorage` methods can take `&self`.
+#[derive(Debug)]
 pub struct FsStorage {
     inner: RwLock<FsStorageState>,
     handles: RwLock<HashMap<PathBuf, Arc<Mutex<Handle>>>>,
@@ -542,8 +543,8 @@ impl FsStorage {
             return Err(Error::Storage(StorageError::TreeReconstruct));
         }
 
-        let path = self.path(&path);
-        self.ensure_handle(&path)?;
+        let stored_path = self.path(&path);
+        self.ensure_handle(&stored_path)?;
 
         let available_hashes: HashSet<Hash> = local_hashes.iter().copied().collect();
         let mut received_chunks: VecDeque<Vec<u8>> = received_chunks.into();
@@ -578,7 +579,7 @@ impl FsStorage {
                 if do_hash(&data) != chunk_hash {
                     return Err(Error::Storage(StorageError::TreeReconstruct));
                 }
-                self.pre_allocate_chunk(&path, &chunk_info, offset)?;
+                self.pre_allocate_chunk(&stored_path, &chunk_info, offset)?;
                 self.store_chunk(chunk_hash, &data).map_err(Error::from)?;
                 Arc::new(Node::Skipped {
                     hash: chunk_hash,
@@ -913,12 +914,12 @@ impl ChunkStorage for FsStorage {
     {
         tracing::debug!("Create item {name} with path {path:?}");
         let mut inner = self.inner.write().unwrap();
-        let path = inner.path(&path);
-        create_dir_all(path.parent().ok_or(Error::MissingData)?)?;
-        inner.pre_allocate_bytes(&path, &file)?;
+        let stored_path = inner.path(&path);
+        create_dir_all(stored_path.parent().ok_or(Error::MissingData)?)?;
+        inner.pre_allocate_bytes(&stored_path, &file)?;
         drop(inner);
-        self.ensure_handle(&path)?;
-        tracing::info!("Preallocated on disk {:?}", path);
+        self.ensure_handle(&stored_path)?;
+        tracing::info!("Preallocated on disk {:?}", stored_path);
 
         // Build the hash tree using interior HashTreeCapable
         let hash_tree = self.compute_tree(file.as_ref())?;
@@ -944,11 +945,11 @@ impl ChunkStorage for FsStorage {
     {
         tracing::debug!("Create item {name} with path {path:?}");
         let mut inner = self.inner.write().unwrap();
-        let path = inner.path(&path);
-        inner.pre_allocate(&path, &root.flatten_with_sizes()?)?;
+        let stored_path = inner.path(&path);
+        inner.pre_allocate(&stored_path, &root.flatten_with_sizes()?)?;
         drop(inner);
-        self.ensure_handle(&path)?;
-        tracing::info!("Preallocated on disk {:?}", path);
+        self.ensure_handle(&stored_path)?;
+        tracing::info!("Preallocated on disk {:?}", stored_path);
         let mut inner = self.inner.write().unwrap();
         let item = Item::new(name, path, revision, description, &root);
         tracing::debug!("New item: {item}");
@@ -971,9 +972,9 @@ impl ChunkStorage for FsStorage {
         Self: Sized,
         T: Stream<Item = Node> + std::marker::Unpin,
     {
-        let path = self.path(&path);
-        self.ensure_handle(&path)?;
-        tracing::trace!("Receiving item at '{}'", path.to_string_lossy());
+        let stored_path = self.path(&path);
+        self.ensure_handle(&stored_path)?;
+        tracing::trace!("Receiving item at '{}'", stored_path.to_string_lossy());
         let mut i = 0;
         let mut o = 0u64;
         let mut chunks = Vec::new();
@@ -988,10 +989,10 @@ impl ChunkStorage for FsStorage {
                         "Preallocating {} bytes in {}@'{}'",
                         s_n.size(),
                         o,
-                        path.to_string_lossy()
+                        stored_path.to_string_lossy()
                     );
                     chunks.push(s_n.chunk_info());
-                    self.pre_allocate_chunk(&path, &s_n.chunk_info(), o)?;
+                    self.pre_allocate_chunk(&stored_path, &s_n.chunk_info(), o)?;
                     o += s_n.size();
                 }
                 skipped @ Node::Skipped { .. } => {
@@ -999,7 +1000,7 @@ impl ChunkStorage for FsStorage {
                         "Skipping {} bytes already present at {}@'{}'",
                         skipped.size(),
                         o,
-                        path.to_string_lossy()
+                        stored_path.to_string_lossy()
                     );
                     chunks.push(skipped.chunk_info());
                     o += skipped.size();
@@ -1238,6 +1239,26 @@ mod tests {
         for b in file {
             assert_eq!(b, 1u8);
         }
+    }
+
+    #[test]
+    fn fs_storage_create_item_preserves_logical_path() {
+        let tempdir = temp_path();
+        let storage = FsStorage::new(tempdir.clone());
+        let logical_path = PathBuf::from("bench-artifact");
+
+        let item = storage
+            .create_item(
+                "bench-artifact".to_string(),
+                logical_path.clone(),
+                0,
+                None,
+                bytes::Bytes::from_static(b"hello world"),
+            )
+            .unwrap();
+
+        assert_eq!(item.metadata.path, logical_path);
+        assert_eq!(storage.item_path(&item).unwrap(), tempdir.join("bench-artifact"));
     }
 
     #[tokio::test]

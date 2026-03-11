@@ -11,7 +11,7 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::metrics::{self, ProcessMonitor, RunMetrics};
 use crate::workload::{self, Workload};
@@ -127,6 +127,21 @@ impl DistdRunner {
         }
 
         std::fs::create_dir_all(&self.work_dir).map_err(|e| e.to_string())?;
+        for entry in std::fs::read_dir(&self.work_dir).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            if entry.file_type().map_err(|e| e.to_string())?.is_dir()
+                && entry.file_name().to_string_lossy().starts_with("server_storage_")
+            {
+                std::fs::remove_dir_all(entry.path()).map_err(|e| e.to_string())?;
+            }
+        }
+        let storage_nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_nanos();
+        let storage_root = self
+            .work_dir
+            .join(format!("server_storage_{storage_nonce}"));
 
         let bins = Self::binary_paths();
         if !bins.server.exists() {
@@ -139,8 +154,8 @@ impl DistdRunner {
         let child = Command::new(&bins.server)
             .current_dir(&self.work_dir)
             .env("RUST_LOG", "distd_server=info")
-            // Use in-memory storage for benchmarks: no leftover state, consistent results
-            .env("DISTD_STORAGE", "memory")
+            .env("DISTD_STORAGE", "fs")
+            .env("DISTD_STORAGE_ROOT", &storage_root)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()

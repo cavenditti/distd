@@ -58,7 +58,7 @@ impl From<InternalMetadata> for ServerMetadata {
 ///
 /// Server signature is used to check replicated data among clients when shared p2p,
 /// Note that this is different from an eventual "build" signature.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Server<T>
 where
     T: ChunkStorage + Sync + Send,
@@ -75,6 +75,22 @@ where
 
     /// gRPC interceptor for uuids check
     pub uuid_interceptor: UuidAuthInterceptor,
+}
+
+impl<T> Clone for Server<T>
+where
+    T: ChunkStorage + Sync + Send,
+{
+    fn clone(&self) -> Self {
+        Self {
+            key_pair: Arc::clone(&self.key_pair),
+            uuid_nonce: self.uuid_nonce.clone(),
+            metadata: Arc::clone(&self.metadata),
+            storage: Arc::clone(&self.storage),
+            clients: Arc::clone(&self.clients),
+            uuid_interceptor: self.uuid_interceptor.clone(),
+        }
+    }
 }
 
 impl<T> Server<T>

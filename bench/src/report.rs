@@ -265,7 +265,7 @@ fn print_averages_table(results: &[RunMetrics], group_by_workload: bool) {
 pub fn print_fairness_caveats() {
     let caveats = [
         "distd uses fixed 256 KiB chunking (no content-defined chunking yet)",
-        "distd current server uses ephemeral in-memory storage (HashMapStorage)",
+        "distd benchmark server uses ephemeral filesystem storage (FsStorage)",
         "distd item model is single-file; multi-file workloads are partial",
         "distd sync path uses ordered leaf hashes to build possession bitfields",
         "http is a naïve baseline — full-file download with no delta support",

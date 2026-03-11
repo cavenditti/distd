@@ -1,3 +1,4 @@
+use distd_core::chunk_storage::fs_storage::FsStorage;
 use distd_core::chunk_storage::hashmap_storage::HashMapStorage;
 use distd_core::chunk_storage::ChunkStorage;
 use distd_core::feed::Feed;
@@ -14,7 +15,7 @@ pub mod server;
 /// Run the server with a concrete storage backend.
 async fn run_server<T>(server: Server<T>)
 where
-    T: ChunkStorage + Send + Sync + Clone + std::fmt::Debug + 'static,
+    T: ChunkStorage + Send + Sync + std::fmt::Debug + 'static,
 {
     let feed = Feed::new("A feed");
     server.expose_feed(feed).await.unwrap();
@@ -45,16 +46,24 @@ async fn main() {
     tracing::info!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
 
     // Select storage backend via DISTD_STORAGE env var.
-    // Supported values: "memory" (default when redb feature is off), "redb" (default).
+    // Supported values: "fs", "memory" (default when redb feature is off), "redb" (default).
     let storage_kind = std::env::var("DISTD_STORAGE").unwrap_or_else(|_| {
         if cfg!(feature = "redb") {
             "redb".to_string()
         } else {
-            "memory".to_string()
+            "fs".to_string()
         }
     });
 
     match storage_kind.as_str() {
+        "fs" => {
+            let root = std::env::var("DISTD_STORAGE_ROOT")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| distd_core::utils::settings::cache_dir().join("server-fs"));
+            tracing::info!("Using filesystem storage at {}", root.display());
+            let server = Server::new_ephemeral(FsStorage::new(root));
+            run_server(server).await;
+        }
         #[cfg(feature = "redb")]
         "redb" => {
             let db_path = distd_core::utils::settings::cache_dir().join("server.redb");
@@ -70,7 +79,7 @@ async fn main() {
             run_server(server).await;
         }
         other => {
-            eprintln!("Unknown DISTD_STORAGE value: {other}. Supported: \"redb\", \"memory\".");
+            eprintln!("Unknown DISTD_STORAGE value: {other}. Supported: \"fs\", \"redb\", \"memory\".");
             std::process::exit(1);
         }
     }
