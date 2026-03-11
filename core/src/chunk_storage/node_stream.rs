@@ -29,8 +29,7 @@ where
     let s = BatchingStream::new(stream, batch_size, duration);
     s.map(|x| {
         bitcode::serialize(&x)
-            .inspect_err(|e| tracing::error!("Cannot serialize node batch: {e}"))
-            .unwrap_or_default()
+            .expect("Node batch serialization is infallible (Node derives Serialize)")
     })
 }
 
