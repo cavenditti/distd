@@ -1,10 +1,11 @@
 use std::{
     collections::VecDeque,
+    future::Future,
     pin::Pin,
     task::{Context, Poll},
 };
 
-use tokio::time::{Duration, Instant};
+use tokio::time::{Duration, Instant, Sleep};
 use tokio_stream::Stream;
 
 /// A stream that batches items from an inner stream.
@@ -23,6 +24,7 @@ where
     timeout: Duration,
     buffer: VecDeque<S::Item>, // TODO limit capacity
     last_emit: Instant,
+    delay: Pin<Box<Sleep>>,
 }
 
 impl<S> BatchingStream<S>
@@ -36,6 +38,7 @@ where
             timeout,
             buffer: VecDeque::default(),
             last_emit: Instant::now(),
+            delay: Box::pin(tokio::time::sleep(timeout)),
         }
     }
 }
@@ -72,15 +75,17 @@ where
                     }
                 }
                 Poll::Pending => {
-                    return if this.buffer.is_empty() {
-                        Poll::Pending
-                    } else if this.last_emit.elapsed() >= this.timeout {
+                    if this.buffer.is_empty() {
+                        return Poll::Pending;
+                    }
+                    // Register a waker via Sleep so the executor re-polls after the timeout.
+                    this.delay.as_mut().reset(this.last_emit + this.timeout);
+                    if this.delay.as_mut().poll(cx).is_ready() {
                         let batch = std::mem::take(&mut this.buffer);
                         this.last_emit = Instant::now();
-                        Poll::Ready(Some(batch.into()))
-                    } else {
-                        Poll::Pending
+                        return Poll::Ready(Some(batch.into()));
                     }
+                    return Poll::Pending;
                 }
             }
         }
@@ -100,6 +105,7 @@ where
     timeout: Duration,
     buffer: VecDeque<I>,
     last_emit: Instant,
+    delay: Pin<Box<Sleep>>,
 }
 
 impl<I, S> DeBatchingStream<I, S>
@@ -113,6 +119,7 @@ where
             timeout,
             buffer: VecDeque::default(),
             last_emit: Instant::now(),
+            delay: Box::pin(tokio::time::sleep(timeout)),
         }
     }
 }
@@ -149,14 +156,16 @@ where
                     }
                 }
                 Poll::Pending => {
-                    return if this.buffer.is_empty() {
-                        Poll::Pending
-                    } else if this.last_emit.elapsed() >= this.timeout {
-                        this.last_emit = Instant::now();
-                        Poll::Ready(this.buffer.pop_front())
-                    } else {
-                        Poll::Pending
+                    if this.buffer.is_empty() {
+                        return Poll::Pending;
                     }
+                    // Register a waker via Sleep so the executor re-polls after the timeout.
+                    this.delay.as_mut().reset(this.last_emit + this.timeout);
+                    if this.delay.as_mut().poll(cx).is_ready() {
+                        this.last_emit = Instant::now();
+                        return Poll::Ready(this.buffer.pop_front());
+                    }
+                    return Poll::Pending;
                 }
             }
         }
