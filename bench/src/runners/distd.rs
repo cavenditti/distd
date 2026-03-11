@@ -373,6 +373,12 @@ impl ToolRunner for DistdRunner {
                 } else {
                     // Already reaped by wait_child_with_timeout
                 }
+
+                if let Some(bytes) = extract_payload_bytes(&stderr_buf) {
+                    m.bytes_transferred = bytes;
+                } else {
+                    m.notes.push_str(" | missing payload byte metric");
+                }
             }
             Err(timeout_msg) => {
                 tracing::error!("distd client timed out: {timeout_msg}");
@@ -384,7 +390,9 @@ impl ToolRunner for DistdRunner {
         m.wall_clock_secs = elapsed.as_secs_f64();
         m.source_bytes = workload.total_bytes_v1;
         m.dest_size_bytes = metrics::dir_size(dest_dir);
-        m.bytes_transferred = m.dest_size_bytes; // actual bytes received, not assumed
+        if m.bytes_transferred == 0 {
+            m.bytes_transferred = m.dest_size_bytes;
+        }
         m.peak_rss_bytes = peak_rss;
         m.cpu_seconds = cpu_secs;
 
@@ -425,6 +433,7 @@ impl ToolRunner for DistdRunner {
             .source_dir_v2
             .as_ref()
             .ok_or("No v2 source for delta benchmark")?;
+        let expected_source_bytes = workload.total_bytes_v2.unwrap_or(workload.total_bytes_v1);
 
         // Clear client cache to avoid stale UUIDs
         clean_distd_cache();
@@ -526,6 +535,16 @@ impl ToolRunner for DistdRunner {
                         tracing::warn!("distd client update exited with error: {stderr_buf}");
                         m.notes.push_str(&format!(" | client error: {stderr_buf}"));
                     }
+                    if stderr_buf.contains("gRPC stream error during transfer") {
+                        m.correct = false;
+                        m.notes.push_str(" | transfer stream error observed");
+                    }
+
+                    if let Some(bytes) = extract_payload_bytes(&stderr_buf) {
+                        m.bytes_transferred = bytes;
+                    } else {
+                        m.notes.push_str(" | missing payload byte metric");
+                    }
                 }
             }
             Err(timeout_msg) => {
@@ -536,11 +555,18 @@ impl ToolRunner for DistdRunner {
         }
 
         m.wall_clock_secs = elapsed.as_secs_f64();
-        m.source_bytes = workload.total_bytes_v2.unwrap_or(workload.total_bytes_v1);
+        m.source_bytes = expected_source_bytes;
         m.dest_size_bytes = metrics::dir_size(dest_dir);
-        m.bytes_transferred = m.dest_size_bytes;
+        if m.bytes_transferred == 0 {
+            m.bytes_transferred = m.dest_size_bytes;
+            m.notes.push_str(" | fell back to dest-size byte estimate");
+        }
         m.peak_rss_bytes = peak_rss;
         m.cpu_seconds = cpu_secs;
+
+        if m.bytes_transferred >= expected_source_bytes {
+            m.notes.push_str(" | update transferred full artifact or more");
+        }
 
         // Validate v2 output hash
         let dest_file = dest_dir.join(item_path);
@@ -624,6 +650,14 @@ fn query_store_size() -> Result<u64, String> {
     body.trim()
         .parse::<u64>()
         .map_err(|e| format!("Failed to parse store size: {e}"))
+}
+
+fn extract_payload_bytes(stderr: &str) -> Option<u64> {
+    stderr.lines().find_map(|line| {
+        line.split("distd_payload_bytes=")
+            .nth(1)
+            .and_then(|value| value.trim().parse::<u64>().ok())
+    })
 }
 
 /// Find the workspace root by walking up from the current executable or CARGO_MANIFEST_DIR.
