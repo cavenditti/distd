@@ -295,6 +295,35 @@ impl FsStorageState {
         self.mark_dirty();
         Ok(res)
     }
+
+    fn store_compact_link(
+        &mut self,
+        hash: Hash,
+        left: Arc<Node>,
+        right: Arc<Node>,
+    ) -> Result<Arc<Node>, StorageError> {
+        let size = left.size() + right.size();
+        let res = self
+            .links
+            .entry(hash)
+            .or_insert_with(|| {
+                Arc::new(Node::Parent {
+                    hash,
+                    left: Arc::new(Node::Skipped {
+                        hash: *left.hash(),
+                        size: left.size(),
+                    }),
+                    right: Arc::new(Node::Skipped {
+                        hash: *right.hash(),
+                        size: right.size(),
+                    }),
+                    size,
+                })
+            })
+            .clone();
+        self.mark_dirty();
+        Ok(res)
+    }
 }
 
 // ─── Public handle ────────────────────────────────────────────────────────────
@@ -320,6 +349,81 @@ impl Default for FsStorage {
 }
 
 impl FsStorage {
+    fn contains_hash(&self, hash: &Hash) -> bool {
+        let inner = self.inner.read().unwrap();
+        inner.links.contains_key(hash) || inner.data.contains_key(hash)
+    }
+
+    fn materialize_node(&self, node: Arc<Node>) -> Option<Arc<Node>> {
+        match node.as_ref() {
+            Node::Stored { .. } => Some(node),
+            Node::Parent {
+                hash,
+                size,
+                left,
+                right,
+            } => Some(Arc::new(Node::Parent {
+                hash: *hash,
+                size: *size,
+                left: self.materialize_node(left.clone())?,
+                right: self.materialize_node(right.clone())?,
+            })),
+            Node::Skipped { hash, .. } => {
+                let linked = {
+                    let inner = self.inner.read().unwrap();
+                    inner.links.get(hash).cloned()
+                };
+                if let Some(linked) = linked {
+                    self.materialize_node(linked)
+                } else {
+                    self.flush_data_for_hash(hash).ok()?;
+                    self.inner.read().unwrap().get_data(hash)
+                }
+            }
+        }
+    }
+
+    fn store_compact_link(
+        &self,
+        hash: Hash,
+        left: Arc<Node>,
+        right: Arc<Node>,
+    ) -> Result<Arc<Node>, StorageError> {
+        self.inner.write().unwrap().store_compact_link(hash, left, right)
+    }
+
+    fn try_fill_in_compact(&self, tree: &Node) -> Result<Arc<Node>, StorageError> {
+        match tree {
+            Node::Stored { hash, data } => {
+                self.store_chunk(*hash, data)?;
+                Ok(Arc::new(Node::Skipped {
+                    hash: *hash,
+                    size: data.len() as u64,
+                }))
+            }
+            Node::Parent {
+                hash,
+                left,
+                right,
+                ..
+            } => {
+                let left = self.try_fill_in_compact(left)?;
+                let right = self.try_fill_in_compact(right)?;
+                self.store_compact_link(*hash, left, right)
+            }
+            Node::Skipped { hash, size } => {
+                if self.contains_hash(hash) {
+                    Ok(Arc::new(Node::Skipped {
+                        hash: *hash,
+                        size: *size,
+                    }))
+                } else {
+                    Err(StorageError::TreeReconstruct)
+                }
+            }
+        }
+    }
+
     fn handle_for_path(&self, path: &Path) -> Option<Arc<Mutex<Handle>>> {
         self.handles.read().unwrap().get(path).cloned()
     }
@@ -598,7 +702,7 @@ impl ChunkStorage for FsStorage {
     fn get(&self, hash: &Hash) -> Option<Arc<Node>> {
         let linked = self.inner.read().unwrap().links.get(hash).cloned();
         if linked.is_some() {
-            return linked;
+            return self.materialize_node(linked?);
         }
 
         self.flush_data_for_hash(hash)
@@ -731,9 +835,12 @@ impl ChunkStorage for FsStorage {
         tracing::trace!("Receiving item at '{}'", path.to_string_lossy());
         let mut i = 0;
         let mut o = 0u64;
+        let mut chunks = Vec::new();
+        let mut hashes = HashSet::default();
         let mut last: Option<Arc<Node>> = None;
 
         while let Some(node) = stream.next().await {
+            hashes.insert(node.chunk_info());
             match &node {
                 s_n @ Node::Stored { .. } => {
                     tracing::trace!(
@@ -742,6 +849,7 @@ impl ChunkStorage for FsStorage {
                         o,
                         path.to_string_lossy()
                     );
+                    chunks.push(s_n.chunk_info());
                     self.pre_allocate_chunk(&path, &s_n.chunk_info(), o)?;
                     o += s_n.size();
                 }
@@ -752,17 +860,26 @@ impl ChunkStorage for FsStorage {
                         o,
                         path.to_string_lossy()
                     );
+                    chunks.push(skipped.chunk_info());
                     o += skipped.size();
                 }
                 Node::Parent { .. } => {}
             }
-            last = Some(self.try_fill_in(&node)?);
+            last = Some(self.try_fill_in_compact(&node)?);
             i += 1;
         }
 
         let last = last.ok_or(StorageError::TreeReconstruct)?;
         tracing::info!("Reconstructed {i} nodes with {} bytes total", last.size());
-        let item = Item::new(name, path, revision, description, &last);
+        let item = Item::make(
+            name,
+            path,
+            revision,
+            description,
+            last.chunk_info(),
+            chunks,
+            hashes.into_iter().collect(),
+        )?;
         let mut inner = self.inner.write().unwrap();
         inner.items.insert(item.clone());
         drop(inner);
@@ -980,6 +1097,32 @@ mod tests {
         for b in file {
             assert_eq!(b, 1u8);
         }
+    }
+
+    #[tokio::test]
+    async fn fs_storage_receive_item_round_trip() {
+        use crate::chunk_storage::hashmap_storage::HashMapStorage;
+
+        let tempdir = temp_path();
+        let storage = FsStorage::new(tempdir.clone());
+        let source = HashMapStorage::default();
+        let data = vec![7u8; CHUNK_SIZE * 4 + 123];
+        let root = source.insert(data.clone().into()).unwrap();
+        let stream = tokio_stream::iter(root.find_diff(&[]).map(|node| (*node).clone()));
+
+        let item = storage
+            .receive_item(
+                "received-item".to_string(),
+                tempdir.join("received.bin"),
+                1,
+                None,
+                stream,
+            )
+            .await
+            .unwrap();
+
+        let stored = storage.get(&item.metadata.root.hash).unwrap().clone_data().unwrap();
+        assert_eq!(stored, data);
     }
 
     #[test]

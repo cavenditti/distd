@@ -20,14 +20,11 @@ use distd_core::{
     metadata::Item as ItemMetadata,
 };
 
-fn reconstruct_root_from_chunks<T>(
-    storage: &T,
+fn reconstruct_root_from_chunks(
     manifest: &Manifest,
     chunk_hashes: &[Hash],
     received_chunks: &HashMap<u32, Vec<u8>>,
 ) -> Result<Arc<Node>, ClientError>
-where
-    T: ChunkStorage,
 {
     if chunk_hashes.len() != manifest.chunk_count as usize {
         return Err(ClientError::TreeReconstruct);
@@ -44,7 +41,16 @@ where
                 data: Arc::new(data.clone()),
             })
         } else {
-            storage.get(&expected_hash).ok_or(ClientError::TreeReconstruct)?
+            let size = if index + 1 == chunk_hashes.len() {
+                let full_chunks = chunk_hashes.len().saturating_sub(1) as u64;
+                manifest.total_size - full_chunks * manifest.chunk_size as u64
+            } else {
+                manifest.chunk_size as u64
+            };
+            Arc::new(Node::Skipped {
+                hash: expected_hash,
+                size,
+            })
         };
         partials.push(node);
     }
@@ -60,12 +66,21 @@ where
             if index + 1 < partials.len() {
                 let left = partials[index].clone();
                 let right = partials[index + 1].clone();
-                next_level.push(Arc::new(Node::Parent {
-                    hash: merge_hashes(left.hash(), right.hash()),
-                    size: left.size() + right.size(),
-                    left,
-                    right,
-                }));
+                let hash = merge_hashes(left.hash(), right.hash());
+                let size = left.size() + right.size();
+                let node = if matches!(left.as_ref(), Node::Skipped { .. })
+                    && matches!(right.as_ref(), Node::Skipped { .. })
+                {
+                    Arc::new(Node::Skipped { hash, size })
+                } else {
+                    Arc::new(Node::Parent {
+                        hash,
+                        size,
+                        left,
+                        right,
+                    })
+                };
+                next_level.push(node);
                 index += 2;
             } else {
                 next_level.push(partials[index].clone());
@@ -198,13 +213,8 @@ impl Client<FsStorage> {
             .values()
             .map(|chunk| chunk.len() as u64)
             .sum::<u64>();
-        let root = reconstruct_root_from_chunks(
-            &self.storage,
-            &manifest,
-            &chunk_hashes,
-            &received_chunks,
-        )?;
-        let diff_stream = tokio_stream::iter(root.find_diff(from).map(|node| (*node).clone()));
+        let root = reconstruct_root_from_chunks(&manifest, &chunk_hashes, &received_chunks)?;
+        let diff_stream = tokio_stream::iter(root.find_diff(&[]).map(|node| (*node).clone()));
 
         let item = self.storage
             .receive_item(
@@ -352,11 +362,11 @@ mod tests {
             .map(|(index, chunk)| (index as u32, chunk.to_vec()))
             .collect();
 
-        let rebuilt = reconstruct_root_from_chunks(&storage, &manifest, &chunk_hashes, &received_chunks)
-            .unwrap();
+        let rebuilt = reconstruct_root_from_chunks(&manifest, &chunk_hashes, &received_chunks).unwrap();
 
         assert_eq!(rebuilt.hash(), root.hash());
         assert_eq!(rebuilt.size(), root.size());
+        assert_eq!(rebuilt.clone_data().unwrap(), data);
     }
 
     #[test]
@@ -367,7 +377,6 @@ mod tests {
             .collect();
         let old_root = storage.compute_tree(&v1).unwrap();
         storage.try_fill_in(&old_root).unwrap();
-        let old_hashes = old_root.flatten().unwrap();
 
         let mut v2 = v1.clone();
         for block_index in [1usize, 5usize] {
@@ -388,9 +397,8 @@ mod tests {
             .map(|(index, chunk)| (index as u32, chunk.to_vec()))
             .collect();
 
-        let rebuilt = reconstruct_root_from_chunks(&storage, &manifest, &chunk_hashes, &received_chunks)
-            .unwrap();
-        let diff_nodes: Vec<Arc<Node>> = rebuilt.find_diff(&old_hashes).collect();
+        let rebuilt = reconstruct_root_from_chunks(&manifest, &chunk_hashes, &received_chunks).unwrap();
+        let diff_nodes: Vec<Arc<Node>> = rebuilt.clone().find_diff(&[]).collect();
         let stored_bytes: u64 = diff_nodes
             .iter()
             .map(|node| match node.as_ref() {
@@ -401,6 +409,8 @@ mod tests {
 
         assert_eq!(stored_bytes, (CHUNK_SIZE * 2) as u64);
         assert!(diff_nodes.iter().any(|node| matches!(node.as_ref(), Node::Skipped { .. })));
+        assert_eq!(rebuilt.hash(), new_root.hash());
+        assert_eq!(rebuilt.size(), new_root.size());
     }
 }
 
