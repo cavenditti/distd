@@ -419,7 +419,7 @@ fn mutate_bytes(buf: &mut [u8], fraction: f64) {
 }
 
 /// Create a tar archive from `src_dir` contents at `tar_path`.
-fn pack_tar(src_dir: &Path, tar_path: &Path) {
+pub fn pack_tar(src_dir: &Path, tar_path: &Path) {
     use std::io::{BufWriter, Read as TarRead};
 
     let file = fs::File::create(tar_path).expect("create tar");

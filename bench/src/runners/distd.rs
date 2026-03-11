@@ -14,7 +14,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::metrics::{self, ProcessMonitor, RunMetrics};
-use crate::workload::Workload;
+use crate::workload::{self, Workload};
 
 use super::{wait_child_with_timeout, ToolRunner, SMOKE_CHILD_TIMEOUT, DEFAULT_CHILD_TIMEOUT};
 
@@ -139,6 +139,8 @@ impl DistdRunner {
         let child = Command::new(&bins.server)
             .current_dir(&self.work_dir)
             .env("RUST_LOG", "distd_server=info")
+            // Use in-memory storage for benchmarks: no leftover state, consistent results
+            .env("DISTD_STORAGE", "memory")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -303,7 +305,7 @@ impl ToolRunner for DistdRunner {
         let server_pid = self.start_server()?;
 
         // Find source files and publish them
-        let source_files = crate::workload::walkdir_files(&workload.source_dir);
+        let source_files = workload::walkdir_files(&workload.source_dir);
         if source_files.is_empty() {
             self.stop_server();
             return Err("No files in workload source".to_string());
@@ -312,18 +314,23 @@ impl ToolRunner for DistdRunner {
         let item_name = "bench-artifact";
         let item_path = "bench-artifact";
 
-        // Publish the first/primary source file
-        let primary = &source_files[0];
-        if let Err(e) = self.publish_file(primary, item_name, item_path) {
-            self.stop_server();
-            return Err(e);
-        }
-
-        if source_files.len() > 1 {
+        // For multi-file workloads, tar the source directory into a single file
+        // (matches distd's single-item model honestly)
+        let publish_file = if source_files.len() > 1 {
+            let tar_path = self.work_dir.join("publish_packed.tar");
+            workload::pack_tar(&workload.source_dir, &tar_path);
             m.notes = format!(
-                "distd item model is single-file; only first of {} files benchmarked",
+                "distd: {} files tar-packed into single artifact",
                 source_files.len()
             );
+            tar_path
+        } else {
+            source_files[0].clone()
+        };
+
+        if let Err(e) = self.publish_file(&publish_file, item_name, item_path) {
+            self.stop_server();
+            return Err(e);
         }
 
         // Prepare dest
@@ -356,24 +363,18 @@ impl ToolRunner for DistdRunner {
 
         match wait_result {
             Ok(_) => {
-                // Child already exited; read any remaining output
-                // Note: try_wait already reaped the status, so we read pipes manually
                 let mut stderr_buf = String::new();
                 if let Some(ref mut stderr) = client_child.stderr {
                     use std::io::Read;
                     let _ = stderr.read_to_string(&mut stderr_buf);
                 }
-                // Check if the child exited successfully
-                // (wait_child_with_timeout already confirmed it exited)
                 if let Ok(status) = client_child.wait() {
                     if !status.success() {
                         tracing::warn!("distd client exited with error: {stderr_buf}");
                         m.notes.push_str(&format!(" | client error: {stderr_buf}"));
                     }
-                    m.correct = status.success();
                 } else {
-                    // Already reaped; assume success if wait_child_with_timeout returned Ok
-                    m.correct = true;
+                    // Already reaped by wait_child_with_timeout
                 }
             }
             Err(timeout_msg) => {
@@ -385,15 +386,181 @@ impl ToolRunner for DistdRunner {
 
         m.wall_clock_secs = elapsed.as_secs_f64();
         m.source_bytes = workload.total_bytes_v1;
-        m.bytes_transferred = workload.total_bytes_v1;
+        m.dest_size_bytes = metrics::dir_size(dest_dir);
+        m.bytes_transferred = m.dest_size_bytes; // actual bytes received, not assumed
         m.peak_rss_bytes = peak_rss;
         m.cpu_seconds = cpu_secs;
-        m.dest_size_bytes = metrics::dir_size(dest_dir);
+
+        // Validate correctness by comparing source and dest hashes
+        let src_hash = metrics::hash_file(&publish_file);
+        // distd writes the item under dest_dir at the item_path
+        let dest_file = dest_dir.join(item_path);
+        if dest_file.exists() {
+            let dst_hash = metrics::hash_file(&dest_file);
+            m.correct = src_hash == dst_hash;
+            if !m.correct {
+                m.notes
+                    .push_str(&format!(" | hash mismatch: src={src_hash} dst={dst_hash}"));
+            }
+        } else {
+            m.correct = false;
+            m.notes.push_str(" | dest file not found");
+        }
 
         // Check server store size via REST API (with timeout)
         if let Ok(store_size) = query_store_size() {
             m.notes
                 .push_str(&format!(" | server_store_bytes={store_size}"));
+        }
+
+        self.stop_server();
+        m.finalize();
+        Ok(())
+    }
+
+    fn update(
+        &self,
+        workload: &Workload,
+        dest_dir: &Path,
+        m: &mut RunMetrics,
+    ) -> Result<(), String> {
+        let v2_dir = workload
+            .source_dir_v2
+            .as_ref()
+            .ok_or("No v2 source for delta benchmark")?;
+
+        // Clear client cache to avoid stale UUIDs
+        if let Ok(cache_dir) = std::env::var("HOME") {
+            let cache_path = PathBuf::from(cache_dir).join("Library/Caches/distd");
+            let _ = std::fs::remove_dir_all(&cache_path);
+        }
+
+        // Start server
+        let server_pid = self.start_server()?;
+
+        // --- Phase 1: publish v1 and fetch it (setup) ---
+        let v1_files = workload::walkdir_files(&workload.source_dir);
+        if v1_files.is_empty() {
+            self.stop_server();
+            return Err("No files in v1 source".to_string());
+        }
+
+        let item_name = "bench-artifact";
+        let item_path = "bench-artifact";
+
+        let v1_publish_file = if v1_files.len() > 1 {
+            let tar_path = self.work_dir.join("update_v1.tar");
+            workload::pack_tar(&workload.source_dir, &tar_path);
+            tar_path
+        } else {
+            v1_files[0].clone()
+        };
+
+        self.publish_file(&v1_publish_file, item_name, item_path)
+            .map_err(|e| { self.stop_server(); e })?;
+
+        std::fs::create_dir_all(dest_dir).map_err(|e| { self.stop_server(); e.to_string() })?;
+
+        // Fetch v1 (setup — not measured)
+        let (mut setup_child, _) = self.client_get(item_path, dest_dir)
+            .map_err(|e| { self.stop_server(); e })?;
+        let setup_pid = setup_child.id();
+        let mut setup_monitor = ProcessMonitor::new(&[server_pid, setup_pid]);
+        let setup_timeout = if workload.total_bytes_v1 < 1024 * 1024 {
+            SMOKE_CHILD_TIMEOUT
+        } else {
+            DEFAULT_CHILD_TIMEOUT
+        };
+        match wait_child_with_timeout(&mut setup_child, &mut setup_monitor, setup_timeout) {
+            Ok(_) => {
+                if let Ok(status) = setup_child.wait() {
+                    if !status.success() {
+                        self.stop_server();
+                        return Err("v1 setup transfer failed".to_string());
+                    }
+                }
+            }
+            Err(e) => {
+                self.stop_server();
+                return Err(format!("v1 setup timed out: {e}"));
+            }
+        }
+
+        // --- Phase 2: publish v2 to the SAME item path (triggers revision bump) ---
+        let v2_files = workload::walkdir_files(v2_dir);
+        let v2_publish_file = if v2_files.len() > 1 {
+            let tar_path = self.work_dir.join("update_v2.tar");
+            workload::pack_tar(v2_dir, &tar_path);
+            tar_path
+        } else if v2_files.is_empty() {
+            self.stop_server();
+            return Err("No files in v2 source".to_string());
+        } else {
+            v2_files[0].clone()
+        };
+
+        self.publish_file(&v2_publish_file, item_name, item_path)
+            .map_err(|e| { self.stop_server(); e })?;
+
+        // --- Phase 3: fetch again (the measured delta operation) ---
+        // The client's dest already has v1 data; this exercises the diff path
+        let start = Instant::now();
+        let (mut client_child, _client_dir) = self.client_get(item_path, dest_dir)
+            .map_err(|e| { self.stop_server(); e })?;
+        let client_pid = client_child.id();
+        let mut monitor = ProcessMonitor::new(&[server_pid, client_pid]);
+
+        let timeout = if m.source_bytes < 1024 * 1024 {
+            SMOKE_CHILD_TIMEOUT
+        } else {
+            DEFAULT_CHILD_TIMEOUT
+        };
+
+        let wait_result = wait_child_with_timeout(&mut client_child, &mut monitor, timeout);
+        let elapsed = start.elapsed();
+        let (peak_rss, cpu_secs) = monitor.finish();
+
+        match wait_result {
+            Ok(_) => {
+                let mut stderr_buf = String::new();
+                if let Some(ref mut stderr) = client_child.stderr {
+                    use std::io::Read;
+                    let _ = stderr.read_to_string(&mut stderr_buf);
+                }
+                if let Ok(status) = client_child.wait() {
+                    if !status.success() {
+                        tracing::warn!("distd client update exited with error: {stderr_buf}");
+                        m.notes.push_str(&format!(" | client error: {stderr_buf}"));
+                    }
+                }
+            }
+            Err(timeout_msg) => {
+                tracing::error!("distd client update timed out: {timeout_msg}");
+                m.notes.push_str(&format!(" | TIMEOUT: {timeout_msg}"));
+                m.correct = false;
+            }
+        }
+
+        m.wall_clock_secs = elapsed.as_secs_f64();
+        m.source_bytes = workload.total_bytes_v2.unwrap_or(workload.total_bytes_v1);
+        m.dest_size_bytes = metrics::dir_size(dest_dir);
+        m.bytes_transferred = m.dest_size_bytes;
+        m.peak_rss_bytes = peak_rss;
+        m.cpu_seconds = cpu_secs;
+
+        // Validate v2 output hash
+        let dest_file = dest_dir.join(item_path);
+        if dest_file.exists() {
+            let src_hash = metrics::hash_file(&v2_publish_file);
+            let dst_hash = metrics::hash_file(&dest_file);
+            m.correct = src_hash == dst_hash;
+            if !m.correct {
+                m.notes
+                    .push_str(&format!(" | hash mismatch: src={src_hash} dst={dst_hash}"));
+            }
+        } else {
+            m.correct = false;
+            m.notes.push_str(" | dest file not found after update");
         }
 
         self.stop_server();
