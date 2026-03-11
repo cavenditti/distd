@@ -84,26 +84,27 @@ where
         state.persistent.client_uuid = Some(server.client_uuid().to_string());
         state.persistent.commit().unwrap();
 
-        // Check for missing paths on server
+        // Check for missing artifact IDs on server
         let items = server.metadata().await.items;
-        let server_paths: Vec<&PathBuf> = items.keys().collect();
+        let server_ids: Vec<&String> = items.keys().collect();
         let missing: Vec<&PathBuf> = settings
             .client
             .sync
             .iter()
-            .filter(|p| !server_paths.contains(p))
+            .filter(|p| {
+                let aid = p.to_string_lossy().to_string();
+                !server_ids.iter().any(|s| **s == aid)
+            })
             .collect();
         if !missing.is_empty() {
             tracing::error!(
-                "Some requested paths could not be found found in server: {}",
+                "Some requested items could not be found on server: {}",
                 missing
                     .iter()
                     .map(|p| format!("'{}'", p.to_string_lossy()))
                     .collect::<Vec<String>>()
                     .join(",")
             );
-            // It probably shouldn't exit in this case
-            //return Err(ClientError::MissingItem);
         }
 
         Ok(Self {
@@ -136,10 +137,12 @@ impl Client<FsStorage> {
         }
 
         let server_metadata = self.server.metadata().await;
+        // Look up by artifact_id (target path string used as artifact_id)
+        let target_str = target.to_string_lossy().to_string();
         let item_metadata = server_metadata
             .items
-            .get(target)
-            .ok_or(ClientError::FileNotFound(target.to_string_lossy().into()))?;
+            .get(&target_str)
+            .ok_or(ClientError::FileNotFound(target_str.clone()))?;
 
         let _item = self.storage.create_item(
             item_metadata.name.clone(),
@@ -171,7 +174,7 @@ where
         let stream = self
             .server
             .transfer_diff(
-                target.path.to_string_lossy().into_owned(),
+                target.artifact_id.clone(),
                 request_version,
                 from_version,
                 from,
@@ -234,28 +237,25 @@ where
     pub async fn client_loop(mut self) -> Result<(), ClientError> {
         tokio::spawn(self.server.clone().fetch_loop());
 
-        let mut latest: HashMap<PathBuf, Hash> = HashMap::default();
+        let mut latest: HashMap<String, Hash> = HashMap::default();
 
         loop {
             tokio::time::sleep(self.server.timeout).await;
             let items = self.server.metadata().await.items;
             for path in &self.settings.client.sync.clone() {
-                if latest.get(path)
-                    == self
-                        .server
-                        .metadata()
-                        .await
-                        .items
-                        .get(path)
+                let artifact_id = path.to_string_lossy().to_string();
+                if latest.get(&artifact_id)
+                    == items
+                        .get(&artifact_id)
                         .map(|i| &i.root.hash)
                 {
                     continue;
                 }
 
-                tracing::debug!("Syncing '{}'", path.to_string_lossy());
-                let old_item = items.get(path).ok_or(ClientError::Storage)?; //TODO should fail on missing on server or sync other files anyway?
+                tracing::debug!("Syncing '{artifact_id}'");
+                let old_item = items.get(&artifact_id).ok_or(ClientError::Storage)?;
                 let item = self.update(old_item).await?;
-                latest.insert(path.clone(), *item.root());
+                latest.insert(artifact_id, *item.root());
             }
         }
     }

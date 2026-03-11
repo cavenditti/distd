@@ -49,6 +49,15 @@ pub enum ServerRequest {
 
     #[error("Invalid format for provided server public key")]
     BadPubKey,
+
+    #[error("Sync stream closed unexpectedly")]
+    StreamClosed,
+
+    #[error("Unexpected message in sync protocol")]
+    UnexpectedMessage,
+
+    #[error("Invalid hash in sync response")]
+    BadHash,
 }
 
 #[derive(Error, Debug)]

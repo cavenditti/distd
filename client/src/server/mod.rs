@@ -9,10 +9,14 @@ use tokio::{sync::RwLock, time::Instant};
 //use ring::agreement::PublicKey;
 
 use distd_core::{
+    chunks::ChunkAlgorithm,
     error::InvalidParameter,
     hash::Hash,
+    item::Manifest,
     metadata::Server as ServerMetadata,
-    proto::{distd_client::DistdClient, Hashes, SerializedTree},
+    possession::Bitfield,
+    proto::{self, distd_client::DistdClient, Hashes, SerializedTree, SyncMessage},
+    proto::sync_message::Msg,
     tonic::{service::interceptor::InterceptedService, transport::Channel, Streaming},
     utils::grpc::uuid_to_metadata,
     version::VERSION,
@@ -202,15 +206,14 @@ impl Server {
     /// Transfer chunks from server, computing diff from local data
     pub async fn transfer_diff(
         &self,
-        item_path: String,
+        artifact_id: String,
         request_version: Option<u32>,
         from_version: Option<u32>,
         from: &[Hash],
     ) -> Result<Streaming<SerializedTree>, ServerRequest> {
-        tracing::trace!("Preparing transfer/diff request: target: '{item_path}', {from_version:?}->{request_version:?}, {from:?}");
+        tracing::trace!("Preparing transfer/diff request: target: '{artifact_id}', {from_version:?}->{request_version:?}, {from:?}");
         let mut shared = self.shared.write().await;
 
-        // comma separated list of hashes
         let from = from
             .iter()
             .map(|x| x.as_bytes().to_vec())
@@ -219,13 +222,129 @@ impl Server {
         Ok(shared
             .grpc_client
             .tree_transfer(Request::new(distd_core::proto::ItemRequest {
-                item_path,
+                artifact_id,
                 request_version,
                 from_version,
                 hashes: Some(Hashes { hashes: from }),
             }))
             .await?
             .into_inner())
+    }
+
+    /// PPSPP-style sync: manifest handshake → bitfield → chunk transfer.
+    ///
+    /// Returns `(manifest, chunk_hashes, received_chunks)` where received_chunks
+    /// maps chunk_index → data for newly transferred chunks.
+    pub async fn sync_artifact(
+        &self,
+        artifact_id: &str,
+        local_bitfield: Bitfield,
+    ) -> Result<(Manifest, Vec<Hash>, std::collections::HashMap<u32, Vec<u8>>), ServerRequest> {
+        use tokio_stream::StreamExt;
+
+        let mut shared = self.shared.write().await;
+
+        // Build outgoing stream
+        let (client_tx, client_rx) = tokio::sync::mpsc::channel::<SyncMessage>(16);
+        let client_stream = tokio_stream::wrappers::ReceiverStream::new(client_rx);
+
+        // Open bidirectional stream
+        let response = shared
+            .grpc_client
+            .sync(Request::new(client_stream))
+            .await?;
+        let mut server_stream = response.into_inner();
+
+        // Send ManifestRequest
+        client_tx
+            .send(SyncMessage {
+                msg: Some(Msg::ManifestRequest(proto::ManifestRequest {
+                    artifact_id: artifact_id.to_string(),
+                    version: None,
+                })),
+            })
+            .await
+            .map_err(|_| ServerRequest::StreamClosed)?;
+
+        // Receive ManifestResponse
+        let manifest_resp = match server_stream.next().await {
+            Some(Ok(SyncMessage { msg: Some(Msg::ManifestResponse(resp)) })) => resp,
+            Some(Ok(_)) => return Err(ServerRequest::UnexpectedMessage),
+            Some(Err(e)) => return Err(ServerRequest::from(e)),
+            None => return Err(ServerRequest::StreamClosed),
+        };
+
+        let manifest = Manifest {
+            artifact_id: manifest_resp.artifact_id,
+            version: manifest_resp.version,
+            root_hash: Hash::from_bytes(
+                manifest_resp.root_hash.try_into().map_err(|_| ServerRequest::BadHash)?
+            ),
+            total_size: manifest_resp.total_size,
+            chunk_count: manifest_resp.chunk_count,
+            chunk_size: manifest_resp.chunk_size,
+            chunk_algorithm: ChunkAlgorithm::default(),
+            entries: Vec::new(),
+        };
+
+        let chunk_hashes: Vec<Hash> = manifest_resp
+            .chunk_hashes
+            .into_iter()
+            .map(|b| -> Result<Hash, ServerRequest> {
+                let arr: [u8; 32] = b.try_into().map_err(|_| ServerRequest::BadHash)?;
+                Ok(Hash::from_bytes(arr))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Send PossessionBitfield
+        client_tx
+            .send(SyncMessage {
+                msg: Some(Msg::Possession(proto::PossessionBitfield {
+                    bitfield: local_bitfield.to_bytes(),
+                })),
+            })
+            .await
+            .map_err(|_| ServerRequest::StreamClosed)?;
+
+        // Drop sender to signal we're done sending
+        drop(client_tx);
+
+        // Receive chunks
+        let mut received: std::collections::HashMap<u32, Vec<u8>> = std::collections::HashMap::new();
+
+        while let Some(msg) = server_stream.next().await {
+            match msg {
+                Ok(SyncMessage { msg: Some(Msg::ChunkData(cd)) }) => {
+                    received.insert(cd.chunk_index, cd.data);
+                }
+                Ok(SyncMessage { msg: Some(Msg::BulkData(bd)) }) => {
+                    // Split bulk data back into individual chunks
+                    let chunk_size = manifest.chunk_size as usize;
+                    let mut offset = 0;
+                    for i in 0..bd.count {
+                        let idx = bd.start_index + i;
+                        let this_size = if idx == manifest.chunk_count - 1 {
+                            // Last chunk may be smaller
+                            let rem = (manifest.total_size as usize) % chunk_size;
+                            if rem == 0 { chunk_size } else { rem }
+                        } else {
+                            chunk_size
+                        };
+                        if offset + this_size <= bd.data.len() {
+                            received.insert(idx, bd.data[offset..offset + this_size].to_vec());
+                        }
+                        offset += this_size;
+                    }
+                }
+                Ok(_) => {} // ignore unknown messages
+                Err(e) => {
+                    tracing::warn!("Sync stream error: {e}");
+                    break;
+                }
+            }
+        }
+
+        Ok((manifest, chunk_hashes, received))
     }
 
     /// Fetch metadata from server in a loop
