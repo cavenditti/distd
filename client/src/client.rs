@@ -144,15 +144,42 @@ impl Client<FsStorage> {
             .get(&target_str)
             .ok_or(ClientError::FileNotFound(target_str.clone()))?;
 
-        let _item = self.storage.create_item(
-            item_metadata.name.clone(),
-            path.clone(),
-            item_metadata.revision,
-            item_metadata.description.clone(),
-            buf.clone().into(),
+        // Create local item from existing content (side-effect: pre-allocates in FsStorage).
+        // Only send this item's chunk hashes, not the entire storage — avoids O(n) over all
+        // previously stored items when the storage has accumulated state.
+        let from: Vec<Hash> = self
+            .storage
+            .create_item(
+                item_metadata.name.clone(),
+                path.clone(),
+                item_metadata.revision,
+                item_metadata.description.clone(),
+                buf.clone().into(),
+            )
+            .map(|item| item.chunks.iter().map(|c| c.hash).collect())
+            .unwrap_or_default();
+
+        tracing::info!(
+            "Fetching item '{}' at '{}' (local chunks: {})",
+            item_metadata.name,
+            item_metadata.path.to_string_lossy(),
+            from.len()
+        );
+        let now = Instant::now();
+
+        let item = self
+            .transfer_diff(item_metadata.clone(), None, None, &from)
+            .await?;
+
+        tracing::info!(
+            "Got {} v{}, {} bytes after {:.4}s",
+            item.metadata.name,
+            item.metadata.revision,
+            item.size(),
+            now.elapsed().as_secs_f32()
         );
 
-        self.update(item_metadata).await
+        Ok(item)
     }
 }
 
