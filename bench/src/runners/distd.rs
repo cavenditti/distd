@@ -118,7 +118,7 @@ impl DistdRunner {
             return Err("Port 3000 already in use before starting distd_server".to_string());
         }
         if std::net::TcpStream::connect_timeout(
-            &"[::1]:50051".parse().unwrap(),
+            &"127.0.0.1:50051".parse().unwrap(),
             Duration::from_millis(200),
         )
         .is_ok()
@@ -169,7 +169,7 @@ impl DistdRunner {
             }
             if !grpc_ready {
                 grpc_ready = std::net::TcpStream::connect_timeout(
-                    &"[::1]:50051".parse().unwrap(),
+                    &"127.0.0.1:50051".parse().unwrap(),
                     Duration::from_millis(200),
                 )
                 .is_ok();
@@ -250,7 +250,7 @@ impl DistdRunner {
                 "root": storage_dir,
             },
             "server": {
-                "url": "http://localhost:50051",
+                "url": "http://127.0.0.1:50051",
             },
             "log": {
                 "level": "INFO",
@@ -350,7 +350,7 @@ impl ToolRunner for DistdRunner {
         let mut monitor = ProcessMonitor::new(&[server_pid, client_pid]);
 
         // Use a shorter timeout for smoke tests
-        let timeout = if m.source_bytes < 1024 * 1024 {
+        let timeout = if workload.total_bytes_v1 < 1024 * 1024 {
             SMOKE_CHILD_TIMEOUT
         } else {
             DEFAULT_CHILD_TIMEOUT
@@ -510,7 +510,7 @@ impl ToolRunner for DistdRunner {
         let client_pid = client_child.id();
         let mut monitor = ProcessMonitor::new(&[server_pid, client_pid]);
 
-        let timeout = if m.source_bytes < 1024 * 1024 {
+        let timeout = if workload.total_bytes_v2.unwrap_or(workload.total_bytes_v1) < 1024 * 1024 {
             SMOKE_CHILD_TIMEOUT
         } else {
             DEFAULT_CHILD_TIMEOUT

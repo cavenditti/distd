@@ -21,7 +21,7 @@ where
 
     let app = rest_api::make_app(server.clone());
 
-    let addr_grpc = "[::1]:50051".parse().unwrap();
+    let addr_grpc = "0.0.0.0:50051".parse().unwrap();
     let grpc_service = server.clone().make_grpc_service().await.unwrap();
     tokio::spawn(grpc_service.serve(addr_grpc));
     tracing::info!("listening on {} for gRPC", addr_grpc);
