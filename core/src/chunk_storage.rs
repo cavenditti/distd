@@ -11,6 +11,7 @@ use crate::{
     item::{Item, Name as ItemName},
 };
 
+pub mod cas;
 pub mod fs_storage;
 pub mod hashmap_storage;
 pub mod node;
@@ -50,6 +51,22 @@ pub trait ChunkStorage: HashTreeCapable<Arc<Node>, Error> {
     /// Allocated size for all chunks, in bytes
     /// This only counts actual chunks size, excluding any auxiliary structure used by storage backend/adapter
     fn size(&self) -> u64;
+
+    /// Return the ordered list of leaf chunk hashes for a given root.
+    /// Default implementation walks the tree.
+    fn chunk_list(&self, root: &Hash) -> Vec<Hash> {
+        self.get(root)
+            .and_then(|node| node.flatten().ok())
+            .unwrap_or_default()
+    }
+
+    /// Retrieve a chunk by its positional index within a tree.
+    /// Default implementation walks to the Nth leaf.
+    fn get_chunk_by_index(&self, root: &Hash, index: u32) -> Option<Vec<u8>> {
+        let node = self.get(root)?;
+        let leaves = node.flatten_iter().ok()?;
+        leaves.get(index as usize).map(|arc| (**arc).clone())
+    }
 
     //fn drop(hash: Hash); // TODO
 

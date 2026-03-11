@@ -6,7 +6,7 @@ use std::{collections::HashMap, path::PathBuf, time::SystemTime};
 use crate::{
     chunks::ChunkInfo,
     feed::{Feed, Name as FeedName},
-    item::{Format as ItemFormat, Name as ItemName},
+    item::{ArtifactId, Format as ItemFormat, Name as ItemName},
     utils::serde::BitcodeSerializable,
     version::Version,
 };
@@ -19,8 +19,8 @@ pub struct Server {
     pub version: Version,
     // Feed map
     pub feeds: HashMap<FeedName, Feed>,
-    // Item map
-    pub items: HashMap<PathBuf, Item>,
+    // Item map — keyed by ArtifactId
+    pub items: HashMap<ArtifactId, Item>,
 }
 
 impl BitcodeSerializable<'_, Server> for Server {}
@@ -28,13 +28,15 @@ impl BitcodeSerializable<'_, Server> for Server {}
 /// A compact subset of the fields in an Item
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Item {
+    /// Artifact identity — stable across revisions and path changes
+    pub artifact_id: ArtifactId,
     /// Name of the Item
     pub name: ItemName,
     /// Optional description, a generic String
     pub description: Option<String>,
     /// Incremental number of the file revision
     pub revision: u32,
-    /// Path of the file (it may change among revisions?)
+    /// Path of the file (deployment hint, may change among revisions)
     pub path: PathBuf,
     /// BLAKE3 root hash of the file
     pub root: ChunkInfo,
@@ -51,8 +53,8 @@ pub struct Item {
 
 impl std::hash::Hash for Item {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.artifact_id.hash(state);
         self.root.hash.hash(state);
-        self.path.hash(state);
     }
 }
 
@@ -81,6 +83,7 @@ mod tests {
     #[test]
     fn item() {
         let _ = Item {
+            artifact_id: "test-artifact".to_string(),
             name: "An item".to_string(),
             description: Some("A description".to_string()),
             revision: 0,
@@ -99,6 +102,7 @@ mod tests {
     #[test]
     fn item_comparison() {
         let item = Item {
+            artifact_id: "test-artifact".to_string(),
             name: "An item".to_string(),
             description: Some("A description".to_string()),
             revision: 0,
@@ -116,6 +120,7 @@ mod tests {
         assert_eq!(item, item2);
 
         let item3 = Item {
+            artifact_id: "other-artifact".to_string(),
             name: "Another item".to_string(),
             description: Some("A description".to_string()),
             revision: 0,

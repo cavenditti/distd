@@ -29,7 +29,6 @@
 
 use std::collections::HashSet;
 use std::fmt::Display;
-use std::hash::Hash;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -38,11 +37,66 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 
 use crate::chunk_storage::Node;
-use crate::chunks::ChunkInfo;
+use crate::chunks::{ChunkAlgorithm, ChunkInfo, CHUNK_SIZE};
+use crate::hash::Hash as Blake3Hash;
 use crate::metadata::Item as ItemMetadata;
 use crate::unique_name::UniqueName;
 
 pub type Name = UniqueName;
+
+/// Stable artifact identity — persists across revisions and path changes.
+pub type ArtifactId = String;
+
+/// A single file within a multi-file artifact.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct FileEntry {
+    /// Relative path within the artifact
+    pub relative_path: String,
+    /// File size in bytes
+    pub size: u64,
+    /// Range of global chunk indices [start, end) that cover this file
+    pub chunk_range: (u32, u32),
+}
+
+/// Compact manifest describing an artifact — no full chunk list.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct Manifest {
+    pub artifact_id: ArtifactId,
+    pub version: u64,
+    pub root_hash: Blake3Hash,
+    pub total_size: u64,
+    pub chunk_count: u32,
+    pub chunk_size: u32, // nominal (256 KiB), last chunk smaller
+    /// Chunking algorithm used (default: Fixed256K)
+    #[serde(default)]
+    pub chunk_algorithm: ChunkAlgorithm,
+    /// File entries for multi-file artifacts. Empty for single-file artifacts.
+    #[serde(default)]
+    pub entries: Vec<FileEntry>,
+}
+
+impl Manifest {
+    /// Build a manifest from a hash tree root node.
+    #[must_use]
+    pub fn from_tree(artifact_id: ArtifactId, version: u64, root: &Arc<Node>) -> Self {
+        let total_size = root.size();
+        let chunk_count = if total_size == 0 {
+            1
+        } else {
+            ((total_size + CHUNK_SIZE as u64 - 1) / CHUNK_SIZE as u64) as u32
+        };
+        Self {
+            artifact_id,
+            version,
+            root_hash: *root.hash(),
+            total_size,
+            chunk_count,
+            chunk_size: CHUNK_SIZE as u32,
+            chunk_algorithm: ChunkAlgorithm::default(),
+            entries: Vec::new(),
+        }
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Format {
@@ -60,6 +114,8 @@ pub enum Format {
 pub struct Item {
     /// General metadata of the Item
     pub metadata: ItemMetadata,
+    /// Compact manifest (always available, cheap to compute)
+    pub manifest: Manifest,
     /// BLAKE3 hashes of the chunks that make the item
     pub chunks: Vec<ChunkInfo>,
     /// BLAKE3 hashes of any hash subtree
@@ -71,6 +127,8 @@ impl Item {
     ///
     /// Calling `create_item` on a `ChunkStorage` object encapsulates this and its the recommended way to create
     /// an Item unless there is an explicit reason not to do so.
+    ///
+    /// `artifact_id` is derived from the `name` if not provided explicitly.
     #[must_use]
     pub fn new(
         name: Name,
@@ -79,9 +137,12 @@ impl Item {
         description: Option<String>,
         hash_tree: &Arc<Node>,
     ) -> Self {
+        let artifact_id = name.clone();
+        let manifest = Manifest::from_tree(artifact_id.clone(), revision as u64, hash_tree);
         let now = SystemTime::now();
         Self {
             metadata: ItemMetadata {
+                artifact_id,
                 name,
                 description,
                 revision,
@@ -92,6 +153,7 @@ impl Item {
                 created_by: env!("CARGO_PKG_VERSION").to_owned(),
                 format: Format::V1,
             },
+            manifest,
             chunks: hash_tree.flatten_with_sizes().unwrap_or_default(),
             hashes: hash_tree.all_hashes_with_sizes(),
         }
@@ -107,9 +169,22 @@ impl Item {
         chunks: Vec<ChunkInfo>,
         hashes: HashSet<ChunkInfo>,
     ) -> Result<Self, std::io::Error> {
+        let artifact_id = name.clone();
+        let chunk_count = if chunks.is_empty() { 1 } else { chunks.len() as u32 };
+        let manifest = Manifest {
+            artifact_id: artifact_id.clone(),
+            version: revision as u64,
+            root_hash: root.hash,
+            total_size: root.size,
+            chunk_count,
+            chunk_size: CHUNK_SIZE as u32,
+            chunk_algorithm: ChunkAlgorithm::default(),
+            entries: Vec::new(),
+        };
         let now = SystemTime::now();
         Ok(Self {
             metadata: ItemMetadata {
+                artifact_id,
                 name,
                 description,
                 revision,
@@ -120,6 +195,7 @@ impl Item {
                 created_by: env!("CARGO_PKG_VERSION").to_owned(),
                 format: Format::V1,
             },
+            manifest,
             chunks,
             hashes,
         })
@@ -147,7 +223,7 @@ impl Item {
     }
 
     #[inline]
-    #[must_use] pub fn root(&self) -> &crate::hash::Hash {
+    #[must_use] pub fn root(&self) -> &Blake3Hash {
         &self.metadata.root.hash
     }
 }
