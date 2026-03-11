@@ -1,6 +1,7 @@
 //use std::{net::SocketAddr
 use crate::{error::ServerRequest, grpc::DistdGrpcClient};
 
+use std::collections::HashSet;
 use std::{fmt::Debug, sync::Arc, time::Duration};
 use uuid::Uuid;
 
@@ -14,7 +15,6 @@ use distd_core::{
     hash::Hash,
     item::Manifest,
     metadata::Server as ServerMetadata,
-    possession::Bitfield,
     proto::{self, distd_client::DistdClient, Hashes, SerializedTree, SyncMessage},
     proto::sync_message::Msg,
     tonic::{service::interceptor::InterceptedService, transport::Channel, Streaming},
@@ -239,7 +239,7 @@ impl Server {
     pub async fn sync_artifact(
         &self,
         artifact_id: &str,
-        local_bitfield: Bitfield,
+        local_hashes: &[Hash],
     ) -> Result<(Manifest, Vec<Hash>, std::collections::HashMap<u32, Vec<u8>>), ServerRequest> {
         use tokio_stream::StreamExt;
 
@@ -296,6 +296,14 @@ impl Server {
                 Ok(Hash::from_bytes(arr))
             })
             .collect::<Result<Vec<_>, _>>()?;
+
+        let available_hashes: HashSet<Hash> = local_hashes.iter().copied().collect();
+        let mut local_bitfield = distd_core::possession::Bitfield::empty(manifest.chunk_count);
+        for (index, chunk_hash) in chunk_hashes.iter().enumerate() {
+            if available_hashes.contains(chunk_hash) {
+                local_bitfield.set(index as u32);
+            }
+        }
 
         // Send PossessionBitfield
         client_tx

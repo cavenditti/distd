@@ -7,21 +7,81 @@ use std::{
 };
 
 use tokio::time::{sleep, Instant};
-use tokio_stream::StreamExt;
 use uuid::Uuid;
 
 use crate::{
     error::Client as ClientError, persistence::ClientState, server::Server, settings::Settings,
 };
 
-use std::{fs::File, io::Read};
-
 use distd_core::{
-    chunk_storage::{fs_storage::FsStorage, node_stream::receiver, ChunkStorage},
-    hash::{Hash, HashTreeCapable},
-    item::Item,
+    chunk_storage::{fs_storage::FsStorage, node::Node, ChunkStorage},
+    hash::{hash, merge_hashes, Hash},
+    item::{Item, Manifest},
     metadata::Item as ItemMetadata,
 };
+
+fn reconstruct_root_from_chunks<T>(
+    storage: &T,
+    manifest: &Manifest,
+    chunk_hashes: &[Hash],
+    received_chunks: &HashMap<u32, Vec<u8>>,
+) -> Result<Arc<Node>, ClientError>
+where
+    T: ChunkStorage,
+{
+    if chunk_hashes.len() != manifest.chunk_count as usize {
+        return Err(ClientError::TreeReconstruct);
+    }
+
+    let mut partials = Vec::with_capacity(chunk_hashes.len());
+    for (index, expected_hash) in chunk_hashes.iter().copied().enumerate() {
+        let node = if let Some(data) = received_chunks.get(&(index as u32)) {
+            if hash(data) != expected_hash {
+                return Err(ClientError::TreeReconstruct);
+            }
+            Arc::new(Node::Stored {
+                hash: expected_hash,
+                data: Arc::new(data.clone()),
+            })
+        } else {
+            storage.get(&expected_hash).ok_or(ClientError::TreeReconstruct)?
+        };
+        partials.push(node);
+    }
+
+    if partials.is_empty() {
+        return Err(ClientError::TreeReconstruct);
+    }
+
+    while partials.len() > 1 {
+        let mut next_level = Vec::with_capacity(partials.len().div_ceil(2));
+        let mut index = 0;
+        while index < partials.len() {
+            if index + 1 < partials.len() {
+                let left = partials[index].clone();
+                let right = partials[index + 1].clone();
+                next_level.push(Arc::new(Node::Parent {
+                    hash: merge_hashes(left.hash(), right.hash()),
+                    size: left.size() + right.size(),
+                    left,
+                    right,
+                }));
+                index += 2;
+            } else {
+                next_level.push(partials[index].clone());
+                index += 1;
+            }
+        }
+        partials = next_level;
+    }
+
+    let root = partials.swap_remove(0);
+    if root.hash() != &manifest.root_hash || root.size() != manifest.total_size {
+        return Err(ClientError::TreeReconstruct);
+    }
+
+    Ok(root)
+}
 
 #[derive(Debug)]
 pub struct RegisterError;
@@ -31,18 +91,10 @@ pub struct Client<T>
 where
     T: ChunkStorage,
 {
-    /// Client name
     name: String,
-
-    //pub state: ClientState,
-    /// Associated server
     pub server: Server,
-
-    /// Storage, implementing `ChunkStorage`
     pub storage: T,
-
     pub settings: Arc<Settings>,
-
     pub state: Arc<ClientState>,
 }
 
@@ -62,7 +114,6 @@ where
             .as_ref()
             .and_then(|uuid_str| Uuid::from_str(uuid_str).ok());
 
-        // Wait for server connection to get client uid
         let server = loop {
             match Server::new(
                 &settings.server.url,
@@ -84,7 +135,6 @@ where
         state.persistent.client_uuid = Some(server.client_uuid().to_string());
         state.persistent.commit().unwrap();
 
-        // Check for missing artifact IDs on server
         let items = server.metadata().await.items;
         let server_ids: Vec<&String> = items.keys().collect();
         let missing: Vec<&PathBuf> = settings
@@ -134,19 +184,52 @@ impl Client<FsStorage> {
             .unwrap_or_default()
     }
 
+    async fn sync_transfer(
+        &mut self,
+        target: ItemMetadata,
+        from: &[Hash],
+    ) -> Result<Item, ClientError> {
+        let (manifest, chunk_hashes, received_chunks) = self
+            .server
+            .sync_artifact(&target.artifact_id, from)
+            .await?;
+
+        let payload_bytes = received_chunks
+            .values()
+            .map(|chunk| chunk.len() as u64)
+            .sum::<u64>();
+        let root = reconstruct_root_from_chunks(
+            &self.storage,
+            &manifest,
+            &chunk_hashes,
+            &received_chunks,
+        )?;
+        let diff_stream = tokio_stream::iter(root.find_diff(from).map(|node| (*node).clone()));
+
+        let item = self.storage
+            .receive_item(
+                target.name,
+                target.path,
+                target.revision,
+                target.description,
+                diff_stream,
+            )
+            .await
+            .map_err(ClientError::Core)?;
+
+        tracing::info!(
+            "distd_sync_payload_bytes={payload_bytes} distd_sync_received_chunks={}",
+            received_chunks.len()
+        );
+
+        Ok(item)
+    }
+
     pub async fn get(&mut self, target: &Path, path: &Path) -> Result<Item, ClientError> {
         tracing::debug!("sync: {target:?} {path:?}");
-        let mut buf = vec![];
 
         let path = self.storage.path(path);
-
-        // If it exists read into buffer
-        if path.exists() {
-            tracing::trace!("File exists");
-            File::open(&path)
-                .and_then(|mut f| f.read_to_end(&mut buf))
-                .map_err(ClientError::Io)?;
-        }
+        let (_, from) = self.local_diff_basis(&path);
 
         let server_metadata = self.server.metadata().await;
         // Look up by artifact_id (target path string used as artifact_id)
@@ -155,19 +238,6 @@ impl Client<FsStorage> {
             .items
             .get(&target_str)
             .ok_or(ClientError::FileNotFound(target_str.clone()))?;
-
-        // Derive the local diff basis from the bytes currently on disk without mutating storage.
-        let from: Vec<Hash> = self
-            .storage
-            .compute_tree(&buf)
-            .map(|tree| {
-                tree.flatten_with_sizes()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|chunk| chunk.hash)
-                    .collect()
-            })
-            .unwrap_or_default();
 
         tracing::info!(
             "Fetching item '{}' at '{}' (local chunks: {})",
@@ -178,7 +248,7 @@ impl Client<FsStorage> {
         let now = Instant::now();
 
         let item = self
-            .transfer_diff(item_metadata.clone(), None, None, &from)
+            .sync_transfer(item_metadata.clone(), &from)
             .await?;
 
         tracing::info!(
@@ -211,12 +281,7 @@ impl Client<FsStorage> {
         );
 
         let item = self
-            .transfer_diff(
-                new_item_metadata.clone(),
-                Some(new_item_metadata.revision),
-                from_version,
-                &from,
-            )
+            .sync_transfer(new_item_metadata.clone(), &from)
             .await?;
 
         tracing::info!(
@@ -258,60 +323,85 @@ impl Client<FsStorage> {
     }
 }
 
-impl<T> Client<T>
-where
-    T: ChunkStorage + Send + Sync + 'static,
-{
-    /// Transfer a diff from the server
-    ///
-    /// Note: this function is item-agnostic, if using the `FsStorage` backend one should have already
-    /// preallocated an item in order to be able to reconstruct sub-trees
-    async fn transfer_diff(
-        &mut self,
-        target: ItemMetadata,
-        request_version: Option<u32>,
-        from_version: Option<u32>,
-        from: &[Hash],
-    ) -> Result<Item, ClientError> {
-        let mut payload_bytes = 0u64;
-        let stream = self
-            .server
-            .transfer_diff(
-                target.artifact_id.clone(),
-                request_version,
-                from_version,
-                from,
-            )
-            .await?;
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
-        let stream = stream.filter_map(|x| match x {
-            Ok(tree) => {
-                payload_bytes += tree.payload.len() as u64;
-                Some(tree.payload)
-            }
-            Err(e) => {
-                tracing::error!("gRPC stream error during transfer: {e}");
-                None
-            }
-        });
-        let stream = receiver(stream, 32, Duration::from_nanos(4800));
+    use distd_core::chunk_storage::{hashmap_storage::HashMapStorage, ChunkStorage, Node};
+    use distd_core::chunks::CHUNK_SIZE;
+    use distd_core::hash::HashTreeCapable;
+    use distd_core::item::Manifest;
 
-        let item = self.storage
-            .receive_item(
-                target.name,
-                target.path,
-                target.revision,
-                target.description,
-                stream,
-            )
-            .await
-            .map_err(ClientError::Core)?;
+    use super::reconstruct_root_from_chunks;
 
-        tracing::info!("distd_payload_bytes={payload_bytes}");
+    #[test]
+    fn reconstruct_root_from_chunks_matches_manifest() {
+        let storage = HashMapStorage::default();
+        let data: Vec<u8> = (0..(CHUNK_SIZE * 5 + 17))
+            .map(|index| (index % 251) as u8)
+            .collect();
 
-        Ok(item)
+        let root = storage.compute_tree(&data).unwrap();
+        storage.try_fill_in(&root).unwrap();
+        let manifest = Manifest::from_tree("artifact".into(), 1, &root);
+        let chunk_hashes = root.flatten().unwrap();
+        let received_chunks: HashMap<u32, Vec<u8>> = data
+            .chunks(CHUNK_SIZE)
+            .enumerate()
+            .map(|(index, chunk)| (index as u32, chunk.to_vec()))
+            .collect();
+
+        let rebuilt = reconstruct_root_from_chunks(&storage, &manifest, &chunk_hashes, &received_chunks)
+            .unwrap();
+
+        assert_eq!(rebuilt.hash(), root.hash());
+        assert_eq!(rebuilt.size(), root.size());
     }
 
+    #[test]
+    fn reconstruct_root_supports_sparse_sync() {
+        let storage = HashMapStorage::default();
+        let v1: Vec<u8> = (0..(CHUNK_SIZE * 8))
+            .map(|index| ((index * 3) % 251) as u8)
+            .collect();
+        let old_root = storage.compute_tree(&v1).unwrap();
+        storage.try_fill_in(&old_root).unwrap();
+        let old_hashes = old_root.flatten().unwrap();
+
+        let mut v2 = v1.clone();
+        for block_index in [1usize, 5usize] {
+            let start = block_index * CHUNK_SIZE;
+            let end = start + CHUNK_SIZE;
+            for (offset, byte) in v2[start..end].iter_mut().enumerate() {
+                *byte = byte.wrapping_add((block_index as u8).wrapping_mul(17)) ^ (offset as u8);
+            }
+        }
+
+        let new_root = storage.compute_tree(&v2).unwrap();
+        let manifest = Manifest::from_tree("artifact".into(), 2, &new_root);
+        let chunk_hashes = new_root.flatten().unwrap();
+        let received_chunks: HashMap<u32, Vec<u8>> = v2
+            .chunks(CHUNK_SIZE)
+            .enumerate()
+            .filter(|(index, _)| matches!(*index, 1 | 5))
+            .map(|(index, chunk)| (index as u32, chunk.to_vec()))
+            .collect();
+
+        let rebuilt = reconstruct_root_from_chunks(&storage, &manifest, &chunk_hashes, &received_chunks)
+            .unwrap();
+        let diff_nodes: Vec<Arc<Node>> = rebuilt.find_diff(&old_hashes).collect();
+        let stored_bytes: u64 = diff_nodes
+            .iter()
+            .map(|node| match node.as_ref() {
+                Node::Stored { data, .. } => data.len() as u64,
+                Node::Parent { .. } | Node::Skipped { .. } => 0,
+            })
+            .sum();
+
+        assert_eq!(stored_bytes, (CHUNK_SIZE * 2) as u64);
+        assert!(diff_nodes.iter().any(|node| matches!(node.as_ref(), Node::Skipped { .. })));
+    }
 }
 
 pub mod cli {
