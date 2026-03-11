@@ -206,12 +206,13 @@ impl Server {
     /// PPSPP-style sync: manifest handshake → bitfield → chunk transfer.
     ///
     /// Returns `(manifest, chunk_hashes, received_chunks)` where received_chunks
-    /// maps chunk_index → data for newly transferred chunks.
+    /// are ordered exactly like the missing leaf chunks implied by `chunk_hashes`
+    /// and the provided `local_hashes`.
     pub async fn sync_artifact(
         &self,
         artifact_id: &str,
         local_hashes: &[Hash],
-    ) -> Result<(Manifest, Vec<Hash>, std::collections::HashMap<u32, Vec<u8>>), ServerRequest> {
+    ) -> Result<(Manifest, Vec<Hash>, Vec<Vec<u8>>), ServerRequest> {
         use tokio_stream::StreamExt;
 
         let mut shared = self.shared.write().await;
@@ -290,12 +291,12 @@ impl Server {
         drop(client_tx);
 
         // Receive chunks
-        let mut received: std::collections::HashMap<u32, Vec<u8>> = std::collections::HashMap::new();
+        let mut received = Vec::new();
 
         while let Some(msg) = server_stream.next().await {
             match msg {
                 Ok(SyncMessage { msg: Some(Msg::ChunkData(cd)) }) => {
-                    received.insert(cd.chunk_index, cd.data);
+                    received.push(cd.data);
                 }
                 Ok(SyncMessage { msg: Some(Msg::BulkData(bd)) }) => {
                     // Split bulk data back into individual chunks
@@ -311,7 +312,7 @@ impl Server {
                             chunk_size
                         };
                         if offset + this_size <= bd.data.len() {
-                            received.insert(idx, bd.data[offset..offset + this_size].to_vec());
+                            received.push(bd.data[offset..offset + this_size].to_vec());
                         }
                         offset += this_size;
                     }

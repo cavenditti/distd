@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
@@ -23,24 +23,20 @@ use distd_core::{
 fn reconstruct_root_from_chunks(
     manifest: &Manifest,
     chunk_hashes: &[Hash],
-    received_chunks: &HashMap<u32, Vec<u8>>,
+    local_hashes: &[Hash],
+    received_chunks: Vec<Vec<u8>>,
 ) -> Result<Arc<Node>, ClientError>
 {
     if chunk_hashes.len() != manifest.chunk_count as usize {
         return Err(ClientError::TreeReconstruct);
     }
 
+    let available_hashes: HashSet<Hash> = local_hashes.iter().copied().collect();
+    let mut received_chunks: VecDeque<Vec<u8>> = received_chunks.into();
+
     let mut partials = Vec::with_capacity(chunk_hashes.len());
     for (index, expected_hash) in chunk_hashes.iter().copied().enumerate() {
-        let node = if let Some(data) = received_chunks.get(&(index as u32)) {
-            if hash(data) != expected_hash {
-                return Err(ClientError::TreeReconstruct);
-            }
-            Arc::new(Node::Stored {
-                hash: expected_hash,
-                data: Arc::new(data.clone()),
-            })
-        } else {
+        let node = if available_hashes.contains(&expected_hash) {
             let size = if index + 1 == chunk_hashes.len() {
                 let full_chunks = chunk_hashes.len().saturating_sub(1) as u64;
                 manifest.total_size - full_chunks * manifest.chunk_size as u64
@@ -51,8 +47,21 @@ fn reconstruct_root_from_chunks(
                 hash: expected_hash,
                 size,
             })
+        } else {
+            let data = received_chunks.pop_front().ok_or(ClientError::TreeReconstruct)?;
+            if hash(&data) != expected_hash {
+                return Err(ClientError::TreeReconstruct);
+            }
+            Arc::new(Node::Stored {
+                hash: expected_hash,
+                data: Arc::new(data),
+            })
         };
         partials.push(node);
+    }
+
+    if !received_chunks.is_empty() {
+        return Err(ClientError::TreeReconstruct);
     }
 
     if partials.is_empty() {
@@ -209,11 +218,9 @@ impl Client<FsStorage> {
             .sync_artifact(&target.artifact_id, from)
             .await?;
 
-        let payload_bytes = received_chunks
-            .values()
-            .map(|chunk| chunk.len() as u64)
-            .sum::<u64>();
-        let root = reconstruct_root_from_chunks(&manifest, &chunk_hashes, &received_chunks)?;
+        let received_chunk_count = received_chunks.len();
+        let payload_bytes = received_chunks.iter().map(|chunk| chunk.len() as u64).sum::<u64>();
+        let root = reconstruct_root_from_chunks(&manifest, &chunk_hashes, from, received_chunks)?;
         let diff_stream = tokio_stream::iter(root.find_diff(&[]).map(|node| (*node).clone()));
 
         let item = self.storage
@@ -229,7 +236,7 @@ impl Client<FsStorage> {
 
         tracing::info!(
             "distd_sync_payload_bytes={payload_bytes} distd_sync_received_chunks={}",
-            received_chunks.len()
+            received_chunk_count
         );
 
         Ok(item)
@@ -335,7 +342,6 @@ impl Client<FsStorage> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::sync::Arc;
 
     use distd_core::chunk_storage::{hashmap_storage::HashMapStorage, ChunkStorage, Node};
@@ -356,13 +362,12 @@ mod tests {
         storage.try_fill_in(&root).unwrap();
         let manifest = Manifest::from_tree("artifact".into(), 1, &root);
         let chunk_hashes = root.flatten().unwrap();
-        let received_chunks: HashMap<u32, Vec<u8>> = data
+        let received_chunks: Vec<Vec<u8>> = data
             .chunks(CHUNK_SIZE)
-            .enumerate()
-            .map(|(index, chunk)| (index as u32, chunk.to_vec()))
+            .map(|chunk| chunk.to_vec())
             .collect();
 
-        let rebuilt = reconstruct_root_from_chunks(&manifest, &chunk_hashes, &received_chunks).unwrap();
+        let rebuilt = reconstruct_root_from_chunks(&manifest, &chunk_hashes, &[], received_chunks).unwrap();
 
         assert_eq!(rebuilt.hash(), root.hash());
         assert_eq!(rebuilt.size(), root.size());
@@ -390,14 +395,15 @@ mod tests {
         let new_root = storage.compute_tree(&v2).unwrap();
         let manifest = Manifest::from_tree("artifact".into(), 2, &new_root);
         let chunk_hashes = new_root.flatten().unwrap();
-        let received_chunks: HashMap<u32, Vec<u8>> = v2
+        let old_hashes = old_root.flatten().unwrap();
+        let received_chunks: Vec<Vec<u8>> = v2
             .chunks(CHUNK_SIZE)
             .enumerate()
             .filter(|(index, _)| matches!(*index, 1 | 5))
-            .map(|(index, chunk)| (index as u32, chunk.to_vec()))
+            .map(|(_, chunk)| chunk.to_vec())
             .collect();
 
-        let rebuilt = reconstruct_root_from_chunks(&manifest, &chunk_hashes, &received_chunks).unwrap();
+        let rebuilt = reconstruct_root_from_chunks(&manifest, &chunk_hashes, &old_hashes, received_chunks).unwrap();
         let diff_nodes: Vec<Arc<Node>> = rebuilt.clone().find_diff(&[]).collect();
         let stored_bytes: u64 = diff_nodes
             .iter()

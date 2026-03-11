@@ -31,7 +31,7 @@ pub struct RunMetrics {
     pub bytes_transferred: u64,
 
     // Resources
-    /// Peak RSS in bytes during the operation (sender + receiver combined where possible).
+    /// Peak RSS growth in bytes during the operation, relative to the initial sample.
     pub peak_rss_bytes: u64,
     /// Approximate CPU-seconds consumed.
     pub cpu_seconds: f64,
@@ -84,7 +84,8 @@ impl RunMetrics {
 pub struct ProcessMonitor {
     pids: Vec<Pid>,
     system: System,
-    peak_rss: u64,
+    baseline_rss: u64,
+    peak_rss_delta: u64,
     start: Instant,
     cpu_time_start: f64,
 }
@@ -104,6 +105,12 @@ impl ProcessMonitor {
             refresh,
         );
 
+        let baseline_rss: u64 = pids
+            .iter()
+            .filter_map(|pid| system.process(*pid))
+            .map(|p| p.memory())
+            .sum();
+
         let cpu_start: f64 = pids
             .iter()
             .filter_map(|pid| system.process(*pid))
@@ -113,7 +120,8 @@ impl ProcessMonitor {
         Self {
             pids,
             system,
-            peak_rss: 0,
+            baseline_rss,
+            peak_rss_delta: 0,
             start: Instant::now(),
             cpu_time_start: cpu_start,
         }
@@ -136,10 +144,11 @@ impl ProcessMonitor {
             .filter_map(|pid| self.system.process(*pid))
             .map(|p| p.memory())
             .sum();
-        self.peak_rss = self.peak_rss.max(rss);
+        let rss_delta = rss.saturating_sub(self.baseline_rss);
+        self.peak_rss_delta = self.peak_rss_delta.max(rss_delta);
     }
 
-    /// Finalize and return (peak_rss_bytes, cpu_seconds).
+    /// Finalize and return (peak_rss_growth_bytes, cpu_seconds).
     pub fn finish(&mut self) -> (u64, f64) {
         self.sample();
         let elapsed = self.start.elapsed().as_secs_f64();
@@ -154,7 +163,7 @@ impl ProcessMonitor {
         let avg_cpu_pct = (cpu_now + self.cpu_time_start) / 2.0;
         let cpu_seconds = avg_cpu_pct / 100.0 * elapsed;
 
-        (self.peak_rss, cpu_seconds)
+        (self.peak_rss_delta, cpu_seconds)
     }
 }
 

@@ -64,7 +64,7 @@ fn print_detail_table(results: &[RunMetrics], group_by_workload: bool) {
             Cell::new("MiB/s").add_attribute(Attribute::Bold),
             Cell::new("Transferred").add_attribute(Attribute::Bold),
             Cell::new("Dest Size").add_attribute(Attribute::Bold),
-            Cell::new("RSS MB").add_attribute(Attribute::Bold),
+            Cell::new("RSS Δ MB").add_attribute(Attribute::Bold),
             Cell::new("OK").add_attribute(Attribute::Bold),
         ]);
 
