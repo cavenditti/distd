@@ -1,16 +1,12 @@
 use std::borrow::Borrow;
 use std::collections::HashSet;
 use std::fmt::Debug;
-use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
 
-use distd_core::chunk_storage::node_stream::sender;
 use distd_core::chunk_storage::ChunkStorage;
-use distd_core::hash::Hash;
 use distd_core::possession::Bitfield;
-use distd_core::proto::{self, EnumAcknowledge, ItemRequest, SerializedTree, SyncMessage};
+use distd_core::proto::{self, SyncMessage};
 use distd_core::proto::sync_message::Msg;
 use distd_core::utils::grpc::metadata_to_uuid;
 use distd_core::utils::serde::BitcodeSerializable;
@@ -24,9 +20,7 @@ use tonic::service::Interceptor;
 use tonic::{Code, Request, Response, Status, Streaming};
 
 use distd_core::metadata::Server as ServerMetadataRepr;
-use distd_core::proto::{
-    distd_server::Distd, Acknowledge, ClientKeepAlive, ClientRegister, Hashes, ServerMetadata,
-};
+use distd_core::proto::{distd_server::Distd, ClientKeepAlive, ClientRegister, ServerMetadata};
 use uuid::Uuid;
 use crate::error::Server as ServerError;
 use crate::Server;
@@ -86,15 +80,13 @@ where
     }
 }
 
-type ResponseStream = Pin<Box<dyn Stream<Item = Result<SerializedTree, Status>> + Send>>;
-type SyncResponseStream = Pin<Box<dyn Stream<Item = Result<SyncMessage, Status>> + Send>>;
+type SyncResponseStream = std::pin::Pin<Box<dyn Stream<Item = Result<SyncMessage, Status>> + Send>>;
 
 #[tonic::async_trait]
 impl<T> Distd for Server<T>
 where
     T: ChunkStorage + Sync + Send + Debug + 'static,
 {
-    type TreeTransferStream = ResponseStream;
     type SyncStream = SyncResponseStream;
 
     async fn register(
@@ -134,73 +126,6 @@ where
             serialized,
             uuid: None,
         }))
-    }
-
-    async fn adv_hashes(&self, request: Request<Hashes>) -> Result<Response<Acknowledge>, Status> {
-        ensure_authenticated(&request, &self.uuid_interceptor)?;
-        Ok(Response::new(Acknowledge {
-            ack: EnumAcknowledge::AckIgnored.into(),
-        }))
-    }
-
-    async fn tree_transfer(
-        &self,
-        request: Request<ItemRequest>,
-    ) -> Result<Response<ResponseStream>, Status> {
-        ensure_authenticated(&request, &self.uuid_interceptor)?;
-        let inner = request.into_inner();
-
-        let hash = {
-            let metadata = self.metadata.read().await;
-            *metadata
-                .items
-                .get(&inner.artifact_id)
-                .ok_or(Status::new(
-                    Code::InvalidArgument,
-                    format!("Unknown artifact_id: {}", inner.artifact_id),
-                ))?
-                .root()
-        };
-
-        tracing::debug!("Transfer {hash}");
-
-        let from = inner.hashes.unwrap_or_default();
-        let from: Vec<Hash> = from
-            .hashes
-            .into_iter()
-            .flat_map(|v| {
-                v.try_into()
-                    .map_err(|_| Status::new(Code::InvalidArgument, "Bad BLAKE3 hash"))
-            })
-            .map(Hash::from_bytes)
-            .collect();
-
-        let nodes = self
-            .storage
-            .get(&hash)
-            .ok_or(Status::new(Code::NotFound, "tree not found"))?
-            .find_diff(&from)
-            .inspect(|hs| tracing::trace!("Transferring chunks: {hs}"));
-
-        let stream = Box::pin(tokio_stream::iter(nodes));
-        let mut stream =
-            sender(stream, 32, Duration::new(0, 4800)).map(|x| SerializedTree { payload: x });
-
-        let (tx, rx) = mpsc::channel(128);
-        tokio::spawn(async move {
-            while let Some(item) = stream.next().await {
-                match tx.send(Result::<_, Status>::Ok(item)).await {
-                    Ok(()) => {}
-                    Err(_item) => break,
-                }
-            }
-            tracing::trace!("\tclient disconnected");
-        });
-
-        let output_stream = ReceiverStream::new(rx);
-        Ok(Response::new(
-            Box::pin(output_stream) as Self::TreeTransferStream
-        ))
     }
 
     /// PPSPP-style bidirectional sync.

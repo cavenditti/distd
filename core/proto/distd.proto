@@ -4,9 +4,6 @@ package distd;
 service Distd {
   rpc Register(ClientRegister) returns (ServerMetadata);
   rpc Fetch(ClientKeepAlive) returns (ServerMetadata);
-  // Legacy RPCs — kept for backward compatibility during transition
-  rpc AdvHashes(Hashes) returns (Acknowledge);
-  rpc TreeTransfer(ItemRequest) returns (stream SerializedTree);
   // PPSPP-style bidirectional sync
   rpc Sync(stream SyncMessage) returns (stream SyncMessage);
 }
@@ -60,22 +57,6 @@ message BulkData {
   uint32 count = 3;
 }
 
-// ─── Legacy messages ────────────────────────────────────────────────────────
-
-message Hashes { repeated bytes hashes = 1; }
-
-message ItemRequest {
-  string artifact_id = 1; // Stable artifact identity
-  reserved 2; //bytes item_root = 2; // root hash of the item
-  optional uint32 request_version = 3; // if not specified latest is returned
-  optional uint32 from_version = 4;
-  optional Hashes hashes = 5;
-}
-
-message SerializedTree { bytes payload = 1; }
-
-message Acknowledge { EnumAcknowledge ack = 1; }
-
 message ClientKeepAlive {}
 
 message ServerMetadata {
@@ -87,13 +68,4 @@ message ClientRegister {
   string name = 1;
   string version = 2;
   optional bytes uuid = 3;
-}
-
-enum EnumAcknowledge {
-  // option allow_alias = true;
-  ACK_UNSPECIFIED = 0;
-  ACK_OK = 1;
-  ACK_CONFUSED = 2; // Something wrong, provided invalid hash maybe?
-  ACK_IGNORED = 3;  // Request well formed but will be ignored (item didn't
-                    // change from last hashes maybe)
 }

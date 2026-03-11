@@ -267,7 +267,7 @@ pub fn print_fairness_caveats() {
         "distd uses fixed 256 KiB chunking (no content-defined chunking yet)",
         "distd current server uses ephemeral in-memory storage (HashMapStorage)",
         "distd item model is single-file; multi-file workloads are partial",
-        "distd legacy tree-transfer still sends per-artifact chunk hashes as diff basis",
+        "distd sync path uses ordered leaf hashes to build possession bitfields",
         "http is a naïve baseline — full-file download with no delta support",
         "rsync is measured via local filesystem (no actual network I/O)",
         "zsync requires single-file input; multi-file workloads use first file",

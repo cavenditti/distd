@@ -15,9 +15,9 @@ use distd_core::{
     hash::Hash,
     item::Manifest,
     metadata::Server as ServerMetadata,
-    proto::{self, distd_client::DistdClient, Hashes, SerializedTree, SyncMessage},
+    proto::{self, distd_client::DistdClient, SyncMessage},
     proto::sync_message::Msg,
-    tonic::{service::interceptor::InterceptedService, transport::Channel, Streaming},
+    tonic::{service::interceptor::InterceptedService, transport::Channel},
     utils::grpc::uuid_to_metadata,
     version::VERSION,
     Request,
@@ -201,35 +201,6 @@ impl Server {
         }
 
         Ok(())
-    }
-
-    // TODO diff may optionally be computed client-side
-    /// Transfer chunks from server, computing diff from local data
-    pub async fn transfer_diff(
-        &self,
-        artifact_id: String,
-        request_version: Option<u32>,
-        from_version: Option<u32>,
-        from: &[Hash],
-    ) -> Result<Streaming<SerializedTree>, ServerRequest> {
-        tracing::trace!("Preparing transfer/diff request: target: '{artifact_id}', {from_version:?}->{request_version:?}, {from:?}");
-        let mut shared = self.shared.write().await;
-
-        let from = from
-            .iter()
-            .map(|x| x.as_bytes().to_vec())
-            .collect::<Vec<Vec<u8>>>();
-
-        Ok(shared
-            .grpc_client
-            .tree_transfer(Request::new(distd_core::proto::ItemRequest {
-                artifact_id,
-                request_version,
-                from_version,
-                hashes: Some(Hashes { hashes: from }),
-            }))
-            .await?
-            .into_inner())
     }
 
     /// PPSPP-style sync: manifest handshake → bitfield → chunk transfer.
