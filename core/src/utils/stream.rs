@@ -94,32 +94,25 @@ where
 
 /// A stream that de-batches items from an inner stream.
 ///
-/// Order of items in stream is preserved.
+/// Immediately emits buffered items one at a time, then polls the
+/// inner stream for more batches.  Order of items is preserved.
 ///
 pub struct DeBatchingStream<I, S>
 where
     S: Stream<Item = Vec<I>>,
 {
     stream: S,
-    batch_size: usize,
-    timeout: Duration,
     buffer: VecDeque<I>,
-    last_emit: Instant,
-    delay: Pin<Box<Sleep>>,
 }
 
 impl<I, S> DeBatchingStream<I, S>
 where
     S: Stream<Item = Vec<I>>,
 {
-    pub fn new(stream: S, batch_size: usize, timeout: Duration) -> Self {
+    pub fn new(stream: S, _batch_size: usize, _timeout: Duration) -> Self {
         Self {
             stream,
-            batch_size,
-            timeout,
             buffer: VecDeque::default(),
-            last_emit: Instant::now(),
-            delay: Box::pin(tokio::time::sleep(timeout)),
         }
     }
 }
@@ -135,38 +128,21 @@ where
         let this = self.get_mut();
 
         loop {
-            if (this.buffer.len() >= this.batch_size || this.last_emit.elapsed() >= this.timeout)
-                && !this.buffer.is_empty()
-            {
-                this.last_emit = Instant::now();
-                return Poll::Ready(this.buffer.pop_front());
+            // Drain buffered items first
+            if let Some(item) = this.buffer.pop_front() {
+                return Poll::Ready(Some(item));
             }
 
+            // Buffer empty — poll the inner stream for the next batch
             match Pin::new(&mut this.stream).poll_next(cx) {
                 Poll::Ready(Some(items)) => {
                     for item in items {
                         this.buffer.push_back(item);
                     }
+                    // loop back to drain
                 }
-                Poll::Ready(None) => {
-                    return if this.buffer.is_empty() {
-                        Poll::Ready(None)
-                    } else {
-                        Poll::Ready(this.buffer.pop_front())
-                    }
-                }
-                Poll::Pending => {
-                    if this.buffer.is_empty() {
-                        return Poll::Pending;
-                    }
-                    // Register a waker via Sleep so the executor re-polls after the timeout.
-                    this.delay.as_mut().reset(this.last_emit + this.timeout);
-                    if this.delay.as_mut().poll(cx).is_ready() {
-                        this.last_emit = Instant::now();
-                        return Poll::Ready(this.buffer.pop_front());
-                    }
-                    return Poll::Pending;
-                }
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
             }
         }
     }
