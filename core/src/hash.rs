@@ -41,17 +41,19 @@ where
         }
 
         while partials.len() > 1 {
+            let n = partials.len();
             // to is the destination position, i the first result position
-            for (to, i) in (0..partials.len() - 1).step_by(2).enumerate() {
+            for (to, i) in (0..n - 1).step_by(2).enumerate() {
                 partials[to] = self.merge(&partials[i], &partials[i + 1])?;
             }
 
+            let half = n / 2;
             // if there's an element remaining put it in last position
-            if partials.len() % 2 != 0 {
-                partials.swap_remove(partials.len() / 2 + 1);
-                partials.truncate(partials.len() / 2 + 1);
+            if n % 2 != 0 {
+                partials.swap(half, n - 1);
+                partials.truncate(half + 1);
             } else {
-                partials.truncate(partials.len() / 2);
+                partials.truncate(half);
             }
         }
         Ok(partials.swap_remove(0))
@@ -288,5 +290,43 @@ mod tests {
         );
 
         assert_eq!(hash(&data), h);
+    }
+
+    /// 3 chunks (odd count) — must merge(merge(h0,h1), h2), NOT merge(merge(h0,h1), h1)
+    #[test]
+    fn hash_3_chunks() {
+        let mut data = vec![0u8; CHUNK_SIZE * 2 + 100];
+        // Make each chunk distinct
+        data[0] = 0xAA;
+        data[CHUNK_SIZE] = 0xBB;
+        data[CHUNK_SIZE * 2] = 0xCC;
+
+        let h0 = hash(&data[..CHUNK_SIZE]);
+        let h1 = hash(&data[CHUNK_SIZE..CHUNK_SIZE * 2]);
+        let h2 = hash(&data[CHUNK_SIZE * 2..]);
+        let expected = merge_hashes(&merge_hashes(&h0, &h1), &h2);
+
+        assert_eq!(hash(&data), expected);
+    }
+
+    /// 5 chunks (odd count) — verify correct tree structure
+    #[test]
+    fn hash_5_chunks() {
+        let mut data = vec![0u8; CHUNK_SIZE * 4 + 100];
+        let len = data.len();
+        for i in 0..5 {
+            data[i * CHUNK_SIZE.min(len - 1)] = i as u8 + 1;
+        }
+
+        let h: Vec<Hash> = data.chunks(CHUNK_SIZE).map(|c| hash(c)).collect();
+        assert_eq!(h.len(), 5);
+
+        // Expected tree: merge(merge(merge(h0,h1), merge(h2,h3)), h4)
+        let h01 = merge_hashes(&h[0], &h[1]);
+        let h23 = merge_hashes(&h[2], &h[3]);
+        let h0123 = merge_hashes(&h01, &h23);
+        let expected = merge_hashes(&h0123, &h[4]);
+
+        assert_eq!(hash(&data), expected);
     }
 }

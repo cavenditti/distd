@@ -285,12 +285,63 @@ mod tests {
         }
     }
 
+    /// 3 chunks (odd) with distinct random data — regression test for compute_tree
+    pub fn storage_3_chunks<S>(s: &S)
+    where
+        S: ChunkStorage,
+    {
+        let size = CHUNK_SIZE * 2 + CHUNK_SIZE / 2; // 2.5 chunks
+        let mut data = BytesMut::zeroed(size);
+        rand::rngs::OsRng.fill_bytes(&mut data);
+
+        let root = s.insert(data.clone().into()).unwrap();
+        assert_eq!(root.size(), size as u64);
+        let cloned = root.clone_data().unwrap();
+        assert_eq!(cloned.len(), size);
+        assert_eq!(&cloned[..], &data[..]);
+    }
+
+    /// 5 chunks (odd) with distinct random data — regression test for compute_tree
+    pub fn storage_5_chunks<S>(s: &S)
+    where
+        S: ChunkStorage,
+    {
+        let size = CHUNK_SIZE * 4 + CHUNK_SIZE / 3; // 4.33 chunks → 5
+        let mut data = BytesMut::zeroed(size);
+        rand::rngs::OsRng.fill_bytes(&mut data);
+
+        let root = s.insert(data.clone().into()).unwrap();
+        assert_eq!(root.size(), size as u64);
+        let cloned = root.clone_data().unwrap();
+        assert_eq!(cloned.len(), size);
+        assert_eq!(&cloned[..], &data[..]);
+    }
+
+    /// 7 chunks (odd) with distinct random data — regression test for compute_tree
+    pub fn storage_7_chunks<S>(s: &S)
+    where
+        S: ChunkStorage,
+    {
+        let size = CHUNK_SIZE * 6 + CHUNK_SIZE / 2; // 6.5 chunks → 7
+        let mut data = BytesMut::zeroed(size);
+        rand::rngs::OsRng.fill_bytes(&mut data);
+
+        let root = s.insert(data.clone().into()).unwrap();
+        assert_eq!(root.size(), size as u64);
+        let cloned = root.clone_data().unwrap();
+        assert_eq!(cloned.len(), size);
+        assert_eq!(&cloned[..], &data[..]);
+    }
+
     macro_rules! chunk_storage_tests {
         ($t:ty, $builder:ident) => {
             crate::chunk_storage::tests::chunk_storage_tests!($t, single_chunk_insertion, $builder);
             crate::chunk_storage::tests::chunk_storage_tests!($t, multiple_chunks_insertion, $builder);
             crate::chunk_storage::tests::chunk_storage_tests!($t, chunks_deduplication, $builder);
             crate::chunk_storage::tests::chunk_storage_tests!($t, storage_2mb, $builder);
+            crate::chunk_storage::tests::chunk_storage_tests!($t, storage_3_chunks, $builder);
+            crate::chunk_storage::tests::chunk_storage_tests!($t, storage_5_chunks, $builder);
+            crate::chunk_storage::tests::chunk_storage_tests!($t, storage_7_chunks, $builder);
             // ... any more tests go here ...
         };
         ($t:ty, $name:ident, $builder:ident) => {
