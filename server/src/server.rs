@@ -7,7 +7,7 @@ use std::time::SystemTime;
 
 use axum::body::Bytes;
 use distd_core::chunk_storage::ChunkStorage;
-use distd_core::item::{Item, Name as ItemName};
+use distd_core::item::{ArtifactId, Item, Name as ItemName};
 use distd_core::metadata::Server as ServerMetadata;
 use distd_core::utils::grpc::uuid_to_metadata;
 use ring::error::KeyRejected;
@@ -36,8 +36,8 @@ pub struct InternalMetadata {
     pub version: Version,
     // Feed map
     pub feeds: HashMap<FeedName, Feed>,
-    // Item map
-    pub items: HashMap<PathBuf, Item>,
+    // Item map — keyed by ArtifactId
+    pub items: HashMap<ArtifactId, Item>,
 }
 
 impl From<InternalMetadata> for ServerMetadata {
@@ -47,8 +47,8 @@ impl From<InternalMetadata> for ServerMetadata {
             feeds: value.feeds,
             items: value
                 .items
-                .iter()
-                .map(|x| (x.0.clone(), x.1.metadata.clone()))
+                .into_iter()
+                .map(|(artifact_id, item)| (artifact_id, item.metadata))
                 .collect(),
         }
     }
@@ -217,7 +217,7 @@ where
     /// Publish a new item
     ///
     /// This function will insert the item into the storage and the metadata map.
-    /// The item will be inserted into the metadata map using the path as key.
+    /// The item will be inserted into the metadata map using the artifact_id as key.
     ///
     /// # Panics
     ///
@@ -230,20 +230,22 @@ where
         description: Option<String>,
         file: Bytes,
     ) -> Result<Item, ServerError> {
+        // Derive artifact_id from name (matches Item::new default)
+        let artifact_id: ArtifactId = name.clone();
+
         // Get last revision, if any. 0 otherwise
         let revision = self
             .metadata
             .read()
             .await
             .items
-            .get(&path)
+            .get(&artifact_id)
             .map(|i| i.metadata.revision + 1)
             .unwrap_or_default();
 
         // Check if already exists and if so just return the old one
-        // This is doing duplicated hashing calculations, may be improved
         let root = &do_hash(&file);
-        if let Some(old) = self.metadata.read().await.items.get(&path) {
+        if let Some(old) = self.metadata.read().await.items.get(&artifact_id) {
             if old.metadata.name == name
                 && old.metadata.path == path
                 && old.metadata.description == description
@@ -266,7 +268,7 @@ where
             .write()
             .await
             .items
-            .insert(item.metadata.path.clone(), item.clone());
+            .insert(artifact_id, item.clone());
 
         Ok(item)
     }

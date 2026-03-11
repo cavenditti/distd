@@ -167,14 +167,15 @@ where
             .items
             .keys()
             .cloned()
-            .map(|x| x.to_string_lossy().into())
             .collect::<Vec<String>>(),
     )
 }
 
 #[derive(Deserialize, Serialize)]
 struct ItemGetObj {
-    pub path: PathBuf,
+    /// Look up by artifact_id (preferred) or fall back to path
+    pub artifact_id: Option<String>,
+    pub path: Option<PathBuf>,
 }
 
 /// Get one item
@@ -185,12 +186,23 @@ async fn get_one_item<T>(
 where
     T: ChunkStorage + Sync + Send,
 {
-    Json(server.metadata.read().await.items.get(&item.path).cloned())
+    let metadata = server.metadata.read().await;
+    let found = if let Some(ref aid) = item.artifact_id {
+        metadata.items.get(aid).cloned()
+    } else if let Some(ref path) = item.path {
+        metadata
+            .items
+            .values()
+            .find(|i| &i.metadata.path == path)
+            .cloned()
+    } else {
+        None
+    };
+    Json(found)
 }
 
 #[derive(Deserialize, Serialize)]
 struct ItemPostObj {
-    //pub name: ItemName,
     #[serde(default, deserialize_with = "empty_string_as_none")]
     pub description: Option<String>,
     pub path: PathBuf,
