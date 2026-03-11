@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     fs::{self, create_dir_all, remove_file, File},
     io::{BufWriter, Read, Seek, Write},
     path::{Path, PathBuf},
@@ -14,8 +15,8 @@ use crate::{
     chunk_storage::StorageError,
     chunks::{ChunkInfo, CHUNK_SIZE},
     error::{Error, InvalidParameter},
-    hash::{hash as do_hash, Hash, HashTreeCapable},
-    item::{Item, Name as ItemName},
+    hash::{hash as do_hash, merge_hashes, Hash, HashTreeCapable},
+    item::{Item, Manifest, Name as ItemName},
     utils::settings::cache_dir,
 };
 
@@ -349,6 +350,57 @@ impl Default for FsStorage {
 }
 
 impl FsStorage {
+    fn combine_sync_nodes(
+        &self,
+        left: Arc<Node>,
+        right: Arc<Node>,
+        hashes: &mut HashSet<ChunkInfo>,
+    ) -> Result<Arc<Node>, Error> {
+        let hash = merge_hashes(left.hash(), right.hash());
+        let size = left.size() + right.size();
+        hashes.insert(ChunkInfo { hash, size });
+
+        if matches!(left.as_ref(), Node::Skipped { .. })
+            && matches!(right.as_ref(), Node::Skipped { .. })
+            && self.contains_hash(&hash)
+        {
+            return Ok(Arc::new(Node::Skipped { hash, size }));
+        }
+
+        self.store_compact_link(hash, left, right).map_err(Error::from)
+    }
+
+    fn finalize_sync_partials(
+        &self,
+        mut partials: Vec<Arc<Node>>,
+        hashes: &mut HashSet<ChunkInfo>,
+    ) -> Result<Arc<Node>, Error> {
+        if partials.is_empty() {
+            return Err(Error::Storage(StorageError::TreeReconstruct));
+        }
+
+        while partials.len() > 1 {
+            let n = partials.len();
+            for (to, index) in (0..n - 1).step_by(2).enumerate() {
+                partials[to] = self.combine_sync_nodes(
+                    partials[index].clone(),
+                    partials[index + 1].clone(),
+                    hashes,
+                )?;
+            }
+
+            let half = n / 2;
+            if n % 2 != 0 {
+                partials.swap(half, n - 1);
+                partials.truncate(half + 1);
+            } else {
+                partials.truncate(half);
+            }
+        }
+
+        Ok(partials.swap_remove(0))
+    }
+
     fn contains_hash(&self, hash: &Hash) -> bool {
         let inner = self.inner.read().unwrap();
         inner.links.contains_key(hash) || inner.data.contains_key(hash)
@@ -473,6 +525,95 @@ impl FsStorage {
                 .inspect_err(|e| tracing::error!("Cannot flush handle {}: {e}", path.to_string_lossy()))?;
         }
         Ok(())
+    }
+
+    pub fn receive_sync_item(
+        &self,
+        name: ItemName,
+        path: PathBuf,
+        revision: u32,
+        description: Option<String>,
+        manifest: &Manifest,
+        chunk_hashes: &[Hash],
+        local_hashes: &[Hash],
+        received_chunks: Vec<Vec<u8>>,
+    ) -> Result<Item, Error> {
+        if chunk_hashes.len() != manifest.chunk_count as usize {
+            return Err(Error::Storage(StorageError::TreeReconstruct));
+        }
+
+        let path = self.path(&path);
+        self.ensure_handle(&path)?;
+
+        let available_hashes: HashSet<Hash> = local_hashes.iter().copied().collect();
+        let mut received_chunks: VecDeque<Vec<u8>> = received_chunks.into();
+        let mut partials = Vec::with_capacity(chunk_hashes.len());
+        let mut offset = 0u64;
+        let mut chunks = Vec::with_capacity(chunk_hashes.len());
+        let mut hashes = HashSet::default();
+
+        for (index, chunk_hash) in chunk_hashes.iter().copied().enumerate() {
+            let size = if index + 1 == chunk_hashes.len() {
+                let full_chunks = chunk_hashes.len().saturating_sub(1) as u64;
+                manifest.total_size - full_chunks * manifest.chunk_size as u64
+            } else {
+                manifest.chunk_size as u64
+            };
+            let chunk_info = ChunkInfo {
+                hash: chunk_hash,
+                size,
+            };
+            chunks.push(chunk_info);
+            hashes.insert(chunk_info);
+
+            let node = if available_hashes.contains(&chunk_hash) {
+                Arc::new(Node::Skipped {
+                    hash: chunk_hash,
+                    size,
+                })
+            } else {
+                let data = received_chunks
+                    .pop_front()
+                    .ok_or_else(|| Error::Storage(StorageError::TreeReconstruct))?;
+                if do_hash(&data) != chunk_hash {
+                    return Err(Error::Storage(StorageError::TreeReconstruct));
+                }
+                self.pre_allocate_chunk(&path, &chunk_info, offset)?;
+                self.store_chunk(chunk_hash, &data).map_err(Error::from)?;
+                Arc::new(Node::Skipped {
+                    hash: chunk_hash,
+                    size,
+                })
+            };
+
+            offset += size;
+            partials.push(node);
+        }
+
+        if !received_chunks.is_empty() {
+            return Err(Error::Storage(StorageError::TreeReconstruct));
+        }
+
+        let root = self.finalize_sync_partials(partials, &mut hashes)?;
+        if root.hash() != &manifest.root_hash || root.size() != manifest.total_size {
+            return Err(Error::Storage(StorageError::TreeReconstruct));
+        }
+
+        let item = Item::make(
+            name,
+            path,
+            revision,
+            description,
+            root.chunk_info(),
+            chunks,
+            hashes.into_iter().collect(),
+        )?;
+
+        let mut inner = self.inner.write().unwrap();
+        inner.items.insert(item.clone());
+        drop(inner);
+        self.persist()?;
+        Ok(item)
     }
 
     fn flush_data_for_hash(&self, hash: &Hash) -> Result<(), Error> {
@@ -1119,6 +1260,100 @@ mod tests {
                 stream,
             )
             .await
+            .unwrap();
+
+        let stored = storage.get(&item.metadata.root.hash).unwrap().clone_data().unwrap();
+        assert_eq!(stored, data);
+    }
+
+    #[tokio::test]
+    async fn fs_storage_receive_sync_item_sparse_round_trip() {
+        use crate::chunk_storage::{hashmap_storage::HashMapStorage, ChunkStorage};
+        use crate::item::Manifest;
+
+        let tempdir = temp_path();
+        let storage = FsStorage::new(tempdir.clone());
+        let source = HashMapStorage::default();
+
+        let v1: Vec<u8> = (0..(CHUNK_SIZE * 8)).map(|index| ((index * 7) % 251) as u8).collect();
+        let old_root = source.insert(v1.clone().into()).unwrap();
+        let old_stream = tokio_stream::iter(old_root.clone().find_diff(&[]).map(|node| (*node).clone()));
+        let old_item = storage
+            .receive_item(
+                "sync-item".to_string(),
+                tempdir.join("sync.bin"),
+                1,
+                None,
+                old_stream,
+            )
+            .await
+            .unwrap();
+
+        let mut v2 = v1.clone();
+        for block_index in [2usize, 6usize] {
+            let start = block_index * CHUNK_SIZE;
+            let end = start + CHUNK_SIZE;
+            for (offset, byte) in v2[start..end].iter_mut().enumerate() {
+                *byte = byte.wrapping_add((block_index as u8).wrapping_mul(13)) ^ (offset as u8);
+            }
+        }
+
+        let new_root = source.insert(v2.clone().into()).unwrap();
+        let manifest = Manifest::from_tree("sync-item".to_string(), 2, &new_root);
+        let chunk_hashes = new_root.flatten().unwrap();
+        let local_hashes = old_root.flatten().unwrap();
+        let received_chunks: Vec<Vec<u8>> = v2
+            .chunks(CHUNK_SIZE)
+            .enumerate()
+            .filter(|(index, _)| matches!(*index, 2 | 6))
+            .map(|(_, chunk)| chunk.to_vec())
+            .collect();
+
+        let item = storage
+            .receive_sync_item(
+                old_item.metadata.name,
+                old_item.metadata.path,
+                2,
+                None,
+                &manifest,
+                &chunk_hashes,
+                &local_hashes,
+                received_chunks,
+            )
+            .unwrap();
+
+        let stored = storage.get(&item.metadata.root.hash).unwrap().clone_data().unwrap();
+        assert_eq!(stored, v2);
+    }
+
+    #[tokio::test]
+    async fn fs_storage_receive_sync_item_non_power_of_two_round_trip() {
+        use crate::chunk_storage::{hashmap_storage::HashMapStorage, ChunkStorage};
+        use crate::item::Manifest;
+
+        let tempdir = temp_path();
+        let storage = FsStorage::new(tempdir.clone());
+        let source = HashMapStorage::default();
+
+        let data: Vec<u8> = (0..(CHUNK_SIZE * 5 + 123))
+            .map(|index| ((index * 11) % 251) as u8)
+            .collect();
+        let root = source.insert(data.clone().into()).unwrap();
+        let manifest = Manifest::from_tree("odd-item".to_string(), 1, &root);
+        let chunk_hashes = root.flatten().unwrap();
+        let received_chunks: Vec<Vec<u8>> = data.chunks(CHUNK_SIZE).map(|chunk| chunk.to_vec()).collect();
+
+        let item = storage
+            .receive_sync_item(
+                "odd-item".to_string(),
+                tempdir.join("odd.bin"),
+                1,
+                None,
+                &manifest,
+                &chunk_hashes,
+                &[],
+                received_chunks,
+            )
             .unwrap();
 
         let stored = storage.get(&item.metadata.root.hash).unwrap().clone_data().unwrap();
