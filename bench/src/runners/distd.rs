@@ -296,10 +296,7 @@ impl ToolRunner for DistdRunner {
     ) -> Result<(), String> {
         // Clear client cache to avoid stale UUIDs being rejected by fresh server
         // The client stores its UUID in ~/.cache/distd/ and the server rejects old UUIDs
-        if let Ok(cache_dir) = std::env::var("HOME") {
-            let cache_path = PathBuf::from(cache_dir).join("Library/Caches/distd");
-            let _ = std::fs::remove_dir_all(&cache_path);
-        }
+        clean_distd_cache();
 
         // Start server (stop any previous one first)
         let server_pid = self.start_server()?;
@@ -430,10 +427,7 @@ impl ToolRunner for DistdRunner {
             .ok_or("No v2 source for delta benchmark")?;
 
         // Clear client cache to avoid stale UUIDs
-        if let Ok(cache_dir) = std::env::var("HOME") {
-            let cache_path = PathBuf::from(cache_dir).join("Library/Caches/distd");
-            let _ = std::fs::remove_dir_all(&cache_path);
-        }
+        clean_distd_cache();
 
         // Start server
         let server_pid = self.start_server()?;
@@ -577,6 +571,37 @@ impl ToolRunner for DistdRunner {
 impl Drop for DistdRunner {
     fn drop(&mut self) {
         self.stop_server();
+    }
+}
+
+/// Remove the distd client cache directory (UUIDs, FsStorage persistence, etc.)
+/// so that each benchmark run starts with a clean slate.
+fn clean_distd_cache() {
+    // Cross-platform: use $XDG_CACHE_HOME or platform-specific default
+    let cache_base = std::env::var("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .ok()
+        .or_else(|| {
+            std::env::var("HOME").ok().map(|h| {
+                let home = PathBuf::from(h);
+                if cfg!(target_os = "macos") {
+                    home.join("Library/Caches")
+                } else {
+                    home.join(".cache")
+                }
+            })
+        });
+
+    if let Some(base) = cache_base {
+        let cache_path = base.join("distd");
+        if cache_path.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&cache_path) {
+                tracing::warn!(
+                    "Failed to clean distd cache at {}: {e}",
+                    cache_path.display()
+                );
+            }
+        }
     }
 }
 
