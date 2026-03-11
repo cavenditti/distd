@@ -134,7 +134,8 @@ impl Server {
             DistdGrpcClient {
                 uuid: uuid_to_metadata(uuid),
             },
-        ))
+        )
+        .max_decoding_message_size(256 * 1024 * 1024))
     }
 
     /// Register a new client

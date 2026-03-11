@@ -77,7 +77,10 @@ where
 {
     pub async fn make_grpc_service(self) -> Result<tonic::transport::server::Router, ServerError> {
         let interceptor = self.uuid_interceptor.clone();
-        let svc = proto::distd_server::DistdServer::with_interceptor(self, interceptor);
+        let inner = proto::distd_server::DistdServer::new(self)
+            .max_decoding_message_size(256 * 1024 * 1024)
+            .max_encoding_message_size(256 * 1024 * 1024);
+        let svc = tonic::service::interceptor::InterceptedService::new(inner, interceptor);
 
         Ok(tonic::transport::Server::builder().add_service(svc))
     }
