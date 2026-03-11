@@ -111,6 +111,11 @@ pub fn generate_workloads(
 }
 
 fn generate_one(base: &Path, kind: &WorkloadKind, params: &WorkloadParams) -> Workload {
+    // Remove stale data from previous runs so that leftover files
+    // (e.g. from a non-smoke run) don't contaminate the new workload.
+    if base.exists() {
+        fs::remove_dir_all(base).expect("Failed to clean workload directory");
+    }
     match kind {
         WorkloadKind::SingleLargeFile => gen_single_large_file(base, params),
         WorkloadKind::ManySmallFiles => gen_many_small_files(base, params),
