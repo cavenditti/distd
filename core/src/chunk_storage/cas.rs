@@ -45,8 +45,10 @@ impl CasStorage {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        // Write to temp then rename for atomicity
-        let tmp = path.with_extension("tmp");
+        // Use a per-call unique temp name so that two concurrent stores of the
+        // same hash do not truncate each other's in-flight write (TOCTOU).
+        let nonce = rand::random::<u64>();
+        let tmp = path.with_extension(format!("{nonce:016x}.tmp"));
         let mut f = fs::File::create(&tmp)?;
         f.write_all(data)?;
         f.flush()?;
