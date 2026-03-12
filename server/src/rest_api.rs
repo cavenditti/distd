@@ -209,6 +209,24 @@ struct ItemPostObj {
     pub name: String,
 }
 
+fn sanitize_relative_upload_path(path: &str) -> Option<PathBuf> {
+    let candidate = PathBuf::from(path);
+    if candidate.is_absolute() {
+        return None;
+    }
+    if candidate.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return None;
+    }
+    Some(candidate)
+}
+
 /// Publish an item
 async fn publish_item<T>(
     Query(item_data): Query<ItemPostObj>,
@@ -218,6 +236,8 @@ async fn publish_item<T>(
 where
     T: ChunkStorage + Sync + Send + Debug,
 {
+    let mut uploaded_files = Vec::new();
+
     while let Some(field) = multipart
         .next_field()
         .await
@@ -226,23 +246,35 @@ where
         if field.name().unwrap() != "item" {
             continue;
         }
-        let res = server
-            .publish_item(
-                item_data.name,
-                item_data.path,
-                item_data.description,
-                field
-                    .bytes()
-                    .await
-                    .inspect_err(|e| tracing::warn!("Cannot extract bytes from item field: {e}"))
-                    .map_err(|_| StatusCode::BAD_REQUEST)?,
-            )
-            .await;
-        let res = res.map(|x| x.metadata);
-        tracing::debug!("{:?}", res);
-        return res.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+        let file_name = field
+            .file_name()
+            .and_then(sanitize_relative_upload_path)
+            .unwrap_or_else(|| PathBuf::from("item"));
+        let data = field
+            .bytes()
+            .await
+            .inspect_err(|e| tracing::warn!("Cannot extract bytes from item field: {e}"))
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
+        uploaded_files.push((file_name, data));
     }
-    Err(StatusCode::BAD_REQUEST)
+
+    if uploaded_files.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let result = if uploaded_files.len() == 1 {
+        let (_, file) = uploaded_files.pop().unwrap();
+        server
+            .publish_item(item_data.name, item_data.path, item_data.description, file)
+            .await
+    } else {
+        server
+            .publish_item_from_files(item_data.name, item_data.path, item_data.description, uploaded_files)
+            .await
+    };
+    let result = result.map(|item| item.metadata);
+    tracing::debug!("{:?}", result);
+    result.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 /// Get one feed

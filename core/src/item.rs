@@ -169,6 +169,19 @@ impl Item {
         chunks: Vec<ChunkInfo>,
         hashes: HashSet<ChunkInfo>,
     ) -> Result<Self, std::io::Error> {
+        Self::make_with_entries(name, path, revision, description, root, chunks, hashes, Vec::new())
+    }
+
+    pub fn make_with_entries(
+        name: Name,
+        path: PathBuf,
+        revision: u32,
+        description: Option<String>,
+        root: ChunkInfo,
+        chunks: Vec<ChunkInfo>,
+        hashes: HashSet<ChunkInfo>,
+        entries: Vec<FileEntry>,
+    ) -> Result<Self, std::io::Error> {
         let artifact_id = name.clone();
         let chunk_count = if chunks.is_empty() { 1 } else { chunks.len() as u32 };
         let manifest = Manifest {
@@ -179,7 +192,7 @@ impl Item {
             chunk_count,
             chunk_size: CHUNK_SIZE as u32,
             chunk_algorithm: ChunkAlgorithm::default(),
-            entries: Vec::new(),
+            entries,
         };
         let now = SystemTime::now();
         Ok(Self {

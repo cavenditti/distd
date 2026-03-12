@@ -13,7 +13,7 @@ use distd_core::{
     chunks::ChunkAlgorithm,
     error::InvalidParameter,
     hash::Hash,
-    item::Manifest,
+    item::{FileEntry, Manifest},
     metadata::Server as ServerMetadata,
     proto::{self, distd_client::DistdClient, SyncMessage},
     proto::sync_message::Msg,
@@ -257,7 +257,15 @@ impl Server {
             chunk_count: manifest_resp.chunk_count,
             chunk_size: manifest_resp.chunk_size,
             chunk_algorithm: ChunkAlgorithm::default(),
-            entries: Vec::new(),
+            entries: manifest_resp
+                .entries
+                .into_iter()
+                .map(|entry| FileEntry {
+                    relative_path: entry.relative_path,
+                    size: entry.size,
+                    chunk_range: (entry.chunk_start, entry.chunk_end),
+                })
+                .collect(),
         };
 
         let chunk_hashes: Vec<Hash> = manifest_resp
@@ -268,6 +276,40 @@ impl Server {
                 Ok(Hash::from_bytes(arr))
             })
             .collect::<Result<Vec<_>, _>>()?;
+
+        let chunk_sizes: Vec<usize> = if manifest.entries.is_empty() {
+            let chunk_size = manifest.chunk_size as usize;
+            (0..manifest.chunk_count)
+                .map(|idx| {
+                    if idx + 1 == manifest.chunk_count {
+                        let rem = (manifest.total_size as usize) % chunk_size;
+                        if rem == 0 { chunk_size } else { rem }
+                    } else {
+                        chunk_size
+                    }
+                })
+                .collect()
+        } else {
+            let chunk_size = manifest.chunk_size as usize;
+            let mut sizes = Vec::with_capacity(manifest.chunk_count as usize);
+            for entry in &manifest.entries {
+                let start = entry.chunk_range.0;
+                let end = entry.chunk_range.1;
+                let chunk_count = end.saturating_sub(start);
+                for position in 0..chunk_count {
+                    let is_last = position + 1 == chunk_count;
+                    let size = if is_last {
+                        let full_chunks = chunk_count.saturating_sub(1) as usize;
+                        let remainder = (entry.size as usize).saturating_sub(full_chunks * chunk_size);
+                        if remainder == 0 { chunk_size } else { remainder }
+                    } else {
+                        chunk_size
+                    };
+                    sizes.push(size);
+                }
+            }
+            sizes
+        };
 
         let available_hashes: HashSet<Hash> = local_hashes.iter().copied().collect();
         let mut local_bitfield = distd_core::possession::Bitfield::empty(manifest.chunk_count);
@@ -300,17 +342,12 @@ impl Server {
                 }
                 Ok(SyncMessage { msg: Some(Msg::BulkData(bd)) }) => {
                     // Split bulk data back into individual chunks
-                    let chunk_size = manifest.chunk_size as usize;
                     let mut offset = 0;
                     for i in 0..bd.count {
                         let idx = bd.start_index + i;
-                        let this_size = if idx == manifest.chunk_count - 1 {
-                            // Last chunk may be smaller
-                            let rem = (manifest.total_size as usize) % chunk_size;
-                            if rem == 0 { chunk_size } else { rem }
-                        } else {
-                            chunk_size
-                        };
+                        let this_size = *chunk_sizes
+                            .get(idx as usize)
+                            .ok_or(ServerRequest::UnexpectedMessage)?;
                         if offset + this_size <= bd.data.len() {
                             received.push(bd.data[offset..offset + this_size].to_vec());
                         }

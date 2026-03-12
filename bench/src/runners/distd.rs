@@ -247,6 +247,51 @@ impl DistdRunner {
         Ok(())
     }
 
+    fn publish_files(
+        &self,
+        source_root: &Path,
+        source_files: &[PathBuf],
+        item_name: &str,
+        item_path: &str,
+    ) -> Result<(), String> {
+        let mut cmd = Command::new("curl");
+        cmd.arg("-s")
+            .arg("-f")
+            .arg("--connect-timeout")
+            .arg(CURL_CONNECT_TIMEOUT)
+            .arg("--max-time")
+            .arg(CURL_MAX_TIME)
+            .arg("-X")
+            .arg("POST")
+            .arg(format!(
+                "http://127.0.0.1:3000/items?name={}&path={}",
+                item_name, item_path
+            ));
+
+        for source_file in source_files {
+            let relative = source_file
+                .strip_prefix(source_root)
+                .map_err(|e| format!("Cannot derive relative path for {}: {e}", source_file.display()))?;
+            cmd.arg("-F").arg(format!(
+                "item=@{};filename={}",
+                source_file.to_string_lossy(),
+                relative.to_string_lossy()
+            ));
+        }
+
+        let output = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|e| format!("curl publish failed: {e}"))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("Failed to publish multi-file item to distd server: {stderr}"));
+        }
+        Ok(())
+    }
+
     /// Run the distd client to fetch an item.
     fn client_get(
         &self,
@@ -333,21 +378,11 @@ impl ToolRunner for DistdRunner {
         let item_name = "bench-artifact";
         let item_path = "bench-artifact";
 
-        // For multi-file workloads, tar the source directory into a single file
-        // (matches distd's single-item model honestly)
-        let publish_file = if source_files.len() > 1 {
-            let tar_path = self.work_dir.join("publish_packed.tar");
-            workload::pack_tar(&workload.source_dir, &tar_path);
-            m.notes = format!(
-                "distd: {} files tar-packed into single artifact",
-                source_files.len()
-            );
-            tar_path
+        if let Err(e) = if source_files.len() > 1 {
+            self.publish_files(&workload.source_dir, &source_files, item_name, item_path)
         } else {
-            source_files[0].clone()
-        };
-
-        if let Err(e) = self.publish_file(&publish_file, item_name, item_path) {
+            self.publish_file(&source_files[0], item_name, item_path)
+        } {
             self.stop_server();
             return Err(e);
         }
@@ -419,11 +454,19 @@ impl ToolRunner for DistdRunner {
         m.cpu_seconds = cpu_secs;
 
         // Validate correctness by comparing source and dest hashes
-        let src_hash = metrics::hash_file(&publish_file);
-        // distd writes the item under dest_dir at the item_path
         let dest_file = dest_dir.join(item_path);
         if dest_file.exists() {
-            let dst_hash = metrics::hash_file(&dest_file);
+            let (src_hash, dst_hash) = if source_files.len() > 1 {
+                (
+                    metrics::hash_dir(&workload.source_dir),
+                    metrics::hash_dir(&dest_file),
+                )
+            } else {
+                (
+                    metrics::hash_file(&source_files[0]),
+                    metrics::hash_file(&dest_file),
+                )
+            };
             m.correct = src_hash == dst_hash;
             if !m.correct {
                 m.notes
@@ -473,16 +516,12 @@ impl ToolRunner for DistdRunner {
         let item_name = "bench-artifact";
         let item_path = "bench-artifact";
 
-        let v1_publish_file = if v1_files.len() > 1 {
-            let tar_path = self.work_dir.join("update_v1.tar");
-            workload::pack_tar(&workload.source_dir, &tar_path);
-            tar_path
+        if v1_files.len() > 1 {
+            self.publish_files(&workload.source_dir, &v1_files, item_name, item_path)
         } else {
-            v1_files[0].clone()
-        };
-
-        self.publish_file(&v1_publish_file, item_name, item_path)
-            .map_err(|e| { self.stop_server(); e })?;
+            self.publish_file(&v1_files[0], item_name, item_path)
+        }
+        .map_err(|e| { self.stop_server(); e })?;
 
         std::fs::create_dir_all(dest_dir).map_err(|e| { self.stop_server(); e.to_string() })?;
         let dest_file = dest_dir.join(item_path);
@@ -496,19 +535,17 @@ impl ToolRunner for DistdRunner {
 
         // --- Phase 2: publish v2 to the SAME item path (triggers revision bump) ---
         let v2_files = workload::walkdir_files(v2_dir);
-        let v2_publish_file = if v2_files.len() > 1 {
-            let tar_path = self.work_dir.join("update_v2.tar");
-            workload::pack_tar(v2_dir, &tar_path);
-            tar_path
-        } else if v2_files.is_empty() {
+        if v2_files.is_empty() {
             self.stop_server();
             return Err("No files in v2 source".to_string());
-        } else {
-            v2_files[0].clone()
-        };
+        }
 
-        self.publish_file(&v2_publish_file, item_name, item_path)
-            .map_err(|e| { self.stop_server(); e })?;
+        if v2_files.len() > 1 {
+            self.publish_files(v2_dir, &v2_files, item_name, item_path)
+        } else {
+            self.publish_file(&v2_files[0], item_name, item_path)
+        }
+        .map_err(|e| { self.stop_server(); e })?;
 
         // --- Phase 3: fetch again (the measured delta operation) ---
         // The client's dest already has v1 data; this exercises the diff path
@@ -575,8 +612,17 @@ impl ToolRunner for DistdRunner {
 
         // Validate v2 output hash
         if dest_file.exists() {
-            let src_hash = metrics::hash_file(&v2_publish_file);
-            let dst_hash = metrics::hash_file(&dest_file);
+            let (src_hash, dst_hash) = if v2_files.len() > 1 {
+                (
+                    metrics::hash_dir(v2_dir),
+                    metrics::hash_dir(&dest_file),
+                )
+            } else {
+                (
+                    metrics::hash_file(&v2_files[0]),
+                    metrics::hash_file(&dest_file),
+                )
+            };
             m.correct = src_hash == dst_hash;
             if !m.correct {
                 m.notes

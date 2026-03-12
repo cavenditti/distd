@@ -16,7 +16,7 @@ use crate::{
     chunks::{ChunkInfo, CHUNK_SIZE},
     error::{Error, InvalidParameter},
     hash::{hash as do_hash, merge_hashes, Hash, HashTreeCapable},
-    item::{Item, Manifest, Name as ItemName},
+    item::{FileEntry, Item, Manifest, Name as ItemName},
     utils::settings::cache_dir,
 };
 
@@ -517,6 +517,15 @@ impl Default for FsStorage {
 }
 
 impl FsStorage {
+    fn artifact_entry_path(root: &Path, relative_path: &Path) -> PathBuf {
+        relative_path
+            .components()
+            .fold(root.to_path_buf(), |mut acc, component| {
+                acc.push(component.as_os_str());
+                acc
+            })
+    }
+
     fn combine_sync_nodes(
         &self,
         left: Arc<Node>,
@@ -654,6 +663,129 @@ impl FsStorage {
 
         let root = self.finalize_sync_partials(partials, &mut hashes)?;
         Ok((root, chunks, hashes))
+    }
+
+    fn build_compact_tree_from_files(
+        &self,
+        root_path: &Path,
+        files: &[(PathBuf, bytes::Bytes)],
+    ) -> Result<(Arc<Node>, Vec<ChunkInfo>, HashSet<ChunkInfo>, Vec<FileEntry>), Error> {
+        let mut partials = Vec::new();
+        let mut chunks = Vec::new();
+        let mut hashes = HashSet::default();
+        let mut entries = Vec::with_capacity(files.len());
+        let mut next_chunk_index = 0u32;
+
+        for (relative_path, data) in files {
+            let full_path = Self::artifact_entry_path(root_path, relative_path);
+            create_dir_all(full_path.parent().ok_or(Error::MissingData)?)?;
+            self.ensure_handle(&full_path)?;
+
+            let start = next_chunk_index;
+            let mut offset = 0u64;
+            for chunk in data.as_ref().chunks(CHUNK_SIZE) {
+                let hash = do_hash(chunk);
+                let chunk_info = ChunkInfo {
+                    hash,
+                    size: chunk.len() as u64,
+                };
+                self.pre_allocate_chunk(&full_path, &chunk_info, offset)?;
+                self.store_chunk(hash, chunk).map_err(Error::from)?;
+                chunks.push(chunk_info);
+                hashes.insert(chunk_info);
+                partials.push(Arc::new(Node::Skipped {
+                    hash,
+                    size: chunk.len() as u64,
+                }));
+                offset += chunk.len() as u64;
+                next_chunk_index += 1;
+            }
+
+            entries.push(FileEntry {
+                relative_path: relative_path.to_string_lossy().to_string(),
+                size: data.len() as u64,
+                chunk_range: (start, next_chunk_index),
+            });
+        }
+
+        if partials.is_empty() {
+            return Err(Error::MissingData);
+        }
+
+        let root = self.finalize_sync_partials(partials, &mut hashes)?;
+        Ok((root, chunks, hashes, entries))
+    }
+
+    fn receive_manifest_entry_chunks(
+        &self,
+        item_root: &Path,
+        manifest: &Manifest,
+        chunk_hashes: &[Hash],
+        available_hashes: &HashSet<Hash>,
+        received_chunks: &mut VecDeque<Vec<u8>>,
+    ) -> Result<(Vec<ChunkInfo>, HashSet<ChunkInfo>, Arc<Node>), Error> {
+        let mut partials = Vec::with_capacity(chunk_hashes.len());
+        let mut chunks = Vec::with_capacity(chunk_hashes.len());
+        let mut hashes = HashSet::default();
+
+        for entry in &manifest.entries {
+            let relative_path = PathBuf::from(&entry.relative_path);
+            let full_path = Self::artifact_entry_path(item_root, &relative_path);
+            create_dir_all(full_path.parent().ok_or(Error::MissingData)?)?;
+            self.ensure_handle(&full_path)?;
+
+            let start = entry.chunk_range.0 as usize;
+            let end = entry.chunk_range.1 as usize;
+            let chunk_count = end.saturating_sub(start);
+            let mut offset = 0u64;
+            for index in start..end {
+                let chunk_hash = *chunk_hashes
+                    .get(index)
+                    .ok_or_else(|| Error::Storage(StorageError::TreeReconstruct))?;
+                let chunk_info = ChunkInfo {
+                    hash: chunk_hash,
+                    size: if index + 1 == end {
+                        let full_chunks = chunk_count.saturating_sub(1) as u64;
+                        let remainder = entry.size.saturating_sub(full_chunks * manifest.chunk_size as u64);
+                        if remainder == 0 {
+                            manifest.chunk_size as u64
+                        } else {
+                            remainder
+                        }
+                    } else {
+                        manifest.chunk_size as u64
+                    },
+                };
+
+                self.pre_allocate_chunk(&full_path, &chunk_info, offset)?;
+                offset += chunk_info.size;
+                chunks.push(chunk_info);
+                hashes.insert(chunk_info);
+
+                if available_hashes.contains(&chunk_hash) {
+                    let data = self
+                        .read_chunk_data(&chunk_hash)
+                        .ok_or_else(|| Error::Storage(StorageError::TreeReconstruct))?;
+                    self.store_chunk(chunk_hash, data.as_slice()).map_err(Error::from)?;
+                } else {
+                    let data = received_chunks
+                        .pop_front()
+                        .ok_or_else(|| Error::Storage(StorageError::TreeReconstruct))?;
+                    if do_hash(&data) != chunk_hash {
+                        return Err(Error::Storage(StorageError::TreeReconstruct));
+                    }
+                    self.store_chunk(chunk_hash, &data).map_err(Error::from)?;
+                }
+
+                partials.push(Arc::new(Node::Skipped {
+                    hash: chunk_hash,
+                    size: chunk_info.size,
+                }));
+            }
+        }
+
+        let root = self.finalize_sync_partials(partials, &mut hashes)?;
+        Ok((chunks, hashes, root))
     }
 
     fn materialize_node(&self, node: Arc<Node>) -> Option<Arc<Node>> {
@@ -799,63 +931,75 @@ impl FsStorage {
         }
 
         let stored_path = self.path(&path);
-        self.ensure_handle(&stored_path)?;
-
         let available_hashes: HashSet<Hash> = local_hashes.iter().copied().collect();
         let mut received_chunks: VecDeque<Vec<u8>> = received_chunks.into();
-        let mut partials = Vec::with_capacity(chunk_hashes.len());
-        let mut offset = 0u64;
-        let mut chunks = Vec::with_capacity(chunk_hashes.len());
-        let mut hashes = HashSet::default();
+        let (chunks, hashes, root) = if manifest.entries.is_empty() {
+            self.ensure_handle(&stored_path)?;
 
-        for (index, chunk_hash) in chunk_hashes.iter().copied().enumerate() {
-            let size = if index + 1 == chunk_hashes.len() {
-                let full_chunks = chunk_hashes.len().saturating_sub(1) as u64;
-                manifest.total_size - full_chunks * manifest.chunk_size as u64
-            } else {
-                manifest.chunk_size as u64
-            };
-            let chunk_info = ChunkInfo {
-                hash: chunk_hash,
-                size,
-            };
-            chunks.push(chunk_info);
-            hashes.insert(chunk_info);
+            let mut partials = Vec::with_capacity(chunk_hashes.len());
+            let mut offset = 0u64;
+            let mut chunks = Vec::with_capacity(chunk_hashes.len());
+            let mut hashes = HashSet::default();
 
-            let node = if available_hashes.contains(&chunk_hash) {
-                Arc::new(Node::Skipped {
+            for (index, chunk_hash) in chunk_hashes.iter().copied().enumerate() {
+                let size = if index + 1 == chunk_hashes.len() {
+                    let full_chunks = chunk_hashes.len().saturating_sub(1) as u64;
+                    manifest.total_size - full_chunks * manifest.chunk_size as u64
+                } else {
+                    manifest.chunk_size as u64
+                };
+                let chunk_info = ChunkInfo {
                     hash: chunk_hash,
                     size,
-                })
-            } else {
-                let data = received_chunks
-                    .pop_front()
-                    .ok_or_else(|| Error::Storage(StorageError::TreeReconstruct))?;
-                if do_hash(&data) != chunk_hash {
-                    return Err(Error::Storage(StorageError::TreeReconstruct));
-                }
-                self.pre_allocate_chunk(&stored_path, &chunk_info, offset)?;
-                self.store_chunk(chunk_hash, &data).map_err(Error::from)?;
-                Arc::new(Node::Skipped {
-                    hash: chunk_hash,
-                    size,
-                })
-            };
+                };
+                chunks.push(chunk_info);
+                hashes.insert(chunk_info);
 
-            offset += size;
-            partials.push(node);
-        }
+                let node = if available_hashes.contains(&chunk_hash) {
+                    Arc::new(Node::Skipped {
+                        hash: chunk_hash,
+                        size,
+                    })
+                } else {
+                    let data = received_chunks
+                        .pop_front()
+                        .ok_or_else(|| Error::Storage(StorageError::TreeReconstruct))?;
+                    if do_hash(&data) != chunk_hash {
+                        return Err(Error::Storage(StorageError::TreeReconstruct));
+                    }
+                    self.pre_allocate_chunk(&stored_path, &chunk_info, offset)?;
+                    self.store_chunk(chunk_hash, &data).map_err(Error::from)?;
+                    Arc::new(Node::Skipped {
+                        hash: chunk_hash,
+                        size,
+                    })
+                };
+
+                offset += size;
+                partials.push(node);
+            }
+
+            let root = self.finalize_sync_partials(partials, &mut hashes)?;
+            (chunks, hashes, root)
+        } else {
+            self.receive_manifest_entry_chunks(
+                &stored_path,
+                manifest,
+                chunk_hashes,
+                &available_hashes,
+                &mut received_chunks,
+            )?
+        };
 
         if !received_chunks.is_empty() {
             return Err(Error::Storage(StorageError::TreeReconstruct));
         }
 
-        let root = self.finalize_sync_partials(partials, &mut hashes)?;
         if root.hash() != &manifest.root_hash || root.size() != manifest.total_size {
             return Err(Error::Storage(StorageError::TreeReconstruct));
         }
 
-        let item = Item::make(
+        let item = Item::make_with_entries(
             name,
             path,
             revision,
@@ -863,6 +1007,7 @@ impl FsStorage {
             root.chunk_info(),
             chunks,
             hashes.into_iter().collect(),
+            manifest.entries.clone(),
         )?;
 
         let mut inner = self.inner.write().unwrap();
@@ -1210,6 +1355,45 @@ impl ChunkStorage for FsStorage {
             hash_tree.chunk_info(),
             chunks,
             hashes.into_iter().collect::<StdHashSet<_>>(),
+        )?;
+        tracing::debug!("New item: {item}");
+        inner.insert_item(item.clone());
+        drop(inner);
+        self.persist()?;
+        Ok(item)
+    }
+
+    fn create_item_from_files(
+        &self,
+        name: ItemName,
+        path: PathBuf,
+        revision: u32,
+        description: Option<String>,
+        mut files: Vec<(PathBuf, bytes::Bytes)>,
+    ) -> Result<Item, Error>
+    where
+        Self: Sized,
+    {
+        if files.is_empty() {
+            return Err(Error::MissingData);
+        }
+
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let item_root = self.path(&path);
+        create_dir_all(&item_root)?;
+        let (hash_tree, chunks, hashes, entries) =
+            self.build_compact_tree_from_files(&item_root, &files)?;
+        let mut inner = self.inner.write().unwrap();
+        let item = Item::make_with_entries(
+            name,
+            path,
+            revision,
+            description,
+            hash_tree.chunk_info(),
+            chunks,
+            hashes.into_iter().collect::<StdHashSet<_>>(),
+            entries,
         )?;
         tracing::debug!("New item: {item}");
         inner.insert_item(item.clone());

@@ -35,6 +35,14 @@ message ManifestResponse {
   uint32 chunk_size = 6;
   // Ordered leaf hashes so client can build its bitfield
   repeated bytes chunk_hashes = 7;
+  repeated FileEntry entries = 8;
+}
+
+message FileEntry {
+  string relative_path = 1;
+  uint64 size = 2;
+  uint32 chunk_start = 3;
+  uint32 chunk_end = 4;
 }
 
 message PossessionBitfield {

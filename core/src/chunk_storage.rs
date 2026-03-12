@@ -110,6 +110,20 @@ pub trait ChunkStorage: HashTreeCapable<Arc<Node>, Error> {
         Ok(Item::new(name, path, revision, description, &hash_tree))
     }
 
+    fn create_item_from_files(
+        &self,
+        _name: ItemName,
+        _path: PathBuf,
+        _revision: u32,
+        _description: Option<String>,
+        _files: Vec<(PathBuf, Bytes)>,
+    ) -> Result<Item, Error>
+    where
+        Self: Sized,
+    {
+        Err(Error::Other("multi-file artifacts are unsupported by this storage".to_string()))
+    }
+
     /// Build a new Item from its metadata and root node
     fn build_item(
         &self,

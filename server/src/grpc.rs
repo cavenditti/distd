@@ -186,6 +186,17 @@ where
                     chunk_count: item.manifest.chunk_count,
                     chunk_size: item.manifest.chunk_size,
                     chunk_hashes: chunk_hashes.iter().map(|h| h.as_bytes().to_vec()).collect(),
+                    entries: item
+                        .manifest
+                        .entries
+                        .iter()
+                        .map(|entry| proto::FileEntry {
+                            relative_path: entry.relative_path.clone(),
+                            size: entry.size,
+                            chunk_start: entry.chunk_range.0,
+                            chunk_end: entry.chunk_range.1,
+                        })
+                        .collect(),
                 })),
             };
             if tx.send(Ok(resp)).await.is_err() {
@@ -214,7 +225,7 @@ where
 
             // Phase 3: stream missing chunks
             // If client has nothing, use BulkData fast path (Step 7)
-            if bitfield.is_empty() && !missing.is_empty() {
+            if bitfield.is_empty() && !missing.is_empty() && item.manifest.entries.is_empty() {
                 // Bulk mode: stream concatenated chunks
                 const BULK_BATCH: usize = 64;
                 for batch_start in (0..missing.len()).step_by(BULK_BATCH) {

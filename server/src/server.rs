@@ -289,6 +289,43 @@ where
         Ok(item)
     }
 
+    #[allow(clippy::missing_panics_doc)]
+    pub async fn publish_item_from_files(
+        &self,
+        name: ItemName,
+        path: PathBuf,
+        description: Option<String>,
+        mut files: Vec<(PathBuf, Bytes)>,
+    ) -> Result<Item, ServerError> {
+        let artifact_id: ArtifactId = name.clone();
+        let revision = self
+            .metadata
+            .read()
+            .await
+            .items
+            .get(&artifact_id)
+            .map(|i| i.metadata.revision + 1)
+            .unwrap_or_default();
+
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let item = self
+            .storage
+            .create_item_from_files(name, path, revision, description, files)
+            .map_err(|e| {
+                tracing::error!("Storage error: {e}");
+                ServerError::ChunkInsertError
+            })?;
+
+        self.metadata
+            .write()
+            .await
+            .items
+            .insert(artifact_id, item.clone());
+
+        Ok(item)
+    }
+
     /// Get the public key of the server
     #[must_use] pub fn public_key(&self) -> &[u8] {
         self.key_pair.public_key().as_ref()
