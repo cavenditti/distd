@@ -10,6 +10,7 @@ pub mod client;
 pub mod error;
 pub mod rest_api;
 pub mod grpc;
+pub mod quic;
 pub mod server;
 
 /// Run the server with a concrete storage backend.
@@ -26,6 +27,9 @@ where
     let grpc_service = server.clone().make_grpc_service().await.unwrap();
     tokio::spawn(grpc_service.serve(addr_grpc));
     tracing::info!("listening on {} for gRPC", addr_grpc);
+
+    let addr_quic = "0.0.0.0:50051".parse().unwrap();
+    tokio::spawn(server.clone().serve_quic(addr_quic));
 
     // run our app with hyper, listening globally on port 3000
     let addr = "0.0.0.0:3000";

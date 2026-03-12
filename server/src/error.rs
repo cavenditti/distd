@@ -19,6 +19,9 @@ pub enum Server {
     #[error("gRPC transport error, is port already in use?")]
     Transport(#[from] TransportError),
 
+    #[error("QUIC transport error: {0}")]
+    Quic(String),
+
     #[error("unknown data store error")]
     UnknownDataStore,
 

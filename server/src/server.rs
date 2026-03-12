@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -9,7 +10,11 @@ use axum::body::Bytes;
 use distd_core::chunk_storage::ChunkStorage;
 use distd_core::item::{ArtifactId, Item, Name as ItemName};
 use distd_core::metadata::Server as ServerMetadata;
+use distd_core::possession::Bitfield;
+use distd_core::proto::{self, sync_message::Msg, ClientKeepAlive, ClientRegister, ServerMetadata as ProtoServerMetadata, SyncMessage};
 use distd_core::utils::grpc::uuid_to_metadata;
+use distd_core::utils::uuid::slice_to_uuid;
+use distd_core::utils::serde::BitcodeSerializable;
 use ring::error::KeyRejected;
 use ring::pkcs8::Document;
 use ring::signature::{Ed25519KeyPair, KeyPair};
@@ -141,6 +146,146 @@ impl<T> Server<T>
 where
     T: ChunkStorage + Sync + Send + Debug,
 {
+    pub async fn register_response(
+        &self,
+        addr: SocketAddr,
+        request: ClientRegister,
+    ) -> Result<ProtoServerMetadata, String> {
+        let uuid = self
+            .register_client(
+                request.name,
+                addr,
+                Version::from_str(&request.version).ok(),
+                request.uuid.map(|x| slice_to_uuid(&x)),
+            )
+            .await
+            .map_err(|_| String::from("Cannot assign new UUID"))?;
+        let serialized = ServerMetadata::from(self.metadata.read().await.clone())
+            .to_bitcode()
+            .map_err(|_| String::from("Cannot serialize server metadata"))?;
+        Ok(ProtoServerMetadata {
+            serialized,
+            uuid: Some(uuid.as_bytes().to_vec()),
+        })
+    }
+
+    pub async fn fetch_response(
+        &self,
+        _request: ClientKeepAlive,
+    ) -> Result<ProtoServerMetadata, String> {
+        let serialized = ServerMetadata::from(self.metadata.read().await.clone())
+            .to_bitcode()
+            .map_err(|_| String::from("Cannot serialize server metadata"))?;
+        Ok(ProtoServerMetadata {
+            serialized,
+            uuid: None,
+        })
+    }
+
+    pub async fn sync_response_messages(
+        &self,
+        manifest_req: proto::ManifestRequest,
+        possession: proto::PossessionBitfield,
+    ) -> Result<Vec<SyncMessage>, String> {
+        let item = {
+            let md = self.metadata.read().await;
+            md.items.get(&manifest_req.artifact_id).cloned()
+        }
+        .ok_or_else(|| format!("Unknown artifact: {}", manifest_req.artifact_id))?;
+
+        let root_hash = *item.root();
+        let chunk_hashes = self.storage.chunk_list(&root_hash);
+        let bitfield = Bitfield::from_bytes(&possession.bitfield)
+            .ok_or_else(|| String::from("Invalid bitfield"))?;
+
+        let mut messages = vec![SyncMessage {
+            msg: Some(Msg::ManifestResponse(proto::ManifestResponse {
+                artifact_id: item.manifest.artifact_id.clone(),
+                version: item.manifest.version,
+                root_hash: root_hash.as_bytes().to_vec(),
+                total_size: item.manifest.total_size,
+                chunk_count: item.manifest.chunk_count,
+                chunk_size: item.manifest.chunk_size,
+                chunk_hashes: chunk_hashes.iter().map(|h| h.as_bytes().to_vec()).collect(),
+                entries: item
+                    .manifest
+                    .entries
+                    .iter()
+                    .map(|entry| proto::FileEntry {
+                        relative_path: entry.relative_path.clone(),
+                        size: entry.size,
+                        chunk_start: entry.chunk_range.0,
+                        chunk_end: entry.chunk_range.1,
+                    })
+                    .collect(),
+            })),
+        }];
+
+        let missing = bitfield.missing_indices();
+        tracing::debug!(
+            "Sync: {} missing chunks out of {}",
+            missing.len(),
+            bitfield.chunk_count()
+        );
+
+        if bitfield.is_empty() && !missing.is_empty() {
+            const BULK_TARGET_BYTES: usize = 16 * 1024 * 1024;
+            const BULK_MAX_CHUNKS: usize = 512;
+
+            let mut cursor = 0;
+            while cursor < missing.len() {
+                let start_index = missing[cursor];
+                let mut count = 0usize;
+                let mut bulk_buf = Vec::with_capacity(BULK_TARGET_BYTES);
+
+                while cursor < missing.len() && count < BULK_MAX_CHUNKS {
+                    let idx = missing[cursor];
+                    if idx != start_index + count as u32 {
+                        break;
+                    }
+
+                    let Some(data) = self.storage.get_chunk_by_index(&root_hash, idx) else {
+                        cursor += 1;
+                        continue;
+                    };
+
+                    if count > 0 && bulk_buf.len() + data.len() > BULK_TARGET_BYTES {
+                        break;
+                    }
+
+                    bulk_buf.extend_from_slice(&data);
+                    count += 1;
+                    cursor += 1;
+                }
+
+                if count == 0 {
+                    continue;
+                }
+
+                messages.push(SyncMessage {
+                    msg: Some(Msg::BulkData(proto::BulkData {
+                        data: bulk_buf,
+                        start_index,
+                        count: count as u32,
+                    })),
+                });
+            }
+        } else {
+            for idx in missing {
+                if let Some(data) = self.storage.get_chunk_by_index(&root_hash, idx) {
+                    messages.push(SyncMessage {
+                        msg: Some(Msg::ChunkData(proto::ChunkData {
+                            chunk_index: idx,
+                            data,
+                        })),
+                    });
+                }
+            }
+        }
+
+        Ok(messages)
+    }
+
     /// Register a new client
     ///
     /// This function will insert a new client into the clients map.

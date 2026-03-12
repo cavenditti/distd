@@ -1,17 +1,12 @@
 use std::borrow::Borrow;
 use std::collections::HashSet;
 use std::fmt::Debug;
-use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 
 use distd_core::chunk_storage::ChunkStorage;
-use distd_core::possession::Bitfield;
 use distd_core::proto::{self, SyncMessage};
 use distd_core::proto::sync_message::Msg;
 use distd_core::utils::grpc::metadata_to_uuid;
-use distd_core::utils::serde::BitcodeSerializable;
-use distd_core::utils::uuid::slice_to_uuid;
-use distd_core::version::Version;
 use tokio::sync::mpsc;
 use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
 
@@ -19,7 +14,6 @@ use tonic::metadata::MetadataValue;
 use tonic::service::Interceptor;
 use tonic::{Code, Request, Response, Status, Streaming};
 
-use distd_core::metadata::Server as ServerMetadataRepr;
 use distd_core::proto::{distd_server::Distd, ClientKeepAlive, ClientRegister, ServerMetadata};
 use uuid::Uuid;
 use crate::error::Server as ServerError;
@@ -96,22 +90,11 @@ where
         let addr = request.remote_addr();
         let inner = request.into_inner();
         let addr = addr.ok_or(Status::new(Code::Internal, "Invalid source address"))?;
-        let uuid = self
-            .register_client(
-                inner.name,
-                addr,
-                Version::from_str(&inner.version).ok(),
-                inner.uuid.map(|x| slice_to_uuid(&x)),
-            )
+        let response = self
+            .register_response(addr, inner)
             .await
-            .map_err(|_| Status::new(Code::Internal, "Cannot assign new UUID"))?;
-        let serialized = ServerMetadataRepr::from(self.metadata.read().await.clone())
-            .to_bitcode()
-            .map_err(|_| Status::new(Code::Internal, "Cannot serialize server metadata"))?;
-        Ok(Response::new(ServerMetadata {
-            serialized,
-            uuid: Some(uuid.as_bytes().to_vec()),
-        }))
+            .map_err(|message| Status::new(Code::Internal, message))?;
+        Ok(Response::new(response))
     }
 
     async fn fetch(
@@ -119,13 +102,11 @@ where
         request: Request<ClientKeepAlive>,
     ) -> Result<Response<ServerMetadata>, Status> {
         ensure_authenticated(&request, &self.uuid_interceptor)?;
-        let serialized = ServerMetadataRepr::from(self.metadata.read().await.clone())
-            .to_bitcode()
-            .map_err(|_| Status::new(Code::Internal, "Cannot serialize server metadata"))?;
-        Ok(Response::new(ServerMetadata {
-            serialized,
-            uuid: None,
-        }))
+        let response = self
+            .fetch_response(request.into_inner())
+            .await
+            .map_err(|message| Status::new(Code::Internal, message))?;
+        Ok(Response::new(response))
     }
 
     /// PPSPP-style bidirectional sync.
@@ -143,8 +124,7 @@ where
         // so we rely on the interceptor having already validated the UUID.
 
         let mut in_stream = request.into_inner();
-        let storage = self.storage.clone();
-        let metadata = self.metadata.clone();
+        let server = self.clone();
 
         let (tx, rx) = mpsc::channel(128);
 
@@ -158,140 +138,35 @@ where
                 }
             };
 
-            // Look up the item
-            let item = {
-                let md = metadata.read().await;
-                md.items.get(&manifest_req.artifact_id).cloned()
-            };
-            let item = match item {
-                Some(i) => i,
-                None => {
-                    let _ = tx.send(Err(Status::not_found(
-                        format!("Unknown artifact: {}", manifest_req.artifact_id),
-                    ))).await;
-                    return;
-                }
-            };
-
-            let root_hash = *item.root();
-            let chunk_hashes = storage.chunk_list(&root_hash);
-
-            // Send ManifestResponse
-            let resp = SyncMessage {
-                msg: Some(Msg::ManifestResponse(proto::ManifestResponse {
-                    artifact_id: item.manifest.artifact_id.clone(),
-                    version: item.manifest.version,
-                    root_hash: root_hash.as_bytes().to_vec(),
-                    total_size: item.manifest.total_size,
-                    chunk_count: item.manifest.chunk_count,
-                    chunk_size: item.manifest.chunk_size,
-                    chunk_hashes: chunk_hashes.iter().map(|h| h.as_bytes().to_vec()).collect(),
-                    entries: item
-                        .manifest
-                        .entries
-                        .iter()
-                        .map(|entry| proto::FileEntry {
-                            relative_path: entry.relative_path.clone(),
-                            size: entry.size,
-                            chunk_start: entry.chunk_range.0,
-                            chunk_end: entry.chunk_range.1,
-                        })
-                        .collect(),
-                })),
-            };
-            if tx.send(Ok(resp)).await.is_err() {
-                return;
-            }
-
             // Phase 2: wait for PossessionBitfield
-            let bitfield = match in_stream.next().await {
-                Some(Ok(SyncMessage { msg: Some(Msg::Possession(poss)) })) => {
-                    match Bitfield::from_bytes(&poss.bitfield) {
-                        Some(bf) => bf,
-                        None => {
-                            let _ = tx.send(Err(Status::invalid_argument("Invalid bitfield"))).await;
-                            return;
-                        }
-                    }
-                }
+            let possession = match in_stream.next().await {
+                Some(Ok(SyncMessage { msg: Some(Msg::Possession(poss)) })) => poss,
                 _ => {
                     let _ = tx.send(Err(Status::invalid_argument("Expected PossessionBitfield"))).await;
                     return;
                 }
             };
 
-            let missing = bitfield.missing_indices();
-            tracing::debug!("Sync: {} missing chunks out of {}", missing.len(), bitfield.chunk_count());
-
-            // Phase 3: stream missing chunks
-            // If client has nothing, use BulkData fast path regardless of artifact layout.
-            // The client already knows per-chunk sizes from the manifest entries and can split
-            // the stream back into individual chunks without per-chunk gRPC framing.
-            if bitfield.is_empty() && !missing.is_empty() {
-                // Bulk mode: stream concatenated chunks with a byte budget rather than a fixed
-                // chunk count so many-small-files can amortize framing overhead more effectively.
-                const BULK_TARGET_BYTES: usize = 16 * 1024 * 1024;
-                const BULK_MAX_CHUNKS: usize = 512;
-
-                let mut cursor = 0;
-                while cursor < missing.len() {
-                    let start_index = missing[cursor];
-                    let mut count = 0usize;
-                    let mut bulk_buf = Vec::with_capacity(BULK_TARGET_BYTES);
-
-                    while cursor < missing.len() && count < BULK_MAX_CHUNKS {
-                        let idx = missing[cursor];
-                        if idx != start_index + count as u32 {
-                            break;
-                        }
-
-                        let Some(data) = storage.get_chunk_by_index(&root_hash, idx) else {
-                            cursor += 1;
-                            continue;
-                        };
-
-                        if count > 0 && bulk_buf.len() + data.len() > BULK_TARGET_BYTES {
-                            break;
-                        }
-
-                        bulk_buf.extend_from_slice(&data);
-                        count += 1;
-                        cursor += 1;
-                    }
-
-                    if count == 0 {
-                        continue;
-                    }
-
-                    let msg = SyncMessage {
-                        msg: Some(Msg::BulkData(proto::BulkData {
-                            data: bulk_buf,
-                            start_index,
-                            count: count as u32,
-                        })),
-                    };
-                    if tx.send(Ok(msg)).await.is_err() {
-                        return;
-                    }
-                }
-            } else {
-                // Per-chunk mode
-                for idx in missing {
-                    if let Some(data) = storage.get_chunk_by_index(&root_hash, idx) {
-                        let msg = SyncMessage {
-                            msg: Some(Msg::ChunkData(proto::ChunkData {
-                                chunk_index: idx,
-                                data,
-                            })),
-                        };
-                        if tx.send(Ok(msg)).await.is_err() {
+            match server.sync_response_messages(manifest_req, possession).await {
+                Ok(messages) => {
+                    for message in messages {
+                        if tx.send(Ok(message)).await.is_err() {
                             return;
                         }
                     }
                 }
+                Err(message) => {
+                    let status = if message.starts_with("Unknown artifact:") {
+                        Status::not_found(message)
+                    } else if message == "Invalid bitfield" {
+                        Status::invalid_argument(message)
+                    } else {
+                        Status::internal(message)
+                    };
+                    let _ = tx.send(Err(status)).await;
+                    return;
+                }
             }
-
-            tracing::debug!("Sync complete for {}", item.manifest.artifact_id);
         });
 
         let output_stream = ReceiverStream::new(rx);

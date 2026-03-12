@@ -13,6 +13,7 @@ workspace = true
 http = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
+quinn = { workspace = true }
 
 thiserror = { workspace = true }
 tracing = { workspace = true }

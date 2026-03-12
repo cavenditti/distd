@@ -23,6 +23,75 @@ use distd_core::{
     Request,
 };
 
+mod quic;
+
+use quic::QuicTransportClient;
+
+type GrpcClient = DistdClient<InterceptedService<Channel, DistdGrpcClient>>;
+
+#[derive(Debug)]
+enum TransportClient {
+    Grpc(GrpcClient),
+    Quic(QuicTransportClient),
+}
+
+impl TransportClient {
+    async fn register(&mut self, request: distd_core::proto::ClientRegister) -> Result<distd_core::proto::ServerMetadata, ServerRequest> {
+        match self {
+            Self::Grpc(client) => Ok(client.register(Request::new(request)).await?.into_inner()),
+            Self::Quic(client) => client.register(request).await,
+        }
+    }
+
+    async fn fetch(&mut self, request: distd_core::proto::ClientKeepAlive) -> Result<distd_core::proto::ServerMetadata, ServerRequest> {
+        match self {
+            Self::Grpc(client) => Ok(client.fetch(Request::new(request)).await?.into_inner()),
+            Self::Quic(client) => client.fetch(request).await,
+        }
+    }
+
+    async fn sync(
+        &mut self,
+        manifest_request: proto::ManifestRequest,
+        possession: proto::PossessionBitfield,
+    ) -> Result<Vec<SyncMessage>, ServerRequest> {
+        match self {
+            Self::Grpc(client) => {
+                use tokio_stream::StreamExt;
+
+                let (client_tx, client_rx) = tokio::sync::mpsc::channel::<SyncMessage>(16);
+                let client_stream = tokio_stream::wrappers::ReceiverStream::new(client_rx);
+                let response = client.sync(Request::new(client_stream)).await?;
+                let mut server_stream = response.into_inner();
+
+                client_tx
+                    .send(SyncMessage {
+                        msg: Some(Msg::ManifestRequest(manifest_request)),
+                    })
+                    .await
+                    .map_err(|_| ServerRequest::StreamClosed)?;
+                client_tx
+                    .send(SyncMessage {
+                        msg: Some(Msg::Possession(possession)),
+                    })
+                    .await
+                    .map_err(|_| ServerRequest::StreamClosed)?;
+                drop(client_tx);
+
+                let mut responses = Vec::new();
+                while let Some(msg) = server_stream.next().await {
+                    match msg {
+                        Ok(message) => responses.push(message),
+                        Err(e) => return Err(ServerRequest::from(e)),
+                    }
+                }
+                Ok(responses)
+            }
+            Self::Quic(client) => client.sync(manifest_request, possession).await,
+        }
+    }
+}
+
 /// Shared server-related data to be kept behind an async lock
 #[derive(Debug)]
 struct SharedServer {
@@ -32,8 +101,8 @@ struct SharedServer {
     /// last time metadata was fetched from server
     pub last_update: Instant,
 
-    /// client for gRPC requests to server
-    pub grpc_client: distd_core::Client<InterceptedService<Channel, DistdGrpcClient>>,
+    /// transport client for server requests
+    pub transport: TransportClient,
 }
 
 /// Server representation used by clients
@@ -89,7 +158,12 @@ impl Server {
         client_uuid: Option<Uuid>,
         pub_key: &[u8; 32],
     ) -> Result<Self, ServerRequest> {
-        let grpc_client = Self::make_grpc_client(url, &Uuid::nil()).await?;
+        let effective_client_uuid = if Self::uses_quic(url) {
+            None
+        } else {
+            client_uuid
+        };
+        let transport = Self::make_transport(url, &Uuid::nil()).await?;
         tracing::debug!("Connected to server");
 
         let timeout = Duration::new(5, 0); // TODO make this configurable
@@ -100,11 +174,11 @@ impl Server {
                 .try_into()
                 .map_err(|_| ServerRequest::BadPubKey)?,
             url: url.to_string(),
-            client_uuid,
+            client_uuid: effective_client_uuid,
             client_name: client_name.to_string(),
             shared: Arc::new(RwLock::new(SharedServer {
                 metadata: ServerMetadata::default(),
-                grpc_client,
+                transport,
                 last_update: Instant::now(),
             })),
             timeout,
@@ -138,20 +212,32 @@ impl Server {
         .max_decoding_message_size(256 * 1024 * 1024))
     }
 
+    fn uses_quic(url: &str) -> bool {
+        url.starts_with("quic://") || url.starts_with("udp://")
+    }
+
+    async fn make_transport(url: &str, uuid: &Uuid) -> Result<TransportClient, ServerRequest> {
+        if Self::uses_quic(url) {
+            let _ = uuid;
+            QuicTransportClient::connect(url).await.map(TransportClient::Quic)
+        } else {
+            Self::make_grpc_client(url, uuid).await.map(TransportClient::Grpc)
+        }
+    }
+
     /// Register a new client
     pub async fn register(&mut self) -> Result<Uuid, ServerRequest> {
         let mut shared = self.shared.write().await;
 
         tracing::trace!("Starting `Register` request");
         let res = shared
-            .grpc_client
-            .register(Request::new(distd_core::proto::ClientRegister {
+            .transport
+            .register(distd_core::proto::ClientRegister {
                 name: self.client_name.to_string(),
                 version: VERSION.to_string(),
                 uuid: self.client_uuid.map(|uuid| uuid.as_bytes().to_vec()),
-            }))
-            .await?
-            .into_inner();
+            })
+            .await?;
         tracing::trace!("Parsed `Register` response");
 
         let uuid = res.uuid.ok_or(ServerRequest::MissingUuid)?;
@@ -159,9 +245,13 @@ impl Server {
         let uuid = Uuid::from_bytes(uuid);
         tracing::info!("Got uuid '{uuid:?}' from server");
 
-        // Update client_uuid and create a new gRPC connection setting it in the metadata
+        // gRPC carries the UUID in request metadata, so it needs a rebuilt client.
+        // QUIC keeps using the same connection for now, and rebuilding it would change the
+        // source port and invalidate the server's current UUID derivation.
         self.client_uuid = Some(uuid);
-        shared.grpc_client = Self::make_grpc_client(&self.url, &self.client_uuid()).await?;
+        if !Self::uses_quic(&self.url) {
+            shared.transport = Self::make_transport(&self.url, &self.client_uuid()).await?;
+        }
 
         Ok(uuid)
     }
@@ -186,10 +276,9 @@ impl Server {
 
         //distd_core::AcknowledgeRequest::new(distd_core::proto::EnumAcknowledge::AckOk);
         let res = shared
-            .grpc_client
-            .fetch(Request::new(distd_core::proto::ClientKeepAlive {}))
-            .await?
-            .into_inner();
+            .transport
+            .fetch(distd_core::proto::ClientKeepAlive {})
+            .await?;
         tracing::trace!("Parsed `Fetch` response");
 
         let new_metadata = bitcode::deserialize(&res.serialized)?;
@@ -213,37 +302,25 @@ impl Server {
         artifact_id: &str,
         local_hashes: &[Hash],
     ) -> Result<(Manifest, Vec<Hash>, Vec<Vec<u8>>), ServerRequest> {
-        use tokio_stream::StreamExt;
-
         let mut shared = self.shared.write().await;
-
-        // Build outgoing stream
-        let (client_tx, client_rx) = tokio::sync::mpsc::channel::<SyncMessage>(16);
-        let client_stream = tokio_stream::wrappers::ReceiverStream::new(client_rx);
-
-        // Open bidirectional stream
-        let response = shared
-            .grpc_client
-            .sync(Request::new(client_stream))
+        let manifest_request = proto::ManifestRequest {
+            artifact_id: artifact_id.to_string(),
+            version: None,
+        };
+        let bootstrap = shared
+            .transport
+            .sync(
+                manifest_request.clone(),
+                proto::PossessionBitfield {
+                    bitfield: distd_core::possession::Bitfield::empty(0).to_bytes(),
+                },
+            )
             .await?;
-        let mut server_stream = response.into_inner();
 
-        // Send ManifestRequest
-        client_tx
-            .send(SyncMessage {
-                msg: Some(Msg::ManifestRequest(proto::ManifestRequest {
-                    artifact_id: artifact_id.to_string(),
-                    version: None,
-                })),
-            })
-            .await
-            .map_err(|_| ServerRequest::StreamClosed)?;
-
-        // Receive ManifestResponse
-        let manifest_resp = match server_stream.next().await {
-            Some(Ok(SyncMessage { msg: Some(Msg::ManifestResponse(resp)) })) => resp,
-            Some(Ok(_)) => return Err(ServerRequest::UnexpectedMessage),
-            Some(Err(e)) => return Err(ServerRequest::from(e)),
+        let mut bootstrap = bootstrap.into_iter();
+        let manifest_resp = match bootstrap.next() {
+            Some(SyncMessage { msg: Some(Msg::ManifestResponse(resp)) }) => resp,
+            Some(_) => return Err(ServerRequest::UnexpectedMessage),
             None => return Err(ServerRequest::StreamClosed),
         };
 
@@ -276,6 +353,14 @@ impl Server {
                 Ok(Hash::from_bytes(arr))
             })
             .collect::<Result<Vec<_>, _>>()?;
+
+        let available_hashes: HashSet<Hash> = local_hashes.iter().copied().collect();
+        let mut local_bitfield = distd_core::possession::Bitfield::empty(manifest.chunk_count);
+        for (index, chunk_hash) in chunk_hashes.iter().enumerate() {
+            if available_hashes.contains(chunk_hash) {
+                local_bitfield.set(index as u32);
+            }
+        }
 
         let chunk_sizes: Vec<usize> = if manifest.entries.is_empty() {
             let chunk_size = manifest.chunk_size as usize;
@@ -311,37 +396,27 @@ impl Server {
             sizes
         };
 
-        let available_hashes: HashSet<Hash> = local_hashes.iter().copied().collect();
-        let mut local_bitfield = distd_core::possession::Bitfield::empty(manifest.chunk_count);
-        for (index, chunk_hash) in chunk_hashes.iter().enumerate() {
-            if available_hashes.contains(chunk_hash) {
-                local_bitfield.set(index as u32);
-            }
+        let responses = shared
+            .transport
+            .sync(
+                manifest_request,
+                proto::PossessionBitfield {
+                    bitfield: local_bitfield.to_bytes(),
+                },
+            )
+            .await?;
+        let mut responses = responses.into_iter();
+        match responses.next() {
+            Some(SyncMessage { msg: Some(Msg::ManifestResponse(_)) }) => {}
+            Some(_) => return Err(ServerRequest::UnexpectedMessage),
+            None => return Err(ServerRequest::StreamClosed),
         }
 
-        // Send PossessionBitfield
-        client_tx
-            .send(SyncMessage {
-                msg: Some(Msg::Possession(proto::PossessionBitfield {
-                    bitfield: local_bitfield.to_bytes(),
-                })),
-            })
-            .await
-            .map_err(|_| ServerRequest::StreamClosed)?;
-
-        // Drop sender to signal we're done sending
-        drop(client_tx);
-
-        // Receive chunks
         let mut received = Vec::new();
-
-        while let Some(msg) = server_stream.next().await {
+        for msg in responses {
             match msg {
-                Ok(SyncMessage { msg: Some(Msg::ChunkData(cd)) }) => {
-                    received.push(cd.data);
-                }
-                Ok(SyncMessage { msg: Some(Msg::BulkData(bd)) }) => {
-                    // Split bulk data back into individual chunks
+                SyncMessage { msg: Some(Msg::ChunkData(cd)) } => received.push(cd.data),
+                SyncMessage { msg: Some(Msg::BulkData(bd)) } => {
                     let mut offset = 0;
                     for i in 0..bd.count {
                         let idx = bd.start_index + i;
@@ -354,11 +429,7 @@ impl Server {
                         offset += this_size;
                     }
                 }
-                Ok(_) => {} // ignore unknown messages
-                Err(e) => {
-                    tracing::warn!("Sync stream error: {e}");
-                    break;
-                }
+                _ => {}
             }
         }
 
@@ -371,9 +442,9 @@ impl Server {
             tokio::time::sleep(self.timeout).await;
             if self.fetch().await.is_err() {
                 // try to re-establish connection to server
-                if let Ok(client) = Self::make_grpc_client(&self.url, &self.client_uuid()).await {
+                if let Ok(client) = Self::make_transport(&self.url, &self.client_uuid()).await {
                     tracing::info!("Connected to server");
-                    self.shared.write().await.grpc_client = client;
+                    self.shared.write().await.transport = client;
                 } else {
                     tracing::warn!(
                         "Cannot connect to server, retrying in {} seconds",

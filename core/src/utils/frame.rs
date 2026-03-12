@@ -1,8 +1,14 @@
 use prost::Message;
 use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+use crate::transport::{TransportOp, TransportOpError};
 
 #[derive(Debug, Error)]
 pub enum FrameError {
+    #[error("frame I/O error")]
+    IoError(#[from] std::io::Error),
+
     #[error("frame payload exceeds u32 length prefix")]
     FrameTooLarge,
 
@@ -14,6 +20,9 @@ pub enum FrameError {
 
     #[error("protobuf encode error")]
     Encode(#[from] prost::EncodeError),
+
+    #[error("transport op error")]
+    TransportOp(#[from] TransportOpError),
 }
 
 pub fn encode_length_delimited<M>(message: &M) -> Result<Vec<u8>, FrameError>
@@ -61,6 +70,44 @@ where
 
     let message = M::decode(&buffer[4..total_len])?;
     Ok(Some((message, total_len)))
+}
+
+pub async fn write_length_delimited_async<W, M>(writer: &mut W, message: &M) -> Result<(), FrameError>
+where
+    W: AsyncWrite + Unpin,
+    M: Message,
+{
+    let frame = encode_length_delimited(message)?;
+    writer.write_all(&frame).await?;
+    Ok(())
+}
+
+pub async fn read_length_delimited_async<R, M>(reader: &mut R) -> Result<M, FrameError>
+where
+    R: AsyncRead + Unpin,
+    M: Message + Default,
+{
+    let mut len_buf = [0u8; 4];
+    reader.read_exact(&mut len_buf).await?;
+    let frame_len = u32::from_be_bytes(len_buf) as usize;
+    let mut payload = vec![0u8; frame_len];
+    reader.read_exact(&mut payload).await?;
+    Ok(M::decode(payload.as_slice())?)
+}
+
+pub async fn write_transport_op_async<W>(writer: &mut W, op: TransportOp) -> Result<(), FrameError>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer.write_u8(op.into()).await?;
+    Ok(())
+}
+
+pub async fn read_transport_op_async<R>(reader: &mut R) -> Result<TransportOp, FrameError>
+where
+    R: AsyncRead + Unpin,
+{
+    Ok(TransportOp::try_from(reader.read_u8().await?)?)
 }
 
 #[cfg(test)]

@@ -11,6 +11,9 @@ pub enum ServerConnection {
     #[error("Cannot create stream")]
     StreamCreation(#[from] std::io::Error),
 
+    #[error("QUIC connection error: {0}")]
+    Quic(String),
+
     #[error("Invalid parameter")]
     InvalidParameter(#[from] InvalidParameter),
 }
@@ -58,6 +61,9 @@ pub enum ServerRequest {
 
     #[error("Invalid hash in sync response")]
     BadHash,
+
+    #[error("QUIC transport error: {0}")]
+    Quic(String),
 }
 
 #[derive(Error, Debug)]
