@@ -1,4 +1,4 @@
-use distd_core::chunk_storage::fs_storage::FsStorage;
+use distd_core::chunk_storage::fs_storage::{FsStorage, FsStorageCacheConfig};
 use distd_core::chunk_storage::hashmap_storage::HashMapStorage;
 use distd_core::chunk_storage::ChunkStorage;
 use distd_core::feed::Feed;
@@ -60,8 +60,21 @@ async fn main() {
             let root = std::env::var("DISTD_STORAGE_ROOT")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|_| distd_core::utils::settings::cache_dir().join("server-fs"));
-            tracing::info!("Using filesystem storage at {}", root.display());
-            let server = Server::new_ephemeral(FsStorage::new(root));
+            let chunk_cache_mb = std::env::var("DISTD_STORAGE_CHUNK_CACHE_MB")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(FsStorageCacheConfig::default().max_chunk_bytes / (1024 * 1024));
+            tracing::info!(
+                "Using filesystem storage at {} with {} MiB chunk cache",
+                root.display(),
+                chunk_cache_mb
+            );
+            let server = Server::new_ephemeral(FsStorage::with_cache_config(
+                root,
+                FsStorageCacheConfig {
+                    max_chunk_bytes: chunk_cache_mb.saturating_mul(1024 * 1024),
+                },
+            ));
             run_server(server).await;
         }
         #[cfg(feature = "redb")]

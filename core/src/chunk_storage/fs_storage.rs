@@ -22,6 +22,80 @@ use crate::{
 
 use super::{ChunkStorage, Node};
 
+const DEFAULT_CHUNK_CACHE_BYTES: usize = 512 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy)]
+pub struct FsStorageCacheConfig {
+    pub max_chunk_bytes: usize,
+}
+
+impl Default for FsStorageCacheConfig {
+    fn default() -> Self {
+        Self {
+            max_chunk_bytes: DEFAULT_CHUNK_CACHE_BYTES,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct HotChunkCache {
+    max_bytes: usize,
+    total_bytes: usize,
+    order: VecDeque<Hash>,
+    entries: HashMap<Hash, Arc<Vec<u8>>>,
+}
+
+impl HotChunkCache {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            max_bytes,
+            total_bytes: 0,
+            order: VecDeque::new(),
+            entries: HashMap::default(),
+        }
+    }
+
+    fn get(&mut self, hash: &Hash) -> Option<Arc<Vec<u8>>> {
+        let data = self.entries.get(hash)?.clone();
+        self.order.push_back(*hash);
+        Some(data)
+    }
+
+    fn insert(&mut self, hash: Hash, data: Arc<Vec<u8>>) {
+        if self.max_bytes == 0 {
+            return;
+        }
+
+        let data_len = data.len();
+        if data_len > self.max_bytes {
+            return;
+        }
+
+        if let Some(old) = self.entries.insert(hash, data) {
+            self.total_bytes = self.total_bytes.saturating_sub(old.len());
+        }
+
+        self.total_bytes = self.total_bytes.saturating_add(data_len);
+        self.order.push_back(hash);
+
+        while self.total_bytes > self.max_bytes {
+            let Some(oldest_hash) = self.order.pop_front() else {
+                break;
+            };
+            let remove = self
+                .entries
+                .get(&oldest_hash)
+                .map(|current| Arc::strong_count(current) == 1)
+                .unwrap_or(false);
+            if remove {
+                if let Some(old) = self.entries.remove(&oldest_hash) {
+                    self.total_bytes = self.total_bytes.saturating_sub(old.len());
+                }
+            }
+        }
+    }
+}
+
 pub fn open_file(path: &Path) -> Result<File, Error> {
     File::options()
         .create(true)
@@ -209,6 +283,14 @@ impl FsStorageState {
             .map(Arc::new)
     }
 
+    fn item_for_root(&self, root: &Hash) -> Option<Item> {
+        self.items
+            .iter()
+            .filter(|item| item.metadata.root.hash == *root)
+            .cloned()
+            .max_by_key(|item| (item.metadata.revision, item.chunks.len(), item.size()))
+    }
+
     /// Atomically persist state to disk (write to *.tmp then rename)
     fn persist(&mut self) -> Result<(), Error> {
         let buf = bitcode::serialize(self)
@@ -339,6 +421,7 @@ impl FsStorageState {
 pub struct FsStorage {
     inner: RwLock<FsStorageState>,
     handles: RwLock<HashMap<PathBuf, Arc<Mutex<Handle>>>>,
+    chunk_cache: Mutex<HotChunkCache>,
 }
 
 impl Default for FsStorage {
@@ -346,6 +429,7 @@ impl Default for FsStorage {
         Self {
             inner: RwLock::new(FsStorageState::default()),
             handles: RwLock::new(HashMap::default()),
+            chunk_cache: Mutex::new(HotChunkCache::new(DEFAULT_CHUNK_CACHE_BYTES)),
         }
     }
 }
@@ -407,6 +491,44 @@ impl FsStorage {
         inner.links.contains_key(hash) || inner.data.contains_key(hash)
     }
 
+    fn item_for_root_hash(&self, root: &Hash) -> Option<Item> {
+        self.inner.read().unwrap().item_for_root(root)
+    }
+
+    fn cached_chunk_data(&self, hash: &Hash) -> Option<Arc<Vec<u8>>> {
+        self.chunk_cache.lock().unwrap().get(hash)
+    }
+
+    fn cache_chunk_data(&self, hash: Hash, data: Arc<Vec<u8>>) -> Arc<Vec<u8>> {
+        self.chunk_cache.lock().unwrap().insert(hash, data.clone());
+        data
+    }
+
+    fn read_chunk_data(&self, hash: &Hash) -> Option<Arc<Vec<u8>>> {
+        if let Some(cached) = self.cached_chunk_data(hash) {
+            return Some(cached);
+        }
+
+        self.flush_data_for_hash(hash).ok()?;
+
+        let entry = {
+            let inner = self.inner.read().unwrap();
+            inner.data.get(hash).and_then(|entries| entries.first()).cloned()
+        }?;
+
+        let node = Node::try_from(&entry).ok()?;
+        let data = node.stored_data()?;
+        Some(self.cache_chunk_data(*hash, data))
+    }
+
+    fn stored_node(&self, hash: &Hash) -> Option<Arc<Node>> {
+        let data = self.read_chunk_data(hash)?;
+        Some(Arc::new(Node::Stored {
+            hash: *hash,
+            data,
+        }))
+    }
+
     fn materialize_node(&self, node: Arc<Node>) -> Option<Arc<Node>> {
         match node.as_ref() {
             Node::Stored { .. } => Some(node),
@@ -429,8 +551,7 @@ impl FsStorage {
                 if let Some(linked) = linked {
                     self.materialize_node(linked)
                 } else {
-                    self.flush_data_for_hash(hash).ok()?;
-                    self.inner.read().unwrap().get_data(hash)
+                    self.stored_node(hash)
                 }
             }
         }
@@ -641,6 +762,11 @@ impl FsStorage {
     /// Falls back to an empty storage (with a warning) if persistence data is corrupt.
     #[must_use]
     pub fn new(root: PathBuf) -> Self {
+        Self::with_cache_config(root, FsStorageCacheConfig::default())
+    }
+
+    #[must_use]
+    pub fn with_cache_config(root: PathBuf, cache_config: FsStorageCacheConfig) -> Self {
         let persistance_dir = cache_dir().join("chunk_storage").join("fs_storage");
         let persistance_path = persistance_dir.join(root.to_string_lossy().replace('/', "___"));
         create_dir_all(&persistance_dir).unwrap();
@@ -725,6 +851,7 @@ impl FsStorage {
                                     .map(|(path, handle)| (path, Arc::new(Mutex::new(handle))))
                                     .collect(),
                             ),
+                            chunk_cache: Mutex::new(HotChunkCache::new(cache_config.max_chunk_bytes)),
                         };
                     }
                     tracing::debug!("Cannot reload FsStorage; starting fresh");
@@ -741,6 +868,7 @@ impl FsStorage {
                 ..Default::default()
             }),
             handles: RwLock::new(HashMap::default()),
+            chunk_cache: Mutex::new(HotChunkCache::new(cache_config.max_chunk_bytes)),
         }
     }
 
@@ -847,11 +975,7 @@ impl ChunkStorage for FsStorage {
             return self.materialize_node(linked?);
         }
 
-        self.flush_data_for_hash(hash)
-            .inspect_err(|e| tracing::error!("Cannot flush chunk data for {hash}: {e}"))
-            .ok()?;
-
-        self.inner.read().unwrap().get_data(hash)
+        self.stored_node(hash)
     }
 
     fn size(&self) -> u64 {
@@ -866,6 +990,27 @@ impl ChunkStorage for FsStorage {
             .filter(|entry| entry.populated.load(std::sync::atomic::Ordering::Relaxed))
             .map(|entry| entry.info.size)
             .sum()
+    }
+
+    fn chunk_list(&self, root: &Hash) -> Vec<Hash> {
+        self.item_for_root_hash(root)
+            .map(|item| item.chunks.iter().map(|chunk| chunk.hash).collect())
+            .unwrap_or_else(|| {
+                self.get(root)
+                    .and_then(|node| node.flatten().ok())
+                    .unwrap_or_default()
+            })
+    }
+
+    fn get_chunk_by_index(&self, root: &Hash, index: u32) -> Option<Vec<u8>> {
+        if let Some(item) = self.item_for_root_hash(root) {
+            let chunk = item.chunks.get(index as usize)?;
+            return self.read_chunk_data(&chunk.hash).map(|data| (*data).clone());
+        }
+
+        let node = self.get(root)?;
+        let leaves = node.flatten_iter().ok()?;
+        leaves.get(index as usize).map(|arc| (**arc).clone())
     }
 
     fn store_chunk(&self, hash: Hash, chunk: &[u8]) -> Result<Arc<Node>, StorageError> {
@@ -1234,7 +1379,7 @@ mod tests {
         }
 
         // check for data on disk to match the expected one
-        let file = std::fs::read(item.metadata.path).unwrap();
+        let file = std::fs::read(storage.item_path(&item).unwrap()).unwrap();
         assert_eq!(file.len(), 1_000_000);
         for b in file {
             assert_eq!(b, 1u8);
@@ -1259,6 +1404,41 @@ mod tests {
 
         assert_eq!(item.metadata.path, logical_path);
         assert_eq!(storage.item_path(&item).unwrap(), tempdir.join("bench-artifact"));
+    }
+
+    #[test]
+    fn fs_storage_chunk_lookup_uses_item_metadata() {
+        let tempdir = temp_path();
+        let storage = FsStorage::with_cache_config(
+            tempdir.clone(),
+            FsStorageCacheConfig {
+                max_chunk_bytes: CHUNK_SIZE * 2,
+            },
+        );
+        let data: Vec<u8> = (0..(CHUNK_SIZE * 3 + 17))
+            .map(|index| ((index * 5) % 251) as u8)
+            .collect();
+
+        let item = storage
+            .create_item(
+                "bench-artifact".to_string(),
+                PathBuf::from("bench-artifact"),
+                0,
+                None,
+                bytes::Bytes::from(data.clone()),
+            )
+            .unwrap();
+
+        let listed = storage.chunk_list(&item.metadata.root.hash);
+        let expected: Vec<_> = item.chunks.iter().map(|chunk| chunk.hash).collect();
+        assert_eq!(listed, expected);
+
+        for (index, chunk) in data.chunks(CHUNK_SIZE).enumerate() {
+            assert_eq!(
+                storage.get_chunk_by_index(&item.metadata.root.hash, index as u32),
+                Some(chunk.to_vec())
+            );
+        }
     }
 
     #[tokio::test]

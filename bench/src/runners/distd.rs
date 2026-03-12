@@ -151,13 +151,17 @@ impl DistdRunner {
             ));
         }
 
-        let child = Command::new(&bins.server)
-            .current_dir(&self.work_dir)
+        let mut cmd = Command::new(&bins.server);
+        cmd.current_dir(&self.work_dir)
             .env("RUST_LOG", "distd_server=info")
             .env("DISTD_STORAGE", "fs")
             .env("DISTD_STORAGE_ROOT", &storage_root)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Ok(cache_mb) = std::env::var("DISTD_STORAGE_CHUNK_CACHE_MB") {
+            cmd.env("DISTD_STORAGE_CHUNK_CACHE_MB", cache_mb);
+        }
+        let child = cmd
             .spawn()
             .map_err(|e| format!("Failed to spawn distd_server: {e}"))?;
 
