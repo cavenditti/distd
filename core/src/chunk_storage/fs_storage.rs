@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashSet as StdHashSet, VecDeque},
     fs::{self, create_dir_all, remove_file, File},
     io::{BufWriter, Read, Seek, Write},
     path::{Path, PathBuf},
@@ -23,16 +23,19 @@ use crate::{
 use super::{ChunkStorage, Node};
 
 const DEFAULT_CHUNK_CACHE_BYTES: usize = 512 * 1024 * 1024;
+const DEFAULT_TREE_CACHE_ENTRIES: usize = 65_536;
 
 #[derive(Debug, Clone, Copy)]
 pub struct FsStorageCacheConfig {
     pub max_chunk_bytes: usize,
+    pub max_tree_entries: usize,
 }
 
 impl Default for FsStorageCacheConfig {
     fn default() -> Self {
         Self {
             max_chunk_bytes: DEFAULT_CHUNK_CACHE_BYTES,
+            max_tree_entries: DEFAULT_TREE_CACHE_ENTRIES,
         }
     }
 }
@@ -43,6 +46,52 @@ struct HotChunkCache {
     total_bytes: usize,
     order: VecDeque<Hash>,
     entries: HashMap<Hash, Arc<Vec<u8>>>,
+}
+
+#[derive(Debug, Default)]
+struct HotNodeCache {
+    max_entries: usize,
+    order: VecDeque<Hash>,
+    entries: HashMap<Hash, Arc<Node>>,
+}
+
+impl HotNodeCache {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            max_entries,
+            order: VecDeque::new(),
+            entries: HashMap::default(),
+        }
+    }
+
+    fn get(&mut self, hash: &Hash) -> Option<Arc<Node>> {
+        let node = self.entries.get(hash)?.clone();
+        self.order.push_back(*hash);
+        Some(node)
+    }
+
+    fn insert(&mut self, hash: Hash, node: Arc<Node>) {
+        if self.max_entries == 0 {
+            return;
+        }
+
+        self.entries.insert(hash, node);
+        self.order.push_back(hash);
+
+        while self.entries.len() > self.max_entries {
+            let Some(oldest_hash) = self.order.pop_front() else {
+                break;
+            };
+            let remove = self
+                .entries
+                .get(&oldest_hash)
+                .map(|current| Arc::strong_count(current) == 1)
+                .unwrap_or(false);
+            if remove {
+                self.entries.remove(&oldest_hash);
+            }
+        }
+    }
 }
 
 impl HotChunkCache {
@@ -453,6 +502,7 @@ pub struct FsStorage {
     inner: RwLock<FsStorageState>,
     handles: RwLock<HashMap<PathBuf, Arc<Mutex<Handle>>>>,
     chunk_cache: Mutex<HotChunkCache>,
+    tree_cache: Mutex<HotNodeCache>,
 }
 
 impl Default for FsStorage {
@@ -461,6 +511,7 @@ impl Default for FsStorage {
             inner: RwLock::new(FsStorageState::default()),
             handles: RwLock::new(HashMap::default()),
             chunk_cache: Mutex::new(HotChunkCache::new(DEFAULT_CHUNK_CACHE_BYTES)),
+            tree_cache: Mutex::new(HotNodeCache::new(DEFAULT_TREE_CACHE_ENTRIES)),
         }
     }
 }
@@ -530,9 +581,18 @@ impl FsStorage {
         self.chunk_cache.lock().unwrap().get(hash)
     }
 
+    fn cached_tree_node(&self, hash: &Hash) -> Option<Arc<Node>> {
+        self.tree_cache.lock().unwrap().get(hash)
+    }
+
     fn cache_chunk_data(&self, hash: Hash, data: Arc<Vec<u8>>) -> Arc<Vec<u8>> {
         self.chunk_cache.lock().unwrap().insert(hash, data.clone());
         data
+    }
+
+    fn cache_tree_node(&self, hash: Hash, node: Arc<Node>) -> Arc<Node> {
+        self.tree_cache.lock().unwrap().insert(hash, node.clone());
+        node
     }
 
     fn read_chunk_data(&self, hash: &Hash) -> Option<Arc<Vec<u8>>> {
@@ -560,7 +620,47 @@ impl FsStorage {
         }))
     }
 
+    fn build_compact_tree(
+        &self,
+        data: &[u8],
+    ) -> Result<(Arc<Node>, Vec<ChunkInfo>, HashSet<ChunkInfo>), Error> {
+        let mut partials = Vec::with_capacity(data.len() / CHUNK_SIZE + 1);
+        let mut chunks = Vec::with_capacity(data.len() / CHUNK_SIZE + 1);
+        let mut hashes = HashSet::default();
+
+        if data.is_empty() {
+            let hash = do_hash(&[]);
+            let chunk_info = ChunkInfo { hash, size: 0 };
+            self.store_chunk(hash, &[]).map_err(Error::from)?;
+            chunks.push(chunk_info);
+            hashes.insert(chunk_info);
+            partials.push(Arc::new(Node::Skipped { hash, size: 0 }));
+        } else {
+            for chunk in data.chunks(CHUNK_SIZE) {
+                let hash = do_hash(chunk);
+                let chunk_info = ChunkInfo {
+                    hash,
+                    size: chunk.len() as u64,
+                };
+                self.store_chunk(hash, chunk).map_err(Error::from)?;
+                chunks.push(chunk_info);
+                hashes.insert(chunk_info);
+                partials.push(Arc::new(Node::Skipped {
+                    hash,
+                    size: chunk.len() as u64,
+                }));
+            }
+        }
+
+        let root = self.finalize_sync_partials(partials, &mut hashes)?;
+        Ok((root, chunks, hashes))
+    }
+
     fn materialize_node(&self, node: Arc<Node>) -> Option<Arc<Node>> {
+        if let Some(cached) = self.cached_tree_node(node.hash()) {
+            return Some(cached);
+        }
+
         match node.as_ref() {
             Node::Stored { .. } => Some(node),
             Node::Parent {
@@ -568,12 +668,15 @@ impl FsStorage {
                 size,
                 left,
                 right,
-            } => Some(Arc::new(Node::Parent {
-                hash: *hash,
-                size: *size,
-                left: self.materialize_node(left.clone())?,
-                right: self.materialize_node(right.clone())?,
-            })),
+            } => Some(self.cache_tree_node(
+                *hash,
+                Arc::new(Node::Parent {
+                    hash: *hash,
+                    size: *size,
+                    left: self.materialize_node(left.clone())?,
+                    right: self.materialize_node(right.clone())?,
+                }),
+            )),
             Node::Skipped { hash, .. } => {
                 let linked = {
                     let inner = self.inner.read().unwrap();
@@ -884,6 +987,7 @@ impl FsStorage {
                                     .collect(),
                             ),
                             chunk_cache: Mutex::new(HotChunkCache::new(cache_config.max_chunk_bytes)),
+                            tree_cache: Mutex::new(HotNodeCache::new(cache_config.max_tree_entries)),
                         };
                     }
                     tracing::debug!("Cannot reload FsStorage; starting fresh");
@@ -901,6 +1005,7 @@ impl FsStorage {
             }),
             handles: RwLock::new(HashMap::default()),
             chunk_cache: Mutex::new(HotChunkCache::new(cache_config.max_chunk_bytes)),
+            tree_cache: Mutex::new(HotNodeCache::new(cache_config.max_tree_entries)),
         }
     }
 
@@ -1064,9 +1169,10 @@ impl ChunkStorage for FsStorage {
         }
 
         self.inner.write().unwrap().mark_dirty();
+        let data = self.cache_chunk_data(hash, Arc::new(chunk.to_vec()));
         Ok(Arc::new(Node::Stored {
             hash,
-            data: Arc::new(chunk.to_vec()),
+            data,
         }))
     }
 
@@ -1094,10 +1200,17 @@ impl ChunkStorage for FsStorage {
         self.ensure_handle(&stored_path)?;
         tracing::info!("Preallocated on disk {:?}", stored_path);
 
-        // Build the hash tree using interior HashTreeCapable
-        let hash_tree = self.compute_tree(file.as_ref())?;
+        let (hash_tree, chunks, hashes) = self.build_compact_tree(file.as_ref())?;
         let mut inner = self.inner.write().unwrap();
-        let item = Item::new(name, path, revision, description, &hash_tree);
+        let item = Item::make(
+            name,
+            path,
+            revision,
+            description,
+            hash_tree.chunk_info(),
+            chunks,
+            hashes.into_iter().collect::<StdHashSet<_>>(),
+        )?;
         tracing::debug!("New item: {item}");
         inner.insert_item(item.clone());
         drop(inner);
@@ -1439,6 +1552,7 @@ mod tests {
             tempdir.clone(),
             FsStorageCacheConfig {
                 max_chunk_bytes: CHUNK_SIZE * 2,
+                max_tree_entries: FsStorageCacheConfig::default().max_tree_entries,
             },
         );
         let data: Vec<u8> = (0..(CHUNK_SIZE * 3 + 17))

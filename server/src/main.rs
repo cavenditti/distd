@@ -64,15 +64,21 @@ async fn main() {
                 .ok()
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(FsStorageCacheConfig::default().max_chunk_bytes / (1024 * 1024));
+            let tree_cache_entries = std::env::var("DISTD_STORAGE_TREE_CACHE_ENTRIES")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(FsStorageCacheConfig::default().max_tree_entries);
             tracing::info!(
-                "Using filesystem storage at {} with {} MiB chunk cache",
+                "Using filesystem storage at {} with {} MiB chunk cache and {} tree cache entries",
                 root.display(),
-                chunk_cache_mb
+                chunk_cache_mb,
+                tree_cache_entries,
             );
             let server = Server::new_ephemeral(FsStorage::with_cache_config(
                 root,
                 FsStorageCacheConfig {
                     max_chunk_bytes: chunk_cache_mb.saturating_mul(1024 * 1024),
+                    max_tree_entries: tree_cache_entries,
                 },
             ));
             run_server(server).await;

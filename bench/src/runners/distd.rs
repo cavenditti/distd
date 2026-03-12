@@ -161,6 +161,9 @@ impl DistdRunner {
         if let Ok(cache_mb) = std::env::var("DISTD_STORAGE_CHUNK_CACHE_MB") {
             cmd.env("DISTD_STORAGE_CHUNK_CACHE_MB", cache_mb);
         }
+        if let Ok(tree_entries) = std::env::var("DISTD_STORAGE_TREE_CACHE_ENTRIES") {
+            cmd.env("DISTD_STORAGE_TREE_CACHE_ENTRIES", tree_entries);
+        }
         let child = cmd
             .spawn()
             .map_err(|e| format!("Failed to spawn distd_server: {e}"))?;
