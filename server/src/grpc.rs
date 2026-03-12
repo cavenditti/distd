@@ -114,7 +114,7 @@ where
     /// Protocol:
     /// 1. Client sends ManifestRequest
     /// 2. Server sends ManifestResponse (with ordered chunk hashes)
-    /// 3. Client sends PossessionBitfield
+    /// 3. Client sends PossessionBitfield on the same stream
     /// 4. Server streams ChunkData (or BulkData) for missing chunks
     async fn sync(
         &self,
@@ -138,6 +138,32 @@ where
                 }
             };
 
+            let (manifest_response, root_hash, expected_chunk_count) = match server
+                .sync_manifest_response(manifest_req)
+                .await
+            {
+                Ok(response) => response,
+                Err(message) => {
+                    let status = if message.starts_with("Unknown artifact:") {
+                        Status::not_found(message)
+                    } else {
+                        Status::internal(message)
+                    };
+                    let _ = tx.send(Err(status)).await;
+                    return;
+                }
+            };
+
+            if tx
+                .send(Ok(SyncMessage {
+                    msg: Some(Msg::ManifestResponse(manifest_response)),
+                }))
+                .await
+                .is_err()
+            {
+                return;
+            }
+
             // Phase 2: wait for PossessionBitfield
             let possession = match in_stream.next().await {
                 Some(Ok(SyncMessage { msg: Some(Msg::Possession(poss)) })) => poss,
@@ -147,7 +173,10 @@ where
                 }
             };
 
-            match server.sync_response_messages(manifest_req, possession).await {
+            match server
+                .sync_chunk_response_messages(root_hash, expected_chunk_count, possession)
+                .await
+            {
                 Ok(messages) => {
                     for message in messages {
                         if tx.send(Ok(message)).await.is_err() {

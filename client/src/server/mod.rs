@@ -3,9 +3,10 @@ use crate::{error::ServerRequest, grpc::DistdGrpcClient};
 
 use std::collections::HashSet;
 use std::{fmt::Debug, sync::Arc, time::Duration};
+use distd_core::tonic::Streaming;
 use uuid::Uuid;
 
-use tokio::{sync::RwLock, time::Instant};
+use tokio::{sync::{mpsc, RwLock}, time::Instant};
 
 //use ring::agreement::PublicKey;
 
@@ -25,7 +26,7 @@ use distd_core::{
 
 mod quic;
 
-use quic::QuicTransportClient;
+use quic::{QuicSyncSession, QuicTransportClient};
 
 type GrpcClient = DistdClient<InterceptedService<Channel, DistdGrpcClient>>;
 
@@ -33,6 +34,15 @@ type GrpcClient = DistdClient<InterceptedService<Channel, DistdGrpcClient>>;
 enum TransportClient {
     Grpc(GrpcClient),
     Quic(QuicTransportClient),
+}
+
+#[derive(Debug)]
+enum SyncContinuation {
+    Grpc {
+        sender: mpsc::Sender<SyncMessage>,
+        receiver: Streaming<SyncMessage>,
+    },
+    Quic(QuicSyncSession),
 }
 
 impl TransportClient {
@@ -50,19 +60,25 @@ impl TransportClient {
         }
     }
 
-    async fn sync(
+    async fn set_client_uuid(&mut self, client_uuid: Uuid) {
+        match self {
+            Self::Grpc(_) => {}
+            Self::Quic(client) => client.set_client_uuid(client_uuid).await,
+        }
+    }
+
+    async fn open_sync(
         &mut self,
         manifest_request: proto::ManifestRequest,
-        possession: proto::PossessionBitfield,
-    ) -> Result<Vec<SyncMessage>, ServerRequest> {
+    ) -> Result<(proto::ManifestResponse, SyncContinuation), ServerRequest> {
         match self {
             Self::Grpc(client) => {
                 use tokio_stream::StreamExt;
 
-                let (client_tx, client_rx) = tokio::sync::mpsc::channel::<SyncMessage>(16);
+                let (client_tx, client_rx) = mpsc::channel::<SyncMessage>(16);
                 let client_stream = tokio_stream::wrappers::ReceiverStream::new(client_rx);
                 let response = client.sync(Request::new(client_stream)).await?;
-                let mut server_stream = response.into_inner();
+                let mut receiver = response.into_inner();
 
                 client_tx
                     .send(SyncMessage {
@@ -70,16 +86,51 @@ impl TransportClient {
                     })
                     .await
                     .map_err(|_| ServerRequest::StreamClosed)?;
-                client_tx
+                let manifest = match receiver.next().await {
+                    Some(Ok(SyncMessage { msg: Some(Msg::ManifestResponse(resp)) })) => resp,
+                    Some(Ok(_)) => return Err(ServerRequest::UnexpectedMessage),
+                    Some(Err(e)) => return Err(ServerRequest::from(e)),
+                    None => return Err(ServerRequest::StreamClosed),
+                };
+
+                Ok((
+                    manifest,
+                    SyncContinuation::Grpc {
+                        sender: client_tx,
+                        receiver,
+                    },
+                ))
+            }
+            Self::Quic(client) => {
+                let (manifest, session) = client.sync(manifest_request).await?;
+                Ok((manifest, SyncContinuation::Quic(session)))
+            }
+        }
+    }
+}
+
+impl SyncContinuation {
+    async fn send_possession_and_collect(
+        self,
+        possession: proto::PossessionBitfield,
+    ) -> Result<Vec<SyncMessage>, ServerRequest> {
+        match self {
+            Self::Grpc {
+                sender,
+                mut receiver,
+            } => {
+                use tokio_stream::StreamExt;
+
+                sender
                     .send(SyncMessage {
                         msg: Some(Msg::Possession(possession)),
                     })
                     .await
                     .map_err(|_| ServerRequest::StreamClosed)?;
-                drop(client_tx);
+                drop(sender);
 
                 let mut responses = Vec::new();
-                while let Some(msg) = server_stream.next().await {
+                while let Some(msg) = receiver.next().await {
                     match msg {
                         Ok(message) => responses.push(message),
                         Err(e) => return Err(ServerRequest::from(e)),
@@ -87,7 +138,7 @@ impl TransportClient {
                 }
                 Ok(responses)
             }
-            Self::Quic(client) => client.sync(manifest_request, possession).await,
+            Self::Quic(session) => session.send_possession_and_collect(possession).await,
         }
     }
 }
@@ -158,12 +209,7 @@ impl Server {
         client_uuid: Option<Uuid>,
         pub_key: &[u8; 32],
     ) -> Result<Self, ServerRequest> {
-        let effective_client_uuid = if Self::uses_quic(url) {
-            None
-        } else {
-            client_uuid
-        };
-        let transport = Self::make_transport(url, &Uuid::nil()).await?;
+        let transport = Self::make_transport(url, &client_uuid.unwrap_or_else(Uuid::nil)).await?;
         tracing::debug!("Connected to server");
 
         let timeout = Duration::new(5, 0); // TODO make this configurable
@@ -174,7 +220,7 @@ impl Server {
                 .try_into()
                 .map_err(|_| ServerRequest::BadPubKey)?,
             url: url.to_string(),
-            client_uuid: effective_client_uuid,
+            client_uuid,
             client_name: client_name.to_string(),
             shared: Arc::new(RwLock::new(SharedServer {
                 metadata: ServerMetadata::default(),
@@ -218,8 +264,9 @@ impl Server {
 
     async fn make_transport(url: &str, uuid: &Uuid) -> Result<TransportClient, ServerRequest> {
         if Self::uses_quic(url) {
-            let _ = uuid;
-            QuicTransportClient::connect(url).await.map(TransportClient::Quic)
+            QuicTransportClient::connect(url, if uuid.is_nil() { None } else { Some(*uuid) })
+                .await
+                .map(TransportClient::Quic)
         } else {
             Self::make_grpc_client(url, uuid).await.map(TransportClient::Grpc)
         }
@@ -245,11 +292,10 @@ impl Server {
         let uuid = Uuid::from_bytes(uuid);
         tracing::info!("Got uuid '{uuid:?}' from server");
 
-        // gRPC carries the UUID in request metadata, so it needs a rebuilt client.
-        // QUIC keeps using the same connection for now, and rebuilding it would change the
-        // source port and invalidate the server's current UUID derivation.
         self.client_uuid = Some(uuid);
-        if !Self::uses_quic(&self.url) {
+        if Self::uses_quic(&self.url) {
+            shared.transport.set_client_uuid(uuid).await;
+        } else {
             shared.transport = Self::make_transport(&self.url, &self.client_uuid()).await?;
         }
 
@@ -307,22 +353,7 @@ impl Server {
             artifact_id: artifact_id.to_string(),
             version: None,
         };
-        let bootstrap = shared
-            .transport
-            .sync(
-                manifest_request.clone(),
-                proto::PossessionBitfield {
-                    bitfield: distd_core::possession::Bitfield::empty(0).to_bytes(),
-                },
-            )
-            .await?;
-
-        let mut bootstrap = bootstrap.into_iter();
-        let manifest_resp = match bootstrap.next() {
-            Some(SyncMessage { msg: Some(Msg::ManifestResponse(resp)) }) => resp,
-            Some(_) => return Err(ServerRequest::UnexpectedMessage),
-            None => return Err(ServerRequest::StreamClosed),
-        };
+        let (manifest_resp, continuation) = shared.transport.open_sync(manifest_request).await?;
 
         let manifest = Manifest {
             artifact_id: manifest_resp.artifact_id,
@@ -396,21 +427,11 @@ impl Server {
             sizes
         };
 
-        let responses = shared
-            .transport
-            .sync(
-                manifest_request,
-                proto::PossessionBitfield {
-                    bitfield: local_bitfield.to_bytes(),
-                },
-            )
+        let responses = continuation
+            .send_possession_and_collect(proto::PossessionBitfield {
+                bitfield: local_bitfield.to_bytes(),
+            })
             .await?;
-        let mut responses = responses.into_iter();
-        match responses.next() {
-            Some(SyncMessage { msg: Some(Msg::ManifestResponse(_)) }) => {}
-            Some(_) => return Err(ServerRequest::UnexpectedMessage),
-            None => return Err(ServerRequest::StreamClosed),
-        }
 
         let mut received = Vec::new();
         for msg in responses {

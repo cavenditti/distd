@@ -2,9 +2,10 @@ use std::fmt::Debug;
 use std::net::SocketAddr;
 
 use distd_core::chunk_storage::ChunkStorage;
-use distd_core::proto::{ClientKeepAlive, ClientRegister, ManifestRequest, PossessionBitfield};
+use distd_core::proto::{ClientKeepAlive, ClientRegister, ManifestRequest, PossessionBitfield, SyncMessage};
+use distd_core::proto::sync_message::Msg;
 use distd_core::transport::TransportOp;
-use distd_core::utils::frame::{read_length_delimited_async, read_transport_op_async, write_length_delimited_async};
+use distd_core::utils::frame::{read_length_delimited_async, read_optional_uuid_async, read_transport_op_async, write_length_delimited_async};
 use quinn::{Endpoint, RecvStream, SendStream};
 use rcgen::generate_simple_self_signed;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -40,10 +41,18 @@ where
         recv: &mut RecvStream,
     ) -> Result<(), ServerError> {
         match read_transport_op_async(recv).await {
-            Ok(TransportOp::Register) => {
+            Ok(op) => {
+                let client_uuid = read_optional_uuid_async(recv)
+                    .await
+                    .map_err(|err| ServerError::Quic(err.to_string()))?;
+                match op {
+                    TransportOp::Register => {
                 let request: ClientRegister = read_length_delimited_async(recv)
                     .await
                     .map_err(|err| ServerError::Quic(err.to_string()))?;
+                if client_uuid.is_some() && request.uuid.is_none() {
+                    tracing::debug!("QUIC register stream carried client auth UUID");
+                }
                 let response = self
                     .register_response(remote_addr, request)
                     .await
@@ -52,8 +61,11 @@ where
                     .await
                     .map_err(|err| ServerError::Quic(err.to_string()))?;
                 finish_send(send).await
-            }
-            Ok(TransportOp::Fetch) => {
+                    }
+                    TransportOp::Fetch => {
+                self.authenticate_client_uuid(client_uuid)
+                    .await
+                    .map_err(ServerError::Quic)?;
                 let request: ClientKeepAlive = read_length_delimited_async(recv)
                     .await
                     .map_err(|err| ServerError::Quic(err.to_string()))?;
@@ -65,16 +77,31 @@ where
                     .await
                     .map_err(|err| ServerError::Quic(err.to_string()))?;
                 finish_send(send).await
-            }
-            Ok(TransportOp::Sync) => {
+                    }
+                    TransportOp::Sync => {
+                self.authenticate_client_uuid(client_uuid)
+                    .await
+                    .map_err(ServerError::Quic)?;
                 let manifest_request: ManifestRequest = read_length_delimited_async(recv)
                     .await
                     .map_err(|err| ServerError::Quic(err.to_string()))?;
+                let (manifest_response, root_hash, expected_chunk_count) = self
+                    .sync_manifest_response(manifest_request)
+                    .await
+                    .map_err(ServerError::Quic)?;
+                write_length_delimited_async(
+                    send,
+                    &SyncMessage {
+                        msg: Some(Msg::ManifestResponse(manifest_response)),
+                    },
+                )
+                .await
+                .map_err(|err| ServerError::Quic(err.to_string()))?;
                 let possession: PossessionBitfield = read_length_delimited_async(recv)
                     .await
                     .map_err(|err| ServerError::Quic(err.to_string()))?;
                 let responses = self
-                    .sync_response_messages(manifest_request, possession)
+                    .sync_chunk_response_messages(root_hash, expected_chunk_count, possession)
                     .await
                     .map_err(ServerError::Quic)?;
                 for response in responses {
@@ -83,6 +110,8 @@ where
                         .map_err(|err| ServerError::Quic(err.to_string()))?;
                 }
                 finish_send(send).await
+                    }
+                }
             }
             Err(err) => Err(ServerError::Quic(err.to_string())),
         }

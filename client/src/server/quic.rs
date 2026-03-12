@@ -1,13 +1,15 @@
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 
-use distd_core::proto::{ClientKeepAlive, ClientRegister, ManifestRequest, PossessionBitfield, ServerMetadata, SyncMessage};
+use distd_core::proto::{ClientKeepAlive, ClientRegister, ManifestRequest, ManifestResponse, PossessionBitfield, ServerMetadata, SyncMessage};
 use distd_core::transport::TransportOp;
-use distd_core::utils::frame::{read_length_delimited_async, write_length_delimited_async, write_transport_op_async};
+use distd_core::utils::frame::{read_length_delimited_async, write_length_delimited_async, write_optional_uuid_async, write_transport_op_async};
 use quinn::{ClientConfig, Endpoint};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, Error as TlsError, SignatureScheme};
+use tokio::sync::RwLock;
+use uuid::Uuid;
 
 use crate::error::{ServerConnection, ServerRequest};
 
@@ -88,10 +90,17 @@ fn parse_quic_target(url: &str) -> Result<(SocketAddr, String), ServerRequest> {
 pub struct QuicTransportClient {
     _endpoint: Endpoint,
     connection: quinn::Connection,
+    client_uuid: Arc<RwLock<Option<Uuid>>>,
+}
+
+#[derive(Debug)]
+pub struct QuicSyncSession {
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
 }
 
 impl QuicTransportClient {
-    pub async fn connect(url: &str) -> Result<Self, ServerRequest> {
+    pub async fn connect(url: &str, client_uuid: Option<Uuid>) -> Result<Self, ServerRequest> {
         let (addr, server_name) = parse_quic_target(url)?;
         let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
             .map_err(|err| ServerRequest::Connection(ServerConnection::Quic(err.to_string())))?;
@@ -115,7 +124,24 @@ impl QuicTransportClient {
         Ok(Self {
             _endpoint: endpoint,
             connection,
+            client_uuid: Arc::new(RwLock::new(client_uuid)),
         })
+    }
+
+    pub async fn set_client_uuid(&self, client_uuid: Uuid) {
+        *self.client_uuid.write().await = Some(client_uuid);
+    }
+
+    async fn auth_uuid_for_op(&self, op: TransportOp) -> Result<Option<Uuid>, ServerRequest> {
+        match op {
+            TransportOp::Register => Ok(*self.client_uuid.read().await),
+            TransportOp::Fetch | TransportOp::Sync => self
+                .client_uuid
+                .read()
+                .await
+                .ok_or(ServerRequest::MissingUuid)
+                .map(Some),
+        }
     }
 
     async fn open_bi(&self, op: TransportOp) -> Result<(quinn::SendStream, quinn::RecvStream), ServerRequest> {
@@ -125,6 +151,10 @@ impl QuicTransportClient {
             .await
             .map_err(|err| ServerRequest::Quic(err.to_string()))?;
         write_transport_op_async(&mut send, op)
+            .await
+            .map_err(|err| ServerRequest::Quic(err.to_string()))?;
+        let auth_uuid = self.auth_uuid_for_op(op).await?;
+        write_optional_uuid_async(&mut send, auth_uuid)
             .await
             .map_err(|err| ServerRequest::Quic(err.to_string()))?;
         Ok((send, recv))
@@ -155,20 +185,33 @@ impl QuicTransportClient {
     pub async fn sync(
         &self,
         manifest_request: ManifestRequest,
-        possession: PossessionBitfield,
-    ) -> Result<Vec<SyncMessage>, ServerRequest> {
+    ) -> Result<(ManifestResponse, QuicSyncSession), ServerRequest> {
         let (mut send, mut recv) = self.open_bi(TransportOp::Sync).await?;
         write_length_delimited_async(&mut send, &manifest_request)
             .await
             .map_err(|err| ServerRequest::Quic(err.to_string()))?;
-        write_length_delimited_async(&mut send, &possession)
+
+        let manifest = read_length_delimited_async(&mut recv)
             .await
             .map_err(|err| ServerRequest::Quic(err.to_string()))?;
-        send.finish().map_err(|err| ServerRequest::Quic(err.to_string()))?;
+
+        Ok((manifest, QuicSyncSession { send, recv }))
+    }
+}
+
+impl QuicSyncSession {
+    pub async fn send_possession_and_collect(
+        mut self,
+        possession: PossessionBitfield,
+    ) -> Result<Vec<SyncMessage>, ServerRequest> {
+        write_length_delimited_async(&mut self.send, &possession)
+            .await
+            .map_err(|err| ServerRequest::Quic(err.to_string()))?;
+        self.send.finish().map_err(|err| ServerRequest::Quic(err.to_string()))?;
 
         let mut responses = Vec::new();
         loop {
-            match read_length_delimited_async::<_, SyncMessage>(&mut recv).await {
+            match read_length_delimited_async::<_, SyncMessage>(&mut self.recv).await {
                 Ok(message) => responses.push(message),
                 Err(distd_core::utils::frame::FrameError::IoError(err))
                     if err.kind() == std::io::ErrorKind::UnexpectedEof => break,

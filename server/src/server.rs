@@ -30,7 +30,7 @@ use crate::client::{Client, Name as ClientName};
 use crate::error::Server as ServerError;
 use crate::grpc::UuidAuthInterceptor;
 use distd_core::feed::{Feed, Name as FeedName};
-use distd_core::hash::hash as do_hash;
+use distd_core::hash::{hash as do_hash, Hash};
 use distd_core::version::Version;
 
 /// Data structure used internally by server, may be converted to `ServerMetadata`
@@ -146,6 +146,14 @@ impl<T> Server<T>
 where
     T: ChunkStorage + Sync + Send + Debug,
 {
+    pub async fn authenticate_client_uuid(&self, uuid: Option<Uuid>) -> Result<Uuid, String> {
+        let uuid = uuid.ok_or_else(|| String::from("Unauthenticated"))?;
+        if uuid.is_nil() || !self.clients.read().await.contains_key(&uuid) {
+            return Err(String::from("Unauthenticated"));
+        }
+        Ok(uuid)
+    }
+
     pub async fn register_response(
         &self,
         addr: SocketAddr,
@@ -182,11 +190,10 @@ where
         })
     }
 
-    pub async fn sync_response_messages(
+    pub async fn sync_manifest_response(
         &self,
         manifest_req: proto::ManifestRequest,
-        possession: proto::PossessionBitfield,
-    ) -> Result<Vec<SyncMessage>, String> {
+    ) -> Result<(proto::ManifestResponse, Hash, usize), String> {
         let item = {
             let md = self.metadata.read().await;
             md.items.get(&manifest_req.artifact_id).cloned()
@@ -195,11 +202,10 @@ where
 
         let root_hash = *item.root();
         let chunk_hashes = self.storage.chunk_list(&root_hash);
-        let bitfield = Bitfield::from_bytes(&possession.bitfield)
-            .ok_or_else(|| String::from("Invalid bitfield"))?;
+        let chunk_count = chunk_hashes.len();
 
-        let mut messages = vec![SyncMessage {
-            msg: Some(Msg::ManifestResponse(proto::ManifestResponse {
+        Ok((
+            proto::ManifestResponse {
                 artifact_id: item.manifest.artifact_id.clone(),
                 version: item.manifest.version,
                 root_hash: root_hash.as_bytes().to_vec(),
@@ -218,8 +224,25 @@ where
                         chunk_end: entry.chunk_range.1,
                     })
                     .collect(),
-            })),
-        }];
+            },
+            root_hash,
+            chunk_count,
+        ))
+    }
+
+    pub async fn sync_chunk_response_messages(
+        &self,
+        root_hash: Hash,
+        expected_chunk_count: usize,
+        possession: proto::PossessionBitfield,
+    ) -> Result<Vec<SyncMessage>, String> {
+        let bitfield = Bitfield::from_bytes(&possession.bitfield)
+            .ok_or_else(|| String::from("Invalid bitfield"))?;
+        if bitfield.chunk_count() as usize != expected_chunk_count {
+            return Err(String::from("Invalid bitfield"));
+        }
+
+        let mut messages = Vec::new();
 
         let missing = bitfield.missing_indices();
         tracing::debug!(
@@ -283,6 +306,23 @@ where
             }
         }
 
+        Ok(messages)
+    }
+
+    pub async fn sync_response_messages(
+        &self,
+        manifest_req: proto::ManifestRequest,
+        possession: proto::PossessionBitfield,
+    ) -> Result<Vec<SyncMessage>, String> {
+        let (manifest, root_hash, expected_chunk_count) = self.sync_manifest_response(manifest_req).await?;
+        let mut messages = Vec::with_capacity(1);
+        messages.push(SyncMessage {
+            msg: Some(Msg::ManifestResponse(manifest)),
+        });
+        messages.extend(
+            self.sync_chunk_response_messages(root_hash, expected_chunk_count, possession)
+                .await?,
+        );
         Ok(messages)
     }
 

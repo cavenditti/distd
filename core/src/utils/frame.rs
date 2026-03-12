@@ -1,6 +1,7 @@
 use prost::Message;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use uuid::Uuid;
 
 use crate::transport::{TransportOp, TransportOpError};
 
@@ -108,6 +109,37 @@ where
     R: AsyncRead + Unpin,
 {
     Ok(TransportOp::try_from(reader.read_u8().await?)?)
+}
+
+pub async fn write_optional_uuid_async<W>(writer: &mut W, uuid: Option<Uuid>) -> Result<(), FrameError>
+where
+    W: AsyncWrite + Unpin,
+{
+    match uuid {
+        Some(uuid) => {
+            writer.write_u8(1).await?;
+            writer.write_all(uuid.as_bytes()).await?;
+        }
+        None => {
+            writer.write_u8(0).await?;
+        }
+    }
+    Ok(())
+}
+
+pub async fn read_optional_uuid_async<R>(reader: &mut R) -> Result<Option<Uuid>, FrameError>
+where
+    R: AsyncRead + Unpin,
+{
+    match reader.read_u8().await? {
+        0 => Ok(None),
+        1 => {
+            let mut raw = [0u8; 16];
+            reader.read_exact(&mut raw).await?;
+            Ok(Some(Uuid::from_bytes(raw)))
+        }
+        _ => Err(FrameError::MalformedFrame),
+    }
 }
 
 #[cfg(test)]
