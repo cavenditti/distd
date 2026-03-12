@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashSet as StdHashSet, VecDeque},
+    collections::VecDeque,
     fs::{self, create_dir_all, remove_file, File},
     io::{BufWriter, Read, Seek, Write},
     path::{Path, PathBuf},
@@ -530,11 +530,9 @@ impl FsStorage {
         &self,
         left: Arc<Node>,
         right: Arc<Node>,
-        hashes: &mut HashSet<ChunkInfo>,
     ) -> Result<Arc<Node>, Error> {
         let hash = merge_hashes(left.hash(), right.hash());
         let size = left.size() + right.size();
-        hashes.insert(ChunkInfo { hash, size });
 
         if matches!(left.as_ref(), Node::Skipped { .. })
             && matches!(right.as_ref(), Node::Skipped { .. })
@@ -549,7 +547,6 @@ impl FsStorage {
     fn finalize_sync_partials(
         &self,
         mut partials: Vec<Arc<Node>>,
-        hashes: &mut HashSet<ChunkInfo>,
     ) -> Result<Arc<Node>, Error> {
         if partials.is_empty() {
             return Err(Error::Storage(StorageError::TreeReconstruct));
@@ -558,11 +555,7 @@ impl FsStorage {
         while partials.len() > 1 {
             let n = partials.len();
             for (to, index) in (0..n - 1).step_by(2).enumerate() {
-                partials[to] = self.combine_sync_nodes(
-                    partials[index].clone(),
-                    partials[index + 1].clone(),
-                    hashes,
-                )?;
+                partials[to] = self.combine_sync_nodes(partials[index].clone(), partials[index + 1].clone())?;
             }
 
             let half = n / 2;
@@ -632,17 +625,15 @@ impl FsStorage {
     fn build_compact_tree(
         &self,
         data: &[u8],
-    ) -> Result<(Arc<Node>, Vec<ChunkInfo>, HashSet<ChunkInfo>), Error> {
+    ) -> Result<(Arc<Node>, Vec<ChunkInfo>), Error> {
         let mut partials = Vec::with_capacity(data.len() / CHUNK_SIZE + 1);
         let mut chunks = Vec::with_capacity(data.len() / CHUNK_SIZE + 1);
-        let mut hashes = HashSet::default();
 
         if data.is_empty() {
             let hash = do_hash(&[]);
             let chunk_info = ChunkInfo { hash, size: 0 };
             self.store_chunk(hash, &[]).map_err(Error::from)?;
             chunks.push(chunk_info);
-            hashes.insert(chunk_info);
             partials.push(Arc::new(Node::Skipped { hash, size: 0 }));
         } else {
             for chunk in data.chunks(CHUNK_SIZE) {
@@ -653,7 +644,6 @@ impl FsStorage {
                 };
                 self.store_chunk(hash, chunk).map_err(Error::from)?;
                 chunks.push(chunk_info);
-                hashes.insert(chunk_info);
                 partials.push(Arc::new(Node::Skipped {
                     hash,
                     size: chunk.len() as u64,
@@ -661,18 +651,17 @@ impl FsStorage {
             }
         }
 
-        let root = self.finalize_sync_partials(partials, &mut hashes)?;
-        Ok((root, chunks, hashes))
+        let root = self.finalize_sync_partials(partials)?;
+        Ok((root, chunks))
     }
 
     fn build_compact_tree_from_files(
         &self,
         root_path: &Path,
         files: &[(PathBuf, bytes::Bytes)],
-    ) -> Result<(Arc<Node>, Vec<ChunkInfo>, HashSet<ChunkInfo>, Vec<FileEntry>), Error> {
+    ) -> Result<(Arc<Node>, Vec<ChunkInfo>, Vec<FileEntry>), Error> {
         let mut partials = Vec::new();
         let mut chunks = Vec::new();
-        let mut hashes = HashSet::default();
         let mut entries = Vec::with_capacity(files.len());
         let mut next_chunk_index = 0u32;
 
@@ -694,7 +683,6 @@ impl FsStorage {
                     .pre_allocate_chunk(&full_path, &chunk_info, offset)?;
                 self.store_chunk(hash, chunk).map_err(Error::from)?;
                 chunks.push(chunk_info);
-                hashes.insert(chunk_info);
                 partials.push(Arc::new(Node::Skipped {
                     hash,
                     size: chunk.len() as u64,
@@ -714,8 +702,8 @@ impl FsStorage {
             return Err(Error::MissingData);
         }
 
-        let root = self.finalize_sync_partials(partials, &mut hashes)?;
-        Ok((root, chunks, hashes, entries))
+        let root = self.finalize_sync_partials(partials)?;
+        Ok((root, chunks, entries))
     }
 
     fn receive_manifest_entry_chunks(
@@ -724,10 +712,9 @@ impl FsStorage {
         chunk_hashes: &[Hash],
         available_hashes: &HashSet<Hash>,
         received_chunks: &mut VecDeque<Vec<u8>>,
-    ) -> Result<(Vec<ChunkInfo>, HashSet<ChunkInfo>, Arc<Node>), Error> {
+    ) -> Result<(Vec<ChunkInfo>, Arc<Node>), Error> {
         let mut partials = Vec::with_capacity(chunk_hashes.len());
         let mut chunks = Vec::with_capacity(chunk_hashes.len());
-        let mut hashes = HashSet::default();
 
         for entry in &manifest.entries {
             let start = entry.chunk_range.0 as usize;
@@ -753,7 +740,6 @@ impl FsStorage {
                 };
 
                 chunks.push(chunk_info);
-                hashes.insert(chunk_info);
 
                 if available_hashes.contains(&chunk_hash) {
                     self.read_chunk_data(&chunk_hash)
@@ -775,8 +761,8 @@ impl FsStorage {
             }
         }
 
-        let root = self.finalize_sync_partials(partials, &mut hashes)?;
-        Ok((chunks, hashes, root))
+        let root = self.finalize_sync_partials(partials)?;
+        Ok((chunks, root))
     }
 
     fn activate_staged_chunks(
@@ -993,10 +979,9 @@ impl FsStorage {
         let stored_path = self.path(&path);
         let available_hashes: HashSet<Hash> = local_hashes.iter().copied().collect();
         let mut received_chunks: VecDeque<Vec<u8>> = received_chunks.into();
-        let (chunks, hashes, root) = if manifest.entries.is_empty() {
+        let (chunks, root) = if manifest.entries.is_empty() {
             let mut partials = Vec::with_capacity(chunk_hashes.len());
             let mut chunks = Vec::with_capacity(chunk_hashes.len());
-            let mut hashes = HashSet::default();
 
             for (index, chunk_hash) in chunk_hashes.iter().copied().enumerate() {
                 let size = if index + 1 == chunk_hashes.len() {
@@ -1010,7 +995,6 @@ impl FsStorage {
                     size,
                 };
                 chunks.push(chunk_info);
-                hashes.insert(chunk_info);
 
                 let node = if available_hashes.contains(&chunk_hash) {
                     self.read_chunk_data(&chunk_hash)
@@ -1036,8 +1020,8 @@ impl FsStorage {
                 partials.push(node);
             }
 
-            let root = self.finalize_sync_partials(partials, &mut hashes)?;
-            (chunks, hashes, root)
+            let root = self.finalize_sync_partials(partials)?;
+            (chunks, root)
         } else {
             self.receive_manifest_entry_chunks(
                 manifest,
@@ -1064,7 +1048,6 @@ impl FsStorage {
             description,
             root.chunk_info(),
             chunks,
-            hashes.into_iter().collect(),
             manifest.entries.clone(),
         )?;
 
@@ -1420,7 +1403,7 @@ impl ChunkStorage for FsStorage {
         self.ensure_handle(&stored_path)?;
         tracing::info!("Preallocated on disk {:?}", stored_path);
 
-        let (hash_tree, chunks, hashes) = self.build_compact_tree(file.as_ref())?;
+        let (hash_tree, chunks) = self.build_compact_tree(file.as_ref())?;
         let mut inner = self.inner.write().unwrap();
         let item = Item::make(
             name,
@@ -1429,7 +1412,6 @@ impl ChunkStorage for FsStorage {
             description,
             hash_tree.chunk_info(),
             chunks,
-            hashes.into_iter().collect::<StdHashSet<_>>(),
         )?;
         tracing::debug!("New item: {item}");
         inner.insert_item(item.clone());
@@ -1457,7 +1439,7 @@ impl ChunkStorage for FsStorage {
 
         let item_root = self.path(&path);
         create_dir_all(&item_root)?;
-        let (hash_tree, chunks, hashes, entries) =
+        let (hash_tree, chunks, entries) =
             self.build_compact_tree_from_files(&item_root, &files)?;
         let mut inner = self.inner.write().unwrap();
         let item = Item::make_with_entries(
@@ -1467,7 +1449,6 @@ impl ChunkStorage for FsStorage {
             description,
             hash_tree.chunk_info(),
             chunks,
-            hashes.into_iter().collect::<StdHashSet<_>>(),
             entries,
         )?;
         tracing::debug!("New item: {item}");
@@ -1565,7 +1546,6 @@ impl ChunkStorage for FsStorage {
             description,
             last.chunk_info(),
             chunks,
-            hashes.into_iter().collect(),
         )?;
         let mut inner = self.inner.write().unwrap();
         inner.insert_item(item.clone());

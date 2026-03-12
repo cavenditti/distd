@@ -27,7 +27,6 @@
 //!}
 //!```
 
-use std::collections::HashSet;
 use std::fmt::Display;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -118,8 +117,6 @@ pub struct Item {
     pub manifest: Manifest,
     /// BLAKE3 hashes of the chunks that make the item
     pub chunks: Vec<ChunkInfo>,
-    /// BLAKE3 hashes of any hash subtree
-    pub hashes: HashSet<ChunkInfo>,
 }
 
 impl Item {
@@ -155,7 +152,6 @@ impl Item {
             },
             manifest,
             chunks: hash_tree.flatten_with_sizes().unwrap_or_default(),
-            hashes: hash_tree.all_hashes_with_sizes(),
         }
     }
 
@@ -167,9 +163,8 @@ impl Item {
         description: Option<String>,
         root: ChunkInfo,
         chunks: Vec<ChunkInfo>,
-        hashes: HashSet<ChunkInfo>,
     ) -> Result<Self, std::io::Error> {
-        Self::make_with_entries(name, path, revision, description, root, chunks, hashes, Vec::new())
+        Self::make_with_entries(name, path, revision, description, root, chunks, Vec::new())
     }
 
     pub fn make_with_entries(
@@ -179,7 +174,6 @@ impl Item {
         description: Option<String>,
         root: ChunkInfo,
         chunks: Vec<ChunkInfo>,
-        hashes: HashSet<ChunkInfo>,
         entries: Vec<FileEntry>,
     ) -> Result<Self, std::io::Error> {
         let artifact_id = name.clone();
@@ -210,7 +204,6 @@ impl Item {
             },
             manifest,
             chunks,
-            hashes,
         })
     }
 
@@ -231,8 +224,14 @@ impl Item {
     /// `Stored` chunks diff of two items
     /// Chunks in self and not in other
     #[must_use]
-    pub fn diff(&self, other: &Self) -> HashSet<ChunkInfo> {
-        self.hashes.difference(&other.hashes).copied().collect()
+    pub fn diff(&self, other: &Self) -> std::collections::HashSet<ChunkInfo> {
+        let own_chunks = self.chunks.iter().copied().collect::<std::collections::HashSet<_>>();
+        let other_chunks = other
+            .chunks
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        own_chunks.difference(&other_chunks).copied().collect()
     }
 
     #[inline]
@@ -345,7 +344,6 @@ pub mod tests {
             Some("Some description for the larger item".to_string()),
             chunk,
             vec![chunk],
-            HashSet::from_iter(vec![chunk]),
         ).ok()
     }
 
