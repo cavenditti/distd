@@ -266,7 +266,7 @@ pub fn print_fairness_caveats() {
     let caveats = [
         "distd uses fixed 256 KiB chunking (no content-defined chunking yet)",
         "distd benchmark server uses ephemeral filesystem storage (FsStorage)",
-        "distd multi-file artifact path is experimental; bulk mode is still single-file only",
+        "distd multi-file artifact path is experimental; bulk mode now covers cold full-fetches but not partial updates",
         "distd sync path uses ordered leaf hashes to build possession bitfields",
         "http is a naïve baseline — full-file download with no delta support",
         "rsync is measured via local filesystem (no actual network I/O)",

@@ -760,10 +760,34 @@ fn query_store_size() -> Result<u64, String> {
 
 fn extract_payload_bytes(stderr: &str) -> Option<u64> {
     stderr.lines().find_map(|line| {
-        line.split("distd_payload_bytes=")
-            .nth(1)
-            .and_then(|value| value.trim().parse::<u64>().ok())
+        ["distd_sync_payload_bytes=", "distd_payload_bytes="]
+            .into_iter()
+            .find_map(|needle| {
+                line.split(needle)
+                    .nth(1)
+                    .and_then(|value| value.split_whitespace().next())
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_payload_bytes;
+
+    #[test]
+    fn extracts_current_sync_payload_metric() {
+        let stderr = "INFO distd_sync_payload_bytes=65536000 distd_sync_received_chunks=1000";
+
+        assert_eq!(extract_payload_bytes(stderr), Some(65_536_000));
+    }
+
+    #[test]
+    fn extracts_legacy_payload_metric() {
+        let stderr = "INFO distd_payload_bytes=42";
+
+        assert_eq!(extract_payload_bytes(stderr), Some(42));
+    }
 }
 
 /// Find the workspace root by walking up from the current executable or CARGO_MANIFEST_DIR.
