@@ -228,24 +228,46 @@ where
             // The client already knows per-chunk sizes from the manifest entries and can split
             // the stream back into individual chunks without per-chunk gRPC framing.
             if bitfield.is_empty() && !missing.is_empty() {
-                // Bulk mode: stream concatenated chunks
-                const BULK_BATCH: usize = 64;
-                for batch_start in (0..missing.len()).step_by(BULK_BATCH) {
-                    let batch_end = (batch_start + BULK_BATCH).min(missing.len());
-                    let batch_indices = &missing[batch_start..batch_end];
+                // Bulk mode: stream concatenated chunks with a byte budget rather than a fixed
+                // chunk count so many-small-files can amortize framing overhead more effectively.
+                const BULK_TARGET_BYTES: usize = 16 * 1024 * 1024;
+                const BULK_MAX_CHUNKS: usize = 512;
 
-                    let mut bulk_buf = Vec::new();
-                    for &idx in batch_indices {
-                        if let Some(data) = storage.get_chunk_by_index(&root_hash, idx) {
-                            bulk_buf.extend_from_slice(&data);
+                let mut cursor = 0;
+                while cursor < missing.len() {
+                    let start_index = missing[cursor];
+                    let mut count = 0usize;
+                    let mut bulk_buf = Vec::with_capacity(BULK_TARGET_BYTES);
+
+                    while cursor < missing.len() && count < BULK_MAX_CHUNKS {
+                        let idx = missing[cursor];
+                        if idx != start_index + count as u32 {
+                            break;
                         }
+
+                        let Some(data) = storage.get_chunk_by_index(&root_hash, idx) else {
+                            cursor += 1;
+                            continue;
+                        };
+
+                        if count > 0 && bulk_buf.len() + data.len() > BULK_TARGET_BYTES {
+                            break;
+                        }
+
+                        bulk_buf.extend_from_slice(&data);
+                        count += 1;
+                        cursor += 1;
+                    }
+
+                    if count == 0 {
+                        continue;
                     }
 
                     let msg = SyncMessage {
                         msg: Some(Msg::BulkData(proto::BulkData {
                             data: bulk_buf,
-                            start_index: batch_indices[0],
-                            count: batch_indices.len() as u32,
+                            start_index,
+                            count: count as u32,
                         })),
                     };
                     if tx.send(Ok(msg)).await.is_err() {

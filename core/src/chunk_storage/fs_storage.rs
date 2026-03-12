@@ -761,7 +761,7 @@ impl FsStorage {
                     },
                 };
 
-                self.pre_allocate_chunk(&full_path, &chunk_info, offset)?;
+                self.pre_allocate_registered_chunk(&full_path, &chunk_info, offset)?;
                 offset += chunk_info.size;
                 chunks.push(chunk_info);
                 hashes.insert(chunk_info);
@@ -901,6 +901,15 @@ impl FsStorage {
         Ok(())
     }
 
+    fn pre_allocate_registered_chunk(
+        &self,
+        path: &Path,
+        chunk_info: &ChunkInfo,
+        offset: u64,
+    ) -> Result<(), Error> {
+        self.inner.write().unwrap().pre_allocate_chunk(path, chunk_info, offset)
+    }
+
     fn flush_handles(&self) -> Result<(), Error> {
         let handles = self
             .handles
@@ -971,7 +980,7 @@ impl FsStorage {
                     if do_hash(&data) != chunk_hash {
                         return Err(Error::Storage(StorageError::TreeReconstruct));
                     }
-                    self.pre_allocate_chunk(&stored_path, &chunk_info, offset)?;
+                    self.pre_allocate_registered_chunk(&stored_path, &chunk_info, offset)?;
                     self.store_chunk(chunk_hash, &data).map_err(Error::from)?;
                     Arc::new(Node::Skipped {
                         hash: chunk_hash,
