@@ -9,6 +9,8 @@
 //! Both "in-memory" (current default) and "persistent" server modes are supported.
 
 use std::cell::RefCell;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -21,6 +23,7 @@ use super::{wait_child_with_timeout, ToolRunner, SMOKE_CHILD_TIMEOUT, DEFAULT_CH
 /// Timeout for curl HTTP requests to the server (connect + total).
 const CURL_CONNECT_TIMEOUT: &str = "5";
 const CURL_MAX_TIME: &str = "30";
+const PUBLISH_RETRIES: usize = 3;
 
 /// Paths to the compiled distd binaries.
 struct BinaryPaths {
@@ -76,6 +79,30 @@ unsafe impl Send for DistdRunner {}
 unsafe impl Sync for DistdRunner {}
 
 impl DistdRunner {
+    fn http_version_ready() -> bool {
+        let Ok(mut stream) = TcpStream::connect_timeout(
+            &"127.0.0.1:3000".parse().unwrap(),
+            Duration::from_millis(200),
+        ) else {
+            return false;
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+        if stream
+            .write_all(b"GET /version HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .is_err()
+        {
+            return false;
+        }
+
+        let mut response = String::new();
+        if stream.read_to_string(&mut response).is_err() {
+            return false;
+        }
+
+        response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.0 200")
+    }
+
     pub fn new(work_dir: &Path) -> Self {
         Self {
             work_dir: work_dir.join("distd"),
@@ -173,8 +200,7 @@ impl DistdRunner {
 
         *self.server_guard.borrow_mut() = Some(guard);
 
-        // Wait for BOTH HTTP (3000) and gRPC (50051) ports to be ready.
-        // The server binds gRPC on [::1]:50051 (IPv6) and HTTP on 0.0.0.0:3000.
+        // Wait for gRPC to accept connections and HTTP to return a real 200 on /version.
         let start = Instant::now();
         let timeout = Duration::from_secs(10);
         let mut http_ready = false;
@@ -187,7 +213,7 @@ impl DistdRunner {
                 ));
             }
             if !http_ready {
-                http_ready = std::net::TcpStream::connect("127.0.0.1:3000").is_ok();
+                http_ready = Self::http_version_ready();
             }
             if !grpc_ready {
                 grpc_ready = std::net::TcpStream::connect_timeout(
@@ -218,32 +244,47 @@ impl DistdRunner {
         item_name: &str,
         item_path: &str,
     ) -> Result<(), String> {
-        let output = Command::new("curl")
-            .args([
-                "-s",
-                "-f",  // fail fast on HTTP errors
-                "--connect-timeout",
-                CURL_CONNECT_TIMEOUT,
-                "--max-time",
-                CURL_MAX_TIME,
-                "-X",
-                "POST",
-                &format!(
-                    "http://127.0.0.1:3000/items?name={}&path={}",
-                    item_name, item_path
-                ),
-                "-F",
-                &format!("item=@{}", source_file.to_string_lossy()),
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|e| format!("curl publish failed: {e}"))?;
+        for attempt in 1..=PUBLISH_RETRIES {
+            let output = Command::new("curl")
+                .args([
+                    "-sS",
+                    "--fail-with-body",
+                    "--connect-timeout",
+                    CURL_CONNECT_TIMEOUT,
+                    "--max-time",
+                    CURL_MAX_TIME,
+                    "-X",
+                    "POST",
+                    &format!(
+                        "http://127.0.0.1:3000/items?name={}&path={}",
+                        item_name, item_path
+                    ),
+                    "-F",
+                    &format!("item=@{}", source_file.to_string_lossy()),
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .map_err(|e| format!("curl publish failed: {e}"))?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("Failed to publish item to distd server: {stderr}"));
+            if output.status.success() {
+                return Ok(());
+            }
+
+            if attempt == PUBLISH_RETRIES {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(format!(
+                    "Failed to publish item to distd server: status={} stdout={} stderr={}",
+                    output.status,
+                    stdout.trim(),
+                    stderr.trim()
+                ));
+            }
+
+            std::thread::sleep(Duration::from_millis(150 * attempt as u64));
         }
+
         Ok(())
     }
 
@@ -254,41 +295,56 @@ impl DistdRunner {
         item_name: &str,
         item_path: &str,
     ) -> Result<(), String> {
-        let mut cmd = Command::new("curl");
-        cmd.arg("-s")
-            .arg("-f")
-            .arg("--connect-timeout")
-            .arg(CURL_CONNECT_TIMEOUT)
-            .arg("--max-time")
-            .arg(CURL_MAX_TIME)
-            .arg("-X")
-            .arg("POST")
-            .arg(format!(
-                "http://127.0.0.1:3000/items?name={}&path={}",
-                item_name, item_path
-            ));
+        for attempt in 1..=PUBLISH_RETRIES {
+            let mut cmd = Command::new("curl");
+            cmd.arg("-sS")
+                .arg("--fail-with-body")
+                .arg("--connect-timeout")
+                .arg(CURL_CONNECT_TIMEOUT)
+                .arg("--max-time")
+                .arg(CURL_MAX_TIME)
+                .arg("-X")
+                .arg("POST")
+                .arg(format!(
+                    "http://127.0.0.1:3000/items?name={}&path={}",
+                    item_name, item_path
+                ));
 
-        for source_file in source_files {
-            let relative = source_file
-                .strip_prefix(source_root)
-                .map_err(|e| format!("Cannot derive relative path for {}: {e}", source_file.display()))?;
-            cmd.arg("-F").arg(format!(
-                "item=@{};filename={}",
-                source_file.to_string_lossy(),
-                relative.to_string_lossy()
-            ));
+            for source_file in source_files {
+                let relative = source_file
+                    .strip_prefix(source_root)
+                    .map_err(|e| format!("Cannot derive relative path for {}: {e}", source_file.display()))?;
+                cmd.arg("-F").arg(format!(
+                    "item=@{};filename={}",
+                    source_file.to_string_lossy(),
+                    relative.to_string_lossy()
+                ));
+            }
+
+            let output = cmd
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .map_err(|e| format!("curl publish failed: {e}"))?;
+
+            if output.status.success() {
+                return Ok(());
+            }
+
+            if attempt == PUBLISH_RETRIES {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(format!(
+                    "Failed to publish multi-file item to distd server: status={} stdout={} stderr={}",
+                    output.status,
+                    stdout.trim(),
+                    stderr.trim()
+                ));
+            }
+
+            std::thread::sleep(Duration::from_millis(150 * attempt as u64));
         }
 
-        let output = cmd
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|e| format!("curl publish failed: {e}"))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("Failed to publish multi-file item to distd server: {stderr}"));
-        }
         Ok(())
     }
 
