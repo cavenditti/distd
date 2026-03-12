@@ -224,8 +224,10 @@ where
             tracing::debug!("Sync: {} missing chunks out of {}", missing.len(), bitfield.chunk_count());
 
             // Phase 3: stream missing chunks
-            // If client has nothing, use BulkData fast path (Step 7)
-            if bitfield.is_empty() && !missing.is_empty() && item.manifest.entries.is_empty() {
+            // If client has nothing, use BulkData fast path regardless of artifact layout.
+            // The client already knows per-chunk sizes from the manifest entries and can split
+            // the stream back into individual chunks without per-chunk gRPC framing.
+            if bitfield.is_empty() && !missing.is_empty() {
                 // Bulk mode: stream concatenated chunks
                 const BULK_BATCH: usize = 64;
                 for batch_start in (0..missing.len()).step_by(BULK_BATCH) {

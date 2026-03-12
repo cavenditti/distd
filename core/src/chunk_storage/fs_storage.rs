@@ -727,11 +727,15 @@ impl FsStorage {
         let mut partials = Vec::with_capacity(chunk_hashes.len());
         let mut chunks = Vec::with_capacity(chunk_hashes.len());
         let mut hashes = HashSet::default();
+        let mut ensured_parents = HashSet::default();
 
         for entry in &manifest.entries {
             let relative_path = PathBuf::from(&entry.relative_path);
             let full_path = Self::artifact_entry_path(item_root, &relative_path);
-            create_dir_all(full_path.parent().ok_or(Error::MissingData)?)?;
+            let parent = full_path.parent().ok_or(Error::MissingData)?;
+            if ensured_parents.insert(parent.to_path_buf()) {
+                create_dir_all(parent)?;
+            }
             self.ensure_handle(&full_path)?;
 
             let start = entry.chunk_range.0 as usize;
