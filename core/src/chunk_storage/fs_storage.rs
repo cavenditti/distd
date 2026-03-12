@@ -244,12 +244,47 @@ struct FsStorageState {
     #[serde(default)]
     #[serde(skip_serializing)]
     #[serde(skip_deserializing)]
+    root_index: HashMap<Hash, Item>,
+    #[serde(default)]
+    #[serde(skip_serializing)]
+    #[serde(skip_deserializing)]
     dirty: bool,
 }
 
 impl FsStorageState {
     fn mark_dirty(&mut self) {
         self.dirty = true;
+    }
+
+    fn rebuild_indexes(&mut self) {
+        self.root_index.clear();
+        for item in &self.items {
+            let root_hash = item.metadata.root.hash;
+            let replace = self
+                .root_index
+                .get(&root_hash)
+                .map(|current| {
+                    (item.metadata.revision, item.chunks.len(), item.size())
+                        > (current.metadata.revision, current.chunks.len(), current.size())
+                })
+                .unwrap_or(true);
+            if replace {
+                self.root_index.insert(root_hash, item.clone());
+            }
+        }
+    }
+
+    fn insert_item(&mut self, item: Item) {
+        self.items.replace(item);
+        self.rebuild_indexes();
+    }
+
+    fn remove_item(&mut self, item: &Item) -> bool {
+        let removed = self.items.remove(item);
+        if removed {
+            self.rebuild_indexes();
+        }
+        removed
     }
 
     /// Returns the stored path of any path relative to root
@@ -284,11 +319,7 @@ impl FsStorageState {
     }
 
     fn item_for_root(&self, root: &Hash) -> Option<Item> {
-        self.items
-            .iter()
-            .filter(|item| item.metadata.root.hash == *root)
-            .cloned()
-            .max_by_key(|item| (item.metadata.revision, item.chunks.len(), item.size()))
+        self.root_index.get(root).cloned()
     }
 
     /// Atomically persist state to disk (write to *.tmp then rename)
@@ -782,6 +813,7 @@ impl FsStorage {
                     tracing::warn!("Cannot deserialize FsStorage persistence data: {e}; starting fresh");
                 }
                 Ok(mut s) => {
+                    s.rebuild_indexes();
                     let mut handles_map = HashMap::default();
                     for hash in s.data.keys().copied().collect::<Vec<_>>() {
                         if let Some(entries) = s.data.get(&hash) {
@@ -928,7 +960,7 @@ impl FsStorage {
         let path = inner.item_path(item)?;
         tracing::debug!("Preallocating item to {:?}", path);
         inner.pre_allocate(&path, &item.chunks[..])?;
-        inner.items.insert(item.clone());
+        inner.insert_item(item.clone());
         drop(inner);
         self.ensure_handle(&path)?;
         self.persist()
@@ -938,11 +970,7 @@ impl FsStorage {
     pub fn remove(&self, item: Item) -> Result<(), Error> {
         let mut inner = self.inner.write().unwrap();
         let path = inner.item_path(&item)?;
-        let item = inner
-            .items
-            .remove(&item)
-            .then_some(item)
-            .ok_or(Error::MissingData)?;
+        let item = inner.remove_item(&item).then_some(item).ok_or(Error::MissingData)?;
         for chunk in &item.chunks {
             let remove_key = if let Some(infile_chunks) = inner.data.get_mut(&chunk.hash) {
                 infile_chunks.retain(|infile_chunk| infile_chunk.path != path);
@@ -1071,7 +1099,7 @@ impl ChunkStorage for FsStorage {
         let mut inner = self.inner.write().unwrap();
         let item = Item::new(name, path, revision, description, &hash_tree);
         tracing::debug!("New item: {item}");
-        inner.items.insert(item.clone());
+        inner.insert_item(item.clone());
         drop(inner);
         self.persist()?;
         Ok(item)
@@ -1098,7 +1126,7 @@ impl ChunkStorage for FsStorage {
         let mut inner = self.inner.write().unwrap();
         let item = Item::new(name, path, revision, description, &root);
         tracing::debug!("New item: {item}");
-        inner.items.insert(item.clone());
+        inner.insert_item(item.clone());
         drop(inner);
         self.persist()?;
         Ok(item)
@@ -1168,7 +1196,7 @@ impl ChunkStorage for FsStorage {
             hashes.into_iter().collect(),
         )?;
         let mut inner = self.inner.write().unwrap();
-        inner.items.insert(item.clone());
+        inner.insert_item(item.clone());
         drop(inner);
         self.persist()?;
         Ok(item)
@@ -1211,8 +1239,6 @@ mod tests {
         utils::testing::temp_path,
     };
     use std::str::FromStr;
-
-    use test_log::test;
 
     use super::*;
 
