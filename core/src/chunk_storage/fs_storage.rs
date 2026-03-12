@@ -679,7 +679,6 @@ impl FsStorage {
         for (relative_path, data) in files {
             let full_path = Self::artifact_entry_path(root_path, relative_path);
             create_dir_all(full_path.parent().ok_or(Error::MissingData)?)?;
-            self.ensure_handle(&full_path)?;
 
             let start = next_chunk_index;
             let mut offset = 0u64;
@@ -689,7 +688,10 @@ impl FsStorage {
                     hash,
                     size: chunk.len() as u64,
                 };
-                self.pre_allocate_chunk(&full_path, &chunk_info, offset)?;
+                self.inner
+                    .write()
+                    .unwrap()
+                    .pre_allocate_chunk(&full_path, &chunk_info, offset)?;
                 self.store_chunk(hash, chunk).map_err(Error::from)?;
                 chunks.push(chunk_info);
                 hashes.insert(chunk_info);
@@ -784,15 +786,13 @@ impl FsStorage {
         chunks: &[ChunkInfo],
     ) -> Result<(), Error> {
         let mut unique_hashes = HashSet::default();
+        let mut activation_paths = Vec::new();
+        let mut activation_ranges = Vec::new();
 
         if manifest.entries.is_empty() {
-            self.ensure_handle(item_root)?;
-            let mut offset = 0u64;
-            for chunk in chunks {
-                self.pre_allocate_registered_chunk(item_root, chunk, offset)?;
-                unique_hashes.insert(chunk.hash);
-                offset += chunk.size;
-            }
+            activation_paths.push(item_root.to_path_buf());
+            activation_ranges.push((0usize, chunks.len()));
+            unique_hashes.extend(chunks.iter().map(|chunk| chunk.hash));
         } else {
             let mut ensured_parents = HashSet::default();
             for entry in &manifest.entries {
@@ -802,16 +802,19 @@ impl FsStorage {
                 if ensured_parents.insert(parent.to_path_buf()) {
                     create_dir_all(parent)?;
                 }
-                self.ensure_handle(&full_path)?;
 
                 let start = entry.chunk_range.0 as usize;
                 let end = entry.chunk_range.1 as usize;
-                let mut offset = 0u64;
-                for chunk in chunks.iter().take(end).skip(start) {
-                    self.pre_allocate_registered_chunk(&full_path, chunk, offset)?;
-                    unique_hashes.insert(chunk.hash);
-                    offset += chunk.size;
-                }
+                activation_paths.push(full_path);
+                activation_ranges.push((start, end));
+                unique_hashes.extend(chunks.iter().take(end).skip(start).map(|chunk| chunk.hash));
+            }
+        }
+
+        {
+            let mut inner = self.inner.write().unwrap();
+            for (path, (start, end)) in activation_paths.iter().zip(activation_ranges.iter().copied()) {
+                inner.pre_allocate(path, &chunks[start..end])?;
             }
         }
 
@@ -922,6 +925,26 @@ impl FsStorage {
             .unwrap_or_default()
     }
 
+    fn is_path_fully_populated(&self, path: &Path) -> bool {
+        self.inner
+            .read()
+            .unwrap()
+            .data
+            .values()
+            .flat_map(|entries| entries.iter())
+            .filter(|entry| entry.path == path)
+            .all(|entry| entry.populated.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    fn flush_if_path_complete(&self, path: &Path) -> Result<(), Error> {
+        if self.is_path_fully_populated(path) {
+            if let Some(handle) = self.handle_for_path(path) {
+                handle.lock().unwrap().flush()?;
+            }
+        }
+        Ok(())
+    }
+
     fn ensure_handle(&self, path: &Path) -> Result<(), Error> {
         if self.handle_for_path(path).is_some() {
             return Ok(());
@@ -932,15 +955,6 @@ impl FsStorage {
             handles.insert(path.to_owned(), Arc::new(Mutex::new(Handle::new(path)?)));
         }
         Ok(())
-    }
-
-    fn pre_allocate_registered_chunk(
-        &self,
-        path: &Path,
-        chunk_info: &ChunkInfo,
-        offset: u64,
-    ) -> Result<(), Error> {
-        self.inner.write().unwrap().pre_allocate_chunk(path, chunk_info, offset)
     }
 
     fn flush_handles(&self) -> Result<(), Error> {
@@ -1347,13 +1361,30 @@ impl ChunkStorage for FsStorage {
 
         for infile_chunk in &infile_chunks {
             tracing::trace!("infile chunk {infile_chunk:?}");
-            let handle = self
-                .handle_for_path(&infile_chunk.path)
-                .ok_or(StorageError::ChunkInsertError)?;
-            infile_chunk
-                .write(&hash, chunk, &mut handle.lock().unwrap())
-                .inspect(|()| tracing::trace!("Written infile chunk {hash} to {}", infile_chunk.path.to_string_lossy()))
-                .inspect_err(|e| tracing::error!("Cannot write infile chunk to {}: {e}", infile_chunk.path.to_string_lossy()))
+            if let Some(handle) = self.handle_for_path(&infile_chunk.path) {
+                infile_chunk
+                    .write(&hash, chunk, &mut handle.lock().unwrap())
+                    .inspect(|()| tracing::trace!("Written infile chunk {hash} to {}", infile_chunk.path.to_string_lossy()))
+                    .inspect_err(|e| tracing::error!("Cannot write infile chunk to {}: {e}", infile_chunk.path.to_string_lossy()))
+                    .map_err(|_| StorageError::ChunkInsertError)?;
+            } else {
+                let mut handle = Handle::new(&infile_chunk.path)
+                    .map_err(|_| StorageError::ChunkInsertError)?;
+                infile_chunk
+                    .write(&hash, chunk, &mut handle)
+                    .inspect(|()| tracing::trace!("Written infile chunk {hash} to {} with transient handle", infile_chunk.path.to_string_lossy()))
+                    .inspect_err(|e| tracing::error!("Cannot write infile chunk to {}: {e}", infile_chunk.path.to_string_lossy()))
+                    .map_err(|_| StorageError::ChunkInsertError)?;
+                handle.flush().map_err(|_| StorageError::ChunkInsertError)?;
+            }
+        }
+
+        for path in infile_chunks
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect::<HashSet<_>>()
+        {
+            self.flush_if_path_complete(&path)
                 .map_err(|_| StorageError::ChunkInsertError)?;
         }
 
