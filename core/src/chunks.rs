@@ -84,6 +84,14 @@ pub enum ChunkingPolicy {
     FastCdc,
     Image,
     Archive,
+    Iso,
+    Oci,
+    Package,
+    Tar,
+    TarGzip,
+    TarZstd,
+    Gzip,
+    Zstd,
 }
 
 impl FromStr for ChunkingPolicy {
@@ -97,8 +105,16 @@ impl FromStr for ChunkingPolicy {
             "fastcdc" | "cdc" | "generic" => Ok(Self::FastCdc),
             "image" | "images" | "os-image" | "os_image" => Ok(Self::Image),
             "archive" | "archives" => Ok(Self::Archive),
+            "iso" | "iso9660" => Ok(Self::Iso),
+            "oci" | "oci-image" | "oci_image" | "container" => Ok(Self::Oci),
+            "package" | "pkg" | "packages" => Ok(Self::Package),
+            "tar" => Ok(Self::Tar),
+            "tar-gz" | "tar.gz" | "tgz" | "tar-gzip" => Ok(Self::TarGzip),
+            "tar-zst" | "tar.zst" | "tar-zstd" | "tar.zstd" | "tzst" => Ok(Self::TarZstd),
+            "gzip" | "gz" => Ok(Self::Gzip),
+            "zstd" | "zst" => Ok(Self::Zstd),
             got => Err(InvalidParameter::Generic {
-                expected: "one of auto, fixed-256k, fixed-1m, fastcdc, image, archive".to_string(),
+                expected: "one of auto, fixed-256k, fixed-1m, fastcdc, image, archive, iso, oci, package, tar, tar.gz, tar.zst, gzip, zstd".to_string(),
                 got: got.to_string(),
             }),
         }
@@ -158,13 +174,28 @@ impl Default for ChunkAlgorithm {
 
 impl ChunkAlgorithm {
     #[must_use]
-    pub fn fixed_1m() -> Self {
+    pub fn fixed_aligned(chunk_size: u32, alignment: u32) -> Self {
         Self::FixedAligned {
-            chunk_size: 1024 * 1024,
-            alignment: 4096,
+            chunk_size,
+            alignment,
             header_size: 0,
             profile_version: 1,
         }
+    }
+
+    #[must_use]
+    pub fn fixed_aligned_with_header(chunk_size: u32, alignment: u32, header_size: u32) -> Self {
+        Self::FixedAligned {
+            chunk_size,
+            alignment,
+            header_size,
+            profile_version: 1,
+        }
+    }
+
+    #[must_use]
+    pub fn fixed_1m() -> Self {
+        Self::fixed_aligned(1024 * 1024, 4096)
     }
 
     #[must_use]
@@ -191,6 +222,69 @@ impl ChunkAlgorithm {
             seed: FASTCDC_SEED,
             profile_version: 1,
         }
+    }
+
+    #[must_use]
+    pub fn iso_default() -> Self {
+        Self::BlockAlignedFastCdc {
+            min_size: 128 * 1024,
+            avg_size: 1024 * 1024,
+            max_size: 4 * 1024 * 1024,
+            alignment: 2048,
+            zero_run_cutoff: 128 * 1024,
+            normalization_level: FASTCDC_NORMALIZATION_LEVEL,
+            seed: FASTCDC_SEED,
+            profile_version: 1,
+        }
+    }
+
+    #[must_use]
+    pub fn oci_layer_default() -> Self {
+        Self::ArchiveAwareFastCdc {
+            min_size: 128 * 1024,
+            avg_size: 512 * 1024,
+            max_size: 2 * 1024 * 1024,
+            record_size: 512,
+            alignment: 4096,
+            normalization_level: FASTCDC_NORMALIZATION_LEVEL,
+            seed: FASTCDC_SEED,
+            profile_version: 1,
+        }
+    }
+
+    #[must_use]
+    pub fn gzip_default() -> Self {
+        Self::fixed_aligned(1024 * 1024, 32 * 1024)
+    }
+
+    #[must_use]
+    pub fn zstd_default() -> Self {
+        Self::fixed_aligned(1024 * 1024, 128 * 1024)
+    }
+
+    #[must_use]
+    pub fn xz_default() -> Self {
+        Self::fixed_aligned(2 * 1024 * 1024, 64 * 1024)
+    }
+
+    #[must_use]
+    pub fn tar_gzip_default() -> Self {
+        Self::fixed_aligned(1024 * 1024, 32 * 1024)
+    }
+
+    #[must_use]
+    pub fn tar_zstd_default() -> Self {
+        Self::fixed_aligned(1024 * 1024, 128 * 1024)
+    }
+
+    #[must_use]
+    pub fn package_default() -> Self {
+        Self::fixed_aligned_with_header(1024 * 1024, 4096, 4096)
+    }
+
+    #[must_use]
+    pub fn compressed_image_default() -> Self {
+        Self::fixed_aligned(1024 * 1024, 128 * 1024)
     }
 
     #[must_use]
@@ -227,6 +321,14 @@ impl ChunkAlgorithm {
             ChunkingPolicy::FastCdc => Self::fastcdc_default(),
             ChunkingPolicy::Image => Self::image_default(),
             ChunkingPolicy::Archive => Self::archive_default(),
+            ChunkingPolicy::Iso => Self::iso_default(),
+            ChunkingPolicy::Oci => Self::oci_layer_default(),
+            ChunkingPolicy::Package => Self::package_default(),
+            ChunkingPolicy::Tar => Self::archive_default(),
+            ChunkingPolicy::TarGzip => Self::tar_gzip_default(),
+            ChunkingPolicy::TarZstd => Self::tar_zstd_default(),
+            ChunkingPolicy::Gzip => Self::gzip_default(),
+            ChunkingPolicy::Zstd => Self::zstd_default(),
         }
     }
 
@@ -468,49 +570,188 @@ impl ChunkAlgorithm {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetectedFormat {
+    RawDiskImage,
+    Iso9660,
+    Qcow2,
+    Squashfs,
+    Erofs,
+    Tar,
+    Cpio,
+    TarGzip,
+    TarZstd,
+    TarXz,
+    TarBzip2,
+    Gzip,
+    Zstd,
+    Xz,
+    Zip,
+    OciLayerTar,
+    OciLayerTarGzip,
+    OciLayerTarZstd,
+    Deb,
+    Rpm,
+    Apk,
+    ArchPkgTarZstd,
+    ArchPkgTarXz,
+    Unknown,
+}
+
 #[must_use]
 pub fn detect_chunking_algorithm(path: &Path, sample: &[u8], multi_file: bool) -> ChunkAlgorithm {
     if multi_file {
         return ChunkAlgorithm::fastcdc_default();
     }
-    if looks_like_image(path, sample) {
-        return ChunkAlgorithm::image_default();
-    }
-    if looks_like_archive(path, sample) {
-        return ChunkAlgorithm::archive_default();
-    }
-    if looks_like_precompressed(path, sample) {
-        return ChunkAlgorithm::fixed_1m();
-    }
-    ChunkAlgorithm::fastcdc_default()
+    chunk_algorithm_for_format(detect_format(path, sample), sample)
 }
 
-fn looks_like_image(path: &Path, sample: &[u8]) -> bool {
-    const IMAGE_EXTENSIONS: &[&str] = &[
-        "img", "raw", "qcow", "qcow2", "vmdk", "vhd", "vhdx", "iso", "erofs",
-        "squashfs",
-    ];
-    matches_extension(path, IMAGE_EXTENSIONS)
-        || sample.starts_with(b"QFI\xfb")
-        || sample.starts_with(b"hsqs")
-        || zero_density(sample) >= 0.60
+fn chunk_algorithm_for_format(format: DetectedFormat, sample: &[u8]) -> ChunkAlgorithm {
+    match format {
+        DetectedFormat::RawDiskImage | DetectedFormat::Qcow2 => ChunkAlgorithm::image_default(),
+        DetectedFormat::Iso9660 => ChunkAlgorithm::iso_default(),
+        DetectedFormat::Squashfs | DetectedFormat::Erofs => ChunkAlgorithm::compressed_image_default(),
+        DetectedFormat::Tar | DetectedFormat::Cpio => ChunkAlgorithm::archive_default(),
+        DetectedFormat::OciLayerTar => ChunkAlgorithm::oci_layer_default(),
+        DetectedFormat::TarGzip | DetectedFormat::OciLayerTarGzip | DetectedFormat::Apk | DetectedFormat::Gzip => {
+            ChunkAlgorithm::tar_gzip_default()
+        }
+        DetectedFormat::TarZstd | DetectedFormat::OciLayerTarZstd | DetectedFormat::ArchPkgTarZstd | DetectedFormat::Zstd => {
+            ChunkAlgorithm::tar_zstd_default()
+        }
+        DetectedFormat::TarXz | DetectedFormat::ArchPkgTarXz | DetectedFormat::Xz => ChunkAlgorithm::xz_default(),
+        DetectedFormat::TarBzip2 => ChunkAlgorithm::fixed_aligned(1024 * 1024, 100 * 1024),
+        DetectedFormat::Zip => ChunkAlgorithm::fixed_aligned(1024 * 1024, 4096),
+        DetectedFormat::Deb | DetectedFormat::Rpm => ChunkAlgorithm::package_default(),
+        DetectedFormat::Unknown => {
+            if zero_density(sample) >= 0.60 {
+                ChunkAlgorithm::image_default()
+            } else {
+                ChunkAlgorithm::fastcdc_default()
+            }
+        }
+    }
 }
 
-fn looks_like_archive(path: &Path, sample: &[u8]) -> bool {
-    const ARCHIVE_EXTENSIONS: &[&str] = &["tar", "cpio", "catar", "caidx", "caibx"];
-    matches_extension(path, ARCHIVE_EXTENSIONS) || sample.get(257..262) == Some(&b"ustar"[..])
+fn detect_format(path: &Path, sample: &[u8]) -> DetectedFormat {
+    let lower_path = path.to_string_lossy().to_ascii_lowercase();
+
+    if looks_like_oci_layer(path) {
+        if matches_extension_chain(path, &["tar", "gz"])
+            || matches_extension_chain(path, &["tgz"])
+            || is_gzip(sample)
+        {
+            return DetectedFormat::OciLayerTarGzip;
+        }
+        if matches_extension_chain(path, &["tar", "zst"])
+            || matches_extension_chain(path, &["tar", "zstd"])
+            || is_zstd(sample)
+        {
+            return DetectedFormat::OciLayerTarZstd;
+        }
+        if matches_extension_chain(path, &["tar"]) || is_tar(sample) {
+            return DetectedFormat::OciLayerTar;
+        }
+    }
+
+    if matches_extension_chain(path, &["pkg", "tar", "zst"]) {
+        return DetectedFormat::ArchPkgTarZstd;
+    }
+    if matches_extension_chain(path, &["pkg", "tar", "xz"]) {
+        return DetectedFormat::ArchPkgTarXz;
+    }
+    if matches_extension_chain(path, &["tar", "gz"]) || matches_extension_chain(path, &["tgz"]) {
+        return DetectedFormat::TarGzip;
+    }
+    if matches_extension_chain(path, &["tar", "zst"]) || matches_extension_chain(path, &["tar", "zstd"]) || matches_extension_chain(path, &["tzst"]) {
+        return DetectedFormat::TarZstd;
+    }
+    if matches_extension_chain(path, &["tar", "xz"]) || matches_extension_chain(path, &["txz"]) {
+        return DetectedFormat::TarXz;
+    }
+    if matches_extension_chain(path, &["tar", "bz2"]) || matches_extension_chain(path, &["tbz2"]) {
+        return DetectedFormat::TarBzip2;
+    }
+    if matches_extension_chain(path, &["tar"]) || matches_extension_chain(path, &["cpio"]) {
+        return if matches_extension_chain(path, &["cpio"]) {
+            DetectedFormat::Cpio
+        } else {
+            DetectedFormat::Tar
+        };
+    }
+    if matches_extension_chain(path, &["deb"]) {
+        return DetectedFormat::Deb;
+    }
+    if matches_extension_chain(path, &["rpm"]) {
+        return DetectedFormat::Rpm;
+    }
+    if matches_extension_chain(path, &["apk"]) {
+        return DetectedFormat::Apk;
+    }
+    if matches_extension(path, &["img", "raw", "vmdk", "vhd", "vhdx"]) {
+        return DetectedFormat::RawDiskImage;
+    }
+    if matches_extension(path, &["iso"]) {
+        return DetectedFormat::Iso9660;
+    }
+    if matches_extension(path, &["qcow", "qcow2"]) {
+        return DetectedFormat::Qcow2;
+    }
+    if matches_extension(path, &["squashfs"]) {
+        return DetectedFormat::Squashfs;
+    }
+    if matches_extension(path, &["erofs"]) {
+        return DetectedFormat::Erofs;
+    }
+    if matches_extension(path, &["gz"]) || is_gzip(sample) {
+        return DetectedFormat::Gzip;
+    }
+    if matches_extension(path, &["zst", "zstd"]) || is_zstd(sample) {
+        return DetectedFormat::Zstd;
+    }
+    if matches_extension(path, &["xz"]) || is_xz(sample) {
+        return DetectedFormat::Xz;
+    }
+    if matches_extension(path, &["zip"]) || is_zip(sample) {
+        return DetectedFormat::Zip;
+    }
+    if is_iso9660(sample) {
+        return DetectedFormat::Iso9660;
+    }
+    if sample.starts_with(b"QFI\xfb") {
+        return DetectedFormat::Qcow2;
+    }
+    if sample.starts_with(b"hsqs") {
+        return DetectedFormat::Squashfs;
+    }
+    if is_erofs(sample) {
+        return DetectedFormat::Erofs;
+    }
+    if is_rpm(sample) {
+        return DetectedFormat::Rpm;
+    }
+    if is_deb(sample) {
+        return DetectedFormat::Deb;
+    }
+    if is_tar(sample) {
+        return if lower_path.contains("layer.tar") {
+            DetectedFormat::OciLayerTar
+        } else {
+            DetectedFormat::Tar
+        };
+    }
+    if is_cpio(sample) {
+        return DetectedFormat::Cpio;
+    }
+    if zero_density(sample) >= 0.60 {
+        return DetectedFormat::RawDiskImage;
+    }
+    DetectedFormat::Unknown
 }
 
-fn looks_like_precompressed(path: &Path, sample: &[u8]) -> bool {
-    const COMPRESSED_EXTENSIONS: &[&str] = &[
-        "gz", "xz", "zst", "zip", "7z", "rar", "bz2", "jpg", "jpeg", "png", "gif",
-        "webp", "mp4", "mkv", "webm", "mp3", "flac", "pdf",
-    ];
-    matches_extension(path, COMPRESSED_EXTENSIONS)
-        || sample.starts_with(&[0x1f, 0x8b])
-        || sample.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00])
-        || sample.starts_with(&[0x28, 0xb5, 0x2f, 0xfd])
-        || sample.starts_with(b"PK\x03\x04")
+fn looks_like_oci_layer(path: &Path) -> bool {
+    let lower = path.to_string_lossy().to_ascii_lowercase();
+    lower.contains("layer.tar") || lower.contains("/blobs/") || lower.contains("oci")
 }
 
 fn matches_extension(path: &Path, known: &[&str]) -> bool {
@@ -521,6 +762,69 @@ fn matches_extension(path: &Path, known: &[&str]) -> bool {
             known.iter().any(|candidate| ext == *candidate)
         })
         .unwrap_or(false)
+}
+
+fn matches_extension_chain(path: &Path, suffix: &[&str]) -> bool {
+    let chain = extension_chain(path);
+    chain.len() >= suffix.len()
+        && chain[chain.len() - suffix.len()..]
+            .iter()
+            .map(String::as_str)
+            .eq(suffix.iter().copied())
+}
+
+fn extension_chain(path: &Path) -> Vec<String> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| {
+            let trimmed = name.trim_start_matches('.');
+            trimmed
+                .split('.')
+                .skip(1)
+                .map(|part| part.to_ascii_lowercase())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn is_tar(sample: &[u8]) -> bool {
+    sample.get(257..262) == Some(&b"ustar"[..])
+}
+
+fn is_cpio(sample: &[u8]) -> bool {
+    matches!(sample.get(0..6), Some(b"070701" | b"070702" | b"070707"))
+}
+
+fn is_gzip(sample: &[u8]) -> bool {
+    sample.starts_with(&[0x1f, 0x8b])
+}
+
+fn is_zstd(sample: &[u8]) -> bool {
+    sample.starts_with(&[0x28, 0xb5, 0x2f, 0xfd])
+}
+
+fn is_xz(sample: &[u8]) -> bool {
+    sample.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00])
+}
+
+fn is_zip(sample: &[u8]) -> bool {
+    sample.starts_with(b"PK\x03\x04")
+}
+
+fn is_rpm(sample: &[u8]) -> bool {
+    sample.starts_with(&[0xed, 0xab, 0xee, 0xdb])
+}
+
+fn is_deb(sample: &[u8]) -> bool {
+    sample.starts_with(b"!<arch>\n")
+}
+
+fn is_iso9660(sample: &[u8]) -> bool {
+    sample.get(32_769..32_774) == Some(&b"CD001"[..])
+}
+
+fn is_erofs(sample: &[u8]) -> bool {
+    sample.get(1024..1028) == Some(&[0xe2, 0xe1, 0xf5, 0xe0][..])
 }
 
 fn zero_density(sample: &[u8]) -> f32 {
@@ -757,6 +1061,7 @@ fn is_long_zero_run(data: &[u8], offset: usize, cutoff: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{ChunkAlgorithm, Chunker, ContentDefinedChunker, CHUNK_SIZE};
+    use std::path::Path;
 
     #[test]
     fn fastcdc_boundaries_cover_data_without_gaps() {
@@ -810,6 +1115,44 @@ mod tests {
         let fastcdc = ChunkAlgorithm::fastcdc_default().chunk_boundaries(&data);
 
         assert_ne!(fastcdc, fixed);
+    }
+
+    #[test]
+    fn auto_detects_tar_zstd_profile() {
+        let algorithm = super::detect_chunking_algorithm(Path::new("rootfs.tar.zst"), &[], false);
+
+        assert_eq!(algorithm, ChunkAlgorithm::tar_zstd_default());
+    }
+
+    #[test]
+    fn auto_detects_oci_layer_profile() {
+        let mut sample = vec![0u8; 2048];
+        sample[257..262].copy_from_slice(b"ustar");
+
+        let algorithm = super::detect_chunking_algorithm(
+            Path::new("blobs/sha256/layer.tar"),
+            &sample,
+            false,
+        );
+
+        assert_eq!(algorithm, ChunkAlgorithm::oci_layer_default());
+    }
+
+    #[test]
+    fn auto_detects_iso_profile_from_signature() {
+        let mut sample = vec![0u8; 40_000];
+        sample[32_769..32_774].copy_from_slice(b"CD001");
+
+        let algorithm = super::detect_chunking_algorithm(Path::new("artifact.bin"), &sample, false);
+
+        assert_eq!(algorithm, ChunkAlgorithm::iso_default());
+    }
+
+    #[test]
+    fn auto_detects_deb_package_profile() {
+        let algorithm = super::detect_chunking_algorithm(Path::new("foo.deb"), b"!<arch>\n", false);
+
+        assert_eq!(algorithm, ChunkAlgorithm::package_default());
     }
 
     fn boundary_ends(boundaries: &[(usize, usize)]) -> Vec<usize> {
