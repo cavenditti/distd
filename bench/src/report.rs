@@ -264,7 +264,7 @@ fn print_averages_table(results: &[RunMetrics], group_by_workload: bool) {
 /// Print fairness caveats about the benchmark setup.
 pub fn print_fairness_caveats() {
     let caveats = [
-        "distd uses fixed 256 KiB chunking (no content-defined chunking yet)",
+        "distd now supports fixed and content-defined chunking, but FastCDC profile tuning is still in progress",
         "distd benchmark server uses ephemeral filesystem storage (FsStorage)",
         "distd multi-file artifact path is experimental; bulk mode now covers cold full-fetches but not partial updates",
         "distd sync path uses ordered leaf hashes to build possession bitfields",

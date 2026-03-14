@@ -618,18 +618,33 @@ impl Chunker for ContentDefinedChunker {
         let mut boundaries = Vec::new();
         let mut offset = 0;
         let gear = gear_table(self.seed);
-        let mask = self.avg_size.next_power_of_two() as u64 - 1;
-        let center = self.avg_size.min(self.max_size).max(self.min_size);
-        let normalization_window = (center / 4).max(self.min_size / 2);
+        let (small_mask, large_mask) = normalized_masks(self.avg_size, self.normalization_level);
 
         while offset < data.len() {
             let chunk_start = offset;
             let min_end = (offset + self.min_size).min(data.len());
             let max_end = (offset + self.max_size).min(data.len());
+            let normalization_end = (chunk_start + self.avg_size).clamp(min_end, max_end);
             offset = min_end;
 
             let mut hash = 0u64;
             let mut selected_end = max_end;
+
+            'search: while offset < normalization_end {
+                if let Some(cutoff) = self.zero_run_cutoff {
+                    if is_long_zero_run(data, offset, cutoff) {
+                        selected_end = offset;
+                        break 'search;
+                    }
+                }
+
+                hash = update_gear_hash(hash, data[offset], &gear);
+                offset += 1;
+                if hash & small_mask == 0 {
+                    selected_end = offset;
+                    break 'search;
+                }
+            }
 
             while offset < max_end {
                 if let Some(cutoff) = self.zero_run_cutoff {
@@ -639,15 +654,10 @@ impl Chunker for ContentDefinedChunker {
                     }
                 }
 
-                hash = (hash << 1).wrapping_add(gear[data[offset] as usize]);
+                hash = update_gear_hash(hash, data[offset], &gear);
                 offset += 1;
-                if hash & mask == 0 {
+                if hash & large_mask == 0 {
                     selected_end = offset;
-                    if self.normalization_level > 0
-                        && offset < chunk_start + center.saturating_sub(normalization_window)
-                    {
-                        continue;
-                    }
                     break;
                 }
             }
@@ -688,6 +698,25 @@ fn gear_table(seed: u64) -> [u64; 256] {
     table
 }
 
+fn update_gear_hash(hash: u64, byte: u8, gear: &[u64; 256]) -> u64 {
+    hash.rotate_left(1).wrapping_add(gear[byte as usize])
+}
+
+fn normalized_masks(avg_size: usize, normalization_level: u32) -> (u64, u64) {
+    let base_bits = avg_size.max(2).next_power_of_two().trailing_zeros().min(63);
+    let early_bits = (base_bits + normalization_level).min(63);
+    let late_bits = base_bits.saturating_sub(normalization_level).max(1);
+    (bitmask(early_bits), bitmask(late_bits))
+}
+
+fn bitmask(bits: u32) -> u64 {
+    if bits >= 63 {
+        u64::MAX >> 1
+    } else {
+        (1u64 << bits) - 1
+    }
+}
+
 fn snap_boundary(end: usize, start: usize, max_end: usize, alignment: usize) -> usize {
     if alignment <= 1 || end >= max_end {
         return end.max(start + 1).min(max_end);
@@ -723,4 +752,75 @@ fn is_long_zero_run(data: &[u8], offset: usize, cutoff: usize) -> bool {
     cutoff > 0
         && offset + cutoff <= data.len()
         && data[offset..offset + cutoff].iter().all(|byte| *byte == 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ChunkAlgorithm, Chunker, ContentDefinedChunker, CHUNK_SIZE};
+
+    #[test]
+    fn fastcdc_boundaries_cover_data_without_gaps() {
+        let data: Vec<u8> = (0..(CHUNK_SIZE * 6 + 137))
+            .map(|index| ((index * 31) % 251) as u8)
+            .collect();
+        let chunker = ContentDefinedChunker::default();
+        let boundaries = chunker.chunk_boundaries(&data);
+
+        assert!(!boundaries.is_empty());
+
+        let mut expected_offset = 0usize;
+        for (index, (offset, length)) in boundaries.iter().copied().enumerate() {
+            assert_eq!(offset, expected_offset);
+            assert!(length > 0 || data.is_empty());
+            if index + 1 != boundaries.len() {
+                assert!(length >= chunker.min_size);
+            }
+            assert!(length <= chunker.max_size || offset + length == data.len());
+            expected_offset += length;
+        }
+
+        assert_eq!(expected_offset, data.len());
+    }
+
+    #[test]
+    fn image_profile_aligns_boundaries_and_cuts_on_zero_runs() {
+        let mut data: Vec<u8> = (0..(CHUNK_SIZE * 12))
+            .map(|index| ((index * 17 + index / 97) % 251) as u8)
+            .collect();
+        let zero_start = CHUNK_SIZE + 64 * 1024;
+        let zero_end = zero_start + 128 * 1024;
+        for byte in &mut data[zero_start..zero_end] {
+            *byte = 0;
+        }
+
+        let boundaries = ChunkAlgorithm::image_default().chunk_boundaries(&data);
+        let ends = boundary_ends(&boundaries);
+
+        assert!(ends.iter().all(|end| end % 4096 == 0));
+        assert!(ends.iter().any(|end| *end >= zero_start && *end <= zero_start + 4096));
+    }
+
+    #[test]
+    fn fastcdc_profiles_produce_non_fixed_boundaries() {
+        let data: Vec<u8> = (0..(CHUNK_SIZE * 8 + 4096))
+            .map(|index| ((index * 7 + index / 11) % 251) as u8)
+            .collect();
+
+        let fixed = ChunkAlgorithm::Fixed256K.chunk_boundaries(&data);
+        let fastcdc = ChunkAlgorithm::fastcdc_default().chunk_boundaries(&data);
+
+        assert_ne!(fastcdc, fixed);
+    }
+
+    fn boundary_ends(boundaries: &[(usize, usize)]) -> Vec<usize> {
+        let mut cumulative = 0usize;
+        boundaries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (_, length))| {
+                cumulative += *length;
+                (index + 1 != boundaries.len()).then_some(cumulative)
+            })
+            .collect()
+    }
 }
