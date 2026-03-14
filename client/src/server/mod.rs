@@ -11,7 +11,7 @@ use tokio::{sync::{mpsc, RwLock}, time::Instant};
 //use ring::agreement::PublicKey;
 
 use distd_core::{
-    chunks::ChunkAlgorithm,
+    chunks::{ChunkAlgorithm, ChunkInfo},
     error::InvalidParameter,
     hash::Hash,
     item::{FileEntry, Manifest},
@@ -347,7 +347,7 @@ impl Server {
         &self,
         artifact_id: &str,
         local_hashes: &[Hash],
-    ) -> Result<(Manifest, Vec<Hash>, Vec<Vec<u8>>), ServerRequest> {
+    ) -> Result<(Manifest, Vec<ChunkInfo>, Vec<Vec<u8>>), ServerRequest> {
         let mut shared = self.shared.write().await;
         let manifest_request = proto::ManifestRequest {
             artifact_id: artifact_id.to_string(),
@@ -364,7 +364,7 @@ impl Server {
             total_size: manifest_resp.total_size,
             chunk_count: manifest_resp.chunk_count,
             chunk_size: manifest_resp.chunk_size,
-            chunk_algorithm: ChunkAlgorithm::default(),
+            chunk_algorithm: ChunkAlgorithm::from_proto(manifest_resp.chunk_algorithm.as_ref()),
             entries: manifest_resp
                 .entries
                 .into_iter()
@@ -385,47 +385,28 @@ impl Server {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
+        if manifest_resp.chunk_sizes.len() != chunk_hashes.len() {
+            return Err(ServerRequest::UnexpectedMessage);
+        }
+
+        let chunk_infos: Vec<ChunkInfo> = chunk_hashes
+            .into_iter()
+            .zip(manifest_resp.chunk_sizes.into_iter())
+            .map(|(hash, size)| ChunkInfo {
+                hash,
+                size: size as u64,
+            })
+            .collect();
+
         let available_hashes: HashSet<Hash> = local_hashes.iter().copied().collect();
         let mut local_bitfield = distd_core::possession::Bitfield::empty(manifest.chunk_count);
-        for (index, chunk_hash) in chunk_hashes.iter().enumerate() {
-            if available_hashes.contains(chunk_hash) {
+        for (index, chunk_info) in chunk_infos.iter().enumerate() {
+            if available_hashes.contains(&chunk_info.hash) {
                 local_bitfield.set(index as u32);
             }
         }
 
-        let chunk_sizes: Vec<usize> = if manifest.entries.is_empty() {
-            let chunk_size = manifest.chunk_size as usize;
-            (0..manifest.chunk_count)
-                .map(|idx| {
-                    if idx + 1 == manifest.chunk_count {
-                        let rem = (manifest.total_size as usize) % chunk_size;
-                        if rem == 0 { chunk_size } else { rem }
-                    } else {
-                        chunk_size
-                    }
-                })
-                .collect()
-        } else {
-            let chunk_size = manifest.chunk_size as usize;
-            let mut sizes = Vec::with_capacity(manifest.chunk_count as usize);
-            for entry in &manifest.entries {
-                let start = entry.chunk_range.0;
-                let end = entry.chunk_range.1;
-                let chunk_count = end.saturating_sub(start);
-                for position in 0..chunk_count {
-                    let is_last = position + 1 == chunk_count;
-                    let size = if is_last {
-                        let full_chunks = chunk_count.saturating_sub(1) as usize;
-                        let remainder = (entry.size as usize).saturating_sub(full_chunks * chunk_size);
-                        if remainder == 0 { chunk_size } else { remainder }
-                    } else {
-                        chunk_size
-                    };
-                    sizes.push(size);
-                }
-            }
-            sizes
-        };
+        let chunk_sizes: Vec<usize> = chunk_infos.iter().map(|chunk| chunk.size as usize).collect();
 
         let responses = continuation
             .send_possession_and_collect(proto::PossessionBitfield {
@@ -454,7 +435,7 @@ impl Server {
             }
         }
 
-        Ok((manifest, chunk_hashes, received))
+        Ok((manifest, chunk_infos, received))
     }
 
     /// Fetch metadata from server in a loop

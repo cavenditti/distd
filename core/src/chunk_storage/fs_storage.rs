@@ -13,7 +13,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::{
     chunk_storage::StorageError,
-    chunks::{ChunkInfo, CHUNK_SIZE},
+    chunks::{ChunkAlgorithm, ChunkInfo, CHUNK_SIZE},
     error::{Error, InvalidParameter},
     hash::{hash as do_hash, merge_hashes, Hash, HashTreeCapable},
     item::{FileEntry, Item, Manifest, Name as ItemName},
@@ -625,9 +625,11 @@ impl FsStorage {
     fn build_compact_tree(
         &self,
         data: &[u8],
+        chunk_algorithm: ChunkAlgorithm,
     ) -> Result<(Arc<Node>, Vec<ChunkInfo>), Error> {
-        let mut partials = Vec::with_capacity(data.len() / CHUNK_SIZE + 1);
-        let mut chunks = Vec::with_capacity(data.len() / CHUNK_SIZE + 1);
+        let boundaries = chunk_algorithm.chunk_boundaries(data);
+        let mut partials = Vec::with_capacity(boundaries.len().max(1));
+        let mut chunks = Vec::with_capacity(boundaries.len().max(1));
 
         if data.is_empty() {
             let hash = do_hash(&[]);
@@ -636,7 +638,8 @@ impl FsStorage {
             chunks.push(chunk_info);
             partials.push(Arc::new(Node::Skipped { hash, size: 0 }));
         } else {
-            for chunk in data.chunks(CHUNK_SIZE) {
+            for (offset, length) in boundaries {
+                let chunk = &data[offset..offset + length];
                 let hash = do_hash(chunk);
                 let chunk_info = ChunkInfo {
                     hash,
@@ -659,6 +662,7 @@ impl FsStorage {
         &self,
         root_path: &Path,
         files: &[(PathBuf, bytes::Bytes)],
+        chunk_algorithm: ChunkAlgorithm,
     ) -> Result<(Arc<Node>, Vec<ChunkInfo>, Vec<FileEntry>), Error> {
         let mut partials = Vec::new();
         let mut chunks = Vec::new();
@@ -671,7 +675,8 @@ impl FsStorage {
 
             let start = next_chunk_index;
             let mut offset = 0u64;
-            for chunk in data.as_ref().chunks(CHUNK_SIZE) {
+            for (chunk_offset, length) in chunk_algorithm.chunk_boundaries(data.as_ref()) {
+                let chunk = &data.as_ref()[chunk_offset..chunk_offset + length];
                 let hash = do_hash(chunk);
                 let chunk_info = ChunkInfo {
                     hash,
@@ -709,53 +714,38 @@ impl FsStorage {
     fn receive_manifest_entry_chunks(
         &self,
         manifest: &Manifest,
-        chunk_hashes: &[Hash],
+        chunk_infos: &[ChunkInfo],
         available_hashes: &HashSet<Hash>,
         received_chunks: &mut VecDeque<Vec<u8>>,
     ) -> Result<(Vec<ChunkInfo>, Arc<Node>), Error> {
-        let mut partials = Vec::with_capacity(chunk_hashes.len());
-        let mut chunks = Vec::with_capacity(chunk_hashes.len());
+        let mut partials = Vec::with_capacity(chunk_infos.len());
+        let mut chunks = Vec::with_capacity(chunk_infos.len());
 
         for entry in &manifest.entries {
             let start = entry.chunk_range.0 as usize;
             let end = entry.chunk_range.1 as usize;
-            let chunk_count = end.saturating_sub(start);
             for index in start..end {
-                let chunk_hash = *chunk_hashes
+                let chunk_info = *chunk_infos
                     .get(index)
                     .ok_or_else(|| Error::Storage(StorageError::TreeReconstruct))?;
-                let chunk_info = ChunkInfo {
-                    hash: chunk_hash,
-                    size: if index + 1 == end {
-                        let full_chunks = chunk_count.saturating_sub(1) as u64;
-                        let remainder = entry.size.saturating_sub(full_chunks * manifest.chunk_size as u64);
-                        if remainder == 0 {
-                            manifest.chunk_size as u64
-                        } else {
-                            remainder
-                        }
-                    } else {
-                        manifest.chunk_size as u64
-                    },
-                };
 
                 chunks.push(chunk_info);
 
-                if available_hashes.contains(&chunk_hash) {
-                    self.read_chunk_data(&chunk_hash)
+                if available_hashes.contains(&chunk_info.hash) {
+                    self.read_chunk_data(&chunk_info.hash)
                         .ok_or_else(|| Error::Storage(StorageError::TreeReconstruct))?;
                 } else {
                     let data = received_chunks
                         .pop_front()
                         .ok_or_else(|| Error::Storage(StorageError::TreeReconstruct))?;
-                    if do_hash(&data) != chunk_hash {
+                    if do_hash(&data) != chunk_info.hash {
                         return Err(Error::Storage(StorageError::TreeReconstruct));
                     }
-                    self.cache_chunk_data(chunk_hash, Arc::new(data));
+                    self.cache_chunk_data(chunk_info.hash, Arc::new(data));
                 }
 
                 partials.push(Arc::new(Node::Skipped {
-                    hash: chunk_hash,
+                    hash: chunk_info.hash,
                     size: chunk_info.size,
                 }));
             }
@@ -968,11 +958,11 @@ impl FsStorage {
         revision: u32,
         description: Option<String>,
         manifest: &Manifest,
-        chunk_hashes: &[Hash],
+        chunk_infos: &[ChunkInfo],
         local_hashes: &[Hash],
         received_chunks: Vec<Vec<u8>>,
     ) -> Result<Item, Error> {
-        if chunk_hashes.len() != manifest.chunk_count as usize {
+        if chunk_infos.len() != manifest.chunk_count as usize {
             return Err(Error::Storage(StorageError::TreeReconstruct));
         }
 
@@ -980,40 +970,30 @@ impl FsStorage {
         let available_hashes: HashSet<Hash> = local_hashes.iter().copied().collect();
         let mut received_chunks: VecDeque<Vec<u8>> = received_chunks.into();
         let (chunks, root) = if manifest.entries.is_empty() {
-            let mut partials = Vec::with_capacity(chunk_hashes.len());
-            let mut chunks = Vec::with_capacity(chunk_hashes.len());
+            let mut partials = Vec::with_capacity(chunk_infos.len());
+            let mut chunks = Vec::with_capacity(chunk_infos.len());
 
-            for (index, chunk_hash) in chunk_hashes.iter().copied().enumerate() {
-                let size = if index + 1 == chunk_hashes.len() {
-                    let full_chunks = chunk_hashes.len().saturating_sub(1) as u64;
-                    manifest.total_size - full_chunks * manifest.chunk_size as u64
-                } else {
-                    manifest.chunk_size as u64
-                };
-                let chunk_info = ChunkInfo {
-                    hash: chunk_hash,
-                    size,
-                };
+            for chunk_info in chunk_infos.iter().copied() {
                 chunks.push(chunk_info);
 
-                let node = if available_hashes.contains(&chunk_hash) {
-                    self.read_chunk_data(&chunk_hash)
+                let node = if available_hashes.contains(&chunk_info.hash) {
+                    self.read_chunk_data(&chunk_info.hash)
                         .ok_or_else(|| Error::Storage(StorageError::TreeReconstruct))?;
                     Arc::new(Node::Skipped {
-                        hash: chunk_hash,
-                        size,
+                        hash: chunk_info.hash,
+                        size: chunk_info.size,
                     })
                 } else {
                     let data = received_chunks
                         .pop_front()
                         .ok_or_else(|| Error::Storage(StorageError::TreeReconstruct))?;
-                    if do_hash(&data) != chunk_hash {
+                    if do_hash(&data) != chunk_info.hash {
                         return Err(Error::Storage(StorageError::TreeReconstruct));
                     }
-                    self.cache_chunk_data(chunk_hash, Arc::new(data));
+                    self.cache_chunk_data(chunk_info.hash, Arc::new(data));
                     Arc::new(Node::Skipped {
-                        hash: chunk_hash,
-                        size,
+                        hash: chunk_info.hash,
+                        size: chunk_info.size,
                     })
                 };
 
@@ -1025,7 +1005,7 @@ impl FsStorage {
         } else {
             self.receive_manifest_entry_chunks(
                 manifest,
-                chunk_hashes,
+                chunk_infos,
                 &available_hashes,
                 &mut received_chunks,
             )?
@@ -1049,6 +1029,7 @@ impl FsStorage {
             root.chunk_info(),
             chunks,
             manifest.entries.clone(),
+            manifest.chunk_algorithm,
         )?;
 
         let mut inner = self.inner.write().unwrap();
@@ -1390,6 +1371,7 @@ impl ChunkStorage for FsStorage {
         revision: u32,
         description: Option<String>,
         file: bytes::Bytes,
+        chunk_algorithm: ChunkAlgorithm,
     ) -> Result<Item, Error>
     where
         Self: Sized,
@@ -1398,12 +1380,23 @@ impl ChunkStorage for FsStorage {
         let mut inner = self.inner.write().unwrap();
         let stored_path = inner.path(&path);
         create_dir_all(stored_path.parent().ok_or(Error::MissingData)?)?;
-        inner.pre_allocate_bytes(&stored_path, &file)?;
+        let chunks: Vec<ChunkInfo> = chunk_algorithm
+            .chunk_boundaries(file.as_ref())
+            .into_iter()
+            .map(|(offset, length)| {
+                let chunk = &file[offset..offset + length];
+                ChunkInfo {
+                    hash: do_hash(chunk),
+                    size: length as u64,
+                }
+            })
+            .collect();
+        inner.pre_allocate(&stored_path, &chunks)?;
         drop(inner);
         self.ensure_handle(&stored_path)?;
         tracing::info!("Preallocated on disk {:?}", stored_path);
 
-        let (hash_tree, chunks) = self.build_compact_tree(file.as_ref())?;
+        let (hash_tree, chunks) = self.build_compact_tree(file.as_ref(), chunk_algorithm)?;
         let mut inner = self.inner.write().unwrap();
         let item = Item::make(
             name,
@@ -1412,6 +1405,7 @@ impl ChunkStorage for FsStorage {
             description,
             hash_tree.chunk_info(),
             chunks,
+            chunk_algorithm,
         )?;
         tracing::debug!("New item: {item}");
         inner.insert_item(item.clone());
@@ -1427,6 +1421,7 @@ impl ChunkStorage for FsStorage {
         revision: u32,
         description: Option<String>,
         mut files: Vec<(PathBuf, bytes::Bytes)>,
+        chunk_algorithm: ChunkAlgorithm,
     ) -> Result<Item, Error>
     where
         Self: Sized,
@@ -1440,7 +1435,7 @@ impl ChunkStorage for FsStorage {
         let item_root = self.path(&path);
         create_dir_all(&item_root)?;
         let (hash_tree, chunks, entries) =
-            self.build_compact_tree_from_files(&item_root, &files)?;
+            self.build_compact_tree_from_files(&item_root, &files, chunk_algorithm)?;
         let mut inner = self.inner.write().unwrap();
         let item = Item::make_with_entries(
             name,
@@ -1450,6 +1445,7 @@ impl ChunkStorage for FsStorage {
             hash_tree.chunk_info(),
             chunks,
             entries,
+            chunk_algorithm,
         )?;
         tracing::debug!("New item: {item}");
         inner.insert_item(item.clone());
@@ -1465,6 +1461,7 @@ impl ChunkStorage for FsStorage {
         revision: u32,
         description: Option<String>,
         root: Arc<Node>,
+        chunk_algorithm: ChunkAlgorithm,
     ) -> Result<Item, Error>
     where
         Self: Sized,
@@ -1477,7 +1474,7 @@ impl ChunkStorage for FsStorage {
         self.ensure_handle(&stored_path)?;
         tracing::info!("Preallocated on disk {:?}", stored_path);
         let mut inner = self.inner.write().unwrap();
-        let item = Item::new(name, path, revision, description, &root);
+        let item = Item::new(name, path, revision, description, &root, chunk_algorithm);
         tracing::debug!("New item: {item}");
         inner.insert_item(item.clone());
         drop(inner);
@@ -1493,6 +1490,7 @@ impl ChunkStorage for FsStorage {
         revision: u32,
         description: Option<String>,
         mut stream: T,
+        chunk_algorithm: ChunkAlgorithm,
     ) -> Result<Item, crate::error::Error>
     where
         Self: Sized,
@@ -1546,6 +1544,7 @@ impl ChunkStorage for FsStorage {
             description,
             last.chunk_info(),
             chunks,
+            chunk_algorithm,
         )?;
         let mut inner = self.inner.write().unwrap();
         inner.insert_item(item.clone());
@@ -1585,7 +1584,7 @@ impl Drop for FsStorage {
 #[cfg(test)]
 mod tests {
     use crate::{
-        chunks::CHUNK_SIZE,
+        chunks::{ChunkAlgorithm, CHUNK_SIZE},
         hash::hash as do_hash,
         item::tests::{make_ones_item, new_dummy_item},
         utils::testing::temp_path,
@@ -1777,6 +1776,7 @@ mod tests {
                 0,
                 None,
                 bytes::Bytes::from_static(b"hello world"),
+                ChunkAlgorithm::default(),
             )
             .unwrap();
 
@@ -1805,6 +1805,7 @@ mod tests {
                 0,
                 None,
                 bytes::Bytes::from(data.clone()),
+                ChunkAlgorithm::default(),
             )
             .unwrap();
 
@@ -1818,6 +1819,32 @@ mod tests {
                 Some(chunk.to_vec())
             );
         }
+    }
+
+    #[test]
+    fn fs_storage_create_item_supports_fastcdc_chunks() {
+        let tempdir = temp_path();
+        let storage = FsStorage::new(tempdir.clone());
+        let data: Vec<u8> = (0..(CHUNK_SIZE * 3 + CHUNK_SIZE / 2))
+            .map(|index| ((index * 17) % 251) as u8)
+            .collect();
+
+        let item = storage
+            .create_item(
+                "fastcdc-item".to_string(),
+                PathBuf::from("fastcdc-item"),
+                0,
+                None,
+                bytes::Bytes::from(data.clone()),
+                ChunkAlgorithm::fastcdc_default(),
+            )
+            .unwrap();
+
+        assert_eq!(item.size(), data.len() as u64);
+        assert!(!item.chunks.is_empty());
+        assert_eq!(item.manifest.chunk_algorithm, ChunkAlgorithm::fastcdc_default());
+        let stored = storage.get(&item.metadata.root.hash).unwrap().clone_data().unwrap();
+        assert_eq!(stored, data);
     }
 
     #[tokio::test]
@@ -1838,6 +1865,7 @@ mod tests {
                 1,
                 None,
                 stream,
+                ChunkAlgorithm::default(),
             )
             .await
             .unwrap();
@@ -1865,6 +1893,7 @@ mod tests {
                 1,
                 None,
                 old_stream,
+                ChunkAlgorithm::default(),
             )
             .await
             .unwrap();
@@ -1879,8 +1908,14 @@ mod tests {
         }
 
         let new_root = source.insert(v2.clone().into()).unwrap();
-        let manifest = Manifest::from_tree("sync-item".to_string(), 2, &new_root);
-        let chunk_hashes = new_root.flatten().unwrap();
+        let chunk_infos = new_root.flatten_with_sizes().unwrap();
+        let manifest = Manifest::from_tree(
+            "sync-item".to_string(),
+            2,
+            &new_root,
+            &chunk_infos,
+            ChunkAlgorithm::default(),
+        );
         let local_hashes = old_root.flatten().unwrap();
         let received_chunks: Vec<Vec<u8>> = v2
             .chunks(CHUNK_SIZE)
@@ -1896,7 +1931,7 @@ mod tests {
                 2,
                 None,
                 &manifest,
-                &chunk_hashes,
+                &chunk_infos,
                 &local_hashes,
                 received_chunks,
             )
@@ -1919,8 +1954,14 @@ mod tests {
             .map(|index| ((index * 11) % 251) as u8)
             .collect();
         let root = source.insert(data.clone().into()).unwrap();
-        let manifest = Manifest::from_tree("odd-item".to_string(), 1, &root);
-        let chunk_hashes = root.flatten().unwrap();
+        let chunk_infos = root.flatten_with_sizes().unwrap();
+        let manifest = Manifest::from_tree(
+            "odd-item".to_string(),
+            1,
+            &root,
+            &chunk_infos,
+            ChunkAlgorithm::default(),
+        );
         let received_chunks: Vec<Vec<u8>> = data.chunks(CHUNK_SIZE).map(|chunk| chunk.to_vec()).collect();
 
         let item = storage
@@ -1930,7 +1971,7 @@ mod tests {
                 1,
                 None,
                 &manifest,
-                &chunk_hashes,
+                &chunk_infos,
                 &[],
                 received_chunks,
             )

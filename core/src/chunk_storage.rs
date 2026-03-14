@@ -7,6 +7,7 @@ use tokio_stream::{Stream, StreamExt};
 use crate::error::Error;
 use crate::hash::{hash, Hash, HashTreeCapable};
 use crate::{
+    chunks::{ChunkAlgorithm, ChunkInfo},
     hash::merge_hashes,
     item::{Item, Name as ItemName},
 };
@@ -93,6 +94,49 @@ pub trait ChunkStorage: HashTreeCapable<Arc<Node>, Error> {
         self.compute_tree(data.as_ref())
     }
 
+    fn chunk_tree(
+        &self,
+        data: &[u8],
+        chunk_algorithm: ChunkAlgorithm,
+    ) -> Result<(Arc<Node>, Vec<ChunkInfo>), Error>
+    where
+        Self: Sized,
+    {
+        let boundaries = chunk_algorithm.chunk_boundaries(data);
+        let mut partials = Vec::with_capacity(boundaries.len().max(1));
+        let mut chunks = Vec::with_capacity(boundaries.len().max(1));
+
+        for (offset, length) in boundaries {
+            let chunk = &data[offset..offset + length];
+            let node = self.insert_chunk(chunk)?;
+            let chunk_info = ChunkInfo {
+                size: length as u64,
+                hash: *node.hash(),
+            };
+            partials.push(Arc::new(Node::Skipped {
+                hash: *node.hash(),
+                size: length as u64,
+            }));
+            chunks.push(chunk_info);
+        }
+
+        while partials.len() > 1 {
+            let n = partials.len();
+            for (to, index) in (0..n - 1).step_by(2).enumerate() {
+                partials[to] = self.link(partials[index].clone(), partials[index + 1].clone())?;
+            }
+            let half = n / 2;
+            if n % 2 != 0 {
+                partials.swap(half, n - 1);
+                partials.truncate(half + 1);
+            } else {
+                partials.truncate(half);
+            }
+        }
+
+        Ok((partials.swap_remove(0), chunks))
+    }
+
     /// Create a new Item from its metadata and Bytes
     /// This is the preferred way to create a new Item
     fn create_item(
@@ -102,12 +146,21 @@ pub trait ChunkStorage: HashTreeCapable<Arc<Node>, Error> {
         revision: u32,
         description: Option<String>,
         file: Bytes,
+        chunk_algorithm: ChunkAlgorithm,
     ) -> Result<Item, Error>
     where
         Self: Sized,
     {
-        let hash_tree = self.insert(file)?;
-        Ok(Item::new(name, path, revision, description, &hash_tree))
+        let (hash_tree, chunks) = self.chunk_tree(file.as_ref(), chunk_algorithm)?;
+        Ok(Item::make(
+            name,
+            path,
+            revision,
+            description,
+            hash_tree.chunk_info(),
+            chunks,
+            chunk_algorithm,
+        )?)
     }
 
     fn create_item_from_files(
@@ -117,6 +170,7 @@ pub trait ChunkStorage: HashTreeCapable<Arc<Node>, Error> {
         _revision: u32,
         _description: Option<String>,
         _files: Vec<(PathBuf, Bytes)>,
+        _chunk_algorithm: ChunkAlgorithm,
     ) -> Result<Item, Error>
     where
         Self: Sized,
@@ -132,11 +186,12 @@ pub trait ChunkStorage: HashTreeCapable<Arc<Node>, Error> {
         revision: u32,
         description: Option<String>,
         root: Arc<Node>,
+        chunk_algorithm: ChunkAlgorithm,
     ) -> Result<Item, Error>
     where
         Self: Sized,
     {
-        Ok(Item::new(name, path, revision, description, &root))
+        Ok(Item::new(name, path, revision, description, &root, chunk_algorithm))
     }
 
     /// Build a new Item from its metadata and a streaming of nodes
@@ -147,6 +202,7 @@ pub trait ChunkStorage: HashTreeCapable<Arc<Node>, Error> {
         revision: u32,
         description: Option<String>,
         mut stream: T,
+        chunk_algorithm: ChunkAlgorithm,
     ) -> impl std::future::Future<Output = Result<Item, crate::error::Error>> + Send
     where
         Self: Sized + Send + Sync,
@@ -163,7 +219,7 @@ pub trait ChunkStorage: HashTreeCapable<Arc<Node>, Error> {
             let n = n.ok_or(StorageError::TreeReconstruct)?;
             tracing::trace!("Reconstructed {i} nodes with {} bytes total", n.size());
 
-            Ok(Item::new(name, path, revision, description, &n))
+            Ok(Item::new(name, path, revision, description, &n, chunk_algorithm))
         }
     }
 

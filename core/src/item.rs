@@ -36,7 +36,7 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 
 use crate::chunk_storage::Node;
-use crate::chunks::{ChunkAlgorithm, ChunkInfo, CHUNK_SIZE};
+use crate::chunks::{ChunkAlgorithm, ChunkInfo};
 use crate::hash::Hash as Blake3Hash;
 use crate::metadata::Item as ItemMetadata;
 use crate::unique_name::UniqueName;
@@ -75,23 +75,25 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    /// Build a manifest from a hash tree root node.
+    /// Build a manifest from a hash tree root node and chunk list.
     #[must_use]
-    pub fn from_tree(artifact_id: ArtifactId, version: u64, root: &Arc<Node>) -> Self {
+    pub fn from_tree(
+        artifact_id: ArtifactId,
+        version: u64,
+        root: &Arc<Node>,
+        chunks: &[ChunkInfo],
+        chunk_algorithm: ChunkAlgorithm,
+    ) -> Self {
         let total_size = root.size();
-        let chunk_count = if total_size == 0 {
-            1
-        } else {
-            ((total_size + CHUNK_SIZE as u64 - 1) / CHUNK_SIZE as u64) as u32
-        };
+        let chunk_count = if chunks.is_empty() { 1 } else { chunks.len() as u32 };
         Self {
             artifact_id,
             version,
             root_hash: *root.hash(),
             total_size,
             chunk_count,
-            chunk_size: CHUNK_SIZE as u32,
-            chunk_algorithm: ChunkAlgorithm::default(),
+            chunk_size: chunk_algorithm.nominal_chunk_size(),
+            chunk_algorithm,
             entries: Vec::new(),
         }
     }
@@ -133,9 +135,17 @@ impl Item {
         revision: u32,
         description: Option<String>,
         hash_tree: &Arc<Node>,
+        chunk_algorithm: ChunkAlgorithm,
     ) -> Self {
         let artifact_id = name.clone();
-        let manifest = Manifest::from_tree(artifact_id.clone(), revision as u64, hash_tree);
+        let chunks = hash_tree.flatten_with_sizes().unwrap_or_default();
+        let manifest = Manifest::from_tree(
+            artifact_id.clone(),
+            revision as u64,
+            hash_tree,
+            &chunks,
+            chunk_algorithm,
+        );
         let now = SystemTime::now();
         Self {
             metadata: ItemMetadata {
@@ -151,7 +161,7 @@ impl Item {
                 format: Format::V1,
             },
             manifest,
-            chunks: hash_tree.flatten_with_sizes().unwrap_or_default(),
+            chunks,
         }
     }
 
@@ -163,8 +173,18 @@ impl Item {
         description: Option<String>,
         root: ChunkInfo,
         chunks: Vec<ChunkInfo>,
+        chunk_algorithm: ChunkAlgorithm,
     ) -> Result<Self, std::io::Error> {
-        Self::make_with_entries(name, path, revision, description, root, chunks, Vec::new())
+        Self::make_with_entries(
+            name,
+            path,
+            revision,
+            description,
+            root,
+            chunks,
+            Vec::new(),
+            chunk_algorithm,
+        )
     }
 
     pub fn make_with_entries(
@@ -175,6 +195,7 @@ impl Item {
         root: ChunkInfo,
         chunks: Vec<ChunkInfo>,
         entries: Vec<FileEntry>,
+        chunk_algorithm: ChunkAlgorithm,
     ) -> Result<Self, std::io::Error> {
         let artifact_id = name.clone();
         let chunk_count = if chunks.is_empty() { 1 } else { chunks.len() as u32 };
@@ -184,8 +205,8 @@ impl Item {
             root_hash: root.hash,
             total_size: root.size,
             chunk_count,
-            chunk_size: CHUNK_SIZE as u32,
-            chunk_algorithm: ChunkAlgorithm::default(),
+            chunk_size: chunk_algorithm.nominal_chunk_size(),
+            chunk_algorithm,
             entries,
         };
         let now = SystemTime::now();
@@ -297,6 +318,7 @@ pub mod tests {
                 0,
                 None,
                 Bytes::from_static(b""),
+                ChunkAlgorithm::default(),
             )
     }
 
@@ -313,6 +335,7 @@ pub mod tests {
                 0,
                 Some("Some description for the larger item".to_string()),
                 Bytes::from_static(&[VALUE; SIZE]),
+                ChunkAlgorithm::default(),
             )
     }
 
@@ -344,6 +367,7 @@ pub mod tests {
             Some("Some description for the larger item".to_string()),
             chunk,
             vec![chunk],
+            ChunkAlgorithm::default(),
         ).ok()
     }
 

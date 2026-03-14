@@ -126,7 +126,7 @@ impl Client<FsStorage> {
         target: ItemMetadata,
         from: &[Hash],
     ) -> Result<Item, ClientError> {
-        let (manifest, chunk_hashes, received_chunks) = self
+        let (manifest, chunk_infos, received_chunks) = self
             .server
             .sync_artifact(&target.artifact_id, from)
             .await?;
@@ -140,7 +140,7 @@ impl Client<FsStorage> {
                 target.revision,
                 target.description,
                 &manifest,
-                &chunk_hashes,
+                &chunk_infos,
                 from,
                 received_chunks,
             )

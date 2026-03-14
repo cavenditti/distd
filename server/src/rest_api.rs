@@ -21,6 +21,7 @@ use tower_http::{
 
 use distd_core::{
     chunk_storage::ChunkStorage,
+    chunks::{ChunkAlgorithm, ChunkingPolicy},
     feed::{Feed, Name as FeedName},
     hash::Hash,
     metadata::Server as ServerMetadata,
@@ -207,6 +208,7 @@ struct ItemPostObj {
     pub description: Option<String>,
     pub path: PathBuf,
     pub name: String,
+    pub chunking: Option<String>,
 }
 
 fn sanitize_relative_upload_path(path: &str) -> Option<PathBuf> {
@@ -262,14 +264,44 @@ where
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    let requested_policy = item_data
+        .chunking
+        .as_deref()
+        .unwrap_or("auto")
+        .parse::<ChunkingPolicy>()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let chunk_algorithm = if uploaded_files.len() == 1 {
+        let (relative_path, data) = &uploaded_files[0];
+        let probe_path = if relative_path.as_os_str().is_empty() {
+            &item_data.path
+        } else {
+            relative_path
+        };
+        ChunkAlgorithm::from_policy(requested_policy, probe_path, data.as_ref(), false)
+    } else {
+        ChunkAlgorithm::from_policy(requested_policy, &item_data.path, &[], true)
+    };
+
     let result = if uploaded_files.len() == 1 {
         let (_, file) = uploaded_files.pop().unwrap();
         server
-            .publish_item(item_data.name, item_data.path, item_data.description, file)
+            .publish_item(
+                item_data.name,
+                item_data.path,
+                item_data.description,
+                file,
+                chunk_algorithm,
+            )
             .await
     } else {
         server
-            .publish_item_from_files(item_data.name, item_data.path, item_data.description, uploaded_files)
+            .publish_item_from_files(
+                item_data.name,
+                item_data.path,
+                item_data.description,
+                uploaded_files,
+                chunk_algorithm,
+            )
             .await
     };
     let result = result.map(|item| item.metadata);

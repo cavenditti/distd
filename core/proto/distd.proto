@@ -36,6 +36,31 @@ message ManifestResponse {
   // Ordered leaf hashes so client can build its bitfield
   repeated bytes chunk_hashes = 7;
   repeated FileEntry entries = 8;
+  ChunkAlgorithmProfile chunk_algorithm = 9;
+  repeated uint32 chunk_sizes = 10;
+}
+
+message ChunkAlgorithmProfile {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    FIXED_ALIGNED = 1;
+    FAST_CDC = 2;
+    BLOCK_ALIGNED_FAST_CDC = 3;
+    ARCHIVE_AWARE_FAST_CDC = 4;
+  }
+
+  Kind kind = 1;
+  uint32 profile_version = 2;
+  uint32 nominal_chunk_size = 3;
+  uint32 min_size = 4;
+  uint32 avg_size = 5;
+  uint32 max_size = 6;
+  uint32 alignment = 7;
+  uint32 header_size = 8;
+  uint32 normalization_level = 9;
+  uint32 zero_run_cutoff = 10;
+  uint32 record_size = 11;
+  uint64 seed = 12;
 }
 
 message FileEntry {

@@ -8,6 +8,7 @@ use std::time::SystemTime;
 
 use axum::body::Bytes;
 use distd_core::chunk_storage::ChunkStorage;
+use distd_core::chunks::ChunkAlgorithm;
 use distd_core::item::{ArtifactId, Item, Name as ItemName};
 use distd_core::metadata::Server as ServerMetadata;
 use distd_core::possession::Bitfield;
@@ -201,8 +202,7 @@ where
         .ok_or_else(|| format!("Unknown artifact: {}", manifest_req.artifact_id))?;
 
         let root_hash = *item.root();
-        let chunk_hashes = self.storage.chunk_list(&root_hash);
-        let chunk_count = chunk_hashes.len();
+        let chunk_count = item.chunks.len();
 
         Ok((
             proto::ManifestResponse {
@@ -212,7 +212,11 @@ where
                 total_size: item.manifest.total_size,
                 chunk_count: item.manifest.chunk_count,
                 chunk_size: item.manifest.chunk_size,
-                chunk_hashes: chunk_hashes.iter().map(|h| h.as_bytes().to_vec()).collect(),
+                chunk_hashes: item
+                    .chunks
+                    .iter()
+                    .map(|chunk| chunk.hash.as_bytes().to_vec())
+                    .collect(),
                 entries: item
                     .manifest
                     .entries
@@ -224,6 +228,8 @@ where
                         chunk_end: entry.chunk_range.1,
                     })
                     .collect(),
+                    chunk_algorithm: Some(item.manifest.chunk_algorithm.to_proto()),
+                    chunk_sizes: item.chunks.iter().map(|chunk| chunk.size as u32).collect(),
             },
             root_hash,
             chunk_count,
@@ -430,6 +436,7 @@ where
         path: PathBuf,
         description: Option<String>,
         file: Bytes,
+        chunk_algorithm: ChunkAlgorithm,
     ) -> Result<Item, ServerError> {
         // Derive artifact_id from name (matches Item::new default)
         let artifact_id: ArtifactId = name.clone();
@@ -459,7 +466,7 @@ where
         // Create item and return it
         let item = self
             .storage
-            .create_item(name, path, revision, description, file)
+            .create_item(name, path, revision, description, file, chunk_algorithm)
             .map_err(|e| {
                 tracing::error!("Storage error: {e}");
                 ServerError::ChunkInsertError
@@ -481,6 +488,7 @@ where
         path: PathBuf,
         description: Option<String>,
         mut files: Vec<(PathBuf, Bytes)>,
+        chunk_algorithm: ChunkAlgorithm,
     ) -> Result<Item, ServerError> {
         let artifact_id: ArtifactId = name.clone();
         let revision = self
@@ -496,7 +504,7 @@ where
 
         let item = self
             .storage
-            .create_item_from_files(name, path, revision, description, files)
+            .create_item_from_files(name, path, revision, description, files, chunk_algorithm)
             .map_err(|e| {
                 tracing::error!("Storage error: {e}");
                 ServerError::ChunkInsertError
