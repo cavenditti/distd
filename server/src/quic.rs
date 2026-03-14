@@ -85,7 +85,7 @@ where
                 let manifest_request: ManifestRequest = read_length_delimited_async(recv)
                     .await
                     .map_err(|err| ServerError::Quic(err.to_string()))?;
-                let (manifest_response, root_hash, expected_chunk_count) = self
+                let (manifest_response, item) = self
                     .sync_manifest_response(manifest_request)
                     .await
                     .map_err(ServerError::Quic)?;
@@ -101,7 +101,7 @@ where
                     .await
                     .map_err(|err| ServerError::Quic(err.to_string()))?;
                 let responses = self
-                    .sync_chunk_response_messages(root_hash, expected_chunk_count, possession)
+                    .sync_chunk_response_messages(&item, possession)
                     .await
                     .map_err(ServerError::Quic)?;
                 for response in responses {

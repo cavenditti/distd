@@ -8,11 +8,12 @@ use std::time::SystemTime;
 
 use axum::body::Bytes;
 use distd_core::chunk_storage::ChunkStorage;
-use distd_core::chunks::ChunkAlgorithm;
+use distd_core::chunks::{chunk_algorithm_likely_precompressed, ChunkAlgorithm};
 use distd_core::item::{ArtifactId, Item, Name as ItemName};
 use distd_core::metadata::Server as ServerMetadata;
 use distd_core::possession::Bitfield;
 use distd_core::proto::{self, sync_message::Msg, ClientKeepAlive, ClientRegister, ServerMetadata as ProtoServerMetadata, SyncMessage};
+use distd_core::transport::maybe_compress_sync_payload;
 use distd_core::utils::grpc::uuid_to_metadata;
 use distd_core::utils::uuid::slice_to_uuid;
 use distd_core::utils::serde::BitcodeSerializable;
@@ -31,7 +32,7 @@ use crate::client::{Client, Name as ClientName};
 use crate::error::Server as ServerError;
 use crate::grpc::UuidAuthInterceptor;
 use distd_core::feed::{Feed, Name as FeedName};
-use distd_core::hash::{hash as do_hash, Hash};
+use distd_core::hash::hash as do_hash;
 use distd_core::version::Version;
 
 /// Data structure used internally by server, may be converted to `ServerMetadata`
@@ -194,7 +195,7 @@ where
     pub async fn sync_manifest_response(
         &self,
         manifest_req: proto::ManifestRequest,
-    ) -> Result<(proto::ManifestResponse, Hash, usize), String> {
+    ) -> Result<(proto::ManifestResponse, Item), String> {
         let item = {
             let md = self.metadata.read().await;
             md.items.get(&manifest_req.artifact_id).cloned()
@@ -202,7 +203,6 @@ where
         .ok_or_else(|| format!("Unknown artifact: {}", manifest_req.artifact_id))?;
 
         let root_hash = *item.root();
-        let chunk_count = item.chunks.len();
 
         Ok((
             proto::ManifestResponse {
@@ -231,17 +231,17 @@ where
                     chunk_algorithm: Some(item.manifest.chunk_algorithm.to_proto()),
                     chunk_sizes: item.chunks.iter().map(|chunk| chunk.size as u32).collect(),
             },
-            root_hash,
-            chunk_count,
+            item,
         ))
     }
 
     pub async fn sync_chunk_response_messages(
         &self,
-        root_hash: Hash,
-        expected_chunk_count: usize,
+        item: &Item,
         possession: proto::PossessionBitfield,
     ) -> Result<Vec<SyncMessage>, String> {
+        let root_hash = *item.root();
+        let expected_chunk_count = item.chunks.len();
         let bitfield = Bitfield::from_bytes(&possession.bitfield)
             .ok_or_else(|| String::from("Invalid bitfield"))?;
         if bitfield.chunk_count() as usize != expected_chunk_count {
@@ -249,6 +249,7 @@ where
         }
 
         let mut messages = Vec::new();
+        let likely_precompressed = chunk_algorithm_likely_precompressed(item.manifest.chunk_algorithm);
 
         let missing = bitfield.missing_indices();
         tracing::debug!(
@@ -291,21 +292,38 @@ where
                     continue;
                 }
 
+                let encoded = maybe_compress_sync_payload(
+                    &bulk_buf,
+                    Some(item.metadata.path.as_path()),
+                    likely_precompressed,
+                )
+                    .map_err(|err| err.to_string())?;
+
                 messages.push(SyncMessage {
                     msg: Some(Msg::BulkData(proto::BulkData {
-                        data: bulk_buf,
+                        data: encoded.data,
                         start_index,
                         count: count as u32,
+                        compression: encoded.compression,
+                        uncompressed_size: encoded.uncompressed_size,
                     })),
                 });
             }
         } else {
             for idx in missing {
                 if let Some(data) = self.storage.get_chunk_by_index(&root_hash, idx) {
+                    let encoded = maybe_compress_sync_payload(
+                        &data,
+                        Some(item.metadata.path.as_path()),
+                        likely_precompressed,
+                    )
+                        .map_err(|err| err.to_string())?;
                     messages.push(SyncMessage {
                         msg: Some(Msg::ChunkData(proto::ChunkData {
                             chunk_index: idx,
-                            data,
+                            data: encoded.data,
+                            compression: encoded.compression,
+                            uncompressed_size: encoded.uncompressed_size,
                         })),
                     });
                 }
@@ -320,13 +338,13 @@ where
         manifest_req: proto::ManifestRequest,
         possession: proto::PossessionBitfield,
     ) -> Result<Vec<SyncMessage>, String> {
-        let (manifest, root_hash, expected_chunk_count) = self.sync_manifest_response(manifest_req).await?;
+        let (manifest, item) = self.sync_manifest_response(manifest_req).await?;
         let mut messages = Vec::with_capacity(1);
         messages.push(SyncMessage {
             msg: Some(Msg::ManifestResponse(manifest)),
         });
         messages.extend(
-            self.sync_chunk_response_messages(root_hash, expected_chunk_count, possession)
+            self.sync_chunk_response_messages(&item, possession)
                 .await?,
         );
         Ok(messages)

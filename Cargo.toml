@@ -45,6 +45,7 @@ bitcode = { version = "0", features = ["derive", "serde"], default-features = fa
 uuid = { version = "1.10.0", features = [ "v4", "v5", "fast-rng", "macro-diagnostics" ] }
 percent-encoding = "2.3.1"
 base64 = { version = "0.22.1" }
+zstd = "0.13"
 
 redb = { version = "2.2.0" }
 

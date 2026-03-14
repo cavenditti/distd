@@ -606,6 +606,43 @@ pub fn detect_chunking_algorithm(path: &Path, sample: &[u8], multi_file: bool) -
     chunk_algorithm_for_format(detect_format(path, sample), sample)
 }
 
+#[must_use]
+pub fn path_likely_precompressed(path: &Path) -> bool {
+    matches!(
+        detect_format(path, &[]),
+        DetectedFormat::Squashfs
+            | DetectedFormat::Erofs
+            | DetectedFormat::TarGzip
+            | DetectedFormat::OciLayerTarGzip
+            | DetectedFormat::Apk
+            | DetectedFormat::Gzip
+            | DetectedFormat::TarZstd
+            | DetectedFormat::OciLayerTarZstd
+            | DetectedFormat::ArchPkgTarZstd
+            | DetectedFormat::Zstd
+            | DetectedFormat::TarXz
+            | DetectedFormat::ArchPkgTarXz
+            | DetectedFormat::Xz
+            | DetectedFormat::TarBzip2
+            | DetectedFormat::Zip
+            | DetectedFormat::Deb
+            | DetectedFormat::Rpm
+    )
+}
+
+#[must_use]
+pub fn chunk_algorithm_likely_precompressed(algorithm: ChunkAlgorithm) -> bool {
+    algorithm == ChunkAlgorithm::gzip_default()
+        || algorithm == ChunkAlgorithm::zstd_default()
+        || algorithm == ChunkAlgorithm::xz_default()
+        || algorithm == ChunkAlgorithm::tar_gzip_default()
+        || algorithm == ChunkAlgorithm::tar_zstd_default()
+        || algorithm == ChunkAlgorithm::compressed_image_default()
+        || algorithm == ChunkAlgorithm::package_default()
+        || algorithm == ChunkAlgorithm::fixed_aligned(1024 * 1024, 100 * 1024)
+        || algorithm == ChunkAlgorithm::fixed_aligned(1024 * 1024, 4096)
+}
+
 fn chunk_algorithm_for_format(format: DetectedFormat, sample: &[u8]) -> ChunkAlgorithm {
     match format {
         DetectedFormat::RawDiskImage | DetectedFormat::Qcow2 => ChunkAlgorithm::image_default(),

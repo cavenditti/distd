@@ -18,6 +18,7 @@ use distd_core::{
     metadata::Server as ServerMetadata,
     proto::{self, distd_client::DistdClient, SyncMessage},
     proto::sync_message::Msg,
+    transport::decode_sync_payload,
     tonic::{service::interceptor::InterceptedService, transport::Channel},
     utils::grpc::uuid_to_metadata,
     version::VERSION,
@@ -417,16 +418,19 @@ impl Server {
         let mut received = Vec::new();
         for msg in responses {
             match msg {
-                SyncMessage { msg: Some(Msg::ChunkData(cd)) } => received.push(cd.data),
+                SyncMessage { msg: Some(Msg::ChunkData(cd)) } => {
+                    received.push(decode_sync_payload(cd.compression, &cd.data, cd.uncompressed_size)?);
+                }
                 SyncMessage { msg: Some(Msg::BulkData(bd)) } => {
+                    let decoded = decode_sync_payload(bd.compression, &bd.data, bd.uncompressed_size)?;
                     let mut offset = 0;
                     for i in 0..bd.count {
                         let idx = bd.start_index + i;
                         let this_size = *chunk_sizes
                             .get(idx as usize)
                             .ok_or(ServerRequest::UnexpectedMessage)?;
-                        if offset + this_size <= bd.data.len() {
-                            received.push(bd.data[offset..offset + this_size].to_vec());
+                        if offset + this_size <= decoded.len() {
+                            received.push(decoded[offset..offset + this_size].to_vec());
                         }
                         offset += this_size;
                     }

@@ -2,7 +2,7 @@ use std::str::Utf8Error;
 
 use config::ConfigError;
 use distd_core::{
-    error::InvalidParameter, GrpcError, TransportError,
+    error::InvalidParameter, transport::PayloadCompressionError, GrpcError, TransportError,
 };
 use thiserror::Error;
 
@@ -64,6 +64,9 @@ pub enum ServerRequest {
 
     #[error("QUIC transport error: {0}")]
     Quic(String),
+
+    #[error("Invalid compressed sync payload")]
+    Compression(#[from] PayloadCompressionError),
 }
 
 #[derive(Error, Debug)]

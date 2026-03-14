@@ -616,6 +616,7 @@ dependencies = [
  "tonic-build",
  "tracing",
  "uuid",
+ "zstd",
 ]
 
 [[package]]

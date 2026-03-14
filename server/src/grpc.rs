@@ -138,7 +138,7 @@ where
                 }
             };
 
-            let (manifest_response, root_hash, expected_chunk_count) = match server
+            let (manifest_response, item) = match server
                 .sync_manifest_response(manifest_req)
                 .await
             {
@@ -174,7 +174,7 @@ where
             };
 
             match server
-                .sync_chunk_response_messages(root_hash, expected_chunk_count, possession)
+                .sync_chunk_response_messages(&item, possession)
                 .await
             {
                 Ok(messages) => {
