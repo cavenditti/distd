@@ -46,9 +46,15 @@ fn print_detail_table(results: &[RunMetrics], group_by_workload: bool) {
     // Sort results by the chosen grouping.
     let mut sorted: Vec<&RunMetrics> = results.iter().collect();
     if group_by_workload {
-        sorted.sort_by(|a, b| (&a.workload, &a.tool).cmp(&(&b.workload, &b.tool)));
+        sorted.sort_by(|a, b| {
+            (&a.workload, &a.network_profile, &a.tool)
+                .cmp(&(&b.workload, &b.network_profile, &b.tool))
+        });
     } else {
-        sorted.sort_by(|a, b| (&a.tool, &a.workload).cmp(&(&b.tool, &b.workload)));
+        sorted.sort_by(|a, b| {
+            (&a.tool, &a.network_profile, &a.workload)
+                .cmp(&(&b.tool, &b.network_profile, &b.workload))
+        });
     }
 
     let mut table = Table::new();
@@ -59,6 +65,7 @@ fn print_detail_table(results: &[RunMetrics], group_by_workload: bool) {
         .set_header(vec![
             Cell::new("Tool").add_attribute(Attribute::Bold),
             Cell::new("Workload").add_attribute(Attribute::Bold),
+            Cell::new("Network").add_attribute(Attribute::Bold),
             Cell::new("Cache").add_attribute(Attribute::Bold),
             Cell::new("Time (s)").add_attribute(Attribute::Bold),
             Cell::new("MiB/s").add_attribute(Attribute::Bold),
@@ -69,7 +76,7 @@ fn print_detail_table(results: &[RunMetrics], group_by_workload: bool) {
         ]);
 
     // right-align numeric columns
-    for col_idx in [3usize, 4, 5, 6, 7] {
+    for col_idx in [4usize, 5, 6, 7, 8] {
         if let Some(col) = table.column_mut(col_idx) {
             col.set_cell_alignment(CellAlignment::Right);
         }
@@ -85,6 +92,7 @@ fn print_detail_table(results: &[RunMetrics], group_by_workload: bool) {
         table.add_row(vec![
             Cell::new(&r.tool),
             Cell::new(&r.workload),
+            Cell::new(&r.network_profile),
             Cell::new(&r.cache_state),
             Cell::new(format!("{:.3}", r.wall_clock_secs)),
             Cell::new(format!("{:.2}", r.throughput_mibs)),
@@ -105,6 +113,7 @@ fn print_detail_table(results: &[RunMetrics], group_by_workload: bool) {
 struct AvgRow {
     tool: String,
     workload: String,
+    network_profile: String,
     runs: usize,
     avg_time: f64,
     avg_mibs: f64,
@@ -114,21 +123,22 @@ struct AvgRow {
 
 fn print_averages_table(results: &[RunMetrics], group_by_workload: bool) {
     // Group by (tool, workload).
-    let mut groups: BTreeMap<(String, String), Vec<&RunMetrics>> = BTreeMap::new();
+    let mut groups: BTreeMap<(String, String, String), Vec<&RunMetrics>> = BTreeMap::new();
     for r in results {
         groups
-            .entry((r.tool.clone(), r.workload.clone()))
+            .entry((r.tool.clone(), r.workload.clone(), r.network_profile.clone()))
             .or_default()
             .push(r);
     }
 
     let mut rows: Vec<AvgRow> = groups
         .iter()
-        .map(|((tool, workload), runs)| {
+        .map(|((tool, workload, network_profile), runs)| {
             let n = runs.len();
             AvgRow {
                 tool: tool.clone(),
                 workload: workload.clone(),
+                network_profile: network_profile.clone(),
                 runs: n,
                 avg_time: runs.iter().map(|r| r.wall_clock_secs).sum::<f64>() / n as f64,
                 avg_mibs: runs.iter().map(|r| r.throughput_mibs).sum::<f64>() / n as f64,
@@ -140,34 +150,44 @@ fn print_averages_table(results: &[RunMetrics], group_by_workload: bool) {
 
     // Sort rows according to the chosen grouping.
     if group_by_workload {
-        rows.sort_by(|a, b| (&a.workload, &a.tool).cmp(&(&b.workload, &b.tool)));
+        rows.sort_by(|a, b| {
+            (&a.workload, &a.network_profile, &a.tool)
+                .cmp(&(&b.workload, &b.network_profile, &b.tool))
+        });
     } else {
-        rows.sort_by(|a, b| (&a.tool, &a.workload).cmp(&(&b.tool, &b.workload)));
+        rows.sort_by(|a, b| {
+            (&a.tool, &a.network_profile, &a.workload)
+                .cmp(&(&b.tool, &b.network_profile, &b.workload))
+        });
     }
 
     // Compute per-workload baseline throughput for the speed-up column.
     // distd is never the baseline — if it is the slowest, use the second-slowest
     // non-distd tool instead and show distd with a red multiplier (< 1.0×).
-    let mut baseline_by_workload: BTreeMap<&str, f64> = BTreeMap::new();
+    let mut baseline_by_workload: BTreeMap<(&str, &str), f64> = BTreeMap::new();
     for r in &rows {
         if r.tool == "distd" || r.avg_mibs <= 0.0 {
             continue;
         }
-        let entry = baseline_by_workload.entry(&r.workload).or_insert(f64::MAX);
+        let entry = baseline_by_workload
+            .entry((&r.workload, &r.network_profile))
+            .or_insert(f64::MAX);
         if r.avg_mibs < *entry {
             *entry = r.avg_mibs;
         }
     }
 
     // Compute per-workload fastest (highest throughput) tool for bolding.
-    let mut fastest_by_workload: BTreeMap<&str, &str> = BTreeMap::new();
+    let mut fastest_by_workload: BTreeMap<(&str, &str), &str> = BTreeMap::new();
     {
-        let mut best_mibs: BTreeMap<&str, f64> = BTreeMap::new();
+        let mut best_mibs: BTreeMap<(&str, &str), f64> = BTreeMap::new();
         for r in &rows {
-            let entry = best_mibs.entry(&r.workload).or_insert(0.0_f64);
+            let entry = best_mibs
+                .entry((&r.workload, &r.network_profile))
+                .or_insert(0.0_f64);
             if r.avg_mibs > *entry {
                 *entry = r.avg_mibs;
-                fastest_by_workload.insert(&r.workload, &r.tool);
+                fastest_by_workload.insert((&r.workload, &r.network_profile), &r.tool);
             }
         }
     }
@@ -180,6 +200,7 @@ fn print_averages_table(results: &[RunMetrics], group_by_workload: bool) {
         .set_header(vec![
             Cell::new("Tool").add_attribute(Attribute::Bold),
             Cell::new("Workload").add_attribute(Attribute::Bold),
+            Cell::new("Network").add_attribute(Attribute::Bold),
             Cell::new("Runs").add_attribute(Attribute::Bold),
             Cell::new("Avg (s)").add_attribute(Attribute::Bold),
             Cell::new("Avg MiB/s").add_attribute(Attribute::Bold),
@@ -188,7 +209,7 @@ fn print_averages_table(results: &[RunMetrics], group_by_workload: bool) {
         ]);
 
     // right-align numeric columns
-    for col_idx in [2usize, 3, 4, 5, 6] {
+    for col_idx in [3usize, 4, 5, 6, 7] {
         if let Some(col) = table.column_mut(col_idx) {
             col.set_cell_alignment(CellAlignment::Right);
         }
@@ -196,12 +217,12 @@ fn print_averages_table(results: &[RunMetrics], group_by_workload: bool) {
 
     for r in &rows {
         let is_fastest = fastest_by_workload
-            .get(r.workload.as_str())
+            .get(&(r.workload.as_str(), r.network_profile.as_str()))
             .map(|&t| t == r.tool)
             .unwrap_or(false);
 
         let speedup = baseline_by_workload
-            .get(r.workload.as_str())
+            .get(&(r.workload.as_str(), r.network_profile.as_str()))
             .filter(|&&w| w > 0.0 && r.avg_mibs > 0.0)
             .map(|w| r.avg_mibs / w)
             .unwrap_or(1.0);
@@ -246,6 +267,7 @@ fn print_averages_table(results: &[RunMetrics], group_by_workload: bool) {
         table.add_row(vec![
             bold(Cell::new(&r.tool)),
             bold(Cell::new(&r.workload)),
+            bold(Cell::new(&r.network_profile)),
             bold(Cell::new(r.runs)),
             bold(Cell::new(format!("{:.3}", r.avg_time))),
             bold(Cell::new(format!("{:.2}", r.avg_mibs))),

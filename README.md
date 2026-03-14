@@ -101,3 +101,21 @@ This works pretty much like a partitioned Bittorent swarm, but:
 - distd_core contains common data structures and algorithms, as well as protobuf files and auto-generated implementations.
 - distd_server is responsible of chunking, hashing and first serving the file
 - distd_client fetches files from the server
+
+## Benchmarks
+The benchmark harness can now shape localhost traffic without requiring OS-level traffic control. This is intended for transport experiments where loopback is too optimistic.
+
+Example:
+
+```bash
+cargo run -p distd_bench --release -- \
+    --tools distd \
+    --distd-transport quic \
+    --workloads low-delta,high-delta \
+    --net-delay-ms 40 \
+    --net-jitter-ms 5 \
+    --net-bandwidth-mbps 40 \
+    --net-loss-percent 0.5
+```
+
+Packet loss only applies meaningfully to the QUIC path. On gRPC/TCP runs the benchmark warns and ignores loss, while still applying delay, jitter, and bandwidth limits.

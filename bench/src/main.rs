@@ -1,4 +1,5 @@
 mod metrics;
+mod network;
 mod orchestrator;
 mod report;
 mod runners;
@@ -7,7 +8,9 @@ mod workload;
 use std::path::PathBuf;
 
 use clap::Parser;
+use network::NetworkProfile;
 use orchestrator::BenchmarkOrchestrator;
+use runners::{DistdTransport, RunnerOptions};
 use workload::WorkloadKind;
 
 fn parse_workloads(names: Vec<String>) -> Result<Vec<WorkloadKind>, String> {
@@ -76,6 +79,26 @@ struct Cli {
     /// Group result tables by "tool" (default) or "workload"
     #[arg(long, default_value = "tool")]
     group_by: String,
+
+    /// distd transport to benchmark: grpc or quic
+    #[arg(long, default_value = "grpc")]
+    distd_transport: String,
+
+    /// Add one-way latency in milliseconds to proxied benchmark traffic
+    #[arg(long, default_value_t = 0)]
+    net_delay_ms: u64,
+
+    /// Add random jitter in milliseconds around the configured delay
+    #[arg(long, default_value_t = 0)]
+    net_jitter_ms: u64,
+
+    /// Cap proxied throughput in megabits per second
+    #[arg(long)]
+    net_bandwidth_mbps: Option<f64>,
+
+    /// Drop this percentage of proxied UDP packets; ignored for TCP/gRPC
+    #[arg(long, default_value_t = 0.0)]
+    net_loss_percent: f64,
 }
 
 #[tokio::main]
@@ -123,6 +146,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let group_by_workload = cli.group_by == "workload" || cli.group_by == "benchmark";
+    let distd_transport: DistdTransport = cli.distd_transport.parse()?;
+    let network = NetworkProfile::new(
+        cli.net_delay_ms,
+        cli.net_jitter_ms,
+        cli.net_bandwidth_mbps,
+        cli.net_loss_percent,
+    )?;
+    let runner_options = RunnerOptions {
+        distd_transport,
+        network,
+    };
 
     let orchestrator = BenchmarkOrchestrator::new(
         data_dir,
@@ -138,6 +172,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli.small_file_kib,
         cli.delta_fraction,
         group_by_workload,
+        runner_options,
     );
 
     orchestrator.run().await?;
@@ -147,6 +182,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::parse_workloads;
+    use crate::network::NetworkProfile;
+    use crate::runners::DistdTransport;
     use crate::workload::WorkloadKind;
 
     #[test]
@@ -195,5 +232,20 @@ mod tests {
                 WorkloadKind::ApkPackage,
             ]
         );
+    }
+
+    #[test]
+    fn parses_distd_transport_aliases() {
+        assert_eq!("grpc".parse::<DistdTransport>().expect("grpc"), DistdTransport::Grpc);
+        assert_eq!("udp".parse::<DistdTransport>().expect("udp"), DistdTransport::Quic);
+    }
+
+    #[test]
+    fn builds_network_profile_from_cli_values() {
+        let profile = NetworkProfile::new(25, 5, Some(10.0), 0.25)
+            .expect("profile should parse")
+            .expect("profile should be active");
+
+        assert_eq!(profile.label(), "delay=25ms,jitter=5ms,bw=10.0Mbps,loss=0.25%");
     }
 }

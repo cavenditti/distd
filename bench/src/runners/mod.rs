@@ -7,12 +7,56 @@ pub mod ostree;
 pub mod distd;
 pub mod http;
 
+use std::str::FromStr;
 use std::path::Path;
 use std::process::Child;
 use std::time::{Duration, Instant};
 
 use crate::metrics::{ProcessMonitor, RunMetrics};
+use crate::network::NetworkProfile;
 use crate::workload::Workload;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DistdTransport {
+    Grpc,
+    Quic,
+}
+
+impl DistdTransport {
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Grpc => "distd",
+            Self::Quic => "distd-quic",
+        }
+    }
+}
+
+impl FromStr for DistdTransport {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "grpc" | "tcp" => Ok(Self::Grpc),
+            "quic" | "udp" => Ok(Self::Quic),
+            other => Err(format!("unsupported distd transport '{other}', expected grpc or quic")),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RunnerOptions {
+    pub distd_transport: DistdTransport,
+    pub network: Option<NetworkProfile>,
+}
+
+impl RunnerOptions {
+    pub fn network_label(&self) -> String {
+        self.network
+            .as_ref()
+            .map(NetworkProfile::label)
+            .unwrap_or_else(|| "default".to_string())
+    }
+}
 
 /// Default per-child-process timeout: 5 minutes.
 /// This prevents any single tool invocation from hanging the entire suite.
@@ -109,9 +153,9 @@ pub fn is_tool_available(name: &str) -> bool {
 }
 
 /// Create a `ToolRunner` by name.
-pub fn make_runner(name: &str, work_dir: &Path) -> Option<Box<dyn ToolRunner>> {
+pub fn make_runner(name: &str, work_dir: &Path, options: &RunnerOptions) -> Option<Box<dyn ToolRunner>> {
     match name {
-        "distd" => Some(Box::new(distd::DistdRunner::new(work_dir))),
+        "distd" => Some(Box::new(distd::DistdRunner::new(work_dir, options.clone()))),
         "rsync" => Some(Box::new(rsync::RsyncRunner::new(work_dir))),
         "zsync" => Some(Box::new(zsync::ZsyncRunner::new(work_dir))),
         "http" => Some(Box::new(http::HttpRunner::new(work_dir))),

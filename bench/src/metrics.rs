@@ -11,6 +11,8 @@ pub struct RunMetrics {
     pub tool: String,
     /// Workload name.
     pub workload: String,
+    /// Applied benchmark network profile.
+    pub network_profile: String,
     /// Iteration number.
     pub iteration: u32,
     /// Cache state: "cold" or "warm".
@@ -50,10 +52,17 @@ pub struct RunMetrics {
 }
 
 impl RunMetrics {
-    pub fn new(tool: &str, workload: &str, iteration: u32, cache_state: &str) -> Self {
+    pub fn new(
+        tool: &str,
+        workload: &str,
+        network_profile: &str,
+        iteration: u32,
+        cache_state: &str,
+    ) -> Self {
         Self {
             tool: tool.to_string(),
             workload: workload.to_string(),
+            network_profile: network_profile.to_string(),
             iteration,
             cache_state: cache_state.to_string(),
             is_resume: false,

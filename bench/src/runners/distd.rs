@@ -10,20 +10,23 @@
 
 use std::cell::RefCell;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::metrics::{self, ProcessMonitor, RunMetrics};
+use crate::network::{NetworkProfile, TcpShaperProxy, UdpShaperProxy};
 use crate::workload::{self, Workload};
 
-use super::{wait_child_with_timeout, ToolRunner, SMOKE_CHILD_TIMEOUT, DEFAULT_CHILD_TIMEOUT};
+use super::{wait_child_with_timeout, DistdTransport, RunnerOptions, ToolRunner, SMOKE_CHILD_TIMEOUT, DEFAULT_CHILD_TIMEOUT};
 
 /// Timeout for curl HTTP requests to the server (connect + total).
 const CURL_CONNECT_TIMEOUT: &str = "5";
 const CURL_MAX_TIME: &str = "30";
 const PUBLISH_RETRIES: usize = 3;
+const HTTP_SERVER_ADDR: &str = "127.0.0.1:3000";
+const SYNC_SERVER_ADDR: &str = "127.0.0.1:50051";
 
 /// Paths to the compiled distd binaries.
 struct BinaryPaths {
@@ -69,8 +72,13 @@ impl Drop for ServerGuard {
 
 pub struct DistdRunner {
     work_dir: PathBuf,
+    display_name: String,
+    transport: DistdTransport,
+    network: Option<NetworkProfile>,
     /// Server child held in a RefCell so `transfer(&self)` can manage it.
     server_guard: RefCell<Option<ServerGuard>>,
+    sync_tcp_proxy: RefCell<Option<TcpShaperProxy>>,
+    sync_udp_proxy: RefCell<Option<UdpShaperProxy>>,
 }
 
 // SAFETY: DistdRunner is only used from one thread (the benchmark orchestrator
@@ -81,7 +89,7 @@ unsafe impl Sync for DistdRunner {}
 impl DistdRunner {
     fn http_version_ready() -> bool {
         let Ok(mut stream) = TcpStream::connect_timeout(
-            &"127.0.0.1:3000".parse().unwrap(),
+            &HTTP_SERVER_ADDR.parse().unwrap(),
             Duration::from_millis(200),
         ) else {
             return false;
@@ -103,10 +111,15 @@ impl DistdRunner {
         response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.0 200")
     }
 
-    pub fn new(work_dir: &Path) -> Self {
+    pub fn new(work_dir: &Path, options: RunnerOptions) -> Self {
         Self {
             work_dir: work_dir.join("distd"),
+            display_name: options.distd_transport.display_name().to_string(),
+            transport: options.distd_transport,
+            network: options.network,
             server_guard: RefCell::new(None),
+            sync_tcp_proxy: RefCell::new(None),
+            sync_udp_proxy: RefCell::new(None),
         }
     }
 
@@ -141,11 +154,11 @@ impl DistdRunner {
         self.stop_server();
 
         // Make sure ports are free before starting
-        if std::net::TcpStream::connect("127.0.0.1:3000").is_ok() {
+        if std::net::TcpStream::connect(HTTP_SERVER_ADDR).is_ok() {
             return Err("Port 3000 already in use before starting distd_server".to_string());
         }
         if std::net::TcpStream::connect_timeout(
-            &"127.0.0.1:50051".parse().unwrap(),
+            &SYNC_SERVER_ADDR.parse().unwrap(),
             Duration::from_millis(200),
         )
         .is_ok()
@@ -217,7 +230,7 @@ impl DistdRunner {
             }
             if !grpc_ready {
                 grpc_ready = std::net::TcpStream::connect_timeout(
-                    &"127.0.0.1:50051".parse().unwrap(),
+                    &SYNC_SERVER_ADDR.parse().unwrap(),
                     Duration::from_millis(200),
                 )
                 .is_ok();
@@ -228,13 +241,76 @@ impl DistdRunner {
             std::thread::sleep(Duration::from_millis(100));
         }
 
+        self.start_shapers()?;
+
         tracing::info!("distd_server started (pid {pid})");
         Ok(pid)
     }
 
     fn stop_server(&self) {
+        self.stop_shapers();
         // Dropping the guard kills the child process
         *self.server_guard.borrow_mut() = None;
+    }
+
+    fn start_shapers(&self) -> Result<(), String> {
+        self.stop_shapers();
+        let Some(profile) = self.network.clone() else {
+            return Ok(());
+        };
+
+        match self.transport {
+            DistdTransport::Grpc => {
+                let sync_target: SocketAddr = SYNC_SERVER_ADDR.parse().unwrap();
+                *self.sync_tcp_proxy.borrow_mut() = Some(TcpShaperProxy::start(sync_target, profile)?);
+            }
+            DistdTransport::Quic => {
+                let sync_target: SocketAddr = SYNC_SERVER_ADDR.parse().unwrap();
+                *self.sync_udp_proxy.borrow_mut() = Some(UdpShaperProxy::start(sync_target, profile)?);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn stop_shapers(&self) {
+        *self.sync_tcp_proxy.borrow_mut() = None;
+        *self.sync_udp_proxy.borrow_mut() = None;
+    }
+
+    fn publish_base_url(&self) -> String {
+        format!("http://{HTTP_SERVER_ADDR}")
+    }
+
+    fn client_server_url(&self) -> String {
+        match self.transport {
+            DistdTransport::Grpc => self
+                .sync_tcp_proxy
+                .borrow()
+                .as_ref()
+                .map(|proxy| format!("http://{}", proxy.listen_addr()))
+                .unwrap_or_else(|| format!("http://{SYNC_SERVER_ADDR}")),
+            DistdTransport::Quic => self
+                .sync_udp_proxy
+                .borrow()
+                .as_ref()
+                .map(|proxy| format!("quic://{}", proxy.listen_addr()))
+                .unwrap_or_else(|| format!("quic://{SYNC_SERVER_ADDR}")),
+        }
+    }
+
+    fn annotate_network_notes(&self, metrics: &mut RunMetrics) {
+        if matches!(self.transport, DistdTransport::Grpc)
+            && self
+                .network
+                .as_ref()
+                .map(NetworkProfile::tcp_loss_ignored)
+                .unwrap_or(false)
+        {
+            metrics
+                .notes
+                .push_str(" | tcp shaping ignores packet loss; use --distd-transport quic to exercise loss");
+        }
     }
 
     /// Publish a file to the running server via HTTP REST API.
@@ -255,10 +331,7 @@ impl DistdRunner {
                     CURL_MAX_TIME,
                     "-X",
                     "POST",
-                    &format!(
-                        "http://127.0.0.1:3000/items?name={}&path={}",
-                        item_name, item_path
-                    ),
+                    &format!("{}/items?name={}&path={}", self.publish_base_url(), item_name, item_path),
                     "-F",
                     &format!("item=@{}", source_file.to_string_lossy()),
                 ])
@@ -305,10 +378,7 @@ impl DistdRunner {
                 .arg(CURL_MAX_TIME)
                 .arg("-X")
                 .arg("POST")
-                .arg(format!(
-                    "http://127.0.0.1:3000/items?name={}&path={}",
-                    item_name, item_path
-                ));
+                .arg(format!("{}/items?name={}&path={}", self.publish_base_url(), item_name, item_path));
 
             for source_file in source_files {
                 let relative = source_file
@@ -373,7 +443,7 @@ impl DistdRunner {
                 "root": storage_dir,
             },
             "server": {
-                "url": "http://127.0.0.1:50051",
+                "url": self.client_server_url(),
             },
             "log": {
                 "level": "INFO",
@@ -404,7 +474,7 @@ impl DistdRunner {
 
 impl ToolRunner for DistdRunner {
     fn name(&self) -> &str {
-        "distd"
+        &self.display_name
     }
 
     fn is_available(&self) -> bool {
@@ -417,6 +487,8 @@ impl ToolRunner for DistdRunner {
         dest_dir: &Path,
         m: &mut RunMetrics,
     ) -> Result<(), String> {
+        self.annotate_network_notes(m);
+
         // Clear client cache to avoid stale UUIDs being rejected by fresh server
         // The client stores its UUID in ~/.cache/distd/ and the server rejects old UUIDs
         clean_distd_cache();
@@ -550,6 +622,8 @@ impl ToolRunner for DistdRunner {
         dest_dir: &Path,
         m: &mut RunMetrics,
     ) -> Result<(), String> {
+        self.annotate_network_notes(m);
+
         let v2_dir = workload
             .source_dir_v2
             .as_ref()

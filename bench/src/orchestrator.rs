@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use crate::metrics::{self, RunMetrics};
 use crate::report;
-use crate::runners;
+use crate::runners::{self, RunnerOptions};
 use crate::workload::{self, Workload, WorkloadKind, WorkloadParams};
 
 #[allow(dead_code)]
@@ -19,6 +19,7 @@ pub struct BenchmarkOrchestrator {
     resume: bool,
     params: WorkloadParams,
     group_by_workload: bool,
+    runner_options: RunnerOptions,
 }
 
 impl BenchmarkOrchestrator {
@@ -37,6 +38,7 @@ impl BenchmarkOrchestrator {
         small_file_kib: u64,
         delta_fraction: f64,
         group_by_workload: bool,
+        runner_options: RunnerOptions,
     ) -> Self {
         Self {
             data_dir,
@@ -55,6 +57,7 @@ impl BenchmarkOrchestrator {
                 smoke,
             },
             group_by_workload,
+            runner_options,
         }
     }
 
@@ -100,7 +103,7 @@ impl BenchmarkOrchestrator {
             for tool_name in &available_tools {
                 tracing::info!("  ─── Tool: {tool_name} ───");
                 let tool_work_dir = self.data_dir.join("tool_state").join(tool_name);
-                let runner = match runners::make_runner(tool_name, &tool_work_dir) {
+                let runner = match runners::make_runner(tool_name, &tool_work_dir, &self.runner_options) {
                     Some(r) => r,
                     None => {
                         tracing::warn!("  Cannot create runner for {tool_name}");
@@ -182,6 +185,7 @@ impl BenchmarkOrchestrator {
             let mut m = RunMetrics::new(
                 runner.name(),
                 &workload.kind.to_string(),
+                &self.runner_options.network_label(),
                 i,
                 cache_state,
             );
@@ -238,7 +242,13 @@ impl BenchmarkOrchestrator {
             let _ = std::fs::remove_dir_all(&dest);
             std::fs::create_dir_all(&dest).expect("create dest dir");
 
-            let mut setup = RunMetrics::new(runner.name(), &workload.kind.to_string(), i, "setup");
+            let mut setup = RunMetrics::new(
+                runner.name(),
+                &workload.kind.to_string(),
+                &self.runner_options.network_label(),
+                i,
+                "setup",
+            );
             if let Err(e) = runner.transfer(workload, &dest, &mut setup) {
                 tracing::error!("    → Setup transfer failed: {e}");
                 continue;
@@ -248,6 +258,7 @@ impl BenchmarkOrchestrator {
             let mut m = RunMetrics::new(
                 runner.name(),
                 &format!("{}-update", workload.kind),
+                &self.runner_options.network_label(),
                 i,
                 "warm",
             );
@@ -303,6 +314,7 @@ impl BenchmarkOrchestrator {
         let mut m = RunMetrics::new(
             runner.name(),
             &format!("{}-resume", workload.kind),
+                &self.runner_options.network_label(),
             0,
             "warm",
         );
