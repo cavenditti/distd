@@ -175,4 +175,25 @@ mod tests {
 
         assert!(err.contains("bogus"));
     }
+
+    #[test]
+    fn parses_format_specific_workloads() {
+        let workloads = parse_workloads(vec![
+            "tar.gz".to_string(),
+            "oci-layer-zstd".to_string(),
+            "deb".to_string(),
+            "apk".to_string(),
+        ])
+        .expect("format workloads should parse");
+
+        assert_eq!(
+            workloads,
+            vec![
+                WorkloadKind::TarGzipArchive,
+                WorkloadKind::OciLayerZstd,
+                WorkloadKind::DebPackage,
+                WorkloadKind::ApkPackage,
+            ]
+        );
+    }
 }

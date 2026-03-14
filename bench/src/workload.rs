@@ -1,8 +1,9 @@
 use std::fmt;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use flate2::{write::GzEncoder, Compression};
 use rand::RngCore;
 
 /// Describes the kind of synthetic workload to generate.
@@ -20,6 +21,18 @@ pub enum WorkloadKind {
     HighDeltaRevision,
     /// Dedup-heavy corpus: significant content duplication across files.
     DedupHeavy,
+    /// A gzip-compressed tarball representative of package roots and source bundles.
+    TarGzipArchive,
+    /// A zstd-compressed tarball representative of modern package payloads.
+    TarZstdArchive,
+    /// An OCI-style compressed tar layer using gzip compression.
+    OciLayerGzip,
+    /// An OCI-style compressed tar layer using zstd compression.
+    OciLayerZstd,
+    /// A synthetic .deb package with control and data archives.
+    DebPackage,
+    /// A synthetic .apk package with package metadata and data payload.
+    ApkPackage,
 }
 
 impl WorkloadKind {
@@ -31,6 +44,12 @@ impl WorkloadKind {
             Self::LowDeltaRevision,
             Self::HighDeltaRevision,
             Self::DedupHeavy,
+            Self::TarGzipArchive,
+            Self::TarZstdArchive,
+            Self::OciLayerGzip,
+            Self::OciLayerZstd,
+            Self::DebPackage,
+            Self::ApkPackage,
         ]
     }
 }
@@ -44,6 +63,12 @@ impl fmt::Display for WorkloadKind {
             Self::LowDeltaRevision => write!(f, "low-delta-revision"),
             Self::HighDeltaRevision => write!(f, "high-delta-revision"),
             Self::DedupHeavy => write!(f, "dedup-heavy"),
+            Self::TarGzipArchive => write!(f, "tar-gzip-archive"),
+            Self::TarZstdArchive => write!(f, "tar-zstd-archive"),
+            Self::OciLayerGzip => write!(f, "oci-layer-gzip"),
+            Self::OciLayerZstd => write!(f, "oci-layer-zstd"),
+            Self::DebPackage => write!(f, "deb-package"),
+            Self::ApkPackage => write!(f, "apk-package"),
         }
     }
 }
@@ -60,8 +85,14 @@ impl std::str::FromStr for WorkloadKind {
             "high-delta" => Ok(Self::HighDeltaRevision),
             "high-delta-revision" => Ok(Self::HighDeltaRevision),
             "dedup-heavy" => Ok(Self::DedupHeavy),
+            "tar-gzip-archive" | "tar-gz" | "tar.gz" => Ok(Self::TarGzipArchive),
+            "tar-zstd-archive" | "tar-zst" | "tar.zst" => Ok(Self::TarZstdArchive),
+            "oci-layer-gzip" | "oci-gzip" | "oci-layer-tar-gz" => Ok(Self::OciLayerGzip),
+            "oci-layer-zstd" | "oci-zstd" | "oci-layer-tar-zst" => Ok(Self::OciLayerZstd),
+            "deb-package" | "deb" => Ok(Self::DebPackage),
+            "apk-package" | "apk" => Ok(Self::ApkPackage),
             _ => Err(format!(
-                "unknown workload kind '{s}' (valid: single-large-file, many-small-files, packed-archive, low-delta, low-delta-revision, high-delta, high-delta-revision, dedup-heavy)"
+                "unknown workload kind '{s}' (valid: single-large-file, many-small-files, packed-archive, low-delta, low-delta-revision, high-delta, high-delta-revision, dedup-heavy, tar-gzip-archive, tar-zstd-archive, oci-layer-gzip, oci-layer-zstd, deb-package, apk-package)"
             )),
         }
     }
@@ -127,6 +158,12 @@ fn generate_one(base: &Path, kind: &WorkloadKind, params: &WorkloadParams) -> Wo
         WorkloadKind::LowDeltaRevision => gen_delta_revision(base, params, false),
         WorkloadKind::HighDeltaRevision => gen_delta_revision(base, params, true),
         WorkloadKind::DedupHeavy => gen_dedup_heavy(base, params),
+        WorkloadKind::TarGzipArchive => gen_compressed_archive(base, params, CompressionFormat::Gzip),
+        WorkloadKind::TarZstdArchive => gen_compressed_archive(base, params, CompressionFormat::Zstd),
+        WorkloadKind::OciLayerGzip => gen_oci_layer(base, params, CompressionFormat::Gzip),
+        WorkloadKind::OciLayerZstd => gen_oci_layer(base, params, CompressionFormat::Zstd),
+        WorkloadKind::DebPackage => gen_deb_package(base, params),
+        WorkloadKind::ApkPackage => gen_apk_package(base, params),
     }
 }
 
@@ -201,6 +238,12 @@ fn smoke_count(normal: u32, smoke: bool) -> u32 {
     if smoke { normal.min(10) } else { normal }
 }
 
+#[derive(Clone, Copy)]
+enum CompressionFormat {
+    Gzip,
+    Zstd,
+}
+
 /// Generate a single large random binary file.
 fn gen_single_large_file(base: &Path, params: &WorkloadParams) -> Workload {
     let v1 = base.join("v1");
@@ -269,6 +312,179 @@ fn gen_packed_archive(base: &Path, params: &WorkloadParams) -> Workload {
     let total = dir_total_bytes(&v1);
     Workload {
         kind: WorkloadKind::PackedArchive,
+        source_dir: v1,
+        source_dir_v2: None,
+        total_bytes_v1: total,
+        total_bytes_v2: None,
+        file_count_v1: 1,
+    }
+}
+
+fn gen_compressed_archive(base: &Path, params: &WorkloadParams, compression: CompressionFormat) -> Workload {
+    let staging = base.join("staging");
+    let v1 = base.join("v1");
+    let count = smoke_count(params.small_file_count, params.smoke);
+    let size = smoke_size((params.small_file_kib as usize) * 1024, params.smoke);
+    tracing::info!(
+        "Generating {}: {count} files × {size} bytes",
+        match compression {
+            CompressionFormat::Gzip => "tar-gzip-archive",
+            CompressionFormat::Zstd => "tar-zstd-archive",
+        }
+    );
+
+    populate_compressible_tree(&staging, count, size, "archive");
+
+    fs::create_dir_all(&v1).expect("create v1");
+    let tar_path = base.join("archive.tar");
+    pack_tar(&staging, &tar_path);
+    let archive_path = match compression {
+        CompressionFormat::Gzip => v1.join("archive.tar.gz"),
+        CompressionFormat::Zstd => v1.join("archive.tar.zst"),
+    };
+    compress_file(&tar_path, &archive_path, compression);
+    let _ = fs::remove_file(&tar_path);
+    let _ = fs::remove_dir_all(&staging);
+
+    let total = dir_total_bytes(&v1);
+    Workload {
+        kind: match compression {
+            CompressionFormat::Gzip => WorkloadKind::TarGzipArchive,
+            CompressionFormat::Zstd => WorkloadKind::TarZstdArchive,
+        },
+        source_dir: v1,
+        source_dir_v2: None,
+        total_bytes_v1: total,
+        total_bytes_v2: None,
+        file_count_v1: 1,
+    }
+}
+
+fn gen_oci_layer(base: &Path, params: &WorkloadParams, compression: CompressionFormat) -> Workload {
+    let rootfs = base.join("rootfs");
+    let v1 = base.join("v1");
+    let count = smoke_count(params.small_file_count / 2, params.smoke).max(8);
+    let size = smoke_size((params.small_file_kib as usize) * 1024, params.smoke);
+    tracing::info!(
+        "Generating {}: {count} files × {size} bytes",
+        match compression {
+            CompressionFormat::Gzip => "oci-layer-gzip",
+            CompressionFormat::Zstd => "oci-layer-zstd",
+        }
+    );
+
+    populate_rootfs_tree(&rootfs, count, size);
+
+    fs::create_dir_all(&v1).expect("create v1");
+    let tar_path = base.join("layer.tar");
+    pack_tar(&rootfs, &tar_path);
+    let layer_path = match compression {
+        CompressionFormat::Gzip => v1.join("oci-layer.tar.gz"),
+        CompressionFormat::Zstd => v1.join("oci-layer.tar.zst"),
+    };
+    compress_file(&tar_path, &layer_path, compression);
+    let _ = fs::remove_file(&tar_path);
+    let _ = fs::remove_dir_all(&rootfs);
+
+    let total = dir_total_bytes(&v1);
+    Workload {
+        kind: match compression {
+            CompressionFormat::Gzip => WorkloadKind::OciLayerGzip,
+            CompressionFormat::Zstd => WorkloadKind::OciLayerZstd,
+        },
+        source_dir: v1,
+        source_dir_v2: None,
+        total_bytes_v1: total,
+        total_bytes_v2: None,
+        file_count_v1: 1,
+    }
+}
+
+fn gen_deb_package(base: &Path, params: &WorkloadParams) -> Workload {
+    let control_dir = base.join("control");
+    let data_dir = base.join("data");
+    let v1 = base.join("v1");
+    let size = smoke_size((params.small_file_kib as usize) * 1024, params.smoke);
+    let count = smoke_count(params.small_file_count / 4, params.smoke).max(6);
+    tracing::info!("Generating deb-package: {count} files × {size} bytes");
+
+    fs::create_dir_all(&control_dir).expect("mkdir control dir");
+    fs::write(
+        control_dir.join("control"),
+        format!(
+            "Package: distd-bench\nVersion: 1.0-1\nArchitecture: amd64\nMaintainer: distd bench\nDescription: synthetic benchmark package\nInstalled-Size: {}\n",
+            (count as usize * size) / 1024
+        ),
+    )
+    .expect("write control");
+    populate_package_tree(&data_dir, count, size, "usr/share/distd-bench");
+
+    let control_tar = base.join("control.tar");
+    let control_tgz = base.join("control.tar.gz");
+    let data_tar = base.join("data.tar");
+    let data_tzst = base.join("data.tar.zst");
+    pack_tar(&control_dir, &control_tar);
+    pack_tar(&data_dir, &data_tar);
+    compress_file(&control_tar, &control_tgz, CompressionFormat::Gzip);
+    compress_file(&data_tar, &data_tzst, CompressionFormat::Zstd);
+
+    fs::create_dir_all(&v1).expect("create v1");
+    let deb_path = v1.join("package.deb");
+    write_ar_archive(
+        &deb_path,
+        &[
+            ("debian-binary", b"2.0\n".to_vec()),
+            ("control.tar.gz", fs::read(&control_tgz).expect("read control archive")),
+            ("data.tar.zst", fs::read(&data_tzst).expect("read data archive")),
+        ],
+    );
+
+    let _ = fs::remove_dir_all(&control_dir);
+    let _ = fs::remove_dir_all(&data_dir);
+    let _ = fs::remove_file(&control_tar);
+    let _ = fs::remove_file(&control_tgz);
+    let _ = fs::remove_file(&data_tar);
+    let _ = fs::remove_file(&data_tzst);
+
+    let total = dir_total_bytes(&v1);
+    Workload {
+        kind: WorkloadKind::DebPackage,
+        source_dir: v1,
+        source_dir_v2: None,
+        total_bytes_v1: total,
+        total_bytes_v2: None,
+        file_count_v1: 1,
+    }
+}
+
+fn gen_apk_package(base: &Path, params: &WorkloadParams) -> Workload {
+    let staging = base.join("staging");
+    let v1 = base.join("v1");
+    let size = smoke_size((params.small_file_kib as usize) * 1024, params.smoke);
+    let count = smoke_count(params.small_file_count / 4, params.smoke).max(6);
+    tracing::info!("Generating apk-package: {count} files × {size} bytes");
+
+    fs::create_dir_all(&staging).expect("mkdir apk staging");
+    fs::write(
+        staging.join(".PKGINFO"),
+        format!(
+            "pkgname = distd-bench\npkgver = 1.0-r0\npkgdesc = synthetic benchmark package\nsize = {}\narch = x86_64\n",
+            count as usize * size
+        ),
+    )
+    .expect("write .PKGINFO");
+    populate_package_tree(&staging.join("usr/share/distd-bench"), count, size, "");
+
+    fs::create_dir_all(&v1).expect("create v1");
+    let tar_path = base.join("package.tar");
+    pack_tar(&staging, &tar_path);
+    compress_file(&tar_path, &v1.join("package.apk"), CompressionFormat::Gzip);
+    let _ = fs::remove_file(&tar_path);
+    let _ = fs::remove_dir_all(&staging);
+
+    let total = dir_total_bytes(&v1);
+    Workload {
+        kind: WorkloadKind::ApkPackage,
         source_dir: v1,
         source_dir_v2: None,
         total_bytes_v1: total,
@@ -427,9 +643,143 @@ fn mutate_bytes(buf: &mut [u8], fraction: f64) {
     }
 }
 
+fn populate_compressible_tree(root: &Path, count: u32, size: usize, namespace: &str) {
+    for i in 0..count {
+        let sub = format!("d{:03}", i % 20);
+        let file = root.join(&sub).join(format!("{namespace}_{i:06}.bin"));
+        write_compressible_file(&file, size, i as u64 + 1);
+    }
+}
+
+fn populate_rootfs_tree(root: &Path, count: u32, size: usize) {
+    fs::create_dir_all(root.join("etc")).expect("mkdir etc");
+    fs::create_dir_all(root.join("usr/bin")).expect("mkdir usr/bin");
+    fs::create_dir_all(root.join("var/lib/distd")).expect("mkdir var/lib/distd");
+    fs::write(root.join("etc/os-release"), b"NAME=distd bench\nID=distd\nVERSION_ID=1\n")
+        .expect("write os-release");
+
+    for i in 0..count {
+        let target = match i % 3 {
+            0 => root.join("usr/bin").join(format!("tool-{i:04}")),
+            1 => root.join("var/lib/distd").join(format!("blob-{i:04}.dat")),
+            _ => root.join("usr/share/distd").join(format!("asset-{i:04}.bin")),
+        };
+        write_compressible_file(&target, size, 0x1000 + i as u64);
+    }
+}
+
+fn populate_package_tree(root: &Path, count: u32, size: usize, prefix: &str) {
+    for i in 0..count {
+        let relative = if prefix.is_empty() {
+            PathBuf::from(format!("payload-{i:04}.bin"))
+        } else {
+            PathBuf::from(prefix).join(format!("payload-{i:04}.bin"))
+        };
+        write_compressible_file(&root.join(relative), size, 0x2000 + i as u64);
+    }
+}
+
+fn write_compressible_file(path: &Path, size: usize, seed: u64) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("Failed to create parent dir");
+    }
+    let mut f = fs::File::create(path).expect("Failed to create file");
+    let template = build_template(seed);
+    let mut written = 0usize;
+    let mut chunk_index = 0usize;
+    while written < size {
+        let remaining = size - written;
+        let take = remaining.min(template.len());
+        let mut block = template[..take].to_vec();
+        if chunk_index % 7 == 0 {
+            let zero_prefix = block.len().min(4096);
+            for byte in block.iter_mut().take(zero_prefix) {
+                *byte = 0;
+            }
+        }
+        if chunk_index % 5 == 0 && block.len() > 128 {
+            let marker = format!("seed={seed};chunk={chunk_index};path={}\n", path.display());
+            let copy_len = marker.len().min(block.len());
+            block[..copy_len].copy_from_slice(&marker.as_bytes()[..copy_len]);
+        }
+        f.write_all(&block).expect("write compressible block");
+        written += take;
+        chunk_index += 1;
+    }
+}
+
+fn build_template(seed: u64) -> Vec<u8> {
+    let mut template = vec![0u8; 64 * 1024];
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    for (index, byte) in template.iter_mut().enumerate() {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407 + index as u64);
+        *byte = match index % 8 {
+            0 | 1 => b'A' + (state as u8 % 26),
+            2 => b'0' + (state as u8 % 10),
+            3 => b'\n',
+            4 => 0,
+            _ => ((state >> 16) & 0xff) as u8,
+        };
+    }
+    template
+}
+
+fn compress_file(src: &Path, dest: &Path, compression: CompressionFormat) {
+    let data = fs::read(src).expect("read source for compression");
+    match compression {
+        CompressionFormat::Gzip => {
+            let out = fs::File::create(dest).expect("create gzip output");
+            let mut encoder = GzEncoder::new(out, Compression::new(6));
+            encoder.write_all(&data).expect("gzip write");
+            encoder.finish().expect("finish gzip");
+        }
+        CompressionFormat::Zstd => {
+            let out = fs::File::create(dest).expect("create zstd output");
+            let mut encoder = zstd::stream::write::Encoder::new(out, 10).expect("create zstd encoder");
+            encoder.write_all(&data).expect("zstd write");
+            encoder.finish().expect("finish zstd");
+        }
+    }
+}
+
+fn write_ar_archive(path: &Path, entries: &[(&str, Vec<u8>)]) {
+    let mut file = fs::File::create(path).expect("create ar archive");
+    file.write_all(b"!<arch>\n").expect("write ar header");
+
+    for (name, data) in entries {
+        let mut header = [b' '; 60];
+        let identifier = format!("{}/", name);
+        let identifier_bytes = identifier.as_bytes();
+        let id_len = identifier_bytes.len().min(16);
+        header[..id_len].copy_from_slice(&identifier_bytes[..id_len]);
+        write_ar_decimal(&mut header[16..28], 0);
+        write_ar_decimal(&mut header[28..34], 0);
+        write_ar_decimal(&mut header[34..40], 0);
+        header[40..48].copy_from_slice(b"100644  ");
+        write_ar_decimal(&mut header[48..58], data.len() as u64);
+        header[58..60].copy_from_slice(b"`\n");
+        file.write_all(&header).expect("write ar member header");
+        file.write_all(data).expect("write ar member data");
+        if data.len() % 2 != 0 {
+            file.write_all(b"\n").expect("write ar padding");
+        }
+    }
+}
+
+fn write_ar_decimal(field: &mut [u8], value: u64) {
+    let rendered = format!("{value}");
+    let start = field.len().saturating_sub(rendered.len());
+    for slot in &mut field[..start] {
+        *slot = b' ';
+    }
+    field[start..start + rendered.len()].copy_from_slice(rendered.as_bytes());
+}
+
 /// Create a tar archive from `src_dir` contents at `tar_path`.
 pub fn pack_tar(src_dir: &Path, tar_path: &Path) {
-    use std::io::{BufWriter, Read as TarRead};
+    use std::io::BufWriter;
 
     let file = fs::File::create(tar_path).expect("create tar");
     let mut writer = BufWriter::new(file);
