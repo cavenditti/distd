@@ -1,4 +1,4 @@
-use distd_core::{error::InvalidParameter, TransportError};
+use distd_core::error::InvalidParameter;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -15,9 +15,6 @@ pub enum Server {
 
     #[error("Invalid parameter: '{0}'")]
     InvalidParameter(#[from] InvalidParameter),
-
-    #[error("gRPC transport error, is port already in use?")]
-    Transport(#[from] TransportError),
 
     #[error("QUIC transport error: {0}")]
     Quic(String),

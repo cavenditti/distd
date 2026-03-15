@@ -1,5 +1,4 @@
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
@@ -75,10 +74,6 @@ impl NetworkProfile {
         }
     }
 
-    pub fn tcp_loss_ignored(&self) -> bool {
-        self.loss_percent > 0.0
-    }
-
     fn sample_delay<R: Rng>(&self, rng: &mut R) -> Duration {
         if self.delay_ms == 0 && self.jitter_ms == 0 {
             return Duration::ZERO;
@@ -128,136 +123,6 @@ impl RateLimiter {
         let scheduled_from = self.next_slot.max(now);
         let transmit = Duration::from_secs_f64(bytes as f64 / rate);
         self.next_slot = scheduled_from + transmit;
-    }
-}
-
-pub struct TcpShaperProxy {
-    listen_addr: SocketAddr,
-    stop: Arc<AtomicBool>,
-    accept_thread: Option<JoinHandle<()>>,
-}
-
-impl TcpShaperProxy {
-    pub fn start(target_addr: SocketAddr, profile: NetworkProfile) -> Result<Self, String> {
-        let listener = TcpListener::bind(("127.0.0.1", 0))
-            .map_err(|err| format!("bind tcp proxy: {err}"))?;
-        listener
-            .set_nonblocking(true)
-            .map_err(|err| format!("set tcp proxy nonblocking: {err}"))?;
-        let listen_addr = listener
-            .local_addr()
-            .map_err(|err| format!("read tcp proxy address: {err}"))?;
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_flag = Arc::clone(&stop);
-
-        let accept_thread = thread::spawn(move || {
-            while !stop_flag.load(Ordering::Relaxed) {
-                match listener.accept() {
-                    Ok((downstream, _)) => {
-                        let upstream = match TcpStream::connect(target_addr) {
-                            Ok(stream) => stream,
-                            Err(err) => {
-                                tracing::warn!("tcp proxy connect to {target_addr} failed: {err}");
-                                continue;
-                            }
-                        };
-
-                        let upstream_reader = match upstream.try_clone() {
-                            Ok(stream) => stream,
-                            Err(err) => {
-                                tracing::warn!("tcp proxy clone upstream failed: {err}");
-                                continue;
-                            }
-                        };
-                        let downstream_reader = match downstream.try_clone() {
-                            Ok(stream) => stream,
-                            Err(err) => {
-                                tracing::warn!("tcp proxy clone downstream failed: {err}");
-                                continue;
-                            }
-                        };
-
-                        let profile_up = profile.clone();
-                        let profile_down = profile.clone();
-                        thread::spawn(move || {
-                            let send = thread::spawn(move || {
-                                forward_tcp(downstream_reader, upstream, profile_up);
-                            });
-                            let recv = thread::spawn(move || {
-                                forward_tcp(upstream_reader, downstream, profile_down);
-                            });
-                            let _ = send.join();
-                            let _ = recv.join();
-                        });
-                    }
-                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(20));
-                    }
-                    Err(err) => {
-                        if !stop_flag.load(Ordering::Relaxed) {
-                            tracing::warn!("tcp proxy accept failed: {err}");
-                        }
-                        thread::sleep(Duration::from_millis(20));
-                    }
-                }
-            }
-        });
-
-        Ok(Self {
-            listen_addr,
-            stop,
-            accept_thread: Some(accept_thread),
-        })
-    }
-
-    pub fn listen_addr(&self) -> SocketAddr {
-        self.listen_addr
-    }
-}
-
-impl Drop for TcpShaperProxy {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        let _ = TcpStream::connect(self.listen_addr);
-        if let Some(handle) = self.accept_thread.take() {
-            let _ = handle.join();
-        }
-    }
-}
-
-fn forward_tcp(mut reader: TcpStream, mut writer: TcpStream, profile: NetworkProfile) {
-    let mut buffer = [0_u8; 64 * 1024];
-    let mut limiter = RateLimiter::new(profile.bandwidth_bytes_per_sec());
-    let mut rng = rand::thread_rng();
-    let mut initial_delay_applied = false;
-
-    loop {
-        let read = match reader.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(bytes) => bytes,
-            Err(err) => {
-                if err.kind() != std::io::ErrorKind::ConnectionReset {
-                    tracing::debug!("tcp proxy read error: {err}");
-                }
-                break;
-            }
-        };
-
-        if !initial_delay_applied {
-            initial_delay_applied = true;
-            let delay = profile.sample_delay(&mut rng);
-            if !delay.is_zero() {
-                thread::sleep(delay);
-            }
-        }
-        limiter.wait(read);
-
-        if let Err(err) = writer.write_all(&buffer[..read]) {
-            if err.kind() != std::io::ErrorKind::BrokenPipe {
-                tracing::debug!("tcp proxy write error: {err}");
-            }
-            break;
-        }
     }
 }
 
@@ -403,9 +268,8 @@ fn spawn_udp_worker(
 
 #[cfg(test)]
 mod tests {
-    use super::{NetworkProfile, TcpShaperProxy, UdpShaperProxy};
-    use std::io::{Read, Write};
-    use std::net::{TcpListener, TcpStream, UdpSocket};
+    use super::{NetworkProfile, UdpShaperProxy};
+    use std::net::UdpSocket;
     use std::thread;
     use std::time::Duration;
 
@@ -455,34 +319,5 @@ mod tests {
 
         drop(proxy);
         server_thread.join().expect("join udp server");
-    }
-
-    #[test]
-    fn tcp_proxy_round_trips() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind tcp echo server");
-        let target = listener.local_addr().expect("server addr");
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept client");
-            let mut payload = [0_u8; 5];
-            stream.read_exact(&mut payload).expect("read payload");
-            stream.write_all(&payload).expect("echo payload");
-        });
-
-        let profile = NetworkProfile {
-            delay_ms: 0,
-            jitter_ms: 0,
-            bandwidth_mbps: None,
-            loss_percent: 0.0,
-        };
-        let proxy = TcpShaperProxy::start(target, profile).expect("start tcp proxy");
-        let mut client = TcpStream::connect(proxy.listen_addr()).expect("connect proxy");
-        client.write_all(b"hello").expect("write to proxy");
-
-        let mut echoed = [0_u8; 5];
-        client.read_exact(&mut echoed).expect("read echo");
-        assert_eq!(&echoed, b"hello");
-
-        drop(proxy);
-        server.join().expect("join tcp server");
     }
 }

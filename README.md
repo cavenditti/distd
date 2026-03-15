@@ -21,7 +21,7 @@ the (eventually private storage repo) and keep all items deduplicated.
 - Within a layer (i.e. nodes at the same level of the tree with mutual visibility) it works as a p2p network
 - Root server computes BLAKE3 hash trees (and assigns a 64-bit uid to each hash? To reduce overhead)
 
-- Client-server communication uses gRPC, at least for now
+- Client-server sync uses QUIC; HTTP is retained for publish and metadata-facing REST endpoints
 
 
 > [!NOTE]
@@ -110,7 +110,6 @@ Example:
 ```bash
 cargo run -p distd_bench --release -- \
     --tools distd \
-    --distd-transport quic \
     --workloads low-delta,high-delta \
     --net-delay-ms 40 \
     --net-jitter-ms 5 \
@@ -118,4 +117,4 @@ cargo run -p distd_bench --release -- \
     --net-loss-percent 0.5
 ```
 
-Packet loss only applies meaningfully to the QUIC path. On gRPC/TCP runs the benchmark warns and ignores loss, while still applying delay, jitter, and bandwidth limits.
+Benchmark network shaping applies to the QUIC sync path. Delay, jitter, bandwidth limits, and packet loss all affect the proxied QUIC traffic.

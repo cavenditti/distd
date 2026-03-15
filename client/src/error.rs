@@ -1,9 +1,7 @@
 use std::str::Utf8Error;
 
 use config::ConfigError;
-use distd_core::{
-    error::InvalidParameter, transport::PayloadCompressionError, GrpcError, TransportError,
-};
+use distd_core::{error::InvalidParameter, transport::PayloadCompressionError};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -25,12 +23,6 @@ pub enum ServerRequest {
 
     #[error("Cannot reconstruct buffer from server response")]
     ResponseDeserialize(#[from] bitcode::Error),
-
-    #[error("gRPC error")]
-    Grpc(#[from] GrpcError),
-
-    #[error("gRPC transport error, is server accepting connetions?")]
-    Transport(#[from] TransportError),
 
     #[error("Cannot decode UTF-8 string from server response")]
     Utf8(#[from] Utf8Error),

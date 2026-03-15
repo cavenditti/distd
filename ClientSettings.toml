@@ -3,7 +3,7 @@ enabled = true
 root = "here"
 
 [server]
-url = "http://localhost:3000"
+url = "quic://localhost:50051"
 
 [log]
 level = "DEBUG"

@@ -16,10 +16,10 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::metrics::{self, ProcessMonitor, RunMetrics};
-use crate::network::{NetworkProfile, TcpShaperProxy, UdpShaperProxy};
+use crate::network::{NetworkProfile, UdpShaperProxy};
 use crate::workload::{self, Workload};
 
-use super::{wait_child_with_timeout, DistdTransport, RunnerOptions, ToolRunner, SMOKE_CHILD_TIMEOUT, DEFAULT_CHILD_TIMEOUT};
+use super::{wait_child_with_timeout, RunnerOptions, ToolRunner, SMOKE_CHILD_TIMEOUT, DEFAULT_CHILD_TIMEOUT};
 
 /// Timeout for curl HTTP requests to the server (connect + total).
 const CURL_CONNECT_TIMEOUT: &str = "5";
@@ -73,11 +73,9 @@ impl Drop for ServerGuard {
 pub struct DistdRunner {
     work_dir: PathBuf,
     display_name: String,
-    transport: DistdTransport,
     network: Option<NetworkProfile>,
     /// Server child held in a RefCell so `transfer(&self)` can manage it.
     server_guard: RefCell<Option<ServerGuard>>,
-    sync_tcp_proxy: RefCell<Option<TcpShaperProxy>>,
     sync_udp_proxy: RefCell<Option<UdpShaperProxy>>,
 }
 
@@ -114,13 +112,15 @@ impl DistdRunner {
     pub fn new(work_dir: &Path, options: RunnerOptions) -> Self {
         Self {
             work_dir: work_dir.join("distd"),
-            display_name: options.distd_transport.display_name().to_string(),
-            transport: options.distd_transport,
+            display_name: "distd-quic".to_string(),
             network: options.network,
             server_guard: RefCell::new(None),
-            sync_tcp_proxy: RefCell::new(None),
             sync_udp_proxy: RefCell::new(None),
         }
+    }
+
+    fn quic_port_ready() -> bool {
+        std::net::UdpSocket::bind(SYNC_SERVER_ADDR).is_err()
     }
 
     /// Check if debug binaries exist in the workspace target directory.
@@ -157,12 +157,7 @@ impl DistdRunner {
         if std::net::TcpStream::connect(HTTP_SERVER_ADDR).is_ok() {
             return Err("Port 3000 already in use before starting distd_server".to_string());
         }
-        if std::net::TcpStream::connect_timeout(
-            &SYNC_SERVER_ADDR.parse().unwrap(),
-            Duration::from_millis(200),
-        )
-        .is_ok()
-        {
+        if std::net::UdpSocket::bind(SYNC_SERVER_ADDR).is_err() {
             return Err("Port 50051 already in use before starting distd_server".to_string());
         }
 
@@ -213,29 +208,25 @@ impl DistdRunner {
 
         *self.server_guard.borrow_mut() = Some(guard);
 
-        // Wait for gRPC to accept connections and HTTP to return a real 200 on /version.
+        // Wait for QUIC to bind its UDP port and HTTP to return a real 200 on /version.
         let start = Instant::now();
         let timeout = Duration::from_secs(10);
         let mut http_ready = false;
-        let mut grpc_ready = false;
+        let mut quic_ready = false;
         loop {
             if start.elapsed() > timeout {
                 self.stop_server();
                 return Err(format!(
-                    "Timed out waiting for distd_server (http_ready={http_ready}, grpc_ready={grpc_ready})"
+                    "Timed out waiting for distd_server (http_ready={http_ready}, quic_ready={quic_ready})"
                 ));
             }
             if !http_ready {
                 http_ready = Self::http_version_ready();
             }
-            if !grpc_ready {
-                grpc_ready = std::net::TcpStream::connect_timeout(
-                    &SYNC_SERVER_ADDR.parse().unwrap(),
-                    Duration::from_millis(200),
-                )
-                .is_ok();
+            if !quic_ready {
+                quic_ready = Self::quic_port_ready();
             }
-            if http_ready && grpc_ready {
+            if http_ready && quic_ready {
                 break;
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -259,22 +250,13 @@ impl DistdRunner {
             return Ok(());
         };
 
-        match self.transport {
-            DistdTransport::Grpc => {
-                let sync_target: SocketAddr = SYNC_SERVER_ADDR.parse().unwrap();
-                *self.sync_tcp_proxy.borrow_mut() = Some(TcpShaperProxy::start(sync_target, profile)?);
-            }
-            DistdTransport::Quic => {
-                let sync_target: SocketAddr = SYNC_SERVER_ADDR.parse().unwrap();
-                *self.sync_udp_proxy.borrow_mut() = Some(UdpShaperProxy::start(sync_target, profile)?);
-            }
-        }
+        let sync_target: SocketAddr = SYNC_SERVER_ADDR.parse().unwrap();
+        *self.sync_udp_proxy.borrow_mut() = Some(UdpShaperProxy::start(sync_target, profile)?);
 
         Ok(())
     }
 
     fn stop_shapers(&self) {
-        *self.sync_tcp_proxy.borrow_mut() = None;
         *self.sync_udp_proxy.borrow_mut() = None;
     }
 
@@ -283,34 +265,12 @@ impl DistdRunner {
     }
 
     fn client_server_url(&self) -> String {
-        match self.transport {
-            DistdTransport::Grpc => self
-                .sync_tcp_proxy
-                .borrow()
-                .as_ref()
-                .map(|proxy| format!("http://{}", proxy.listen_addr()))
-                .unwrap_or_else(|| format!("http://{SYNC_SERVER_ADDR}")),
-            DistdTransport::Quic => self
-                .sync_udp_proxy
-                .borrow()
-                .as_ref()
-                .map(|proxy| format!("quic://{}", proxy.listen_addr()))
-                .unwrap_or_else(|| format!("quic://{SYNC_SERVER_ADDR}")),
-        }
-    }
-
-    fn annotate_network_notes(&self, metrics: &mut RunMetrics) {
-        if matches!(self.transport, DistdTransport::Grpc)
-            && self
-                .network
-                .as_ref()
-                .map(NetworkProfile::tcp_loss_ignored)
-                .unwrap_or(false)
-        {
-            metrics
-                .notes
-                .push_str(" | tcp shaping ignores packet loss; use --distd-transport quic to exercise loss");
-        }
+        self
+            .sync_udp_proxy
+            .borrow()
+            .as_ref()
+            .map(|proxy| format!("quic://{}", proxy.listen_addr()))
+            .unwrap_or_else(|| format!("quic://{SYNC_SERVER_ADDR}"))
     }
 
     /// Publish a file to the running server via HTTP REST API.
@@ -487,10 +447,7 @@ impl ToolRunner for DistdRunner {
         dest_dir: &Path,
         m: &mut RunMetrics,
     ) -> Result<(), String> {
-        self.annotate_network_notes(m);
-
         // Clear client cache to avoid stale UUIDs being rejected by fresh server
-        // The client stores its UUID in ~/.cache/distd/ and the server rejects old UUIDs
         clean_distd_cache();
 
         // Start server (stop any previous one first)
@@ -622,8 +579,6 @@ impl ToolRunner for DistdRunner {
         dest_dir: &Path,
         m: &mut RunMetrics,
     ) -> Result<(), String> {
-        self.annotate_network_notes(m);
-
         let v2_dir = workload
             .source_dir_v2
             .as_ref()
@@ -669,7 +624,6 @@ impl ToolRunner for DistdRunner {
             self.stop_server();
             return Err("No files in v2 source".to_string());
         }
-
         if v2_files.len() > 1 {
             self.publish_files(v2_dir, &v2_files, item_name, item_path)
         } else {

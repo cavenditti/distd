@@ -1,69 +1,52 @@
-//use std::{net::SocketAddr
-use crate::{error::ServerRequest, grpc::DistdGrpcClient};
+use crate::error::ServerRequest;
 
 use std::collections::HashSet;
 use std::{fmt::Debug, sync::Arc, time::Duration};
-use distd_core::tonic::Streaming;
 use uuid::Uuid;
 
-use tokio::{sync::{mpsc, RwLock}, time::Instant};
+use tokio::{sync::RwLock, time::Instant};
 
 //use ring::agreement::PublicKey;
 
 use distd_core::{
     chunks::{ChunkAlgorithm, ChunkInfo},
-    error::InvalidParameter,
     hash::Hash,
     item::{FileEntry, Manifest},
     metadata::Server as ServerMetadata,
-    proto::{self, distd_client::DistdClient, SyncMessage},
-    proto::sync_message::Msg,
+    proto::{self, sync_message::Msg, SyncMessage},
     transport::decode_sync_payload,
-    tonic::{service::interceptor::InterceptedService, transport::Channel},
-    utils::grpc::uuid_to_metadata,
     version::VERSION,
-    Request,
 };
 
 mod quic;
 
 use quic::{QuicSyncSession, QuicTransportClient};
 
-type GrpcClient = DistdClient<InterceptedService<Channel, DistdGrpcClient>>;
-
 #[derive(Debug)]
 enum TransportClient {
-    Grpc(GrpcClient),
     Quic(QuicTransportClient),
 }
 
 #[derive(Debug)]
 enum SyncContinuation {
-    Grpc {
-        sender: mpsc::Sender<SyncMessage>,
-        receiver: Streaming<SyncMessage>,
-    },
     Quic(QuicSyncSession),
 }
 
 impl TransportClient {
     async fn register(&mut self, request: distd_core::proto::ClientRegister) -> Result<distd_core::proto::ServerMetadata, ServerRequest> {
         match self {
-            Self::Grpc(client) => Ok(client.register(Request::new(request)).await?.into_inner()),
             Self::Quic(client) => client.register(request).await,
         }
     }
 
     async fn fetch(&mut self, request: distd_core::proto::ClientKeepAlive) -> Result<distd_core::proto::ServerMetadata, ServerRequest> {
         match self {
-            Self::Grpc(client) => Ok(client.fetch(Request::new(request)).await?.into_inner()),
             Self::Quic(client) => client.fetch(request).await,
         }
     }
 
     async fn set_client_uuid(&mut self, client_uuid: Uuid) {
         match self {
-            Self::Grpc(_) => {}
             Self::Quic(client) => client.set_client_uuid(client_uuid).await,
         }
     }
@@ -73,35 +56,6 @@ impl TransportClient {
         manifest_request: proto::ManifestRequest,
     ) -> Result<(proto::ManifestResponse, SyncContinuation), ServerRequest> {
         match self {
-            Self::Grpc(client) => {
-                use tokio_stream::StreamExt;
-
-                let (client_tx, client_rx) = mpsc::channel::<SyncMessage>(16);
-                let client_stream = tokio_stream::wrappers::ReceiverStream::new(client_rx);
-                let response = client.sync(Request::new(client_stream)).await?;
-                let mut receiver = response.into_inner();
-
-                client_tx
-                    .send(SyncMessage {
-                        msg: Some(Msg::ManifestRequest(manifest_request)),
-                    })
-                    .await
-                    .map_err(|_| ServerRequest::StreamClosed)?;
-                let manifest = match receiver.next().await {
-                    Some(Ok(SyncMessage { msg: Some(Msg::ManifestResponse(resp)) })) => resp,
-                    Some(Ok(_)) => return Err(ServerRequest::UnexpectedMessage),
-                    Some(Err(e)) => return Err(ServerRequest::from(e)),
-                    None => return Err(ServerRequest::StreamClosed),
-                };
-
-                Ok((
-                    manifest,
-                    SyncContinuation::Grpc {
-                        sender: client_tx,
-                        receiver,
-                    },
-                ))
-            }
             Self::Quic(client) => {
                 let (manifest, session) = client.sync(manifest_request).await?;
                 Ok((manifest, SyncContinuation::Quic(session)))
@@ -116,29 +70,6 @@ impl SyncContinuation {
         possession: proto::PossessionBitfield,
     ) -> Result<Vec<SyncMessage>, ServerRequest> {
         match self {
-            Self::Grpc {
-                sender,
-                mut receiver,
-            } => {
-                use tokio_stream::StreamExt;
-
-                sender
-                    .send(SyncMessage {
-                        msg: Some(Msg::Possession(possession)),
-                    })
-                    .await
-                    .map_err(|_| ServerRequest::StreamClosed)?;
-                drop(sender);
-
-                let mut responses = Vec::new();
-                while let Some(msg) = receiver.next().await {
-                    match msg {
-                        Ok(message) => responses.push(message),
-                        Err(e) => return Err(ServerRequest::from(e)),
-                    }
-                }
-                Ok(responses)
-            }
             Self::Quic(session) => session.send_possession_and_collect(possession).await,
         }
     }
@@ -241,36 +172,10 @@ impl Server {
         self.client_uuid.unwrap_or(Uuid::nil())
     }
 
-    async fn make_grpc_client(
-        url: &str,
-        uuid: &Uuid,
-    ) -> Result<DistdClient<InterceptedService<Channel, DistdGrpcClient>>, ServerRequest> {
-        tracing::debug!("Connecting to server at {url}");
-        let grpc_channel = distd_core::tonic::transport::Channel::from_shared(url.to_string())
-            .map_err(InvalidParameter::Uri)?
-            .connect()
-            .await?;
-        Ok(distd_core::Client::with_interceptor(
-            grpc_channel,
-            DistdGrpcClient {
-                uuid: uuid_to_metadata(uuid),
-            },
-        )
-        .max_decoding_message_size(256 * 1024 * 1024))
-    }
-
-    fn uses_quic(url: &str) -> bool {
-        url.starts_with("quic://") || url.starts_with("udp://")
-    }
-
     async fn make_transport(url: &str, uuid: &Uuid) -> Result<TransportClient, ServerRequest> {
-        if Self::uses_quic(url) {
-            QuicTransportClient::connect(url, if uuid.is_nil() { None } else { Some(*uuid) })
-                .await
-                .map(TransportClient::Quic)
-        } else {
-            Self::make_grpc_client(url, uuid).await.map(TransportClient::Grpc)
-        }
+        QuicTransportClient::connect(url, if uuid.is_nil() { None } else { Some(*uuid) })
+            .await
+            .map(TransportClient::Quic)
     }
 
     /// Register a new client
@@ -294,11 +199,7 @@ impl Server {
         tracing::info!("Got uuid '{uuid:?}' from server");
 
         self.client_uuid = Some(uuid);
-        if Self::uses_quic(&self.url) {
-            shared.transport.set_client_uuid(uuid).await;
-        } else {
-            shared.transport = Self::make_transport(&self.url, &self.client_uuid()).await?;
-        }
+        shared.transport.set_client_uuid(uuid).await;
 
         Ok(uuid)
     }

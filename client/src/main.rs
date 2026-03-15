@@ -3,7 +3,6 @@
 
 pub mod client;
 pub mod error;
-pub mod grpc;
 pub mod server;
 pub mod settings;
 pub mod persistence;

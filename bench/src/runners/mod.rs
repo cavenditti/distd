@@ -7,7 +7,6 @@ pub mod ostree;
 pub mod distd;
 pub mod http;
 
-use std::str::FromStr;
 use std::path::Path;
 use std::process::Child;
 use std::time::{Duration, Instant};
@@ -16,36 +15,8 @@ use crate::metrics::{ProcessMonitor, RunMetrics};
 use crate::network::NetworkProfile;
 use crate::workload::Workload;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DistdTransport {
-    Grpc,
-    Quic,
-}
-
-impl DistdTransport {
-    pub fn display_name(self) -> &'static str {
-        match self {
-            Self::Grpc => "distd",
-            Self::Quic => "distd-quic",
-        }
-    }
-}
-
-impl FromStr for DistdTransport {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "grpc" | "tcp" => Ok(Self::Grpc),
-            "quic" | "udp" => Ok(Self::Quic),
-            other => Err(format!("unsupported distd transport '{other}', expected grpc or quic")),
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct RunnerOptions {
-    pub distd_transport: DistdTransport,
     pub network: Option<NetworkProfile>,
 }
 

@@ -14,9 +14,8 @@ use distd_core::metadata::Server as ServerMetadata;
 use distd_core::possession::Bitfield;
 use distd_core::proto::{self, sync_message::Msg, ClientKeepAlive, ClientRegister, ServerMetadata as ProtoServerMetadata, SyncMessage};
 use distd_core::transport::maybe_compress_sync_payload;
-use distd_core::utils::grpc::uuid_to_metadata;
-use distd_core::utils::uuid::slice_to_uuid;
 use distd_core::utils::serde::BitcodeSerializable;
+use distd_core::utils::uuid::slice_to_uuid;
 use ring::error::KeyRejected;
 use ring::pkcs8::Document;
 use ring::signature::{Ed25519KeyPair, KeyPair};
@@ -30,7 +29,6 @@ use uuid::Uuid;
 
 use crate::client::{Client, Name as ClientName};
 use crate::error::Server as ServerError;
-use crate::grpc::UuidAuthInterceptor;
 use distd_core::feed::{Feed, Name as FeedName};
 use distd_core::hash::hash as do_hash;
 use distd_core::version::Version;
@@ -79,9 +77,6 @@ where
     pub storage: Arc<T>,
     /// Client map
     pub clients: Arc<RwLock<BTreeMap<Uuid, Client>>>,
-
-    /// gRPC interceptor for uuids check
-    pub uuid_interceptor: UuidAuthInterceptor,
 }
 
 impl<T> Clone for Server<T>
@@ -95,7 +90,6 @@ where
             metadata: Arc::clone(&self.metadata),
             storage: Arc::clone(&self.storage),
             clients: Arc::clone(&self.clients),
-            uuid_interceptor: self.uuid_interceptor.clone(),
         }
     }
 }
@@ -118,7 +112,6 @@ where
             metadata: Arc::new(RwLock::new(metadata)),
             storage: Arc::new(storage),
             clients: Arc::new(RwLock::new(BTreeMap::new())),
-            uuid_interceptor: UuidAuthInterceptor::default(),
         })
     }
 
@@ -136,7 +129,6 @@ where
             metadata: Arc::new(RwLock::new(InternalMetadata::default())),
             storage: Arc::new(storage),
             clients: Arc::new(RwLock::new(BTreeMap::new())),
-            uuid_interceptor: UuidAuthInterceptor::default(),
         }
     }
 }
@@ -403,14 +395,6 @@ where
                 version,
                 last_heartbeat: SystemTime::now(),
             };
-
-            // Add uuid to valid list in interceptor
-            self.uuid_interceptor
-                .uuids
-                .write()
-                .unwrap()
-                .insert(uuid_to_metadata(&uuid));
-
             let mut clients = self.clients.write().await;
             let uuid = client.uuid;
             match clients.entry(uuid) {

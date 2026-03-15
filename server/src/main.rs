@@ -9,7 +9,6 @@ use crate::server::Server;
 pub mod client;
 pub mod error;
 pub mod rest_api;
-pub mod grpc;
 pub mod quic;
 pub mod server;
 
@@ -23,13 +22,13 @@ where
 
     let app = rest_api::make_app(server.clone());
 
-    let addr_grpc = "0.0.0.0:50051".parse().unwrap();
-    let grpc_service = server.clone().make_grpc_service().await.unwrap();
-    tokio::spawn(grpc_service.serve(addr_grpc));
-    tracing::info!("listening on {} for gRPC", addr_grpc);
-
     let addr_quic = "0.0.0.0:50051".parse().unwrap();
-    tokio::spawn(server.clone().serve_quic(addr_quic));
+    tokio::spawn(async move {
+        if let Err(err) = server.clone().serve_quic(addr_quic).await {
+            tracing::error!("QUIC server failed: {err}");
+        }
+    });
+    tracing::info!("listening on {} for QUIC", addr_quic);
 
     // run our app with hyper, listening globally on port 3000
     let addr = "0.0.0.0:3000";
