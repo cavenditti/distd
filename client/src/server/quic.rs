@@ -5,7 +5,7 @@ use distd_core::proto::{
     sync_message::Msg, ClientKeepAlive, ClientRegister, ManifestRequest, ManifestResponse,
     PossessionBitfield, ServerMetadata, SyncMessage,
 };
-use distd_core::transport::TransportOp;
+use distd_core::transport::{decode_sync_payload, TransportOp};
 use distd_core::utils::frame::{
     read_length_delimited_async, write_length_delimited_async, write_optional_uuid_async,
     write_transport_op_async,
@@ -232,10 +232,11 @@ where
 }
 
 impl QuicSyncSession {
-    pub async fn send_possession_and_collect(
+    pub async fn send_possession_and_collect_chunks(
         mut self,
         possession: PossessionBitfield,
-    ) -> Result<Vec<SyncMessage>, ServerRequest> {
+        chunk_sizes: &[usize],
+    ) -> Result<Vec<Vec<u8>>, ServerRequest> {
         write_length_delimited_async(&mut self.send, &possession)
             .await
             .map_err(|err| ServerRequest::Quic(err.to_string()))?;
@@ -243,10 +244,10 @@ impl QuicSyncSession {
             .finish()
             .map_err(|err| ServerRequest::Quic(err.to_string()))?;
 
-        let mut responses = Vec::new();
+        let mut received = Vec::new();
         loop {
             match read_length_delimited_async::<_, SyncMessage>(&mut self.recv).await {
-                Ok(message) => responses.push(message),
+                Ok(message) => decode_sync_message_into(message, chunk_sizes, &mut received)?,
                 Err(distd_core::utils::frame::FrameError::IoError(err))
                     if err.kind() == std::io::ErrorKind::UnexpectedEof =>
                 {
@@ -256,15 +257,58 @@ impl QuicSyncSession {
             }
         }
 
-        Ok(responses)
+        Ok(received)
+    }
+}
+
+fn decode_sync_message_into(
+    message: SyncMessage,
+    chunk_sizes: &[usize],
+    received: &mut Vec<Vec<u8>>,
+) -> Result<(), ServerRequest> {
+    match message {
+        SyncMessage {
+            msg: Some(Msg::ChunkData(cd)),
+        } => {
+            received.push(decode_sync_payload(
+                cd.compression,
+                &cd.data,
+                cd.uncompressed_size,
+            )?);
+            Ok(())
+        }
+        SyncMessage {
+            msg: Some(Msg::BulkData(bd)),
+        } => {
+            let decoded = decode_sync_payload(bd.compression, &bd.data, bd.uncompressed_size)?;
+            let mut offset = 0;
+            for i in 0..bd.count {
+                let idx = bd.start_index + i;
+                let this_size = *chunk_sizes
+                    .get(idx as usize)
+                    .ok_or(ServerRequest::UnexpectedMessage)?;
+                if offset + this_size > decoded.len() {
+                    return Err(ServerRequest::UnexpectedMessage);
+                }
+                received.push(decoded[offset..offset + this_size].to_vec());
+                offset += this_size;
+            }
+
+            if offset != decoded.len() {
+                return Err(ServerRequest::UnexpectedMessage);
+            }
+
+            Ok(())
+        }
+        _ => Err(ServerRequest::UnexpectedMessage),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::read_sync_manifest_response;
+    use super::{decode_sync_message_into, read_sync_manifest_response};
     use distd_core::proto::{
-        sync_message::Msg, ChunkData, ManifestResponse, PayloadCompression, SyncMessage,
+        sync_message::Msg, BulkData, ChunkData, ManifestResponse, PayloadCompression, SyncMessage,
     };
     use distd_core::utils::frame::write_length_delimited_async;
     use tokio::io::duplex;
@@ -322,6 +366,45 @@ mod tests {
         let err = read_sync_manifest_response(&mut reader)
             .await
             .expect_err("non-manifest frame should fail");
+        assert!(matches!(
+            err,
+            crate::error::ServerRequest::UnexpectedMessage
+        ));
+    }
+
+    #[test]
+    fn decodes_bulk_data_frames_directly_into_chunks() {
+        let mut received = Vec::new();
+        let message = SyncMessage {
+            msg: Some(Msg::BulkData(BulkData {
+                start_index: 1,
+                count: 2,
+                data: vec![3, 4, 5, 6, 7],
+                compression: PayloadCompression::Unspecified as i32,
+                uncompressed_size: 5,
+            })),
+        };
+
+        decode_sync_message_into(message, &[2, 2, 3], &mut received).expect("decode bulk frame");
+
+        assert_eq!(received, vec![vec![3, 4], vec![5, 6, 7]]);
+    }
+
+    #[test]
+    fn rejects_bulk_data_with_invalid_decoded_length() {
+        let mut received = Vec::new();
+        let message = SyncMessage {
+            msg: Some(Msg::BulkData(BulkData {
+                start_index: 0,
+                count: 2,
+                data: vec![1, 2, 3],
+                compression: PayloadCompression::Unspecified as i32,
+                uncompressed_size: 3,
+            })),
+        };
+
+        let err = decode_sync_message_into(message, &[2, 2], &mut received)
+            .expect_err("short bulk frame should fail");
         assert!(matches!(
             err,
             crate::error::ServerRequest::UnexpectedMessage

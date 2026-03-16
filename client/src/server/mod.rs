@@ -13,8 +13,7 @@ use distd_core::{
     hash::Hash,
     item::{FileEntry, Manifest},
     metadata::Server as ServerMetadata,
-    proto::{self, sync_message::Msg, SyncMessage},
-    transport::decode_sync_payload,
+    proto::{self},
     version::VERSION,
 };
 
@@ -71,12 +70,17 @@ impl TransportClient {
 }
 
 impl SyncContinuation {
-    async fn send_possession_and_collect(
+    async fn send_possession_and_collect_chunks(
         self,
         possession: proto::PossessionBitfield,
-    ) -> Result<Vec<SyncMessage>, ServerRequest> {
+        chunk_sizes: &[usize],
+    ) -> Result<Vec<Vec<u8>>, ServerRequest> {
         match self {
-            Self::Quic(session) => session.send_possession_and_collect(possession).await,
+            Self::Quic(session) => {
+                session
+                    .send_possession_and_collect_chunks(possession, chunk_sizes)
+                    .await
+            }
         }
     }
 }
@@ -323,44 +327,14 @@ impl Server {
             .map(|chunk| chunk.size as usize)
             .collect();
 
-        let responses = continuation
-            .send_possession_and_collect(proto::PossessionBitfield {
-                bitfield: local_bitfield.to_bytes(),
-            })
+        let received = continuation
+            .send_possession_and_collect_chunks(
+                proto::PossessionBitfield {
+                    bitfield: local_bitfield.to_bytes(),
+                },
+                &chunk_sizes,
+            )
             .await?;
-
-        let mut received = Vec::new();
-        for msg in responses {
-            match msg {
-                SyncMessage {
-                    msg: Some(Msg::ChunkData(cd)),
-                } => {
-                    received.push(decode_sync_payload(
-                        cd.compression,
-                        &cd.data,
-                        cd.uncompressed_size,
-                    )?);
-                }
-                SyncMessage {
-                    msg: Some(Msg::BulkData(bd)),
-                } => {
-                    let decoded =
-                        decode_sync_payload(bd.compression, &bd.data, bd.uncompressed_size)?;
-                    let mut offset = 0;
-                    for i in 0..bd.count {
-                        let idx = bd.start_index + i;
-                        let this_size = *chunk_sizes
-                            .get(idx as usize)
-                            .ok_or(ServerRequest::UnexpectedMessage)?;
-                        if offset + this_size <= decoded.len() {
-                            received.push(decoded[offset..offset + this_size].to_vec());
-                        }
-                        offset += this_size;
-                    }
-                }
-                _ => {}
-            }
-        }
 
         Ok((manifest, chunk_infos, received))
     }

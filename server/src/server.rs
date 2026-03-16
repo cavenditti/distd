@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -258,76 +258,13 @@ where
             bitfield.chunk_count()
         );
 
-        if bitfield.is_empty() && !missing.is_empty() {
-            const BULK_TARGET_BYTES: usize = 16 * 1024 * 1024;
-            const BULK_MAX_CHUNKS: usize = 512;
-
-            let mut cursor = 0;
-            while cursor < missing.len() {
-                let start_index = missing[cursor];
-                let mut count = 0usize;
-                let mut bulk_buf = Vec::with_capacity(BULK_TARGET_BYTES);
-
-                while cursor < missing.len() && count < BULK_MAX_CHUNKS {
-                    let idx = missing[cursor];
-                    if idx != start_index + count as u32 {
-                        break;
-                    }
-
-                    let Some(data) = self.storage.get_chunk_by_index(&root_hash, idx) else {
-                        cursor += 1;
-                        continue;
-                    };
-
-                    if count > 0 && bulk_buf.len() + data.len() > BULK_TARGET_BYTES {
-                        break;
-                    }
-
-                    bulk_buf.extend_from_slice(&data);
-                    count += 1;
-                    cursor += 1;
-                }
-
-                if count == 0 {
-                    continue;
-                }
-
-                let encoded = maybe_compress_sync_payload(
-                    &bulk_buf,
-                    Some(item.metadata.path.as_path()),
-                    likely_precompressed,
-                )
-                .map_err(|err| err.to_string())?;
-
-                messages.push(SyncMessage {
-                    msg: Some(Msg::BulkData(proto::BulkData {
-                        data: encoded.data,
-                        start_index,
-                        count: count as u32,
-                        compression: encoded.compression,
-                        uncompressed_size: encoded.uncompressed_size,
-                    })),
-                });
-            }
-        } else {
-            for idx in missing {
-                if let Some(data) = self.storage.get_chunk_by_index(&root_hash, idx) {
-                    let encoded = maybe_compress_sync_payload(
-                        &data,
-                        Some(item.metadata.path.as_path()),
-                        likely_precompressed,
-                    )
-                    .map_err(|err| err.to_string())?;
-                    messages.push(SyncMessage {
-                        msg: Some(Msg::ChunkData(proto::ChunkData {
-                            chunk_index: idx,
-                            data: encoded.data,
-                            compression: encoded.compression,
-                            uncompressed_size: encoded.uncompressed_size,
-                        })),
-                    });
-                }
-            }
+        for batch in build_sync_payload_batches(
+            &missing,
+            Some(item.metadata.path.as_path()),
+            likely_precompressed,
+            |idx| self.storage.get_chunk_by_index(&root_hash, idx),
+        )? {
+            messages.push(batch);
         }
 
         Ok(messages)
@@ -536,5 +473,139 @@ where
     #[must_use]
     pub fn public_key(&self) -> &[u8] {
         self.key_pair.public_key().as_ref()
+    }
+}
+
+const BULK_TARGET_BYTES: usize = 16 * 1024 * 1024;
+const BULK_MAX_CHUNKS: usize = 512;
+
+fn build_sync_payload_batches<F>(
+    missing: &[u32],
+    primary_path: Option<&Path>,
+    likely_precompressed: bool,
+    mut load_chunk: F,
+) -> Result<Vec<SyncMessage>, String>
+where
+    F: FnMut(u32) -> Option<Vec<u8>>,
+{
+    let mut messages = Vec::new();
+    let mut cursor = 0;
+
+    while cursor < missing.len() {
+        let start_index = missing[cursor];
+        let mut current_index = start_index;
+        let mut count = 0usize;
+        let mut bulk_buf = Vec::with_capacity(BULK_TARGET_BYTES);
+
+        while cursor < missing.len() && count < BULK_MAX_CHUNKS {
+            let idx = missing[cursor];
+            if idx != current_index {
+                break;
+            }
+
+            let Some(data) = load_chunk(idx) else {
+                if count == 0 {
+                    cursor += 1;
+                }
+                break;
+            };
+
+            if count > 0 && bulk_buf.len() + data.len() > BULK_TARGET_BYTES {
+                break;
+            }
+
+            bulk_buf.extend_from_slice(&data);
+            count += 1;
+            cursor += 1;
+            current_index += 1;
+        }
+
+        if count == 0 {
+            continue;
+        }
+
+        let encoded = maybe_compress_sync_payload(&bulk_buf, primary_path, likely_precompressed)
+            .map_err(|err| err.to_string())?;
+
+        let message = if count == 1 {
+            SyncMessage {
+                msg: Some(Msg::ChunkData(proto::ChunkData {
+                    chunk_index: start_index,
+                    data: encoded.data,
+                    compression: encoded.compression,
+                    uncompressed_size: encoded.uncompressed_size,
+                })),
+            }
+        } else {
+            SyncMessage {
+                msg: Some(Msg::BulkData(proto::BulkData {
+                    data: encoded.data,
+                    start_index,
+                    count: count as u32,
+                    compression: encoded.compression,
+                    uncompressed_size: encoded.uncompressed_size,
+                })),
+            }
+        };
+        messages.push(message);
+    }
+
+    Ok(messages)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_sync_payload_batches;
+    use distd_core::proto::{sync_message::Msg, PayloadCompression};
+
+    #[test]
+    fn builds_bulk_messages_for_contiguous_partial_runs() {
+        let messages = build_sync_payload_batches(&[1, 2, 4], None, false, |idx| match idx {
+            1 => Some(vec![1, 2]),
+            2 => Some(vec![3, 4]),
+            4 => Some(vec![9]),
+            _ => None,
+        })
+        .expect("build sync payload batches");
+
+        assert_eq!(messages.len(), 2);
+
+        match &messages[0].msg {
+            Some(Msg::BulkData(bulk)) => {
+                assert_eq!(bulk.start_index, 1);
+                assert_eq!(bulk.count, 2);
+                assert_eq!(bulk.data, vec![1, 2, 3, 4]);
+                assert_eq!(bulk.compression, PayloadCompression::Unspecified as i32);
+            }
+            other => panic!("expected bulk message, got {other:?}"),
+        }
+
+        match &messages[1].msg {
+            Some(Msg::ChunkData(chunk)) => {
+                assert_eq!(chunk.chunk_index, 4);
+                assert_eq!(chunk.data, vec![9]);
+                assert_eq!(chunk.compression, PayloadCompression::Unspecified as i32);
+            }
+            other => panic!("expected chunk message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn skips_missing_chunks_absent_from_storage() {
+        let messages = build_sync_payload_batches(&[0, 1, 2], None, false, |idx| match idx {
+            1 => Some(vec![7, 8]),
+            2 => Some(vec![9, 10]),
+            _ => None,
+        })
+        .expect("build sync payload batches");
+
+        assert_eq!(messages.len(), 1);
+        match &messages[0].msg {
+            Some(Msg::BulkData(bulk)) => {
+                assert_eq!(bulk.start_index, 1);
+                assert_eq!(bulk.count, 2);
+            }
+            other => panic!("expected bulk message, got {other:?}"),
+        }
     }
 }
