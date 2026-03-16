@@ -1,4 +1,4 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tonic_build::compile_protos("proto/distd.proto")?;
+    prost_build::Config::new().compile_protos(&["proto/distd.proto"], &["proto"])?;
     Ok(())
 }

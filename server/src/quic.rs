@@ -305,6 +305,25 @@ mod tests {
         (handle, addr, server)
     }
 
+    async fn register_client_uuid(connection: &quinn::Connection) -> Uuid {
+        let (mut send, mut recv) = open_authed_stream(connection, TransportOp::Register, None).await;
+        write_length_delimited_async(
+            &mut send,
+            &ClientRegister {
+                name: "test-client".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                uuid: None,
+            },
+        )
+        .await
+        .expect("write register request");
+        send.finish().expect("finish register");
+        let register = read_length_delimited_async::<_, distd_core::proto::ServerMetadata>(&mut recv)
+            .await
+            .expect("read register response");
+        Uuid::from_slice(register.uuid.as_ref().expect("uuid present")).expect("valid uuid")
+    }
+
     #[tokio::test]
     async fn quic_register_and_fetch_round_trip() {
         let (server_task, addr, server) = start_test_server().await;
@@ -320,24 +339,7 @@ mod tests {
             .expect("publish test item");
 
         let (_endpoint, connection) = connect_client(addr).await;
-
-        let (mut send, mut recv) = open_authed_stream(&connection, TransportOp::Register, None).await;
-        write_length_delimited_async(
-            &mut send,
-            &ClientRegister {
-                name: "test-client".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                uuid: None,
-            },
-        )
-        .await
-        .expect("write register request");
-        send.finish().expect("finish register");
-
-        let register = read_length_delimited_async::<_, distd_core::proto::ServerMetadata>(&mut recv)
-            .await
-            .expect("read register response");
-        let uuid = Uuid::from_slice(register.uuid.as_ref().expect("uuid present")).expect("valid uuid");
+        let uuid = register_client_uuid(&connection).await;
 
         let (mut send, mut recv) = open_authed_stream(&connection, TransportOp::Fetch, Some(uuid)).await;
         write_length_delimited_async(&mut send, &ClientKeepAlive {})
@@ -369,23 +371,7 @@ mod tests {
             .expect("publish test item");
 
         let (_endpoint, connection) = connect_client(addr).await;
-
-        let (mut send, mut recv) = open_authed_stream(&connection, TransportOp::Register, None).await;
-        write_length_delimited_async(
-            &mut send,
-            &ClientRegister {
-                name: "test-client".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                uuid: None,
-            },
-        )
-        .await
-        .expect("write register request");
-        send.finish().expect("finish register");
-        let register = read_length_delimited_async::<_, distd_core::proto::ServerMetadata>(&mut recv)
-            .await
-            .expect("read register response");
-        let uuid = Uuid::from_slice(register.uuid.as_ref().expect("uuid present")).expect("valid uuid");
+        let uuid = register_client_uuid(&connection).await;
 
         let (mut send, mut recv) = open_authed_stream(&connection, TransportOp::Sync, Some(uuid)).await;
         write_length_delimited_async(
@@ -442,6 +428,81 @@ mod tests {
             }
         }
         assert!(saw_payload, "expected at least one payload frame");
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn quic_fetch_rejects_unauthenticated_client() {
+        let (server_task, addr, _server) = start_test_server().await;
+        let (_endpoint, connection) = connect_client(addr).await;
+
+        let (mut send, mut recv) = open_authed_stream(&connection, TransportOp::Fetch, None).await;
+        write_length_delimited_async(&mut send, &ClientKeepAlive {})
+            .await
+            .expect("write fetch request");
+        send.finish().expect("finish fetch");
+
+        match read_length_delimited_async::<_, distd_core::proto::ServerMetadata>(&mut recv).await {
+            Err(distd_core::utils::frame::FrameError::IoError(err))
+                if err.kind() == std::io::ErrorKind::UnexpectedEof => {}
+            other => panic!("expected EOF for unauthenticated fetch, got {other:?}"),
+        }
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn quic_sync_rejects_invalid_possession_bitfield() {
+        let (server_task, addr, server) = start_test_server().await;
+        server
+            .publish_item(
+                "artifact-a".to_string(),
+                "artifact-a".into(),
+                Some("test artifact".to_string()),
+                axum::body::Bytes::from_static(b"hello over quic"),
+                distd_core::chunks::ChunkAlgorithm::default(),
+            )
+            .await
+            .expect("publish test item");
+
+        let (_endpoint, connection) = connect_client(addr).await;
+        let uuid = register_client_uuid(&connection).await;
+
+        let (mut send, mut recv) = open_authed_stream(&connection, TransportOp::Sync, Some(uuid)).await;
+        write_length_delimited_async(
+            &mut send,
+            &ManifestRequest {
+                artifact_id: "artifact-a".to_string(),
+                version: None,
+            },
+        )
+        .await
+        .expect("write manifest request");
+
+        let manifest = read_length_delimited_async::<_, SyncMessage>(&mut recv)
+            .await
+            .expect("read manifest frame");
+        match manifest.msg {
+            Some(Msg::ManifestResponse(_)) => {}
+            other => panic!("unexpected manifest response: {other:?}"),
+        }
+
+        write_length_delimited_async(
+            &mut send,
+            &PossessionBitfield {
+                bitfield: vec![0, 0, 0, 0],
+            },
+        )
+        .await
+        .expect("write malformed possession bitfield");
+        send.finish().expect("finish sync request");
+
+        match read_length_delimited_async::<_, SyncMessage>(&mut recv).await {
+            Err(distd_core::utils::frame::FrameError::IoError(err))
+                if err.kind() == std::io::ErrorKind::UnexpectedEof => {}
+            other => panic!("expected EOF after invalid bitfield, got {other:?}"),
+        }
 
         server_task.abort();
     }

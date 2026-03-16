@@ -18,15 +18,5 @@ pub mod version;
 #[allow(clippy::all)]
 #[allow(warnings)]
 pub mod proto {
-    tonic::include_proto!("distd");
+    include!(concat!(env!("OUT_DIR"), "/distd.rs"));
 }
-
-pub use tonic;
-
-pub type Client<T> = proto::distd_client::DistdClient<T>;
-pub type Server<T> = proto::distd_server::DistdServer<T>;
-
-pub type Request<T> = tonic::Request<T>;
-
-pub type GrpcError = tonic::Status;
-pub type TransportError = tonic::transport::Error;

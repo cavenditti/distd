@@ -10,10 +10,8 @@ documentation.workspace = true
 workspace = true
 
 [dependencies]
-tonic = { workspace = true }
 prost = { workspace = true }
 tokio = { workspace = true }
-tokio-stream = { workspace = true }
 quinn = { workspace = true }
 rcgen = { workspace = true }
 

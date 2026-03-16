@@ -92,7 +92,7 @@ struct Cli {
     #[arg(long)]
     net_bandwidth_mbps: Option<f64>,
 
-    /// Drop this percentage of proxied UDP packets; ignored for TCP/gRPC
+    /// Drop this percentage of proxied QUIC packets
     #[arg(long, default_value_t = 0.0)]
     net_loss_percent: f64,
 }

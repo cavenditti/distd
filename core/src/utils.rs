@@ -1,6 +1,5 @@
 pub mod path;
 pub mod serde;
-pub mod grpc;
 pub mod frame;
 pub mod stream;
 pub mod uuid;

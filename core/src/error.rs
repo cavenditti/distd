@@ -1,9 +1,8 @@
 use std::str::Utf8Error;
 
 use thiserror::Error;
-use tonic::metadata::errors::{InvalidMetadataValue, InvalidMetadataValueBytes};
 
-use crate::{chunk_storage::StorageError, hash::Hash, GrpcError, TransportError};
+use crate::{chunk_storage::StorageError, hash::Hash};
 
 /// Generic `distd_core` error
 #[derive(Error, Debug)]
@@ -42,12 +41,6 @@ pub enum InvalidParameter {
     #[error("Invalid URI")]
     Uri(#[from] http::uri::InvalidUri),
 
-    #[error("Invalid metadata, possibly a bug in code")]
-    Metadata(#[from] InvalidMetadataValue),
-
-    #[error("Invalid binary metadata, possibly a bug in code")]
-    MetadataBytes(#[from] InvalidMetadataValueBytes),
-
     #[error("Invalid bitcode")]
     Bitcode(#[from] bitcode::Error),
 
@@ -72,12 +65,6 @@ pub enum Communication {
 
     #[error("Cannot reconstruct buffer from response")]
     ResponseDeserialize(#[from] bitcode::Error),
-
-    #[error("gRPC error")]
-    Grpc(#[from] GrpcError),
-
-    #[error("gRPC transport error, is server accepting connetions?")]
-    Transport(#[from] TransportError),
 
     #[error("Invalid parameter")]
     InvalidParameter(#[from] InvalidParameter),

@@ -661,7 +661,7 @@ impl ToolRunner for DistdRunner {
                         tracing::warn!("distd client update exited with error: {stderr_buf}");
                         m.notes.push_str(&format!(" | client error: {stderr_buf}"));
                     }
-                    if stderr_buf.contains("gRPC stream error during transfer") {
+                    if stderr_buf.contains("QUIC transport error") {
                         m.correct = false;
                         m.notes.push_str(" | transfer stream error observed");
                     }
