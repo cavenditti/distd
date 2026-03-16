@@ -62,8 +62,11 @@ where
         return Ok(None);
     }
 
-    let frame_len = u32::from_be_bytes(buffer[..4].try_into().map_err(|_| FrameError::MalformedFrame)?)
-        as usize;
+    let frame_len = u32::from_be_bytes(
+        buffer[..4]
+            .try_into()
+            .map_err(|_| FrameError::MalformedFrame)?,
+    ) as usize;
     let total_len = 4 + frame_len;
     if buffer.len() < total_len {
         return Ok(None);
@@ -73,7 +76,10 @@ where
     Ok(Some((message, total_len)))
 }
 
-pub async fn write_length_delimited_async<W, M>(writer: &mut W, message: &M) -> Result<(), FrameError>
+pub async fn write_length_delimited_async<W, M>(
+    writer: &mut W,
+    message: &M,
+) -> Result<(), FrameError>
 where
     W: AsyncWrite + Unpin,
     M: Message,
@@ -111,7 +117,10 @@ where
     Ok(TransportOp::try_from(reader.read_u8().await?)?)
 }
 
-pub async fn write_optional_uuid_async<W>(writer: &mut W, uuid: Option<Uuid>) -> Result<(), FrameError>
+pub async fn write_optional_uuid_async<W>(
+    writer: &mut W,
+    uuid: Option<Uuid>,
+) -> Result<(), FrameError>
 where
     W: AsyncWrite + Unpin,
 {
@@ -175,9 +184,10 @@ mod tests {
         let (decoded_first, consumed) = try_decode_length_delimited::<SyncMessage>(&buffer)
             .unwrap()
             .unwrap();
-        let (decoded_second, consumed_second) = try_decode_length_delimited::<SyncMessage>(&buffer[consumed..])
-            .unwrap()
-            .unwrap();
+        let (decoded_second, consumed_second) =
+            try_decode_length_delimited::<SyncMessage>(&buffer[consumed..])
+                .unwrap()
+                .unwrap();
 
         assert_eq!(decoded_first, message("artifact-a"));
         assert_eq!(decoded_second, message("artifact-b"));
@@ -188,9 +198,13 @@ mod tests {
     fn waits_for_complete_frame() {
         let encoded = encode_length_delimited(&message("artifact-a")).unwrap();
 
-        assert!(try_decode_length_delimited::<SyncMessage>(&encoded[..3]).unwrap().is_none());
-        assert!(try_decode_length_delimited::<SyncMessage>(&encoded[..encoded.len() - 1])
+        assert!(try_decode_length_delimited::<SyncMessage>(&encoded[..3])
             .unwrap()
             .is_none());
+        assert!(
+            try_decode_length_delimited::<SyncMessage>(&encoded[..encoded.len() - 1])
+                .unwrap()
+                .is_none()
+        );
     }
 }

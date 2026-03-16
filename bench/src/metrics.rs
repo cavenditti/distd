@@ -105,14 +105,8 @@ impl ProcessMonitor {
         let pids: Vec<Pid> = pids.iter().map(|&p| Pid::from_u32(p)).collect();
 
         // Initial refresh — sysinfo 0.32 uses refresh_processes_specifics
-        let refresh = ProcessRefreshKind::new()
-            .with_memory()
-            .with_cpu();
-        system.refresh_processes_specifics(
-            ProcessesToUpdate::Some(&pids),
-            true,
-            refresh,
-        );
+        let refresh = ProcessRefreshKind::new().with_memory().with_cpu();
+        system.refresh_processes_specifics(ProcessesToUpdate::Some(&pids), true, refresh);
 
         let baseline_rss: u64 = pids
             .iter()
@@ -138,14 +132,9 @@ impl ProcessMonitor {
 
     /// Sample current process metrics. Call periodically during the benchmark.
     pub fn sample(&mut self) {
-        let refresh = ProcessRefreshKind::new()
-            .with_memory()
-            .with_cpu();
-        self.system.refresh_processes_specifics(
-            ProcessesToUpdate::Some(&self.pids),
-            true,
-            refresh,
-        );
+        let refresh = ProcessRefreshKind::new().with_memory().with_cpu();
+        self.system
+            .refresh_processes_specifics(ProcessesToUpdate::Some(&self.pids), true, refresh);
 
         let rss: u64 = self
             .pids

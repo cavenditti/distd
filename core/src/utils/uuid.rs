@@ -7,7 +7,8 @@ pub fn bytes_to_uuid(x: &Bytes) -> Uuid {
 }
 
 /// Convert little endian slice of bytes to Uuid
-#[must_use] pub fn slice_to_uuid(x: &[u8]) -> Uuid {
+#[must_use]
+pub fn slice_to_uuid(x: &[u8]) -> Uuid {
     let bytes: [u8; 16] = x[..16].try_into().expect("slice must be at least 16 bytes");
     Uuid::from_bytes(bytes)
 }

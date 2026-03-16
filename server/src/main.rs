@@ -8,8 +8,8 @@ use crate::server::Server;
 
 pub mod client;
 pub mod error;
-pub mod rest_api;
 pub mod quic;
+pub mod rest_api;
 pub mod server;
 
 /// Run the server with a concrete storage backend.
@@ -101,7 +101,9 @@ async fn main() {
             run_server(server).await;
         }
         other => {
-            eprintln!("Unknown DISTD_STORAGE value: {other}. Supported: \"fs\", \"redb\", \"memory\".");
+            eprintln!(
+                "Unknown DISTD_STORAGE value: {other}. Supported: \"fs\", \"redb\", \"memory\"."
+            );
             std::process::exit(1);
         }
     }

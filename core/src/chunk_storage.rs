@@ -45,7 +45,12 @@ pub enum StorageError {
 pub trait ChunkStorage: HashTreeCapable<Arc<Node>, Error> {
     fn get(&self, hash: &Hash) -> Option<Arc<Node>>;
     fn store_chunk(&self, hash: Hash, chunk: &[u8]) -> Result<Arc<Node>, StorageError>;
-    fn store_link(&self, hash: Hash, left: Arc<Node>, right: Arc<Node>) -> Result<Arc<Node>, StorageError>;
+    fn store_link(
+        &self,
+        hash: Hash,
+        left: Arc<Node>,
+        right: Arc<Node>,
+    ) -> Result<Arc<Node>, StorageError>;
 
     fn chunks(&self) -> Vec<Hash>;
 
@@ -175,7 +180,9 @@ pub trait ChunkStorage: HashTreeCapable<Arc<Node>, Error> {
     where
         Self: Sized,
     {
-        Err(Error::Other("multi-file artifacts are unsupported by this storage".to_string()))
+        Err(Error::Other(
+            "multi-file artifacts are unsupported by this storage".to_string(),
+        ))
     }
 
     /// Build a new Item from its metadata and root node
@@ -191,7 +198,14 @@ pub trait ChunkStorage: HashTreeCapable<Arc<Node>, Error> {
     where
         Self: Sized,
     {
-        Ok(Item::new(name, path, revision, description, &root, chunk_algorithm))
+        Ok(Item::new(
+            name,
+            path,
+            revision,
+            description,
+            &root,
+            chunk_algorithm,
+        ))
     }
 
     /// Build a new Item from its metadata and a streaming of nodes
@@ -219,7 +233,14 @@ pub trait ChunkStorage: HashTreeCapable<Arc<Node>, Error> {
             let n = n.ok_or(StorageError::TreeReconstruct)?;
             tracing::trace!("Reconstructed {i} nodes with {} bytes total", n.size());
 
-            Ok(Item::new(name, path, revision, description, &n, chunk_algorithm))
+            Ok(Item::new(
+                name,
+                path,
+                revision,
+                description,
+                &n,
+                chunk_algorithm,
+            ))
         }
     }
 
@@ -406,7 +427,11 @@ mod tests {
     macro_rules! chunk_storage_tests {
         ($t:ty, $builder:ident) => {
             crate::chunk_storage::tests::chunk_storage_tests!($t, single_chunk_insertion, $builder);
-            crate::chunk_storage::tests::chunk_storage_tests!($t, multiple_chunks_insertion, $builder);
+            crate::chunk_storage::tests::chunk_storage_tests!(
+                $t,
+                multiple_chunks_insertion,
+                $builder
+            );
             crate::chunk_storage::tests::chunk_storage_tests!($t, chunks_deduplication, $builder);
             crate::chunk_storage::tests::chunk_storage_tests!($t, storage_2mb, $builder);
             crate::chunk_storage::tests::chunk_storage_tests!($t, storage_3_chunks, $builder);

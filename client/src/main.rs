@@ -3,9 +3,9 @@
 
 pub mod client;
 pub mod error;
+pub mod persistence;
 pub mod server;
 pub mod settings;
-pub mod persistence;
 
 pub use error::Client as ClientError;
 

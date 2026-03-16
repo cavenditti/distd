@@ -25,8 +25,7 @@ impl CasStorage {
     /// Default CAS location under the user's cache directory.
     #[must_use]
     pub fn default_path() -> PathBuf {
-        crate::utils::settings::cache_dir()
-            .join("cas")
+        crate::utils::settings::cache_dir().join("cas")
     }
 
     fn chunk_path(&self, hash: &Hash) -> PathBuf {

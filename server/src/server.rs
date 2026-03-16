@@ -12,7 +12,10 @@ use distd_core::chunks::{chunk_algorithm_likely_precompressed, ChunkAlgorithm};
 use distd_core::item::{ArtifactId, Item, Name as ItemName};
 use distd_core::metadata::Server as ServerMetadata;
 use distd_core::possession::Bitfield;
-use distd_core::proto::{self, sync_message::Msg, ClientKeepAlive, ClientRegister, ServerMetadata as ProtoServerMetadata, SyncMessage};
+use distd_core::proto::{
+    self, sync_message::Msg, ClientKeepAlive, ClientRegister,
+    ServerMetadata as ProtoServerMetadata, SyncMessage,
+};
 use distd_core::transport::maybe_compress_sync_payload;
 use distd_core::utils::serde::BitcodeSerializable;
 use distd_core::utils::uuid::slice_to_uuid;
@@ -102,7 +105,11 @@ where
     ///
     /// The `uuid_nonce` is derived from a random UUID (not from the key bytes) so that it
     /// remains unique across restarts even when the same key is reused.
-    pub fn new(pkcs8_bytes: &Document, storage: T, metadata: InternalMetadata) -> Result<Self, KeyRejected> {
+    pub fn new(
+        pkcs8_bytes: &Document,
+        storage: T,
+        metadata: InternalMetadata,
+    ) -> Result<Self, KeyRejected> {
         let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8_bytes.as_ref())?;
         // Use a cryptographically random nonce – never derived from key material.
         let uuid_nonce = Uuid::new_v4().to_string();
@@ -220,8 +227,8 @@ where
                         chunk_end: entry.chunk_range.1,
                     })
                     .collect(),
-                    chunk_algorithm: Some(item.manifest.chunk_algorithm.to_proto()),
-                    chunk_sizes: item.chunks.iter().map(|chunk| chunk.size as u32).collect(),
+                chunk_algorithm: Some(item.manifest.chunk_algorithm.to_proto()),
+                chunk_sizes: item.chunks.iter().map(|chunk| chunk.size as u32).collect(),
             },
             item,
         ))
@@ -241,7 +248,8 @@ where
         }
 
         let mut messages = Vec::new();
-        let likely_precompressed = chunk_algorithm_likely_precompressed(item.manifest.chunk_algorithm);
+        let likely_precompressed =
+            chunk_algorithm_likely_precompressed(item.manifest.chunk_algorithm);
 
         let missing = bitfield.missing_indices();
         tracing::debug!(
@@ -289,7 +297,7 @@ where
                     Some(item.metadata.path.as_path()),
                     likely_precompressed,
                 )
-                    .map_err(|err| err.to_string())?;
+                .map_err(|err| err.to_string())?;
 
                 messages.push(SyncMessage {
                     msg: Some(Msg::BulkData(proto::BulkData {
@@ -309,7 +317,7 @@ where
                         Some(item.metadata.path.as_path()),
                         likely_precompressed,
                     )
-                        .map_err(|err| err.to_string())?;
+                    .map_err(|err| err.to_string())?;
                     messages.push(SyncMessage {
                         msg: Some(Msg::ChunkData(proto::ChunkData {
                             chunk_index: idx,
@@ -335,10 +343,7 @@ where
         messages.push(SyncMessage {
             msg: Some(Msg::ManifestResponse(manifest)),
         });
-        messages.extend(
-            self.sync_chunk_response_messages(&item, possession)
-                .await?,
-        );
+        messages.extend(self.sync_chunk_response_messages(&item, possession).await?);
         Ok(messages)
     }
 
@@ -358,7 +363,13 @@ where
         let span = span!(tracing::Level::INFO, "register_client");
         let _entered = span.enter();
 
-        tracing::info!("Got new client: \"{}\" ver:{:?}, @{}, {:?}", name, version, addr, uuid);
+        tracing::info!(
+            "Got new client: \"{}\" ver:{:?}, @{}, {:?}",
+            name,
+            version,
+            addr,
+            uuid
+        );
         let nonced_name = name.clone() + &self.uuid_nonce + &addr.to_string();
         tracing::debug!("Client nonced name: '{}'", nonced_name);
 
@@ -522,7 +533,8 @@ where
     }
 
     /// Get the public key of the server
-    #[must_use] pub fn public_key(&self) -> &[u8] {
+    #[must_use]
+    pub fn public_key(&self) -> &[u8] {
         self.key_pair.public_key().as_ref()
     }
 }

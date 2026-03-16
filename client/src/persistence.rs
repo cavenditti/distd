@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use crate::settings::cache_dir;
 
 #[inline]
-#[must_use] pub fn state_path() -> PathBuf {
+#[must_use]
+pub fn state_path() -> PathBuf {
     let p = cache_dir().join(format!("{}_state.json", env!("CARGO_PKG_NAME")));
     tracing::trace!("State path: {}", p.to_string_lossy());
     p
@@ -23,7 +24,8 @@ pub struct ClientPersistentState {
 }
 
 impl ClientPersistentState {
-    #[must_use] pub fn commit(&self) -> Option<()> {
+    #[must_use]
+    pub fn commit(&self) -> Option<()> {
         std::fs::File::create(state_path())
             .map(std::io::BufWriter::new)
             .ok()

@@ -126,14 +126,16 @@ impl Client<FsStorage> {
         target: ItemMetadata,
         from: &[Hash],
     ) -> Result<Item, ClientError> {
-        let (manifest, chunk_infos, received_chunks) = self
-            .server
-            .sync_artifact(&target.artifact_id, from)
-            .await?;
+        let (manifest, chunk_infos, received_chunks) =
+            self.server.sync_artifact(&target.artifact_id, from).await?;
 
         let received_chunk_count = received_chunks.len();
-        let payload_bytes = received_chunks.iter().map(|chunk| chunk.len() as u64).sum::<u64>();
-        let item = self.storage
+        let payload_bytes = received_chunks
+            .iter()
+            .map(|chunk| chunk.len() as u64)
+            .sum::<u64>();
+        let item = self
+            .storage
             .receive_sync_item(
                 target.name,
                 target.path,
@@ -176,9 +178,7 @@ impl Client<FsStorage> {
         );
         let now = Instant::now();
 
-        let item = self
-            .sync_transfer(item_metadata.clone(), &from)
-            .await?;
+        let item = self.sync_transfer(item_metadata.clone(), &from).await?;
 
         tracing::info!(
             "Got {} v{}, {} bytes after {:.4}s",
@@ -209,9 +209,7 @@ impl Client<FsStorage> {
             from.len()
         );
 
-        let item = self
-            .sync_transfer(new_item_metadata.clone(), &from)
-            .await?;
+        let item = self.sync_transfer(new_item_metadata.clone(), &from).await?;
 
         tracing::info!(
             "Got {} v{}, {} bytes after {:.4}s",
@@ -235,11 +233,7 @@ impl Client<FsStorage> {
             let items = self.server.metadata().await.items;
             for path in &self.settings.client.sync.clone() {
                 let artifact_id = path.to_string_lossy().to_string();
-                if latest.get(&artifact_id)
-                    == items
-                        .get(&artifact_id)
-                        .map(|i| &i.root.hash)
-                {
+                if latest.get(&artifact_id) == items.get(&artifact_id).map(|i| &i.root.hash) {
                     continue;
                 }
 

@@ -7,7 +7,7 @@ use std::process::{Child, Command};
 use crate::metrics::{self, ProcessMonitor, RunMetrics};
 use crate::workload::Workload;
 
-use super::{ToolRunner, wait_child_with_timeout, DEFAULT_CHILD_TIMEOUT};
+use super::{wait_child_with_timeout, ToolRunner, DEFAULT_CHILD_TIMEOUT};
 
 /// Python HTTP server script that supports Range requests (HTTP 206).
 /// Python's stdlib http.server only returns 200 (full content) which zsync rejects.
@@ -73,11 +73,8 @@ impl ZsyncRunner {
         // Write a custom HTTP server script that supports Range requests
         let script_path = self.work_dir.join("range_server.py");
         std::fs::create_dir_all(&self.work_dir).map_err(|e| e.to_string())?;
-        std::fs::write(
-            &script_path,
-            RANGE_HTTP_SERVER_PY,
-        )
-        .map_err(|e| format!("Failed to write range_server.py: {e}"))?;
+        std::fs::write(&script_path, RANGE_HTTP_SERVER_PY)
+            .map_err(|e| format!("Failed to write range_server.py: {e}"))?;
 
         let child = Command::new("python3")
             .arg(&script_path)
@@ -104,15 +101,13 @@ impl ZsyncRunner {
 
     /// Run `zsyncmake` on a file to produce its `.zsync` control file.
     fn make_zsync_file(&self, source_file: &Path) -> Result<PathBuf, String> {
-        let zsync_file = source_file.with_extension(
-            format!(
-                "{}.zsync",
-                source_file
-                    .extension()
-                    .map(|e| e.to_string_lossy().to_string())
-                    .unwrap_or_default()
-            ),
-        );
+        let zsync_file = source_file.with_extension(format!(
+            "{}.zsync",
+            source_file
+                .extension()
+                .map(|e| e.to_string_lossy().to_string())
+                .unwrap_or_default()
+        ));
 
         // zsyncmake requires a URL for the file
         let filename = source_file
@@ -233,13 +228,14 @@ impl ToolRunner for ZsyncRunner {
         let pid = zsync_child.id();
         let mut monitor = ProcessMonitor::new(&[pid]);
 
-        let elapsed = match wait_child_with_timeout(&mut zsync_child, &mut monitor, DEFAULT_CHILD_TIMEOUT) {
-            Ok(d) => d,
-            Err(e) => {
-                let _ = http_child.kill();
-                return Err(format!("zsync: {e}"));
-            }
-        };
+        let elapsed =
+            match wait_child_with_timeout(&mut zsync_child, &mut monitor, DEFAULT_CHILD_TIMEOUT) {
+                Ok(d) => d,
+                Err(e) => {
+                    let _ = http_child.kill();
+                    return Err(format!("zsync: {e}"));
+                }
+            };
         let (peak_rss, cpu_secs) = monitor.finish();
 
         let _ = http_child.kill();
@@ -269,8 +265,9 @@ impl ToolRunner for ZsyncRunner {
             } else {
                 "FILE_NOT_FOUND".to_string()
             };
-            m.notes
-                .push_str(&format!(" | zsync correctness failed: src={src_hash} dst={dst_hash}"));
+            m.notes.push_str(&format!(
+                " | zsync correctness failed: src={src_hash} dst={dst_hash}"
+            ));
         }
 
         m.finalize();

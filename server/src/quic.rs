@@ -2,10 +2,15 @@ use std::fmt::Debug;
 use std::net::SocketAddr;
 
 use distd_core::chunk_storage::ChunkStorage;
-use distd_core::proto::{ClientKeepAlive, ClientRegister, ManifestRequest, PossessionBitfield, SyncMessage};
 use distd_core::proto::sync_message::Msg;
+use distd_core::proto::{
+    ClientKeepAlive, ClientRegister, ManifestRequest, PossessionBitfield, SyncMessage,
+};
 use distd_core::transport::TransportOp;
-use distd_core::utils::frame::{read_length_delimited_async, read_optional_uuid_async, read_transport_op_async, write_length_delimited_async};
+use distd_core::utils::frame::{
+    read_length_delimited_async, read_optional_uuid_async, read_transport_op_async,
+    write_length_delimited_async,
+};
 use quinn::{Endpoint, RecvStream, SendStream};
 use rcgen::generate_simple_self_signed;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -14,11 +19,9 @@ use crate::error::Server as ServerError;
 use crate::Server;
 
 fn make_server_config() -> Result<quinn::ServerConfig, ServerError> {
-    let certified = generate_simple_self_signed(vec![
-        String::from("localhost"),
-        String::from("127.0.0.1"),
-    ])
-    .map_err(|err| ServerError::Quic(err.to_string()))?;
+    let certified =
+        generate_simple_self_signed(vec![String::from("localhost"), String::from("127.0.0.1")])
+            .map_err(|err| ServerError::Quic(err.to_string()))?;
     let cert_der = CertificateDer::from(certified.cert.der().clone());
     let key_der = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()));
     quinn::ServerConfig::with_single_cert(vec![cert_der], key_der)
@@ -26,7 +29,8 @@ fn make_server_config() -> Result<quinn::ServerConfig, ServerError> {
 }
 
 async fn finish_send(send: &mut SendStream) -> Result<(), ServerError> {
-    send.finish().map_err(|err| ServerError::Quic(err.to_string()))?;
+    send.finish()
+        .map_err(|err| ServerError::Quic(err.to_string()))?;
     Ok(())
 }
 
@@ -47,69 +51,69 @@ where
                     .map_err(|err| ServerError::Quic(err.to_string()))?;
                 match op {
                     TransportOp::Register => {
-                let request: ClientRegister = read_length_delimited_async(recv)
-                    .await
-                    .map_err(|err| ServerError::Quic(err.to_string()))?;
-                if client_uuid.is_some() && request.uuid.is_none() {
-                    tracing::debug!("QUIC register stream carried client auth UUID");
-                }
-                let response = self
-                    .register_response(remote_addr, request)
-                    .await
-                    .map_err(ServerError::Quic)?;
-                write_length_delimited_async(send, &response)
-                    .await
-                    .map_err(|err| ServerError::Quic(err.to_string()))?;
-                finish_send(send).await
+                        let request: ClientRegister = read_length_delimited_async(recv)
+                            .await
+                            .map_err(|err| ServerError::Quic(err.to_string()))?;
+                        if client_uuid.is_some() && request.uuid.is_none() {
+                            tracing::debug!("QUIC register stream carried client auth UUID");
+                        }
+                        let response = self
+                            .register_response(remote_addr, request)
+                            .await
+                            .map_err(ServerError::Quic)?;
+                        write_length_delimited_async(send, &response)
+                            .await
+                            .map_err(|err| ServerError::Quic(err.to_string()))?;
+                        finish_send(send).await
                     }
                     TransportOp::Fetch => {
-                self.authenticate_client_uuid(client_uuid)
-                    .await
-                    .map_err(ServerError::Quic)?;
-                let request: ClientKeepAlive = read_length_delimited_async(recv)
-                    .await
-                    .map_err(|err| ServerError::Quic(err.to_string()))?;
-                let response = self
-                    .fetch_response(request)
-                    .await
-                    .map_err(ServerError::Quic)?;
-                write_length_delimited_async(send, &response)
-                    .await
-                    .map_err(|err| ServerError::Quic(err.to_string()))?;
-                finish_send(send).await
+                        self.authenticate_client_uuid(client_uuid)
+                            .await
+                            .map_err(ServerError::Quic)?;
+                        let request: ClientKeepAlive = read_length_delimited_async(recv)
+                            .await
+                            .map_err(|err| ServerError::Quic(err.to_string()))?;
+                        let response = self
+                            .fetch_response(request)
+                            .await
+                            .map_err(ServerError::Quic)?;
+                        write_length_delimited_async(send, &response)
+                            .await
+                            .map_err(|err| ServerError::Quic(err.to_string()))?;
+                        finish_send(send).await
                     }
                     TransportOp::Sync => {
-                self.authenticate_client_uuid(client_uuid)
-                    .await
-                    .map_err(ServerError::Quic)?;
-                let manifest_request: ManifestRequest = read_length_delimited_async(recv)
-                    .await
-                    .map_err(|err| ServerError::Quic(err.to_string()))?;
-                let (manifest_response, item) = self
-                    .sync_manifest_response(manifest_request)
-                    .await
-                    .map_err(ServerError::Quic)?;
-                write_length_delimited_async(
-                    send,
-                    &SyncMessage {
-                        msg: Some(Msg::ManifestResponse(manifest_response)),
-                    },
-                )
-                .await
-                .map_err(|err| ServerError::Quic(err.to_string()))?;
-                let possession: PossessionBitfield = read_length_delimited_async(recv)
-                    .await
-                    .map_err(|err| ServerError::Quic(err.to_string()))?;
-                let responses = self
-                    .sync_chunk_response_messages(&item, possession)
-                    .await
-                    .map_err(ServerError::Quic)?;
-                for response in responses {
-                    write_length_delimited_async(send, &response)
+                        self.authenticate_client_uuid(client_uuid)
+                            .await
+                            .map_err(ServerError::Quic)?;
+                        let manifest_request: ManifestRequest = read_length_delimited_async(recv)
+                            .await
+                            .map_err(|err| ServerError::Quic(err.to_string()))?;
+                        let (manifest_response, item) = self
+                            .sync_manifest_response(manifest_request)
+                            .await
+                            .map_err(ServerError::Quic)?;
+                        write_length_delimited_async(
+                            send,
+                            &SyncMessage {
+                                msg: Some(Msg::ManifestResponse(manifest_response)),
+                            },
+                        )
                         .await
                         .map_err(|err| ServerError::Quic(err.to_string()))?;
-                }
-                finish_send(send).await
+                        let possession: PossessionBitfield = read_length_delimited_async(recv)
+                            .await
+                            .map_err(|err| ServerError::Quic(err.to_string()))?;
+                        let responses = self
+                            .sync_chunk_response_messages(&item, possession)
+                            .await
+                            .map_err(ServerError::Quic)?;
+                        for response in responses {
+                            write_length_delimited_async(send, &response)
+                                .await
+                                .map_err(|err| ServerError::Quic(err.to_string()))?;
+                        }
+                        finish_send(send).await
                     }
                 }
             }
@@ -168,8 +172,8 @@ mod tests {
     use distd_core::metadata::Server as ServerMetadata;
     use distd_core::possession::Bitfield;
     use distd_core::proto::{
-        sync_message::Msg, ClientKeepAlive, ClientRegister, ManifestRequest,
-        PayloadCompression, PossessionBitfield, SyncMessage,
+        sync_message::Msg, ClientKeepAlive, ClientRegister, ManifestRequest, PayloadCompression,
+        PossessionBitfield, SyncMessage,
     };
     use distd_core::transport::TransportOp;
     use distd_core::utils::frame::{
@@ -234,9 +238,7 @@ mod tests {
         }
     }
 
-    async fn connect_client(
-        addr: SocketAddr,
-    ) -> (Endpoint, quinn::Connection) {
+    async fn connect_client(addr: SocketAddr) -> (Endpoint, quinn::Connection) {
         let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap()).expect("client endpoint");
         let rustls_config = rustls::ClientConfig::builder()
             .dangerous()
@@ -267,15 +269,26 @@ mod tests {
         uuid: Option<Uuid>,
     ) -> (quinn::SendStream, quinn::RecvStream) {
         let (mut send, recv) = connection.open_bi().await.expect("open bi");
-        write_transport_op_async(&mut send, op).await.expect("write transport op");
-        write_optional_uuid_async(&mut send, uuid).await.expect("write auth uuid");
+        write_transport_op_async(&mut send, op)
+            .await
+            .expect("write transport op");
+        write_optional_uuid_async(&mut send, uuid)
+            .await
+            .expect("write auth uuid");
         (send, recv)
     }
 
-    async fn start_test_server() -> (tokio::task::JoinHandle<()>, SocketAddr, Server<HashMapStorage>) {
+    async fn start_test_server() -> (
+        tokio::task::JoinHandle<()>,
+        SocketAddr,
+        Server<HashMapStorage>,
+    ) {
         let server = Server::new_ephemeral(HashMapStorage::default());
-        let endpoint = Endpoint::server(make_server_config().expect("server config"), "127.0.0.1:0".parse().unwrap())
-            .expect("server endpoint");
+        let endpoint = Endpoint::server(
+            make_server_config().expect("server config"),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .expect("server endpoint");
         let addr = endpoint.local_addr().expect("local addr");
         let task_server = server.clone();
         let handle = tokio::spawn(async move {
@@ -295,7 +308,9 @@ mod tests {
                         };
                         let server = server.clone();
                         tokio::spawn(async move {
-                            let _ = server.handle_quic_stream(remote_addr, &mut send, &mut recv).await;
+                            let _ = server
+                                .handle_quic_stream(remote_addr, &mut send, &mut recv)
+                                .await;
                         });
                     }
                 });
@@ -306,7 +321,8 @@ mod tests {
     }
 
     async fn register_client_uuid(connection: &quinn::Connection) -> Uuid {
-        let (mut send, mut recv) = open_authed_stream(connection, TransportOp::Register, None).await;
+        let (mut send, mut recv) =
+            open_authed_stream(connection, TransportOp::Register, None).await;
         write_length_delimited_async(
             &mut send,
             &ClientRegister {
@@ -318,9 +334,10 @@ mod tests {
         .await
         .expect("write register request");
         send.finish().expect("finish register");
-        let register = read_length_delimited_async::<_, distd_core::proto::ServerMetadata>(&mut recv)
-            .await
-            .expect("read register response");
+        let register =
+            read_length_delimited_async::<_, distd_core::proto::ServerMetadata>(&mut recv)
+                .await
+                .expect("read register response");
         Uuid::from_slice(register.uuid.as_ref().expect("uuid present")).expect("valid uuid")
     }
 
@@ -341,7 +358,8 @@ mod tests {
         let (_endpoint, connection) = connect_client(addr).await;
         let uuid = register_client_uuid(&connection).await;
 
-        let (mut send, mut recv) = open_authed_stream(&connection, TransportOp::Fetch, Some(uuid)).await;
+        let (mut send, mut recv) =
+            open_authed_stream(&connection, TransportOp::Fetch, Some(uuid)).await;
         write_length_delimited_async(&mut send, &ClientKeepAlive {})
             .await
             .expect("write fetch request");
@@ -350,7 +368,8 @@ mod tests {
         let fetch = read_length_delimited_async::<_, distd_core::proto::ServerMetadata>(&mut recv)
             .await
             .expect("read fetch response");
-        let decoded: ServerMetadata = bitcode::deserialize(&fetch.serialized).expect("decode metadata");
+        let decoded: ServerMetadata =
+            bitcode::deserialize(&fetch.serialized).expect("decode metadata");
         assert!(decoded.items.contains_key("artifact-a"));
 
         server_task.abort();
@@ -373,7 +392,8 @@ mod tests {
         let (_endpoint, connection) = connect_client(addr).await;
         let uuid = register_client_uuid(&connection).await;
 
-        let (mut send, mut recv) = open_authed_stream(&connection, TransportOp::Sync, Some(uuid)).await;
+        let (mut send, mut recv) =
+            open_authed_stream(&connection, TransportOp::Sync, Some(uuid)).await;
         write_length_delimited_async(
             &mut send,
             &ManifestRequest {
@@ -423,7 +443,10 @@ mod tests {
                 }
                 Ok(other) => panic!("unexpected sync frame: {other:?}"),
                 Err(distd_core::utils::frame::FrameError::IoError(err))
-                    if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    if err.kind() == std::io::ErrorKind::UnexpectedEof =>
+                {
+                    break
+                }
                 Err(err) => panic!("unexpected sync error: {err}"),
             }
         }
@@ -469,7 +492,8 @@ mod tests {
         let (_endpoint, connection) = connect_client(addr).await;
         let uuid = register_client_uuid(&connection).await;
 
-        let (mut send, mut recv) = open_authed_stream(&connection, TransportOp::Sync, Some(uuid)).await;
+        let (mut send, mut recv) =
+            open_authed_stream(&connection, TransportOp::Sync, Some(uuid)).await;
         write_length_delimited_async(
             &mut send,
             &ManifestRequest {

@@ -47,13 +47,19 @@ fn print_detail_table(results: &[RunMetrics], group_by_workload: bool) {
     let mut sorted: Vec<&RunMetrics> = results.iter().collect();
     if group_by_workload {
         sorted.sort_by(|a, b| {
-            (&a.workload, &a.network_profile, &a.tool)
-                .cmp(&(&b.workload, &b.network_profile, &b.tool))
+            (&a.workload, &a.network_profile, &a.tool).cmp(&(
+                &b.workload,
+                &b.network_profile,
+                &b.tool,
+            ))
         });
     } else {
         sorted.sort_by(|a, b| {
-            (&a.tool, &a.network_profile, &a.workload)
-                .cmp(&(&b.tool, &b.network_profile, &b.workload))
+            (&a.tool, &a.network_profile, &a.workload).cmp(&(
+                &b.tool,
+                &b.network_profile,
+                &b.workload,
+            ))
         });
     }
 
@@ -98,7 +104,10 @@ fn print_detail_table(results: &[RunMetrics], group_by_workload: bool) {
             Cell::new(format!("{:.2}", r.throughput_mibs)),
             Cell::new(format_bytes(r.bytes_transferred)),
             Cell::new(format_bytes(r.dest_size_bytes)),
-            Cell::new(format!("{:.1}", r.peak_rss_bytes as f64 / (1024.0 * 1024.0))),
+            Cell::new(format!(
+                "{:.1}",
+                r.peak_rss_bytes as f64 / (1024.0 * 1024.0)
+            )),
             valid,
         ]);
     }
@@ -126,7 +135,11 @@ fn print_averages_table(results: &[RunMetrics], group_by_workload: bool) {
     let mut groups: BTreeMap<(String, String, String), Vec<&RunMetrics>> = BTreeMap::new();
     for r in results {
         groups
-            .entry((r.tool.clone(), r.workload.clone(), r.network_profile.clone()))
+            .entry((
+                r.tool.clone(),
+                r.workload.clone(),
+                r.network_profile.clone(),
+            ))
             .or_default()
             .push(r);
     }
@@ -151,13 +164,19 @@ fn print_averages_table(results: &[RunMetrics], group_by_workload: bool) {
     // Sort rows according to the chosen grouping.
     if group_by_workload {
         rows.sort_by(|a, b| {
-            (&a.workload, &a.network_profile, &a.tool)
-                .cmp(&(&b.workload, &b.network_profile, &b.tool))
+            (&a.workload, &a.network_profile, &a.tool).cmp(&(
+                &b.workload,
+                &b.network_profile,
+                &b.tool,
+            ))
         });
     } else {
         rows.sort_by(|a, b| {
-            (&a.tool, &a.network_profile, &a.workload)
-                .cmp(&(&b.tool, &b.network_profile, &b.workload))
+            (&a.tool, &a.network_profile, &a.workload).cmp(&(
+                &b.tool,
+                &b.network_profile,
+                &b.workload,
+            ))
         });
     }
 

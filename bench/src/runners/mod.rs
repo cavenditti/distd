@@ -1,11 +1,11 @@
 //! Tool runners — each module knows how to drive one external tool or distd itself.
 
-pub mod rsync;
-pub mod zsync;
 pub mod casync;
-pub mod ostree;
 pub mod distd;
 pub mod http;
+pub mod ostree;
+pub mod rsync;
+pub mod zsync;
 
 use std::path::Path;
 use std::process::Child;
@@ -124,7 +124,11 @@ pub fn is_tool_available(name: &str) -> bool {
 }
 
 /// Create a `ToolRunner` by name.
-pub fn make_runner(name: &str, work_dir: &Path, options: &RunnerOptions) -> Option<Box<dyn ToolRunner>> {
+pub fn make_runner(
+    name: &str,
+    work_dir: &Path,
+    options: &RunnerOptions,
+) -> Option<Box<dyn ToolRunner>> {
     match name {
         "distd" => Some(Box::new(distd::DistdRunner::new(work_dir, options.clone()))),
         "rsync" => Some(Box::new(rsync::RsyncRunner::new(work_dir))),

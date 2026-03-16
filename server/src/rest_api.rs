@@ -306,7 +306,9 @@ where
     };
     let result = result.map(|item| item.metadata);
     tracing::debug!("{:?}", result);
-    result.map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    result
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 /// Get one feed

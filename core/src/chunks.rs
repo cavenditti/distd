@@ -313,7 +313,12 @@ impl ChunkAlgorithm {
     }
 
     #[must_use]
-    pub fn from_policy(policy: ChunkingPolicy, path: &Path, sample: &[u8], multi_file: bool) -> Self {
+    pub fn from_policy(
+        policy: ChunkingPolicy,
+        path: &Path,
+        sample: &[u8],
+        multi_file: bool,
+    ) -> Self {
         match policy {
             ChunkingPolicy::Auto => detect_chunking_algorithm(path, sample, multi_file),
             ChunkingPolicy::Fixed256K => Self::Fixed256K,
@@ -647,16 +652,22 @@ fn chunk_algorithm_for_format(format: DetectedFormat, sample: &[u8]) -> ChunkAlg
     match format {
         DetectedFormat::RawDiskImage | DetectedFormat::Qcow2 => ChunkAlgorithm::image_default(),
         DetectedFormat::Iso9660 => ChunkAlgorithm::iso_default(),
-        DetectedFormat::Squashfs | DetectedFormat::Erofs => ChunkAlgorithm::compressed_image_default(),
+        DetectedFormat::Squashfs | DetectedFormat::Erofs => {
+            ChunkAlgorithm::compressed_image_default()
+        }
         DetectedFormat::Tar | DetectedFormat::Cpio => ChunkAlgorithm::archive_default(),
         DetectedFormat::OciLayerTar => ChunkAlgorithm::oci_layer_default(),
-        DetectedFormat::TarGzip | DetectedFormat::OciLayerTarGzip | DetectedFormat::Apk | DetectedFormat::Gzip => {
-            ChunkAlgorithm::tar_gzip_default()
+        DetectedFormat::TarGzip
+        | DetectedFormat::OciLayerTarGzip
+        | DetectedFormat::Apk
+        | DetectedFormat::Gzip => ChunkAlgorithm::tar_gzip_default(),
+        DetectedFormat::TarZstd
+        | DetectedFormat::OciLayerTarZstd
+        | DetectedFormat::ArchPkgTarZstd
+        | DetectedFormat::Zstd => ChunkAlgorithm::tar_zstd_default(),
+        DetectedFormat::TarXz | DetectedFormat::ArchPkgTarXz | DetectedFormat::Xz => {
+            ChunkAlgorithm::xz_default()
         }
-        DetectedFormat::TarZstd | DetectedFormat::OciLayerTarZstd | DetectedFormat::ArchPkgTarZstd | DetectedFormat::Zstd => {
-            ChunkAlgorithm::tar_zstd_default()
-        }
-        DetectedFormat::TarXz | DetectedFormat::ArchPkgTarXz | DetectedFormat::Xz => ChunkAlgorithm::xz_default(),
         DetectedFormat::TarBzip2 => ChunkAlgorithm::fixed_aligned(1024 * 1024, 100 * 1024),
         DetectedFormat::Zip => ChunkAlgorithm::fixed_aligned(1024 * 1024, 4096),
         DetectedFormat::Deb | DetectedFormat::Rpm => ChunkAlgorithm::package_default(),
@@ -700,7 +711,10 @@ fn detect_format(path: &Path, sample: &[u8]) -> DetectedFormat {
     if matches_extension_chain(path, &["tar", "gz"]) || matches_extension_chain(path, &["tgz"]) {
         return DetectedFormat::TarGzip;
     }
-    if matches_extension_chain(path, &["tar", "zst"]) || matches_extension_chain(path, &["tar", "zstd"]) || matches_extension_chain(path, &["tzst"]) {
+    if matches_extension_chain(path, &["tar", "zst"])
+        || matches_extension_chain(path, &["tar", "zstd"])
+        || matches_extension_chain(path, &["tzst"])
+    {
         return DetectedFormat::TarZstd;
     }
     if matches_extension_chain(path, &["tar", "xz"]) || matches_extension_chain(path, &["txz"]) {
@@ -1139,7 +1153,9 @@ mod tests {
         let ends = boundary_ends(&boundaries);
 
         assert!(ends.iter().all(|end| end % 4096 == 0));
-        assert!(ends.iter().any(|end| *end >= zero_start && *end <= zero_start + 4096));
+        assert!(ends
+            .iter()
+            .any(|end| *end >= zero_start && *end <= zero_start + 4096));
     }
 
     #[test]
@@ -1166,11 +1182,8 @@ mod tests {
         let mut sample = vec![0u8; 2048];
         sample[257..262].copy_from_slice(b"ustar");
 
-        let algorithm = super::detect_chunking_algorithm(
-            Path::new("blobs/sha256/layer.tar"),
-            &sample,
-            false,
-        );
+        let algorithm =
+            super::detect_chunking_algorithm(Path::new("blobs/sha256/layer.tar"), &sample, false);
 
         assert_eq!(algorithm, ChunkAlgorithm::oci_layer_default());
     }

@@ -18,7 +18,10 @@ fn parse_workloads(names: Vec<String>) -> Result<Vec<WorkloadKind>, String> {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "distd-bench", about = "Benchmark suite for distd transfer performance")]
+#[command(
+    name = "distd-bench",
+    about = "Benchmark suite for distd transfer performance"
+)]
 struct Cli {
     /// Output directory for benchmark results and artifacts
     #[arg(short, long, default_value = "bench_results")]
@@ -124,9 +127,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let data_dir = cli.data_dir.unwrap_or_else(|| {
-        std::env::temp_dir().join("distd_bench")
-    });
+    let data_dir = cli
+        .data_dir
+        .unwrap_or_else(|| std::env::temp_dir().join("distd_bench"));
 
     let requested_tools: Vec<String> = cli.tools.unwrap_or_else(|| {
         runners::all_tool_names()
@@ -136,8 +139,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let requested_workloads: Vec<WorkloadKind> = match cli.workloads {
-        Some(names) => parse_workloads(names)
-            .map_err(|err| format!("invalid --workload value: {err}"))?,
+        Some(names) => {
+            parse_workloads(names).map_err(|err| format!("invalid --workload value: {err}"))?
+        }
         None => WorkloadKind::all(),
     };
 
@@ -148,9 +152,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli.net_bandwidth_mbps,
         cli.net_loss_percent,
     )?;
-    let runner_options = RunnerOptions {
-        network,
-    };
+    let runner_options = RunnerOptions { network };
 
     let orchestrator = BenchmarkOrchestrator::new(
         data_dir,
@@ -233,6 +235,9 @@ mod tests {
             .expect("profile should parse")
             .expect("profile should be active");
 
-        assert_eq!(profile.label(), "delay=25ms,jitter=5ms,bw=10.0Mbps,loss=0.25%");
+        assert_eq!(
+            profile.label(),
+            "delay=25ms,jitter=5ms,bw=10.0Mbps,loss=0.25%"
+        );
     }
 }

@@ -175,9 +175,7 @@ impl Handle {
             self.buf_writer.seek(std::io::SeekFrom::Start(offset))?;
             self.position = offset;
         }
-        self.buf_writer
-            .write_all(chunk)
-            .map_err(Error::IoError)?;
+        self.buf_writer.write_all(chunk).map_err(Error::IoError)?;
         self.position += u64::try_from(chunk.len()).map_err(InvalidParameter::from)?;
         Ok(())
     }
@@ -314,7 +312,11 @@ impl FsStorageState {
                 .get(&root_hash)
                 .map(|current| {
                     (item.metadata.revision, item.chunks.len(), item.size())
-                        > (current.metadata.revision, current.chunks.len(), current.size())
+                        > (
+                            current.metadata.revision,
+                            current.chunks.len(),
+                            current.size(),
+                        )
                 })
                 .unwrap_or(true);
             if replace {
@@ -354,7 +356,10 @@ impl FsStorageState {
                 .unwrap_or(&item.metadata.path),
         );
         create_dir_all(full_path.parent().unwrap_or(&full_path))?;
-        tracing::debug!("Created path {:?}", full_path.parent().unwrap_or(&full_path));
+        tracing::debug!(
+            "Created path {:?}",
+            full_path.parent().unwrap_or(&full_path)
+        );
         Ok(full_path)
     }
 
@@ -408,7 +413,10 @@ impl FsStorageState {
             populated: Arc::default(),
         };
         tracing::trace!("Created infile chunk: {ifc:?}");
-        self.data.entry(chunk_info.hash).or_default().push(Arc::new(ifc));
+        self.data
+            .entry(chunk_info.hash)
+            .or_default()
+            .push(Arc::new(ifc));
         self.mark_dirty();
         Ok(())
     }
@@ -448,12 +456,24 @@ impl FsStorageState {
     }
 
     /// Store a parent (link) node
-    fn store_link(&mut self, hash: Hash, left: Arc<Node>, right: Arc<Node>) -> Result<Arc<Node>, StorageError> {
+    fn store_link(
+        &mut self,
+        hash: Hash,
+        left: Arc<Node>,
+        right: Arc<Node>,
+    ) -> Result<Arc<Node>, StorageError> {
         let size = left.size() + right.size();
         let res = self
             .links
             .entry(hash)
-            .or_insert_with(|| Arc::new(Node::Parent { hash, left, right, size }))
+            .or_insert_with(|| {
+                Arc::new(Node::Parent {
+                    hash,
+                    left,
+                    right,
+                    size,
+                })
+            })
             .clone();
         self.mark_dirty();
         Ok(res)
@@ -526,11 +546,7 @@ impl FsStorage {
             })
     }
 
-    fn combine_sync_nodes(
-        &self,
-        left: Arc<Node>,
-        right: Arc<Node>,
-    ) -> Result<Arc<Node>, Error> {
+    fn combine_sync_nodes(&self, left: Arc<Node>, right: Arc<Node>) -> Result<Arc<Node>, Error> {
         let hash = merge_hashes(left.hash(), right.hash());
         let size = left.size() + right.size();
 
@@ -541,13 +557,11 @@ impl FsStorage {
             return Ok(Arc::new(Node::Skipped { hash, size }));
         }
 
-        self.store_compact_link(hash, left, right).map_err(Error::from)
+        self.store_compact_link(hash, left, right)
+            .map_err(Error::from)
     }
 
-    fn finalize_sync_partials(
-        &self,
-        mut partials: Vec<Arc<Node>>,
-    ) -> Result<Arc<Node>, Error> {
+    fn finalize_sync_partials(&self, mut partials: Vec<Arc<Node>>) -> Result<Arc<Node>, Error> {
         if partials.is_empty() {
             return Err(Error::Storage(StorageError::TreeReconstruct));
         }
@@ -555,7 +569,8 @@ impl FsStorage {
         while partials.len() > 1 {
             let n = partials.len();
             for (to, index) in (0..n - 1).step_by(2).enumerate() {
-                partials[to] = self.combine_sync_nodes(partials[index].clone(), partials[index + 1].clone())?;
+                partials[to] =
+                    self.combine_sync_nodes(partials[index].clone(), partials[index + 1].clone())?;
             }
 
             let half = n / 2;
@@ -606,7 +621,11 @@ impl FsStorage {
 
         let entry = {
             let inner = self.inner.read().unwrap();
-            inner.data.get(hash).and_then(|entries| entries.first()).cloned()
+            inner
+                .data
+                .get(hash)
+                .and_then(|entries| entries.first())
+                .cloned()
         }?;
 
         let node = Node::try_from(&entry).ok()?;
@@ -616,10 +635,7 @@ impl FsStorage {
 
     fn stored_node(&self, hash: &Hash) -> Option<Arc<Node>> {
         let data = self.read_chunk_data(hash)?;
-        Some(Arc::new(Node::Stored {
-            hash: *hash,
-            data,
-        }))
+        Some(Arc::new(Node::Stored { hash: *hash, data }))
     }
 
     fn build_compact_tree(
@@ -789,7 +805,10 @@ impl FsStorage {
 
         {
             let mut inner = self.inner.write().unwrap();
-            for (path, (start, end)) in activation_paths.iter().zip(activation_ranges.iter().copied()) {
+            for (path, (start, end)) in activation_paths
+                .iter()
+                .zip(activation_ranges.iter().copied())
+            {
                 inner.pre_allocate(path, &chunks[start..end])?;
             }
         }
@@ -845,7 +864,10 @@ impl FsStorage {
         left: Arc<Node>,
         right: Arc<Node>,
     ) -> Result<Arc<Node>, StorageError> {
-        self.inner.write().unwrap().store_compact_link(hash, left, right)
+        self.inner
+            .write()
+            .unwrap()
+            .store_compact_link(hash, left, right)
     }
 
     fn try_fill_in_compact(&self, tree: &Node) -> Result<Arc<Node>, StorageError> {
@@ -858,10 +880,7 @@ impl FsStorage {
                 }))
             }
             Node::Parent {
-                hash,
-                left,
-                right,
-                ..
+                hash, left, right, ..
             } => {
                 let left = self.try_fill_in_compact(left)?;
                 let right = self.try_fill_in_compact(right)?;
@@ -942,11 +961,9 @@ impl FsStorage {
             .map(|(path, handle)| (path.clone(), handle.clone()))
             .collect::<Vec<_>>();
         for (path, handle) in handles {
-            handle
-                .lock()
-                .unwrap()
-                .flush()
-                .inspect_err(|e| tracing::error!("Cannot flush handle {}: {e}", path.to_string_lossy()))?;
+            handle.lock().unwrap().flush().inspect_err(|e| {
+                tracing::error!("Cannot flush handle {}: {e}", path.to_string_lossy())
+            })?;
         }
         Ok(())
     }
@@ -1042,11 +1059,12 @@ impl FsStorage {
     fn flush_data_for_hash(&self, hash: &Hash) -> Result<(), Error> {
         for path in self.data_paths_for_hash(hash) {
             if let Some(handle) = self.handle_for_path(&path) {
-                handle
-                    .lock()
-                    .unwrap()
-                    .flush()
-                    .inspect_err(|e| tracing::error!("Cannot flush infile chunk handle {}: {e}", path.to_string_lossy()))?;
+                handle.lock().unwrap().flush().inspect_err(|e| {
+                    tracing::error!(
+                        "Cannot flush infile chunk handle {}: {e}",
+                        path.to_string_lossy()
+                    )
+                })?;
             }
         }
         Ok(())
@@ -1080,7 +1098,9 @@ impl FsStorage {
 
             match bitcode::deserialize::<FsStorageState>(&file) {
                 Err(e) => {
-                    tracing::warn!("Cannot deserialize FsStorage persistence data: {e}; starting fresh");
+                    tracing::warn!(
+                        "Cannot deserialize FsStorage persistence data: {e}; starting fresh"
+                    );
                 }
                 Ok(mut s) => {
                     s.rebuild_indexes();
@@ -1105,7 +1125,9 @@ impl FsStorage {
                             return already_processed.get(node.hash()).cloned();
                         }
                         match node.as_ref() {
-                            Node::Parent { hash, left, right, .. } => {
+                            Node::Parent {
+                                hash, left, right, ..
+                            } => {
                                 let n = Arc::new(Node::Parent {
                                     hash: *node.hash(),
                                     size: node.size(),
@@ -1153,8 +1175,12 @@ impl FsStorage {
                                     .map(|(path, handle)| (path, Arc::new(Mutex::new(handle))))
                                     .collect(),
                             ),
-                            chunk_cache: Mutex::new(HotChunkCache::new(cache_config.max_chunk_bytes)),
-                            tree_cache: Mutex::new(HotNodeCache::new(cache_config.max_tree_entries)),
+                            chunk_cache: Mutex::new(HotChunkCache::new(
+                                cache_config.max_chunk_bytes,
+                            )),
+                            tree_cache: Mutex::new(HotNodeCache::new(
+                                cache_config.max_tree_entries,
+                            )),
                         };
                     }
                     tracing::debug!("Cannot reload FsStorage; starting fresh");
@@ -1207,7 +1233,10 @@ impl FsStorage {
         chunk_info: &ChunkInfo,
         offset: u64,
     ) -> Result<(), Error> {
-        self.inner.write().unwrap().pre_allocate_chunk(path, chunk_info, offset)?;
+        self.inner
+            .write()
+            .unwrap()
+            .pre_allocate_chunk(path, chunk_info, offset)?;
         self.ensure_handle(path)
     }
 
@@ -1242,7 +1271,10 @@ impl FsStorage {
     pub fn remove(&self, item: Item) -> Result<(), Error> {
         let mut inner = self.inner.write().unwrap();
         let path = inner.item_path(&item)?;
-        let item = inner.remove_item(&item).then_some(item).ok_or(Error::MissingData)?;
+        let item = inner
+            .remove_item(&item)
+            .then_some(item)
+            .ok_or(Error::MissingData)?;
         for chunk in &item.chunks {
             let remove_key = if let Some(infile_chunks) = inner.data.get_mut(&chunk.hash) {
                 infile_chunks.retain(|infile_chunk| infile_chunk.path != path);
@@ -1305,7 +1337,9 @@ impl ChunkStorage for FsStorage {
     fn get_chunk_by_index(&self, root: &Hash, index: u32) -> Option<Vec<u8>> {
         if let Some(item) = self.item_for_root_hash(root) {
             let chunk = item.chunks.get(index as usize)?;
-            return self.read_chunk_data(&chunk.hash).map(|data| (*data).clone());
+            return self
+                .read_chunk_data(&chunk.hash)
+                .map(|data| (*data).clone());
         }
 
         let node = self.get(root)?;
@@ -1328,16 +1362,36 @@ impl ChunkStorage for FsStorage {
             if let Some(handle) = self.handle_for_path(&infile_chunk.path) {
                 infile_chunk
                     .write(&hash, chunk, &mut handle.lock().unwrap())
-                    .inspect(|()| tracing::trace!("Written infile chunk {hash} to {}", infile_chunk.path.to_string_lossy()))
-                    .inspect_err(|e| tracing::error!("Cannot write infile chunk to {}: {e}", infile_chunk.path.to_string_lossy()))
+                    .inspect(|()| {
+                        tracing::trace!(
+                            "Written infile chunk {hash} to {}",
+                            infile_chunk.path.to_string_lossy()
+                        )
+                    })
+                    .inspect_err(|e| {
+                        tracing::error!(
+                            "Cannot write infile chunk to {}: {e}",
+                            infile_chunk.path.to_string_lossy()
+                        )
+                    })
                     .map_err(|_| StorageError::ChunkInsertError)?;
             } else {
-                let mut handle = Handle::new(&infile_chunk.path)
-                    .map_err(|_| StorageError::ChunkInsertError)?;
+                let mut handle =
+                    Handle::new(&infile_chunk.path).map_err(|_| StorageError::ChunkInsertError)?;
                 infile_chunk
                     .write(&hash, chunk, &mut handle)
-                    .inspect(|()| tracing::trace!("Written infile chunk {hash} to {} with transient handle", infile_chunk.path.to_string_lossy()))
-                    .inspect_err(|e| tracing::error!("Cannot write infile chunk to {}: {e}", infile_chunk.path.to_string_lossy()))
+                    .inspect(|()| {
+                        tracing::trace!(
+                            "Written infile chunk {hash} to {} with transient handle",
+                            infile_chunk.path.to_string_lossy()
+                        )
+                    })
+                    .inspect_err(|e| {
+                        tracing::error!(
+                            "Cannot write infile chunk to {}: {e}",
+                            infile_chunk.path.to_string_lossy()
+                        )
+                    })
                     .map_err(|_| StorageError::ChunkInsertError)?;
                 handle.flush().map_err(|_| StorageError::ChunkInsertError)?;
             }
@@ -1354,13 +1408,15 @@ impl ChunkStorage for FsStorage {
 
         self.inner.write().unwrap().mark_dirty();
         let data = self.cache_chunk_data(hash, Arc::new(chunk.to_vec()));
-        Ok(Arc::new(Node::Stored {
-            hash,
-            data,
-        }))
+        Ok(Arc::new(Node::Stored { hash, data }))
     }
 
-    fn store_link(&self, hash: Hash, left: Arc<Node>, right: Arc<Node>) -> Result<Arc<Node>, StorageError> {
+    fn store_link(
+        &self,
+        hash: Hash,
+        left: Arc<Node>,
+        right: Arc<Node>,
+    ) -> Result<Arc<Node>, StorageError> {
         self.inner.write().unwrap().store_link(hash, left, right)
     }
 
@@ -1747,7 +1803,11 @@ mod tests {
         println!("Created item: {item:?}");
         print_fsstorage(&storage);
 
-        let stored = storage.get(&item.metadata.root.hash).unwrap().clone_data().unwrap();
+        let stored = storage
+            .get(&item.metadata.root.hash)
+            .unwrap()
+            .clone_data()
+            .unwrap();
 
         // reported storage size is deduplicated
         assert_eq!(stored.len(), 1_000_000);
@@ -1781,7 +1841,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(item.metadata.path, logical_path);
-        assert_eq!(storage.item_path(&item).unwrap(), tempdir.join("bench-artifact"));
+        assert_eq!(
+            storage.item_path(&item).unwrap(),
+            tempdir.join("bench-artifact")
+        );
     }
 
     #[test]
@@ -1842,8 +1905,15 @@ mod tests {
 
         assert_eq!(item.size(), data.len() as u64);
         assert!(!item.chunks.is_empty());
-        assert_eq!(item.manifest.chunk_algorithm, ChunkAlgorithm::fastcdc_default());
-        let stored = storage.get(&item.metadata.root.hash).unwrap().clone_data().unwrap();
+        assert_eq!(
+            item.manifest.chunk_algorithm,
+            ChunkAlgorithm::fastcdc_default()
+        );
+        let stored = storage
+            .get(&item.metadata.root.hash)
+            .unwrap()
+            .clone_data()
+            .unwrap();
         assert_eq!(stored, data);
     }
 
@@ -1870,7 +1940,11 @@ mod tests {
             .await
             .unwrap();
 
-        let stored = storage.get(&item.metadata.root.hash).unwrap().clone_data().unwrap();
+        let stored = storage
+            .get(&item.metadata.root.hash)
+            .unwrap()
+            .clone_data()
+            .unwrap();
         assert_eq!(stored, data);
     }
 
@@ -1883,9 +1957,12 @@ mod tests {
         let storage = FsStorage::new(tempdir.clone());
         let source = HashMapStorage::default();
 
-        let v1: Vec<u8> = (0..(CHUNK_SIZE * 8)).map(|index| ((index * 7) % 251) as u8).collect();
+        let v1: Vec<u8> = (0..(CHUNK_SIZE * 8))
+            .map(|index| ((index * 7) % 251) as u8)
+            .collect();
         let old_root = source.insert(v1.clone().into()).unwrap();
-        let old_stream = tokio_stream::iter(old_root.clone().find_diff(&[]).map(|node| (*node).clone()));
+        let old_stream =
+            tokio_stream::iter(old_root.clone().find_diff(&[]).map(|node| (*node).clone()));
         let old_item = storage
             .receive_item(
                 "sync-item".to_string(),
@@ -1937,7 +2014,11 @@ mod tests {
             )
             .unwrap();
 
-        let stored = storage.get(&item.metadata.root.hash).unwrap().clone_data().unwrap();
+        let stored = storage
+            .get(&item.metadata.root.hash)
+            .unwrap()
+            .clone_data()
+            .unwrap();
         assert_eq!(stored, v2);
     }
 
@@ -1962,7 +2043,10 @@ mod tests {
             &chunk_infos,
             ChunkAlgorithm::default(),
         );
-        let received_chunks: Vec<Vec<u8>> = data.chunks(CHUNK_SIZE).map(|chunk| chunk.to_vec()).collect();
+        let received_chunks: Vec<Vec<u8>> = data
+            .chunks(CHUNK_SIZE)
+            .map(|chunk| chunk.to_vec())
+            .collect();
 
         let item = storage
             .receive_sync_item(
@@ -1977,7 +2061,11 @@ mod tests {
             )
             .unwrap();
 
-        let stored = storage.get(&item.metadata.root.hash).unwrap().clone_data().unwrap();
+        let stored = storage
+            .get(&item.metadata.root.hash)
+            .unwrap()
+            .clone_data()
+            .unwrap();
         assert_eq!(stored, data);
     }
 
@@ -2020,7 +2108,11 @@ mod tests {
         // Check data: same as fs_storage_roundtrip
         {
             println!("{:?}", storage.chunks());
-            let stored = storage.get(&item_hash.unwrap()).unwrap().clone_data().unwrap();
+            let stored = storage
+                .get(&item_hash.unwrap())
+                .unwrap()
+                .clone_data()
+                .unwrap();
 
             // reported storage size is deduplicated
             assert_eq!(stored.len(), 1_000_000);
@@ -2048,7 +2140,11 @@ mod tests {
         let storage = FsStorage::new(tempdir.clone());
         b.iter(|| {
             let item = new_dummy_item::<FsStorage, 1u8, 1_000_000>(&storage).unwrap();
-            let stored = storage.get(&item.metadata.root.hash).unwrap().clone_data().unwrap();
+            let stored = storage
+                .get(&item.metadata.root.hash)
+                .unwrap()
+                .clone_data()
+                .unwrap();
             assert_eq!(stored.len(), 1_000_000);
             for b in stored {
                 assert_eq!(b, 1u8);

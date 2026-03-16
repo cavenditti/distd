@@ -1,9 +1,15 @@
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 
-use distd_core::proto::{sync_message::Msg, ClientKeepAlive, ClientRegister, ManifestRequest, ManifestResponse, PossessionBitfield, ServerMetadata, SyncMessage};
+use distd_core::proto::{
+    sync_message::Msg, ClientKeepAlive, ClientRegister, ManifestRequest, ManifestResponse,
+    PossessionBitfield, ServerMetadata, SyncMessage,
+};
 use distd_core::transport::TransportOp;
-use distd_core::utils::frame::{read_length_delimited_async, write_length_delimited_async, write_optional_uuid_async, write_transport_op_async};
+use distd_core::utils::frame::{
+    read_length_delimited_async, write_length_delimited_async, write_optional_uuid_async,
+    write_transport_op_async,
+};
 use quinn::{ClientConfig, Endpoint};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -66,12 +72,18 @@ fn parse_quic_target(url: &str) -> Result<(SocketAddr, String), ServerRequest> {
     let stripped = url
         .strip_prefix("quic://")
         .or_else(|| url.strip_prefix("udp://"))
-        .ok_or_else(|| ServerRequest::Connection(ServerConnection::Quic(format!("unsupported QUIC URL: {url}"))))?;
+        .ok_or_else(|| {
+            ServerRequest::Connection(ServerConnection::Quic(format!(
+                "unsupported QUIC URL: {url}"
+            )))
+        })?;
     let addr = stripped
         .to_socket_addrs()
         .map_err(ServerConnection::from)?
         .next()
-        .ok_or_else(|| ServerRequest::Connection(ServerConnection::Quic(format!("cannot resolve {stripped}"))))?;
+        .ok_or_else(|| {
+            ServerRequest::Connection(ServerConnection::Quic(format!("cannot resolve {stripped}")))
+        })?;
     let server_name = stripped
         .rsplit_once(':')
         .map(|(host, _)| host)
@@ -111,8 +123,9 @@ impl QuicTransportClient {
             .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCertVerifier))
             .with_no_client_auth();
         let client_config = ClientConfig::new(Arc::new(
-            quinn::crypto::rustls::QuicClientConfig::try_from(rustls_config)
-                .map_err(|err| ServerRequest::Connection(ServerConnection::Quic(err.to_string())))?,
+            quinn::crypto::rustls::QuicClientConfig::try_from(rustls_config).map_err(|err| {
+                ServerRequest::Connection(ServerConnection::Quic(err.to_string()))
+            })?,
         ));
         endpoint.set_default_client_config(client_config);
 
@@ -145,7 +158,10 @@ impl QuicTransportClient {
         }
     }
 
-    async fn open_bi(&self, op: TransportOp) -> Result<(quinn::SendStream, quinn::RecvStream), ServerRequest> {
+    async fn open_bi(
+        &self,
+        op: TransportOp,
+    ) -> Result<(quinn::SendStream, quinn::RecvStream), ServerRequest> {
         let (mut send, recv) = self
             .connection
             .open_bi()
@@ -166,7 +182,8 @@ impl QuicTransportClient {
         write_length_delimited_async(&mut send, &request)
             .await
             .map_err(|err| ServerRequest::Quic(err.to_string()))?;
-        send.finish().map_err(|err| ServerRequest::Quic(err.to_string()))?;
+        send.finish()
+            .map_err(|err| ServerRequest::Quic(err.to_string()))?;
         read_length_delimited_async(&mut recv)
             .await
             .map_err(|err| ServerRequest::Quic(err.to_string()))
@@ -177,7 +194,8 @@ impl QuicTransportClient {
         write_length_delimited_async(&mut send, &request)
             .await
             .map_err(|err| ServerRequest::Quic(err.to_string()))?;
-        send.finish().map_err(|err| ServerRequest::Quic(err.to_string()))?;
+        send.finish()
+            .map_err(|err| ServerRequest::Quic(err.to_string()))?;
         read_length_delimited_async(&mut recv)
             .await
             .map_err(|err| ServerRequest::Quic(err.to_string()))
@@ -221,14 +239,19 @@ impl QuicSyncSession {
         write_length_delimited_async(&mut self.send, &possession)
             .await
             .map_err(|err| ServerRequest::Quic(err.to_string()))?;
-        self.send.finish().map_err(|err| ServerRequest::Quic(err.to_string()))?;
+        self.send
+            .finish()
+            .map_err(|err| ServerRequest::Quic(err.to_string()))?;
 
         let mut responses = Vec::new();
         loop {
             match read_length_delimited_async::<_, SyncMessage>(&mut self.recv).await {
                 Ok(message) => responses.push(message),
                 Err(distd_core::utils::frame::FrameError::IoError(err))
-                    if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    if err.kind() == std::io::ErrorKind::UnexpectedEof =>
+                {
+                    break
+                }
                 Err(err) => return Err(ServerRequest::Quic(err.to_string())),
             }
         }
@@ -299,6 +322,9 @@ mod tests {
         let err = read_sync_manifest_response(&mut reader)
             .await
             .expect_err("non-manifest frame should fail");
-        assert!(matches!(err, crate::error::ServerRequest::UnexpectedMessage));
+        assert!(matches!(
+            err,
+            crate::error::ServerRequest::UnexpectedMessage
+        ));
     }
 }

@@ -45,10 +45,9 @@ impl ToolRunner for RsyncRunner {
         let start = Instant::now();
         let mut child = Command::new("rsync")
             .args([
-                "-a",           // archive mode
-                "--stats",      // transfer statistics
-                &src,
-                &dst,
+                "-a",      // archive mode
+                "--stats", // transfer statistics
+                &src, &dst,
             ])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -110,11 +109,8 @@ impl ToolRunner for RsyncRunner {
         let start = Instant::now();
         let mut child = Command::new("rsync")
             .args([
-                "-a",
-                "--stats",
-                "--delete",     // remove files not in source
-                &src,
-                &dst,
+                "-a", "--stats", "--delete", // remove files not in source
+                &src, &dst,
             ])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())

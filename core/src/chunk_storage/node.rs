@@ -417,7 +417,12 @@ mod tests {
             right: Arc::new(r),
         };
 
-        let flat: Vec<u8> = n.flatten_iter().unwrap().into_iter().flat_map(|x| (*x).clone()).collect();
+        let flat: Vec<u8> = n
+            .flatten_iter()
+            .unwrap()
+            .into_iter()
+            .flat_map(|x| (*x).clone())
+            .collect();
 
         assert_eq!(flat.len(), l1 + l2);
 
@@ -510,60 +515,63 @@ mod tests {
 
     #[test]
     fn node_find_diff_only_streams_changed_leaf_bytes() {
-            use crate::hash::compute_tree;
+        use crate::hash::compute_tree;
 
-            fn build_tree(data: &[u8]) -> Arc<Node> {
-                compute_tree(
-                    |chunk| {
-                        Ok::<Arc<Node>, std::convert::Infallible>(Arc::new(Node::Stored {
-                            hash: hash(chunk),
-                            data: Arc::new(chunk.to_vec()),
-                        }))
-                    },
-                    |left, right| {
-                        Ok::<Arc<Node>, std::convert::Infallible>(Arc::new(Node::Parent {
-                            hash: merge_hashes(left.hash(), right.hash()),
-                            size: left.size() + right.size(),
-                            left: left.clone(),
-                            right: right.clone(),
-                        }))
-                    },
-                    data,
-                )
-                .unwrap()
-            }
+        fn build_tree(data: &[u8]) -> Arc<Node> {
+            compute_tree(
+                |chunk| {
+                    Ok::<Arc<Node>, std::convert::Infallible>(Arc::new(Node::Stored {
+                        hash: hash(chunk),
+                        data: Arc::new(chunk.to_vec()),
+                    }))
+                },
+                |left, right| {
+                    Ok::<Arc<Node>, std::convert::Infallible>(Arc::new(Node::Parent {
+                        hash: merge_hashes(left.hash(), right.hash()),
+                        size: left.size() + right.size(),
+                        left: left.clone(),
+                        right: right.clone(),
+                    }))
+                },
+                data,
+            )
+            .unwrap()
+        }
 
-            let block_count = 8;
-            let total_size = CHUNK_SIZE * block_count;
-            let mut v1 = vec![0u8; total_size];
-            rand::rngs::OsRng.fill_bytes(&mut v1);
+        let block_count = 8;
+        let total_size = CHUNK_SIZE * block_count;
+        let mut v1 = vec![0u8; total_size];
+        rand::rngs::OsRng.fill_bytes(&mut v1);
 
-            let mut v2 = v1.clone();
-            for block_index in [1usize, 5usize] {
-                let start = block_index * CHUNK_SIZE;
-                let end = start + CHUNK_SIZE;
-                rand::rngs::OsRng.fill_bytes(&mut v2[start..end]);
-            }
+        let mut v2 = v1.clone();
+        for block_index in [1usize, 5usize] {
+            let start = block_index * CHUNK_SIZE;
+            let end = start + CHUNK_SIZE;
+            rand::rngs::OsRng.fill_bytes(&mut v2[start..end]);
+        }
 
-            let old_tree = build_tree(&v1);
-            let new_tree = build_tree(&v2);
-            let old_hashes = old_tree.flatten().unwrap();
+        let old_tree = build_tree(&v1);
+        let new_tree = build_tree(&v2);
+        let old_hashes = old_tree.flatten().unwrap();
 
-            let diff_nodes: Vec<Arc<Node>> = new_tree.find_diff(&old_hashes).collect();
-            let stored_bytes: u64 = diff_nodes
-                .iter()
-                .map(|node| match node.as_ref() {
-                    Node::Stored { data, .. } => data.len() as u64,
-                    Node::Parent { .. } | Node::Skipped { .. } => 0,
-                })
-                .sum();
-            let skipped_nodes = diff_nodes
-                .iter()
-                .filter(|node| matches!(node.as_ref(), Node::Skipped { .. }))
-                .count();
+        let diff_nodes: Vec<Arc<Node>> = new_tree.find_diff(&old_hashes).collect();
+        let stored_bytes: u64 = diff_nodes
+            .iter()
+            .map(|node| match node.as_ref() {
+                Node::Stored { data, .. } => data.len() as u64,
+                Node::Parent { .. } | Node::Skipped { .. } => 0,
+            })
+            .sum();
+        let skipped_nodes = diff_nodes
+            .iter()
+            .filter(|node| matches!(node.as_ref(), Node::Skipped { .. }))
+            .count();
 
         assert_eq!(stored_bytes, (CHUNK_SIZE * 2) as u64);
-        assert!(skipped_nodes > 0, "expected unchanged subtrees to be skipped");
+        assert!(
+            skipped_nodes > 0,
+            "expected unchanged subtrees to be skipped"
+        );
     }
 
     #[test]

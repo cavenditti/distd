@@ -135,9 +135,7 @@ impl ToolRunner for HttpRunner {
             }
 
             if dst_path.exists() {
-                total_downloaded += std::fs::metadata(&dst_path)
-                    .map(|md| md.len())
-                    .unwrap_or(0);
+                total_downloaded += std::fs::metadata(&dst_path).map(|md| md.len()).unwrap_or(0);
             }
         }
 

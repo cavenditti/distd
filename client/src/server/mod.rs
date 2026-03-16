@@ -33,13 +33,19 @@ enum SyncContinuation {
 }
 
 impl TransportClient {
-    async fn register(&mut self, request: distd_core::proto::ClientRegister) -> Result<distd_core::proto::ServerMetadata, ServerRequest> {
+    async fn register(
+        &mut self,
+        request: distd_core::proto::ClientRegister,
+    ) -> Result<distd_core::proto::ServerMetadata, ServerRequest> {
         match self {
             Self::Quic(client) => client.register(request).await,
         }
     }
 
-    async fn fetch(&mut self, request: distd_core::proto::ClientKeepAlive) -> Result<distd_core::proto::ServerMetadata, ServerRequest> {
+    async fn fetch(
+        &mut self,
+        request: distd_core::proto::ClientKeepAlive,
+    ) -> Result<distd_core::proto::ServerMetadata, ServerRequest> {
         match self {
             Self::Quic(client) => client.fetch(request).await,
         }
@@ -168,7 +174,8 @@ impl Server {
     }
 
     /// Get the client uuid
-    #[must_use] pub fn client_uuid(&self) -> Uuid {
+    #[must_use]
+    pub fn client_uuid(&self) -> Uuid {
         self.client_uuid.unwrap_or(Uuid::nil())
     }
 
@@ -261,7 +268,10 @@ impl Server {
             artifact_id: manifest_resp.artifact_id,
             version: manifest_resp.version,
             root_hash: Hash::from_bytes(
-                manifest_resp.root_hash.try_into().map_err(|_| ServerRequest::BadHash)?
+                manifest_resp
+                    .root_hash
+                    .try_into()
+                    .map_err(|_| ServerRequest::BadHash)?,
             ),
             total_size: manifest_resp.total_size,
             chunk_count: manifest_resp.chunk_count,
@@ -308,7 +318,10 @@ impl Server {
             }
         }
 
-        let chunk_sizes: Vec<usize> = chunk_infos.iter().map(|chunk| chunk.size as usize).collect();
+        let chunk_sizes: Vec<usize> = chunk_infos
+            .iter()
+            .map(|chunk| chunk.size as usize)
+            .collect();
 
         let responses = continuation
             .send_possession_and_collect(proto::PossessionBitfield {
@@ -319,11 +332,20 @@ impl Server {
         let mut received = Vec::new();
         for msg in responses {
             match msg {
-                SyncMessage { msg: Some(Msg::ChunkData(cd)) } => {
-                    received.push(decode_sync_payload(cd.compression, &cd.data, cd.uncompressed_size)?);
+                SyncMessage {
+                    msg: Some(Msg::ChunkData(cd)),
+                } => {
+                    received.push(decode_sync_payload(
+                        cd.compression,
+                        &cd.data,
+                        cd.uncompressed_size,
+                    )?);
                 }
-                SyncMessage { msg: Some(Msg::BulkData(bd)) } => {
-                    let decoded = decode_sync_payload(bd.compression, &bd.data, bd.uncompressed_size)?;
+                SyncMessage {
+                    msg: Some(Msg::BulkData(bd)),
+                } => {
+                    let decoded =
+                        decode_sync_payload(bd.compression, &bd.data, bd.uncompressed_size)?;
                     let mut offset = 0;
                     for i in 0..bd.count {
                         let idx = bd.start_index + i;

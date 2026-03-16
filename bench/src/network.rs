@@ -134,8 +134,8 @@ pub struct UdpShaperProxy {
 
 impl UdpShaperProxy {
     pub fn start(target_addr: SocketAddr, profile: NetworkProfile) -> Result<Self, String> {
-        let socket = UdpSocket::bind(("127.0.0.1", 0))
-            .map_err(|err| format!("bind udp proxy: {err}"))?;
+        let socket =
+            UdpSocket::bind(("127.0.0.1", 0)).map_err(|err| format!("bind udp proxy: {err}"))?;
         socket
             .set_read_timeout(Some(Duration::from_millis(50)))
             .map_err(|err| format!("set udp proxy timeout: {err}"))?;
@@ -149,8 +149,20 @@ impl UdpShaperProxy {
             .map_err(|err| format!("clone udp proxy socket: {err}"))?;
         let (client_tx, client_rx) = mpsc::channel::<UdpPacket>();
         let (server_tx, server_rx) = mpsc::channel::<UdpPacket>();
-        let client_worker = spawn_udp_worker(worker_socket, Arc::clone(&stop_flag), client_rx, profile.clone());
-        let server_worker = spawn_udp_worker(socket.try_clone().map_err(|err| format!("clone udp proxy socket: {err}"))?, Arc::clone(&stop_flag), server_rx, profile.clone());
+        let client_worker = spawn_udp_worker(
+            worker_socket,
+            Arc::clone(&stop_flag),
+            client_rx,
+            profile.clone(),
+        );
+        let server_worker = spawn_udp_worker(
+            socket
+                .try_clone()
+                .map_err(|err| format!("clone udp proxy socket: {err}"))?,
+            Arc::clone(&stop_flag),
+            server_rx,
+            profile.clone(),
+        );
 
         let thread = thread::spawn(move || {
             let mut buffer = vec![0_u8; 65_536];
@@ -279,7 +291,10 @@ mod tests {
             .expect("profile should parse")
             .expect("profile should be active");
 
-        assert_eq!(profile.label(), "delay=40ms,jitter=5ms,bw=12.5Mbps,loss=0.50%");
+        assert_eq!(
+            profile.label(),
+            "delay=40ms,jitter=5ms,bw=12.5Mbps,loss=0.50%"
+        );
     }
 
     #[test]

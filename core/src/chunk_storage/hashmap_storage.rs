@@ -39,7 +39,12 @@ impl ChunkStorage for HashMapStorage {
         Ok(node)
     }
 
-    fn store_link(&self, hash: Hash, left: Arc<Node>, right: Arc<Node>) -> Result<Arc<Node>, StorageError> {
+    fn store_link(
+        &self,
+        hash: Hash,
+        left: Arc<Node>,
+        right: Arc<Node>,
+    ) -> Result<Arc<Node>, StorageError> {
         let mut data = self.data.write().unwrap();
         if let Some(node) = data.get(&hash) {
             return Ok(node.clone());

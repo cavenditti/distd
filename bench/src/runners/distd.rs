@@ -19,7 +19,9 @@ use crate::metrics::{self, ProcessMonitor, RunMetrics};
 use crate::network::{NetworkProfile, UdpShaperProxy};
 use crate::workload::{self, Workload};
 
-use super::{wait_child_with_timeout, RunnerOptions, ToolRunner, SMOKE_CHILD_TIMEOUT, DEFAULT_CHILD_TIMEOUT};
+use super::{
+    wait_child_with_timeout, RunnerOptions, ToolRunner, DEFAULT_CHILD_TIMEOUT, SMOKE_CHILD_TIMEOUT,
+};
 
 /// Timeout for curl HTTP requests to the server (connect + total).
 const CURL_CONNECT_TIMEOUT: &str = "5";
@@ -165,7 +167,10 @@ impl DistdRunner {
         for entry in std::fs::read_dir(&self.work_dir).map_err(|e| e.to_string())? {
             let entry = entry.map_err(|e| e.to_string())?;
             if entry.file_type().map_err(|e| e.to_string())?.is_dir()
-                && entry.file_name().to_string_lossy().starts_with("server_storage_")
+                && entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("server_storage_")
             {
                 std::fs::remove_dir_all(entry.path()).map_err(|e| e.to_string())?;
             }
@@ -265,8 +270,7 @@ impl DistdRunner {
     }
 
     fn client_server_url(&self) -> String {
-        self
-            .sync_udp_proxy
+        self.sync_udp_proxy
             .borrow()
             .as_ref()
             .map(|proxy| format!("quic://{}", proxy.listen_addr()))
@@ -291,7 +295,12 @@ impl DistdRunner {
                     CURL_MAX_TIME,
                     "-X",
                     "POST",
-                    &format!("{}/items?name={}&path={}", self.publish_base_url(), item_name, item_path),
+                    &format!(
+                        "{}/items?name={}&path={}",
+                        self.publish_base_url(),
+                        item_name,
+                        item_path
+                    ),
                     "-F",
                     &format!("item=@{}", source_file.to_string_lossy()),
                 ])
@@ -338,12 +347,20 @@ impl DistdRunner {
                 .arg(CURL_MAX_TIME)
                 .arg("-X")
                 .arg("POST")
-                .arg(format!("{}/items?name={}&path={}", self.publish_base_url(), item_name, item_path));
+                .arg(format!(
+                    "{}/items?name={}&path={}",
+                    self.publish_base_url(),
+                    item_name,
+                    item_path
+                ));
 
             for source_file in source_files {
-                let relative = source_file
-                    .strip_prefix(source_root)
-                    .map_err(|e| format!("Cannot derive relative path for {}: {e}", source_file.display()))?;
+                let relative = source_file.strip_prefix(source_root).map_err(|e| {
+                    format!(
+                        "Cannot derive relative path for {}: {e}",
+                        source_file.display()
+                    )
+                })?;
                 cmd.arg("-F").arg(format!(
                     "item=@{};filename={}",
                     source_file.to_string_lossy(),
@@ -379,11 +396,7 @@ impl DistdRunner {
     }
 
     /// Run the distd client to fetch an item.
-    fn client_get(
-        &self,
-        item_path: &str,
-        dest_dir: &Path,
-    ) -> Result<(Child, PathBuf), String> {
+    fn client_get(&self, item_path: &str, dest_dir: &Path) -> Result<(Child, PathBuf), String> {
         let bins = Self::binary_paths();
         if !bins.client.exists() {
             return Err(format!(
@@ -480,10 +493,11 @@ impl ToolRunner for DistdRunner {
 
         // Fetch — this is the measured operation
         let start = Instant::now();
-        let (mut client_child, _client_dir) = self.client_get(item_path, dest_dir).map_err(|e| {
-            self.stop_server();
-            e
-        })?;
+        let (mut client_child, _client_dir) =
+            self.client_get(item_path, dest_dir).map_err(|e| {
+                self.stop_server();
+                e
+            })?;
         let client_pid = client_child.id();
 
         let mut monitor = ProcessMonitor::new(&[server_pid, client_pid]);
@@ -606,9 +620,15 @@ impl ToolRunner for DistdRunner {
         } else {
             self.publish_file(&v1_files[0], item_name, item_path)
         }
-        .map_err(|e| { self.stop_server(); e })?;
+        .map_err(|e| {
+            self.stop_server();
+            e
+        })?;
 
-        std::fs::create_dir_all(dest_dir).map_err(|e| { self.stop_server(); e.to_string() })?;
+        std::fs::create_dir_all(dest_dir).map_err(|e| {
+            self.stop_server();
+            e.to_string()
+        })?;
         let dest_file = dest_dir.join(item_path);
         if !dest_file.exists() {
             self.stop_server();
@@ -629,13 +649,19 @@ impl ToolRunner for DistdRunner {
         } else {
             self.publish_file(&v2_files[0], item_name, item_path)
         }
-        .map_err(|e| { self.stop_server(); e })?;
+        .map_err(|e| {
+            self.stop_server();
+            e
+        })?;
 
         // --- Phase 3: fetch again (the measured delta operation) ---
         // The client's dest already has v1 data; this exercises the diff path
         let start = Instant::now();
-        let (mut client_child, _client_dir) = self.client_get(item_path, dest_dir)
-            .map_err(|e| { self.stop_server(); e })?;
+        let (mut client_child, _client_dir) =
+            self.client_get(item_path, dest_dir).map_err(|e| {
+                self.stop_server();
+                e
+            })?;
         let client_pid = client_child.id();
         let mut monitor = ProcessMonitor::new(&[server_pid, client_pid]);
 
@@ -691,16 +717,14 @@ impl ToolRunner for DistdRunner {
         m.cpu_seconds = cpu_secs;
 
         if m.bytes_transferred >= expected_source_bytes {
-            m.notes.push_str(" | update transferred full artifact or more");
+            m.notes
+                .push_str(" | update transferred full artifact or more");
         }
 
         // Validate v2 output hash
         if dest_file.exists() {
             let (src_hash, dst_hash) = if v2_files.len() > 1 {
-                (
-                    metrics::hash_dir(v2_dir),
-                    metrics::hash_dir(&dest_file),
-                )
+                (metrics::hash_dir(v2_dir), metrics::hash_dir(&dest_file))
             } else {
                 (
                     metrics::hash_file(&v2_files[0]),

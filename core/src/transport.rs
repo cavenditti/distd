@@ -9,6 +9,7 @@ pub const SYNC_PAYLOAD_COMPRESSION_ZSTD: i32 = 1;
 const SYNC_PAYLOAD_COMPRESSION_MIN_BYTES: usize = 64 * 1024;
 const SYNC_PAYLOAD_COMPRESSION_MIN_SAVINGS_BYTES: usize = 8 * 1024;
 const SYNC_PAYLOAD_ZSTD_LEVEL: i32 = 1;
+const SYNC_PAYLOAD_COMPRESSION_PROBE_WINDOW_BYTES: usize = 32 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -49,46 +50,66 @@ pub struct EncodedSyncPayload {
     pub uncompressed_size: u32,
 }
 
+fn uncompressed_payload(data: &[u8], uncompressed_size: u32) -> EncodedSyncPayload {
+    EncodedSyncPayload {
+        compression: SYNC_PAYLOAD_COMPRESSION_NONE,
+        data: data.to_vec(),
+        uncompressed_size,
+    }
+}
+
+fn compression_probe_sample(data: &[u8]) -> Vec<u8> {
+    if data.len() <= SYNC_PAYLOAD_COMPRESSION_PROBE_WINDOW_BYTES * 3 {
+        return data.to_vec();
+    }
+
+    let window = SYNC_PAYLOAD_COMPRESSION_PROBE_WINDOW_BYTES;
+    let middle_start = data.len() / 2 - window / 2;
+    let end_start = data.len() - window;
+    let mut sample = Vec::with_capacity(window * 3);
+    sample.extend_from_slice(&data[..window]);
+    sample.extend_from_slice(&data[middle_start..middle_start + window]);
+    sample.extend_from_slice(&data[end_start..]);
+    sample
+}
+
+fn probe_payload_compressibility(data: &[u8]) -> Result<bool, PayloadCompressionError> {
+    let sample = compression_probe_sample(data);
+    let compressed = zstd::bulk::compress(&sample, SYNC_PAYLOAD_ZSTD_LEVEL)
+        .map_err(|err| PayloadCompressionError::Compress(err.to_string()))?;
+
+    Ok(compressed.len() + SYNC_PAYLOAD_COMPRESSION_MIN_SAVINGS_BYTES <= sample.len())
+}
+
 pub fn maybe_compress_sync_payload(
     data: &[u8],
     primary_path: Option<&Path>,
     likely_precompressed: bool,
 ) -> Result<EncodedSyncPayload, PayloadCompressionError> {
-    let uncompressed_size = u32::try_from(data.len()).map_err(|_| PayloadCompressionError::SizeTooLarge)?;
+    let uncompressed_size =
+        u32::try_from(data.len()).map_err(|_| PayloadCompressionError::SizeTooLarge)?;
 
     if std::env::var_os("DISTD_DISABLE_SYNC_PAYLOAD_COMPRESSION").is_some() {
-        return Ok(EncodedSyncPayload {
-            compression: SYNC_PAYLOAD_COMPRESSION_NONE,
-            data: data.to_vec(),
-            uncompressed_size,
-        });
+        return Ok(uncompressed_payload(data, uncompressed_size));
     }
 
     if data.len() < SYNC_PAYLOAD_COMPRESSION_MIN_BYTES {
-        return Ok(EncodedSyncPayload {
-            compression: SYNC_PAYLOAD_COMPRESSION_NONE,
-            data: data.to_vec(),
-            uncompressed_size,
-        });
+        return Ok(uncompressed_payload(data, uncompressed_size));
     }
 
     if likely_precompressed || primary_path.is_some_and(path_likely_precompressed) {
-        return Ok(EncodedSyncPayload {
-            compression: SYNC_PAYLOAD_COMPRESSION_NONE,
-            data: data.to_vec(),
-            uncompressed_size,
-        });
+        return Ok(uncompressed_payload(data, uncompressed_size));
+    }
+
+    if !probe_payload_compressibility(data)? {
+        return Ok(uncompressed_payload(data, uncompressed_size));
     }
 
     let compressed = zstd::bulk::compress(data, SYNC_PAYLOAD_ZSTD_LEVEL)
         .map_err(|err| PayloadCompressionError::Compress(err.to_string()))?;
 
     if compressed.len() + SYNC_PAYLOAD_COMPRESSION_MIN_SAVINGS_BYTES > data.len() {
-        return Ok(EncodedSyncPayload {
-            compression: SYNC_PAYLOAD_COMPRESSION_NONE,
-            data: data.to_vec(),
-            uncompressed_size,
-        });
+        return Ok(uncompressed_payload(data, uncompressed_size));
     }
 
     Ok(EncodedSyncPayload {
@@ -157,20 +178,35 @@ impl TryFrom<u8> for TransportOp {
 mod tests {
     use std::path::Path;
 
+    use rand::{rngs::StdRng, RngCore, SeedableRng};
+
     use super::TransportOp;
-    use super::{decode_sync_payload, maybe_compress_sync_payload, SYNC_PAYLOAD_COMPRESSION_NONE, SYNC_PAYLOAD_COMPRESSION_ZSTD};
+    use super::{
+        decode_sync_payload, maybe_compress_sync_payload, SYNC_PAYLOAD_COMPRESSION_NONE,
+        SYNC_PAYLOAD_COMPRESSION_ZSTD,
+    };
 
     #[test]
     fn op_roundtrip() {
-        assert_eq!(TransportOp::try_from(u8::from(TransportOp::Register)).unwrap(), TransportOp::Register);
-        assert_eq!(TransportOp::try_from(u8::from(TransportOp::Fetch)).unwrap(), TransportOp::Fetch);
-        assert_eq!(TransportOp::try_from(u8::from(TransportOp::Sync)).unwrap(), TransportOp::Sync);
+        assert_eq!(
+            TransportOp::try_from(u8::from(TransportOp::Register)).unwrap(),
+            TransportOp::Register
+        );
+        assert_eq!(
+            TransportOp::try_from(u8::from(TransportOp::Fetch)).unwrap(),
+            TransportOp::Fetch
+        );
+        assert_eq!(
+            TransportOp::try_from(u8::from(TransportOp::Sync)).unwrap(),
+            TransportOp::Sync
+        );
     }
 
     #[test]
     fn skips_small_payloads() {
         let payload = vec![b'a'; 4096];
-        let encoded = maybe_compress_sync_payload(&payload, Some(Path::new("artifact.tar")), false).unwrap();
+        let encoded =
+            maybe_compress_sync_payload(&payload, Some(Path::new("artifact.tar")), false).unwrap();
 
         assert_eq!(encoded.compression, SYNC_PAYLOAD_COMPRESSION_NONE);
         assert_eq!(encoded.data, payload);
@@ -179,7 +215,8 @@ mod tests {
     #[test]
     fn skips_known_precompressed_paths() {
         let payload = vec![b'a'; 256 * 1024];
-        let encoded = maybe_compress_sync_payload(&payload, Some(Path::new("layer.tar.gz")), false).unwrap();
+        let encoded =
+            maybe_compress_sync_payload(&payload, Some(Path::new("layer.tar.gz")), false).unwrap();
 
         assert_eq!(encoded.compression, SYNC_PAYLOAD_COMPRESSION_NONE);
         assert_eq!(encoded.data, payload);
@@ -197,10 +234,31 @@ mod tests {
     #[test]
     fn compresses_large_compressible_payloads() {
         let payload = vec![b'a'; 512 * 1024];
-        let encoded = maybe_compress_sync_payload(&payload, Some(Path::new("rootfs.tar")), false).unwrap();
+        let encoded =
+            maybe_compress_sync_payload(&payload, Some(Path::new("rootfs.tar")), false).unwrap();
 
         assert_eq!(encoded.compression, SYNC_PAYLOAD_COMPRESSION_ZSTD);
         assert!(encoded.data.len() < payload.len());
-        assert_eq!(decode_sync_payload(encoded.compression, &encoded.data, encoded.uncompressed_size).unwrap(), payload);
+        assert_eq!(
+            decode_sync_payload(
+                encoded.compression,
+                &encoded.data,
+                encoded.uncompressed_size
+            )
+            .unwrap(),
+            payload
+        );
+    }
+
+    #[test]
+    fn skips_large_incompressible_payloads() {
+        let mut payload = vec![0u8; 512 * 1024];
+        StdRng::seed_from_u64(0xD157_DA7A).fill_bytes(&mut payload);
+
+        let encoded =
+            maybe_compress_sync_payload(&payload, Some(Path::new("artifact.bin")), false).unwrap();
+
+        assert_eq!(encoded.compression, SYNC_PAYLOAD_COMPRESSION_NONE);
+        assert_eq!(encoded.data, payload);
     }
 }

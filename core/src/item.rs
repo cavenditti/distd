@@ -85,7 +85,11 @@ impl Manifest {
         chunk_algorithm: ChunkAlgorithm,
     ) -> Self {
         let total_size = root.size();
-        let chunk_count = if chunks.is_empty() { 1 } else { chunks.len() as u32 };
+        let chunk_count = if chunks.is_empty() {
+            1
+        } else {
+            chunks.len() as u32
+        };
         Self {
             artifact_id,
             version,
@@ -198,7 +202,11 @@ impl Item {
         chunk_algorithm: ChunkAlgorithm,
     ) -> Result<Self, std::io::Error> {
         let artifact_id = name.clone();
-        let chunk_count = if chunks.is_empty() { 1 } else { chunks.len() as u32 };
+        let chunk_count = if chunks.is_empty() {
+            1
+        } else {
+            chunks.len() as u32
+        };
         let manifest = Manifest {
             artifact_id: artifact_id.clone(),
             version: revision as u64,
@@ -246,7 +254,11 @@ impl Item {
     /// Chunks in self and not in other
     #[must_use]
     pub fn diff(&self, other: &Self) -> std::collections::HashSet<ChunkInfo> {
-        let own_chunks = self.chunks.iter().copied().collect::<std::collections::HashSet<_>>();
+        let own_chunks = self
+            .chunks
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
         let other_chunks = other
             .chunks
             .iter()
@@ -256,7 +268,8 @@ impl Item {
     }
 
     #[inline]
-    #[must_use] pub fn root(&self) -> &Blake3Hash {
+    #[must_use]
+    pub fn root(&self) -> &Blake3Hash {
         &self.metadata.root.hash
     }
 }
@@ -311,15 +324,14 @@ pub mod tests {
     where
         T: ChunkStorage,
     {
-        storage
-            .create_item(
-                "name".to_string(),
-                random_path_subdir(),
-                0,
-                None,
-                Bytes::from_static(b""),
-                ChunkAlgorithm::default(),
-            )
+        storage.create_item(
+            "name".to_string(),
+            random_path_subdir(),
+            0,
+            None,
+            Bytes::from_static(b""),
+            ChunkAlgorithm::default(),
+        )
     }
 
     pub fn new_dummy_item<T, const VALUE: u8, const SIZE: usize>(storage: &T) -> Result<Item, Error>
@@ -328,15 +340,14 @@ pub mod tests {
     {
         println!("Inserting {SIZE} {VALUE}u8");
 
-        storage
-            .create_item(
-                "name".to_string(),
-                random_path_subdir(),
-                0,
-                Some("Some description for the larger item".to_string()),
-                Bytes::from_static(&[VALUE; SIZE]),
-                ChunkAlgorithm::default(),
-            )
+        storage.create_item(
+            "name".to_string(),
+            random_path_subdir(),
+            0,
+            Some("Some description for the larger item".to_string()),
+            Bytes::from_static(&[VALUE; SIZE]),
+            ChunkAlgorithm::default(),
+        )
     }
 
     pub fn new_zeros_item<T>(storage: &T) -> Result<Item, Error>
@@ -368,7 +379,8 @@ pub mod tests {
             chunk,
             vec![chunk],
             ChunkAlgorithm::default(),
-        ).ok()
+        )
+        .ok()
     }
 
     #[must_use]

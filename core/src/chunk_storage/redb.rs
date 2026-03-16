@@ -70,23 +70,42 @@ impl ChunkStorage for RedbStorage {
     }
 
     fn store_chunk(&self, hash: Hash, chunk: &[u8]) -> Result<Arc<Node>, StorageError> {
-        let write_txn = self.db.begin_write().map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
         {
-            let mut table = write_txn.open_table(CHUNK_TABLE).map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
-            table.insert(hash.as_bytes(), Vec::from(chunk)).map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
+            let mut table = write_txn
+                .open_table(CHUNK_TABLE)
+                .map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
+            table
+                .insert(hash.as_bytes(), Vec::from(chunk))
+                .map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
         }
-        write_txn.commit().map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
+        write_txn
+            .commit()
+            .map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
         Ok(Arc::new(Node::Stored {
             hash,
             data: Arc::new(Vec::from(chunk)),
         }))
     }
 
-    fn store_link(&self, hash: Hash, left: Arc<Node>, right: Arc<Node>) -> Result<Arc<Node>, StorageError> {
+    fn store_link(
+        &self,
+        hash: Hash,
+        left: Arc<Node>,
+        right: Arc<Node>,
+    ) -> Result<Arc<Node>, StorageError> {
         let size = left.size() + right.size();
-        let write_txn = self.db.begin_write().map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
         {
-            let mut table = write_txn.open_table(LINK_TABLE).map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
+            let mut table = write_txn
+                .open_table(LINK_TABLE)
+                .map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
             table
                 .insert(
                     hash.as_bytes(),
@@ -94,7 +113,9 @@ impl ChunkStorage for RedbStorage {
                 )
                 .map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
         }
-        write_txn.commit().map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
+        write_txn
+            .commit()
+            .map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
         Ok(Arc::new(Node::Parent {
             hash,
             size,
@@ -104,9 +125,15 @@ impl ChunkStorage for RedbStorage {
     }
 
     fn chunks(&self) -> Vec<Hash> {
-        let Ok(read_txn) = self.db.begin_read() else { return Vec::new() };
-        let Ok(table) = read_txn.open_table(CHUNK_TABLE) else { return Vec::new() };
-        let Ok(iter) = table.iter() else { return Vec::new() };
+        let Ok(read_txn) = self.db.begin_read() else {
+            return Vec::new();
+        };
+        let Ok(table) = read_txn.open_table(CHUNK_TABLE) else {
+            return Vec::new();
+        };
+        let Ok(iter) = table.iter() else {
+            return Vec::new();
+        };
         iter.filter_map(|v| v.ok())
             .map(|v| Hash::from_bytes(*v.0.value()))
             .collect()

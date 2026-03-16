@@ -97,19 +97,21 @@ impl BenchmarkOrchestrator {
             tracing::info!("━━━ Workload: {} ━━━", wl.kind);
             tracing::info!(
                 "  Source: {} files, {} bytes",
-                wl.file_count_v1, wl.total_bytes_v1
+                wl.file_count_v1,
+                wl.total_bytes_v1
             );
 
             for tool_name in &available_tools {
                 tracing::info!("  ─── Tool: {tool_name} ───");
                 let tool_work_dir = self.data_dir.join("tool_state").join(tool_name);
-                let runner = match runners::make_runner(tool_name, &tool_work_dir, &self.runner_options) {
-                    Some(r) => r,
-                    None => {
-                        tracing::warn!("  Cannot create runner for {tool_name}");
-                        continue;
-                    }
-                };
+                let runner =
+                    match runners::make_runner(tool_name, &tool_work_dir, &self.runner_options) {
+                        Some(r) => r,
+                        None => {
+                            tracing::warn!("  Cannot create runner for {tool_name}");
+                            continue;
+                        }
+                    };
 
                 if !runner.is_available() {
                     tracing::warn!("  {tool_name} not available, skipping");
@@ -117,28 +119,24 @@ impl BenchmarkOrchestrator {
                 }
 
                 // Run warm iterations
-                let results =
-                    self.run_tool_iterations(&*runner, wl, "warm");
+                let results = self.run_tool_iterations(&*runner, wl, "warm");
                 all_results.extend(results);
 
                 // Run cold iterations if requested
                 if self.cold_cache {
-                    let results =
-                        self.run_tool_iterations(&*runner, wl, "cold");
+                    let results = self.run_tool_iterations(&*runner, wl, "cold");
                     all_results.extend(results);
                 }
 
                 // Run delta/update benchmarks if workload has v2
                 if wl.source_dir_v2.is_some() {
-                    let results =
-                        self.run_tool_update_iterations(&*runner, wl);
+                    let results = self.run_tool_update_iterations(&*runner, wl);
                     all_results.extend(results);
                 }
 
                 // Run resume benchmark if requested
                 if self.resume {
-                    let results =
-                        self.run_resume_iteration(&*runner, wl);
+                    let results = self.run_resume_iteration(&*runner, wl);
                     all_results.extend(results);
                 }
 
@@ -314,17 +312,13 @@ impl BenchmarkOrchestrator {
         let mut m = RunMetrics::new(
             runner.name(),
             &format!("{}-resume", workload.kind),
-                &self.runner_options.network_label(),
+            &self.runner_options.network_label(),
             0,
             "warm",
         );
         m.is_resume = true;
 
-        tracing::info!(
-            "    [resume] {} {}...",
-            runner.name(),
-            workload.kind,
-        );
+        tracing::info!("    [resume] {} {}...", runner.name(), workload.kind,);
 
         // For a proper resume test we'd need to kill mid-transfer and restart.
         // Since we can't easily interrupt external tools uniformly, we simulate:

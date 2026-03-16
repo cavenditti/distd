@@ -45,7 +45,11 @@ impl Bitfield {
     ///
     /// Uses the storage's `chunk_list` to get the ordered chunk hashes for the manifest,
     /// then checks which ones are locally available.
-    pub fn from_storage<S: ChunkStorage>(storage: &S, manifest: &Manifest, chunk_hashes: &[Hash]) -> Self {
+    pub fn from_storage<S: ChunkStorage>(
+        storage: &S,
+        manifest: &Manifest,
+        chunk_hashes: &[Hash],
+    ) -> Self {
         let mut bf = Self::empty(manifest.chunk_count);
         for (i, hash) in chunk_hashes.iter().enumerate() {
             if storage.get(hash).is_some() {

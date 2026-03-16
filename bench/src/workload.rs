@@ -158,8 +158,12 @@ fn generate_one(base: &Path, kind: &WorkloadKind, params: &WorkloadParams) -> Wo
         WorkloadKind::LowDeltaRevision => gen_delta_revision(base, params, false),
         WorkloadKind::HighDeltaRevision => gen_delta_revision(base, params, true),
         WorkloadKind::DedupHeavy => gen_dedup_heavy(base, params),
-        WorkloadKind::TarGzipArchive => gen_compressed_archive(base, params, CompressionFormat::Gzip),
-        WorkloadKind::TarZstdArchive => gen_compressed_archive(base, params, CompressionFormat::Zstd),
+        WorkloadKind::TarGzipArchive => {
+            gen_compressed_archive(base, params, CompressionFormat::Gzip)
+        }
+        WorkloadKind::TarZstdArchive => {
+            gen_compressed_archive(base, params, CompressionFormat::Zstd)
+        }
         WorkloadKind::OciLayerGzip => gen_oci_layer(base, params, CompressionFormat::Gzip),
         WorkloadKind::OciLayerZstd => gen_oci_layer(base, params, CompressionFormat::Zstd),
         WorkloadKind::DebPackage => gen_deb_package(base, params),
@@ -231,11 +235,19 @@ fn walkdir(dir: &Path) -> Vec<PathBuf> {
 }
 
 fn smoke_size(normal: usize, smoke: bool) -> usize {
-    if smoke { normal.min(64 * 1024) } else { normal }
+    if smoke {
+        normal.min(64 * 1024)
+    } else {
+        normal
+    }
 }
 
 fn smoke_count(normal: u32, smoke: bool) -> u32 {
-    if smoke { normal.min(10) } else { normal }
+    if smoke {
+        normal.min(10)
+    } else {
+        normal
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -320,7 +332,11 @@ fn gen_packed_archive(base: &Path, params: &WorkloadParams) -> Workload {
     }
 }
 
-fn gen_compressed_archive(base: &Path, params: &WorkloadParams, compression: CompressionFormat) -> Workload {
+fn gen_compressed_archive(
+    base: &Path,
+    params: &WorkloadParams,
+    compression: CompressionFormat,
+) -> Workload {
     let staging = base.join("staging");
     let v1 = base.join("v1");
     let count = smoke_count(params.small_file_count, params.smoke);
@@ -434,8 +450,14 @@ fn gen_deb_package(base: &Path, params: &WorkloadParams) -> Workload {
         &deb_path,
         &[
             ("debian-binary", b"2.0\n".to_vec()),
-            ("control.tar.gz", fs::read(&control_tgz).expect("read control archive")),
-            ("data.tar.zst", fs::read(&data_tzst).expect("read data archive")),
+            (
+                "control.tar.gz",
+                fs::read(&control_tgz).expect("read control archive"),
+            ),
+            (
+                "data.tar.zst",
+                fs::read(&data_tzst).expect("read data archive"),
+            ),
         ],
     );
 
@@ -549,9 +571,7 @@ fn gen_dedup_heavy(base: &Path, params: &WorkloadParams) -> Workload {
     let mut template = vec![0u8; file_size];
     rand::thread_rng().fill_bytes(&mut template);
 
-    tracing::info!(
-        "Generating dedup-heavy: {count} files × {file_size} bytes (~80% duplicate)",
-    );
+    tracing::info!("Generating dedup-heavy: {count} files × {file_size} bytes (~80% duplicate)",);
 
     for i in 0..count {
         let sub = format!("d{:03}", i % 20);
@@ -655,14 +675,19 @@ fn populate_rootfs_tree(root: &Path, count: u32, size: usize) {
     fs::create_dir_all(root.join("etc")).expect("mkdir etc");
     fs::create_dir_all(root.join("usr/bin")).expect("mkdir usr/bin");
     fs::create_dir_all(root.join("var/lib/distd")).expect("mkdir var/lib/distd");
-    fs::write(root.join("etc/os-release"), b"NAME=distd bench\nID=distd\nVERSION_ID=1\n")
-        .expect("write os-release");
+    fs::write(
+        root.join("etc/os-release"),
+        b"NAME=distd bench\nID=distd\nVERSION_ID=1\n",
+    )
+    .expect("write os-release");
 
     for i in 0..count {
         let target = match i % 3 {
             0 => root.join("usr/bin").join(format!("tool-{i:04}")),
             1 => root.join("var/lib/distd").join(format!("blob-{i:04}.dat")),
-            _ => root.join("usr/share/distd").join(format!("asset-{i:04}.bin")),
+            _ => root
+                .join("usr/share/distd")
+                .join(format!("asset-{i:04}.bin")),
         };
         write_compressible_file(&target, size, 0x1000 + i as u64);
     }
@@ -737,7 +762,8 @@ fn compress_file(src: &Path, dest: &Path, compression: CompressionFormat) {
         }
         CompressionFormat::Zstd => {
             let out = fs::File::create(dest).expect("create zstd output");
-            let mut encoder = zstd::stream::write::Encoder::new(out, 10).expect("create zstd encoder");
+            let mut encoder =
+                zstd::stream::write::Encoder::new(out, 10).expect("create zstd encoder");
             encoder.write_all(&data).expect("zstd write");
             encoder.finish().expect("finish zstd");
         }

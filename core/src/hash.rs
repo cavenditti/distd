@@ -132,17 +132,20 @@ pub mod blake3_hash {
         /// constant-time equality checking, so if  you need to compare hashes,
         /// prefer the `Hash` type.
         #[inline]
-        #[must_use] pub const fn as_bytes(&self) -> &[u8; OUT_LEN] {
+        #[must_use]
+        pub const fn as_bytes(&self) -> &[u8; OUT_LEN] {
             &self.0
         }
 
         /// Create a `Hash` from its raw bytes representation.
-        #[must_use] pub const fn from_bytes(bytes: [u8; OUT_LEN]) -> Self {
+        #[must_use]
+        pub const fn from_bytes(bytes: [u8; OUT_LEN]) -> Self {
             Self(bytes)
         }
 
         /// Convert to `blake3::Hash`
-        #[must_use] pub fn to_blake3_hash(self) -> blake3::Hash {
+        #[must_use]
+        pub fn to_blake3_hash(self) -> blake3::Hash {
             blake3::Hash::from_bytes(self.into())
         }
 

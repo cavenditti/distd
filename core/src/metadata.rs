@@ -135,7 +135,5 @@ mod tests {
             format: ItemFormat::V1,
         };
         assert_ne!(item, item3);
-
     }
-
 }
