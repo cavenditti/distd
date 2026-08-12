@@ -535,6 +535,14 @@ impl ToolRunner for DistdRunner {
                 } else {
                     m.notes.push_str(" | missing payload byte metric");
                 }
+
+                // Log client timing info for analysis
+                for line in stderr_buf.lines() {
+                    if line.contains("distd_network_ms") || line.contains("distd_store_ms") {
+                        tracing::info!("    client: {}", line.trim());
+                    }
+                }
+                let _ = std::fs::write(self.work_dir.join("client-stderr.log"), &stderr_buf);
             }
             Err(timeout_msg) => {
                 tracing::error!("distd client timed out: {timeout_msg}");

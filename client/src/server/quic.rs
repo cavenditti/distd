@@ -5,7 +5,7 @@ use distd_core::proto::{
     sync_message::Msg, ClientKeepAlive, ClientRegister, ManifestRequest, ManifestResponse,
     PossessionBitfield, ServerMetadata, SyncMessage,
 };
-use distd_core::transport::{decode_sync_payload, TransportOp};
+use distd_core::transport::{decode_sync_payload_owned, TransportOp};
 use distd_core::utils::frame::{
     read_length_delimited_async, write_length_delimited_async, write_optional_uuid_async,
     write_transport_op_async,
@@ -270,9 +270,9 @@ fn decode_sync_message_into(
         SyncMessage {
             msg: Some(Msg::ChunkData(cd)),
         } => {
-            received.push(decode_sync_payload(
+            received.push(decode_sync_payload_owned(
                 cd.compression,
-                &cd.data,
+                cd.data,
                 cd.uncompressed_size,
             )?);
             Ok(())
@@ -280,7 +280,7 @@ fn decode_sync_message_into(
         SyncMessage {
             msg: Some(Msg::BulkData(bd)),
         } => {
-            let decoded = decode_sync_payload(bd.compression, &bd.data, bd.uncompressed_size)?;
+            let decoded = decode_sync_payload_owned(bd.compression, bd.data, bd.uncompressed_size)?;
             let mut offset = 0;
             for i in 0..bd.count {
                 let idx = bd.start_index + i;

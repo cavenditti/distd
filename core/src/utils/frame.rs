@@ -5,6 +5,10 @@ use uuid::Uuid;
 
 use crate::transport::{TransportOp, TransportOpError};
 
+/// Hard protocol ceiling. It bounds allocations before any protobuf message is
+/// decoded and is intentionally above the 16 MiB sync batch target.
+pub const MAX_FRAME_PAYLOAD_BYTES: usize = 32 * 1024 * 1024;
+
 #[derive(Debug, Error)]
 pub enum FrameError {
     #[error("frame I/O error")]
@@ -84,8 +88,15 @@ where
     W: AsyncWrite + Unpin,
     M: Message,
 {
-    let frame = encode_length_delimited(message)?;
-    writer.write_all(&frame).await?;
+    let payload_len = message.encoded_len();
+    if payload_len > MAX_FRAME_PAYLOAD_BYTES {
+        return Err(FrameError::FrameTooLarge);
+    }
+    let frame_len = u32::try_from(payload_len).map_err(|_| FrameError::FrameTooLarge)?;
+    writer.write_all(&frame_len.to_be_bytes()).await?;
+    let mut buf = Vec::with_capacity(payload_len);
+    message.encode(&mut buf)?;
+    writer.write_all(&buf).await?;
     Ok(())
 }
 

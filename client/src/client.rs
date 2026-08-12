@@ -126,14 +126,18 @@ impl Client<FsStorage> {
         target: ItemMetadata,
         from: &[Hash],
     ) -> Result<Item, ClientError> {
+        let t0 = Instant::now();
         let (manifest, chunk_infos, received_chunks) =
             self.server.sync_artifact(&target.artifact_id, from).await?;
+        let network_elapsed = t0.elapsed();
 
         let received_chunk_count = received_chunks.len();
         let payload_bytes = received_chunks
             .iter()
             .map(|chunk| chunk.len() as u64)
             .sum::<u64>();
+
+        let t1 = Instant::now();
         let item = self
             .storage
             .receive_sync_item(
@@ -147,10 +151,13 @@ impl Client<FsStorage> {
                 received_chunks,
             )
             .map_err(ClientError::Core)?;
+        let store_elapsed = t1.elapsed();
 
         tracing::info!(
-            "distd_sync_payload_bytes={payload_bytes} distd_sync_received_chunks={}",
-            received_chunk_count
+            "distd_sync_payload_bytes={payload_bytes} distd_sync_received_chunks={} distd_network_ms={} distd_store_ms={}",
+            received_chunk_count,
+            network_elapsed.as_millis(),
+            store_elapsed.as_millis(),
         );
 
         Ok(item)
@@ -261,6 +268,7 @@ pub mod cli {
 
         tracing_subscriber::fmt()
             .with_target(true)
+            .with_writer(std::io::stderr)
             //.compact()
             .with_max_level(tracing::Level::from_str(&settings.log.level).unwrap())
             .init();

@@ -9,10 +9,12 @@ use distd_core::proto::{
 use distd_core::transport::TransportOp;
 use distd_core::utils::frame::{
     read_length_delimited_async, read_optional_uuid_async, read_transport_op_async,
-    write_length_delimited_async,
+    write_length_delimited_async, MAX_FRAME_PAYLOAD_BYTES,
 };
 use quinn::{Endpoint, RecvStream, SendStream};
 use rcgen::generate_simple_self_signed;
+
+use crate::server::build_one_batch;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 use crate::error::Server as ServerError;
@@ -104,15 +106,63 @@ where
                         let possession: PossessionBitfield = read_length_delimited_async(recv)
                             .await
                             .map_err(|err| ServerError::Quic(err.to_string()))?;
-                        let responses = self
-                            .sync_chunk_response_messages(&item, possession)
-                            .await
+                        let mut iter_state = self
+                            .prepare_sync_chunks(&item, &possession)
                             .map_err(ServerError::Quic)?;
-                        for response in responses {
-                            write_length_delimited_async(send, &response)
+                        let primary_path = item.metadata.path.clone();
+                        let root_hash = iter_state.root_hash;
+                        let sync_start = std::time::Instant::now();
+                        let mut batch_build_ns: u64 = 0;
+                        let mut encode_ns: u64 = 0;
+                        let mut write_ns: u64 = 0;
+                        let mut batch_count: u32 = 0;
+                        let mut total_bytes: u64 = 0;
+                        loop {
+                            let t0 = std::time::Instant::now();
+                            let batch = build_one_batch(
+                                &iter_state.missing,
+                                &mut iter_state.cursor,
+                                Some(primary_path.as_path()),
+                                iter_state.likely_precompressed,
+                                &mut |idx| self.storage.get_chunk_by_index(&root_hash, idx),
+                            )
+                            .map_err(ServerError::Quic)?;
+                            batch_build_ns += t0.elapsed().as_nanos() as u64;
+                            let Some(batch) = batch else { break };
+                            batch_count += 1;
+                            let t1 = std::time::Instant::now();
+                            let payload_len = prost::Message::encoded_len(&batch);
+                            if payload_len > MAX_FRAME_PAYLOAD_BYTES {
+                                return Err(ServerError::Quic(
+                                    "sync response frame exceeds protocol limit".to_string(),
+                                ));
+                            }
+                            let frame_len = u32::try_from(payload_len)
+                                .map_err(|error| ServerError::Quic(error.to_string()))?;
+                            let mut buf = Vec::with_capacity(payload_len);
+                            prost::Message::encode(&batch, &mut buf)
+                                .map_err(|error| ServerError::Quic(error.to_string()))?;
+                            encode_ns += t1.elapsed().as_nanos() as u64;
+                            total_bytes += payload_len as u64;
+                            let t2 = std::time::Instant::now();
+                            send.write_all(&frame_len.to_be_bytes())
                                 .await
                                 .map_err(|err| ServerError::Quic(err.to_string()))?;
+                            send.write_all(&buf)
+                                .await
+                                .map_err(|err| ServerError::Quic(err.to_string()))?;
+                            write_ns += t2.elapsed().as_nanos() as u64;
                         }
+                        let total_ms = sync_start.elapsed().as_millis();
+                        tracing::info!(
+                            batch_count,
+                            total_ms,
+                            build_ms = batch_build_ns / 1_000_000,
+                            encode_ms = encode_ns / 1_000_000,
+                            write_ms = write_ns / 1_000_000,
+                            total_bytes,
+                            "sync_server_timing"
+                        );
                         finish_send(send).await
                     }
                 }

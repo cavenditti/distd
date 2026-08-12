@@ -9,6 +9,7 @@ use std::time::SystemTime;
 use axum::body::Bytes;
 use distd_core::chunk_storage::ChunkStorage;
 use distd_core::chunks::{chunk_algorithm_likely_precompressed, ChunkAlgorithm};
+use distd_core::hash::Hash;
 use distd_core::item::{ArtifactId, Item, Name as ItemName};
 use distd_core::metadata::Server as ServerMetadata;
 use distd_core::possession::Bitfield;
@@ -16,7 +17,7 @@ use distd_core::proto::{
     self, sync_message::Msg, ClientKeepAlive, ClientRegister,
     ServerMetadata as ProtoServerMetadata, SyncMessage,
 };
-use distd_core::transport::maybe_compress_sync_payload;
+use distd_core::transport::maybe_compress_sync_payload_owned;
 use distd_core::utils::serde::BitcodeSerializable;
 use distd_core::utils::uuid::slice_to_uuid;
 use ring::error::KeyRejected;
@@ -270,6 +271,39 @@ where
         Ok(messages)
     }
 
+    /// Prepare the sync state (bitfield validation + missing indices) without
+    /// building all response messages up front. Returns the data needed to
+    /// stream batches one at a time via [`build_one_batch`].
+    pub fn prepare_sync_chunks(
+        &self,
+        item: &Item,
+        possession: &proto::PossessionBitfield,
+    ) -> Result<SyncChunkIterState, String> {
+        let root_hash = *item.root();
+        let expected_chunk_count = item.chunks.len();
+        let bitfield = Bitfield::from_bytes(&possession.bitfield)
+            .ok_or_else(|| String::from("Invalid bitfield"))?;
+        if bitfield.chunk_count() as usize != expected_chunk_count {
+            return Err(String::from("Invalid bitfield"));
+        }
+
+        let likely_precompressed =
+            chunk_algorithm_likely_precompressed(item.manifest.chunk_algorithm);
+        let missing = bitfield.missing_indices();
+        tracing::debug!(
+            "Sync: {} missing chunks out of {}",
+            missing.len(),
+            bitfield.chunk_count()
+        );
+
+        Ok(SyncChunkIterState {
+            root_hash,
+            missing,
+            likely_precompressed,
+            cursor: 0,
+        })
+    }
+
     pub async fn sync_response_messages(
         &self,
         manifest_req: proto::ManifestRequest,
@@ -479,33 +513,39 @@ where
 const BULK_TARGET_BYTES: usize = 16 * 1024 * 1024;
 const BULK_MAX_CHUNKS: usize = 512;
 
-fn build_sync_payload_batches<F>(
+/// State for streaming sync chunk batches one at a time.
+pub struct SyncChunkIterState {
+    pub root_hash: Hash,
+    pub missing: Vec<u32>,
+    pub likely_precompressed: bool,
+    pub cursor: usize,
+}
+
+pub fn build_one_batch<F>(
     missing: &[u32],
+    cursor: &mut usize,
     primary_path: Option<&Path>,
     likely_precompressed: bool,
-    mut load_chunk: F,
-) -> Result<Vec<SyncMessage>, String>
+    load_chunk: &mut F,
+) -> Result<Option<SyncMessage>, String>
 where
     F: FnMut(u32) -> Option<Vec<u8>>,
 {
-    let mut messages = Vec::new();
-    let mut cursor = 0;
-
-    while cursor < missing.len() {
-        let start_index = missing[cursor];
+    while *cursor < missing.len() {
+        let start_index = missing[*cursor];
         let mut current_index = start_index;
         let mut count = 0usize;
         let mut bulk_buf = Vec::with_capacity(BULK_TARGET_BYTES);
 
-        while cursor < missing.len() && count < BULK_MAX_CHUNKS {
-            let idx = missing[cursor];
+        while *cursor < missing.len() && count < BULK_MAX_CHUNKS {
+            let idx = missing[*cursor];
             if idx != current_index {
                 break;
             }
 
             let Some(data) = load_chunk(idx) else {
                 if count == 0 {
-                    cursor += 1;
+                    *cursor += 1;
                 }
                 break;
             };
@@ -516,7 +556,7 @@ where
 
             bulk_buf.extend_from_slice(&data);
             count += 1;
-            cursor += 1;
+            *cursor += 1;
             current_index += 1;
         }
 
@@ -524,8 +564,9 @@ where
             continue;
         }
 
-        let encoded = maybe_compress_sync_payload(&bulk_buf, primary_path, likely_precompressed)
-            .map_err(|err| err.to_string())?;
+        let encoded =
+            maybe_compress_sync_payload_owned(bulk_buf, primary_path, likely_precompressed)
+                .map_err(|err| err.to_string())?;
 
         let message = if count == 1 {
             SyncMessage {
@@ -547,9 +588,31 @@ where
                 })),
             }
         };
-        messages.push(message);
+        return Ok(Some(message));
     }
+    Ok(None)
+}
 
+fn build_sync_payload_batches<F>(
+    missing: &[u32],
+    primary_path: Option<&Path>,
+    likely_precompressed: bool,
+    mut load_chunk: F,
+) -> Result<Vec<SyncMessage>, String>
+where
+    F: FnMut(u32) -> Option<Vec<u8>>,
+{
+    let mut messages = Vec::new();
+    let mut cursor = 0;
+    while let Some(msg) = build_one_batch(
+        missing,
+        &mut cursor,
+        primary_path,
+        likely_precompressed,
+        &mut load_chunk,
+    )? {
+        messages.push(msg);
+    }
     Ok(messages)
 }
 

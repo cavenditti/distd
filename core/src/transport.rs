@@ -10,6 +10,7 @@ const SYNC_PAYLOAD_COMPRESSION_MIN_BYTES: usize = 64 * 1024;
 const SYNC_PAYLOAD_COMPRESSION_MIN_SAVINGS_BYTES: usize = 8 * 1024;
 const SYNC_PAYLOAD_ZSTD_LEVEL: i32 = 1;
 const SYNC_PAYLOAD_COMPRESSION_PROBE_WINDOW_BYTES: usize = 32 * 1024;
+pub const MAX_SYNC_DECOMPRESSED_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -54,6 +55,14 @@ fn uncompressed_payload(data: &[u8], uncompressed_size: u32) -> EncodedSyncPaylo
     EncodedSyncPayload {
         compression: SYNC_PAYLOAD_COMPRESSION_NONE,
         data: data.to_vec(),
+        uncompressed_size,
+    }
+}
+
+fn uncompressed_payload_owned(data: Vec<u8>, uncompressed_size: u32) -> EncodedSyncPayload {
+    EncodedSyncPayload {
+        compression: SYNC_PAYLOAD_COMPRESSION_NONE,
+        data,
         uncompressed_size,
     }
 }
@@ -117,6 +126,87 @@ pub fn maybe_compress_sync_payload(
         data: compressed,
         uncompressed_size,
     })
+}
+
+/// Like [`maybe_compress_sync_payload`] but takes ownership of the buffer to
+/// avoid a copy when the data is sent uncompressed.
+pub fn maybe_compress_sync_payload_owned(
+    data: Vec<u8>,
+    primary_path: Option<&Path>,
+    likely_precompressed: bool,
+) -> Result<EncodedSyncPayload, PayloadCompressionError> {
+    let uncompressed_size =
+        u32::try_from(data.len()).map_err(|_| PayloadCompressionError::SizeTooLarge)?;
+
+    if std::env::var_os("DISTD_DISABLE_SYNC_PAYLOAD_COMPRESSION").is_some() {
+        return Ok(uncompressed_payload_owned(data, uncompressed_size));
+    }
+
+    if data.len() < SYNC_PAYLOAD_COMPRESSION_MIN_BYTES {
+        return Ok(uncompressed_payload_owned(data, uncompressed_size));
+    }
+
+    if likely_precompressed || primary_path.is_some_and(path_likely_precompressed) {
+        return Ok(uncompressed_payload_owned(data, uncompressed_size));
+    }
+
+    if !probe_payload_compressibility(&data)? {
+        return Ok(uncompressed_payload_owned(data, uncompressed_size));
+    }
+
+    let compressed = zstd::bulk::compress(&data, SYNC_PAYLOAD_ZSTD_LEVEL)
+        .map_err(|err| PayloadCompressionError::Compress(err.to_string()))?;
+
+    if compressed.len() + SYNC_PAYLOAD_COMPRESSION_MIN_SAVINGS_BYTES > data.len() {
+        return Ok(uncompressed_payload_owned(data, uncompressed_size));
+    }
+
+    Ok(EncodedSyncPayload {
+        compression: SYNC_PAYLOAD_COMPRESSION_ZSTD,
+        data: compressed,
+        uncompressed_size,
+    })
+}
+
+/// Like [`decode_sync_payload`] but takes ownership of the data to avoid a
+/// copy when the payload is uncompressed.
+pub fn decode_sync_payload_owned(
+    compression: i32,
+    data: Vec<u8>,
+    uncompressed_size: u32,
+) -> Result<Vec<u8>, PayloadCompressionError> {
+    let expected_size = if uncompressed_size == 0 {
+        data.len()
+    } else {
+        uncompressed_size as usize
+    };
+    if expected_size > MAX_SYNC_DECOMPRESSED_BYTES {
+        return Err(PayloadCompressionError::SizeTooLarge);
+    }
+
+    match compression {
+        SYNC_PAYLOAD_COMPRESSION_NONE => {
+            if data.len() != expected_size {
+                return Err(PayloadCompressionError::SizeMismatch {
+                    expected: expected_size,
+                    actual: data.len(),
+                });
+            }
+            Ok(data)
+        }
+        SYNC_PAYLOAD_COMPRESSION_ZSTD => {
+            let decoded = zstd::bulk::decompress(&data, expected_size)
+                .map_err(|err| PayloadCompressionError::Decompress(err.to_string()))?;
+            if decoded.len() != expected_size {
+                return Err(PayloadCompressionError::SizeMismatch {
+                    expected: expected_size,
+                    actual: decoded.len(),
+                });
+            }
+            Ok(decoded)
+        }
+        other => Err(PayloadCompressionError::UnknownCodec(other)),
+    }
 }
 
 pub fn decode_sync_payload(

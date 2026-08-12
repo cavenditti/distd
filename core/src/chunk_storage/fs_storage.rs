@@ -148,6 +148,7 @@ impl HotChunkCache {
 pub fn open_file(path: &Path) -> Result<File, Error> {
     File::options()
         .create(true)
+        .read(true)
         .write(true)
         .append(false)
         .truncate(false)
@@ -182,6 +183,18 @@ impl Handle {
 
     pub fn flush(&mut self) -> Result<(), Error> {
         self.buf_writer.flush().map_err(Error::IoError)
+    }
+
+    /// Read `buf.len()` bytes from the underlying file at `offset`.
+    /// Flushes any pending writes first so they are visible.
+    pub fn read(&mut self, buf: &mut [u8], offset: u64) -> Result<(), Error> {
+        self.buf_writer.flush().map_err(Error::IoError)?;
+        let file = self.buf_writer.get_mut();
+        file.seek(std::io::SeekFrom::Start(offset))?;
+        file.read_exact(buf).map_err(Error::IoError)?;
+        // Mark position as unknown so next write re-seeks
+        self.position = offset + buf.len() as u64;
+        Ok(())
     }
 }
 
@@ -617,8 +630,6 @@ impl FsStorage {
             return Some(cached);
         }
 
-        self.flush_data_for_hash(hash).ok()?;
-
         let entry = {
             let inner = self.inner.read().unwrap();
             inner
@@ -628,9 +639,25 @@ impl FsStorage {
                 .cloned()
         }?;
 
-        let node = Node::try_from(&entry).ok()?;
-        let data = node.stored_data()?;
-        Some(self.cache_chunk_data(*hash, data))
+        if !entry.populated.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+
+        let size = usize::try_from(entry.info.size).ok()?;
+        let mut buf = vec![0u8; size];
+
+        // Try to read via the existing handle (avoids File::open per chunk)
+        if let Some(handle) = self.handle_for_path(&entry.path) {
+            if handle.lock().unwrap().read(&mut buf, entry.offset).is_ok() {
+                return Some(self.cache_chunk_data(*hash, Arc::new(buf)));
+            }
+        }
+
+        // Fallback: open file directly (handle may not exist on server side)
+        let mut file = File::open(&entry.path).ok()?;
+        file.seek(std::io::SeekFrom::Start(entry.offset)).ok()?;
+        file.read_exact(&mut buf).ok()?;
+        Some(self.cache_chunk_data(*hash, Arc::new(buf)))
     }
 
     fn stored_node(&self, hash: &Hash) -> Option<Arc<Node>> {
@@ -903,23 +930,6 @@ impl FsStorage {
         self.handles.read().unwrap().get(path).cloned()
     }
 
-    fn data_paths_for_hash(&self, hash: &Hash) -> Vec<PathBuf> {
-        self.inner
-            .read()
-            .unwrap()
-            .data
-            .get(hash)
-            .map(|entries| {
-                entries
-                    .iter()
-                    .map(|entry| entry.path.clone())
-                    .collect::<HashSet<_>>()
-                    .into_iter()
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
     fn is_path_fully_populated(&self, path: &Path) -> bool {
         self.inner
             .read()
@@ -1054,20 +1064,6 @@ impl FsStorage {
         drop(inner);
         self.persist()?;
         Ok(item)
-    }
-
-    fn flush_data_for_hash(&self, hash: &Hash) -> Result<(), Error> {
-        for path in self.data_paths_for_hash(hash) {
-            if let Some(handle) = self.handle_for_path(&path) {
-                handle.lock().unwrap().flush().inspect_err(|e| {
-                    tracing::error!(
-                        "Cannot flush infile chunk handle {}: {e}",
-                        path.to_string_lossy()
-                    )
-                })?;
-            }
-        }
-        Ok(())
     }
 
     fn persist(&self) -> Result<(), Error> {
