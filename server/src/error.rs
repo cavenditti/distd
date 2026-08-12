@@ -3,6 +3,9 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum Server {
+    #[error("server I/O error")]
+    Io(#[from] std::io::Error),
+
     #[error("Cannot insert chunk in data store")]
     ChunkInsertError,
 
@@ -18,6 +21,9 @@ pub enum Server {
 
     #[error("QUIC transport error: {0}")]
     Quic(String),
+
+    #[error("server state error: {0}")]
+    State(String),
 
     #[error("unknown data store error")]
     UnknownDataStore,

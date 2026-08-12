@@ -8,11 +8,11 @@
 //!
 //! Both "in-memory" (current default) and "persistent" server modes are supported.
 
-use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::metrics::{self, ProcessMonitor, RunMetrics};
@@ -29,6 +29,7 @@ const CURL_MAX_TIME: &str = "30";
 const PUBLISH_RETRIES: usize = 3;
 const HTTP_SERVER_ADDR: &str = "127.0.0.1:3000";
 const SYNC_SERVER_ADDR: &str = "127.0.0.1:50051";
+const BENCH_AUTH_TOKEN: &str = "distd-isolated-benchmark-token";
 
 /// Paths to the compiled distd binaries.
 struct BinaryPaths {
@@ -76,17 +77,23 @@ pub struct DistdRunner {
     work_dir: PathBuf,
     display_name: String,
     network: Option<NetworkProfile>,
-    /// Server child held in a RefCell so `transfer(&self)` can manage it.
-    server_guard: RefCell<Option<ServerGuard>>,
-    sync_udp_proxy: RefCell<Option<UdpShaperProxy>>,
+    server_guard: Mutex<Option<ServerGuard>>,
+    sync_udp_proxy: Mutex<Option<UdpShaperProxy>>,
 }
 
-// SAFETY: DistdRunner is only used from one thread (the benchmark orchestrator
-// runs tools sequentially). The RefCell is never shared across threads.
-unsafe impl Send for DistdRunner {}
-unsafe impl Sync for DistdRunner {}
-
 impl DistdRunner {
+    fn client_cache_dir(&self) -> PathBuf {
+        self.work_dir.join("client-cache")
+    }
+
+    fn reset_client_cache(&self) -> Result<(), String> {
+        let cache = self.client_cache_dir();
+        if cache.exists() {
+            std::fs::remove_dir_all(&cache).map_err(|error| error.to_string())?;
+        }
+        std::fs::create_dir_all(cache).map_err(|error| error.to_string())
+    }
+
     fn http_version_ready() -> bool {
         let Ok(mut stream) = TcpStream::connect_timeout(
             &HTTP_SERVER_ADDR.parse().unwrap(),
@@ -116,8 +123,8 @@ impl DistdRunner {
             work_dir: work_dir.join("distd"),
             display_name: "distd-quic".to_string(),
             network: options.network,
-            server_guard: RefCell::new(None),
-            sync_udp_proxy: RefCell::new(None),
+            server_guard: Mutex::new(None),
+            sync_udp_proxy: Mutex::new(None),
         }
     }
 
@@ -182,6 +189,12 @@ impl DistdRunner {
         let storage_root = self
             .work_dir
             .join(format!("server_storage_{storage_nonce}"));
+        let server_state = self.work_dir.join("server-state");
+        std::fs::create_dir_all(&server_state).map_err(|error| error.to_string())?;
+        let metadata_path = server_state.join("metadata.bitcode");
+        if metadata_path.exists() {
+            std::fs::remove_file(&metadata_path).map_err(|error| error.to_string())?;
+        }
 
         let bins = Self::binary_paths();
         if !bins.server.exists() {
@@ -196,6 +209,11 @@ impl DistdRunner {
             .env("RUST_LOG", "distd_server=info")
             .env("DISTD_STORAGE", "fs")
             .env("DISTD_STORAGE_ROOT", &storage_root)
+            .env("DISTD_SERVER_STATE_DIR", &server_state)
+            .env("DISTD_CACHE_DIR", storage_root.join("cache"))
+            .env("DISTD_ENROLLMENT_TOKEN", BENCH_AUTH_TOKEN)
+            .env("DISTD_PUBLISH_TOKEN", BENCH_AUTH_TOKEN)
+            .env("DISTD_ADMIN_TOKEN", BENCH_AUTH_TOKEN)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if let Ok(cache_mb) = std::env::var("DISTD_STORAGE_CHUNK_CACHE_MB") {
@@ -211,7 +229,7 @@ impl DistdRunner {
         let guard = ServerGuard::new(child);
         let pid = guard.pid();
 
-        *self.server_guard.borrow_mut() = Some(guard);
+        *self.server_guard.lock().unwrap() = Some(guard);
 
         // Wait for QUIC to bind its UDP port and HTTP to return a real 200 on /version.
         let start = Instant::now();
@@ -246,7 +264,7 @@ impl DistdRunner {
     fn stop_server(&self) {
         self.stop_shapers();
         // Dropping the guard kills the child process
-        *self.server_guard.borrow_mut() = None;
+        *self.server_guard.lock().unwrap() = None;
     }
 
     fn start_shapers(&self) -> Result<(), String> {
@@ -256,13 +274,13 @@ impl DistdRunner {
         };
 
         let sync_target: SocketAddr = SYNC_SERVER_ADDR.parse().unwrap();
-        *self.sync_udp_proxy.borrow_mut() = Some(UdpShaperProxy::start(sync_target, profile)?);
+        *self.sync_udp_proxy.lock().unwrap() = Some(UdpShaperProxy::start(sync_target, profile)?);
 
         Ok(())
     }
 
     fn stop_shapers(&self) {
-        *self.sync_udp_proxy.borrow_mut() = None;
+        *self.sync_udp_proxy.lock().unwrap() = None;
     }
 
     fn publish_base_url(&self) -> String {
@@ -271,7 +289,8 @@ impl DistdRunner {
 
     fn client_server_url(&self) -> String {
         self.sync_udp_proxy
-            .borrow()
+            .lock()
+            .unwrap()
             .as_ref()
             .map(|proxy| format!("quic://{}", proxy.listen_addr()))
             .unwrap_or_else(|| format!("quic://{SYNC_SERVER_ADDR}"))
@@ -295,6 +314,8 @@ impl DistdRunner {
                     CURL_MAX_TIME,
                     "-X",
                     "POST",
+                    "-H",
+                    &format!("Authorization: Bearer {BENCH_AUTH_TOKEN}"),
                     &format!(
                         "{}/items?name={}&path={}",
                         self.publish_base_url(),
@@ -347,6 +368,8 @@ impl DistdRunner {
                 .arg(CURL_MAX_TIME)
                 .arg("-X")
                 .arg("POST")
+                .arg("-H")
+                .arg(format!("Authorization: Bearer {BENCH_AUTH_TOKEN}"))
                 .arg(format!(
                     "{}/items?name={}&path={}",
                     self.publish_base_url(),
@@ -410,6 +433,9 @@ impl DistdRunner {
         std::fs::create_dir_all(&client_dir).map_err(|e| e.to_string())?;
 
         let storage_dir = dest_dir.to_string_lossy().to_string();
+        let certificate = std::fs::read(self.work_dir.join("server-state/quic-cert.der"))
+            .map_err(|error| format!("Cannot read benchmark server certificate: {error}"))?;
+        let certificate_fingerprint = blake3::hash(&certificate).to_hex().to_string();
         let config = serde_json::json!({
             "fsstorage": {
                 "enabled": true,
@@ -417,6 +443,9 @@ impl DistdRunner {
             },
             "server": {
                 "url": self.client_server_url(),
+                "enrollment_token": BENCH_AUTH_TOKEN,
+                "certificate_fingerprint": certificate_fingerprint,
+                "allow_tofu": false,
             },
             "log": {
                 "level": "INFO",
@@ -436,6 +465,7 @@ impl DistdRunner {
             .args(["get", item_path])
             .current_dir(&client_dir)
             .env("RUST_LOG", "distd_client=info")
+            .env("DISTD_CACHE_DIR", self.client_cache_dir())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -460,8 +490,7 @@ impl ToolRunner for DistdRunner {
         dest_dir: &Path,
         m: &mut RunMetrics,
     ) -> Result<(), String> {
-        // Clear client cache to avoid stale UUIDs being rejected by fresh server
-        clean_distd_cache();
+        self.reset_client_cache()?;
 
         // Start server (stop any previous one first)
         let server_pid = self.start_server()?;
@@ -494,9 +523,8 @@ impl ToolRunner for DistdRunner {
         // Fetch — this is the measured operation
         let start = Instant::now();
         let (mut client_child, _client_dir) =
-            self.client_get(item_path, dest_dir).map_err(|e| {
+            self.client_get(item_path, dest_dir).inspect_err(|_e| {
                 self.stop_server();
-                e
             })?;
         let client_pid = client_child.id();
 
@@ -555,7 +583,7 @@ impl ToolRunner for DistdRunner {
         m.source_bytes = workload.total_bytes_v1;
         m.dest_size_bytes = metrics::dir_size(dest_dir);
         if m.bytes_transferred == 0 {
-            m.bytes_transferred = m.dest_size_bytes;
+            m.notes.push_str(" | wire-byte measurement unavailable");
         }
         m.peak_rss_bytes = peak_rss;
         m.cpu_seconds = cpu_secs;
@@ -607,9 +635,6 @@ impl ToolRunner for DistdRunner {
             .ok_or("No v2 source for delta benchmark")?;
         let expected_source_bytes = workload.total_bytes_v2.unwrap_or(workload.total_bytes_v1);
 
-        // Clear client cache to avoid stale UUIDs
-        clean_distd_cache();
-
         // Start server
         let server_pid = self.start_server()?;
 
@@ -628,9 +653,8 @@ impl ToolRunner for DistdRunner {
         } else {
             self.publish_file(&v1_files[0], item_name, item_path)
         }
-        .map_err(|e| {
+        .inspect_err(|_e| {
             self.stop_server();
-            e
         })?;
 
         std::fs::create_dir_all(dest_dir).map_err(|e| {
@@ -657,18 +681,16 @@ impl ToolRunner for DistdRunner {
         } else {
             self.publish_file(&v2_files[0], item_name, item_path)
         }
-        .map_err(|e| {
+        .inspect_err(|_e| {
             self.stop_server();
-            e
         })?;
 
         // --- Phase 3: fetch again (the measured delta operation) ---
         // The client's dest already has v1 data; this exercises the diff path
         let start = Instant::now();
         let (mut client_child, _client_dir) =
-            self.client_get(item_path, dest_dir).map_err(|e| {
+            self.client_get(item_path, dest_dir).inspect_err(|_e| {
                 self.stop_server();
-                e
             })?;
         let client_pid = client_child.id();
         let mut monitor = ProcessMonitor::new(&[server_pid, client_pid]);
@@ -718,8 +740,7 @@ impl ToolRunner for DistdRunner {
         m.source_bytes = expected_source_bytes;
         m.dest_size_bytes = metrics::dir_size(dest_dir);
         if m.bytes_transferred == 0 {
-            m.bytes_transferred = m.dest_size_bytes;
-            m.notes.push_str(" | fell back to dest-size byte estimate");
+            m.notes.push_str(" | wire-byte measurement unavailable");
         }
         m.peak_rss_bytes = peak_rss;
         m.cpu_seconds = cpu_secs;
@@ -766,37 +787,6 @@ impl Drop for DistdRunner {
     }
 }
 
-/// Remove the distd client cache directory (UUIDs, FsStorage persistence, etc.)
-/// so that each benchmark run starts with a clean slate.
-fn clean_distd_cache() {
-    // Cross-platform: use $XDG_CACHE_HOME or platform-specific default
-    let cache_base = std::env::var("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .ok()
-        .or_else(|| {
-            std::env::var("HOME").ok().map(|h| {
-                let home = PathBuf::from(h);
-                if cfg!(target_os = "macos") {
-                    home.join("Library/Caches")
-                } else {
-                    home.join(".cache")
-                }
-            })
-        });
-
-    if let Some(base) = cache_base {
-        let cache_path = base.join("distd");
-        if cache_path.exists() {
-            if let Err(e) = std::fs::remove_dir_all(&cache_path) {
-                tracing::warn!(
-                    "Failed to clean distd cache at {}: {e}",
-                    cache_path.display()
-                );
-            }
-        }
-    }
-}
-
 /// Query the server's chunk store size via REST.
 fn query_store_size() -> Result<u64, String> {
     let output = Command::new("curl")
@@ -807,6 +797,8 @@ fn query_store_size() -> Result<u64, String> {
             CURL_CONNECT_TIMEOUT,
             "--max-time",
             "5",
+            "-H",
+            &format!("Authorization: Bearer {BENCH_AUTH_TOKEN}"),
             "http://127.0.0.1:3000/chunks/size-sum",
         ])
         .output()
@@ -820,34 +812,19 @@ fn query_store_size() -> Result<u64, String> {
 
 fn extract_payload_bytes(stderr: &str) -> Option<u64> {
     stderr.lines().find_map(|line| {
-        ["distd_sync_payload_bytes=", "distd_payload_bytes="]
-            .into_iter()
-            .find_map(|needle| {
-                line.split(needle)
-                    .nth(1)
-                    .and_then(|value| value.split_whitespace().next())
-                    .and_then(|value| value.parse::<u64>().ok())
-            })
+        [
+            "distd_sync_wire_bytes=",
+            "distd_sync_payload_bytes=",
+            "distd_payload_bytes=",
+        ]
+        .into_iter()
+        .find_map(|needle| {
+            line.split(needle)
+                .nth(1)
+                .and_then(|value| value.split_whitespace().next())
+                .and_then(|value| value.parse::<u64>().ok())
+        })
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::extract_payload_bytes;
-
-    #[test]
-    fn extracts_current_sync_payload_metric() {
-        let stderr = "INFO distd_sync_payload_bytes=65536000 distd_sync_received_chunks=1000";
-
-        assert_eq!(extract_payload_bytes(stderr), Some(65_536_000));
-    }
-
-    #[test]
-    fn extracts_legacy_payload_metric() {
-        let stderr = "INFO distd_payload_bytes=42";
-
-        assert_eq!(extract_payload_bytes(stderr), Some(42));
-    }
 }
 
 /// Find the workspace root by walking up from the current executable or CARGO_MANIFEST_DIR.
@@ -872,4 +849,23 @@ fn workspace_root() -> PathBuf {
 
     // Last resort
     PathBuf::from(".")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_payload_bytes;
+
+    #[test]
+    fn extracts_current_sync_payload_metric() {
+        let stderr = "INFO distd_sync_wire_bytes=1234 distd_sync_payload_bytes=65536000 distd_sync_received_chunks=1000";
+
+        assert_eq!(extract_payload_bytes(stderr), Some(1234));
+    }
+
+    #[test]
+    fn extracts_legacy_payload_metric() {
+        let stderr = "INFO distd_payload_bytes=42";
+
+        assert_eq!(extract_payload_bytes(stderr), Some(42));
+    }
 }

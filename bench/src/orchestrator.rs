@@ -62,6 +62,11 @@ impl BenchmarkOrchestrator {
     }
 
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.resume {
+            return Err(
+                "--resume is not implemented: refusing to label a full transfer as resume".into(),
+            );
+        }
         std::fs::create_dir_all(&self.output_dir)?;
 
         // 1. Check tool availability
@@ -131,12 +136,6 @@ impl BenchmarkOrchestrator {
                 // Run delta/update benchmarks if workload has v2
                 if wl.source_dir_v2.is_some() {
                     let results = self.run_tool_update_iterations(&*runner, wl);
-                    all_results.extend(results);
-                }
-
-                // Run resume benchmark if requested
-                if self.resume {
-                    let results = self.run_resume_iteration(&*runner, wl);
                     all_results.extend(results);
                 }
 
@@ -289,59 +288,5 @@ impl BenchmarkOrchestrator {
         }
 
         results
-    }
-
-    fn run_resume_iteration(
-        &self,
-        runner: &dyn runners::ToolRunner,
-        workload: &Workload,
-    ) -> Vec<RunMetrics> {
-        // Resume test: start a transfer, interrupt it after 50% time of a normal run,
-        // then restart and complete. We approximate by running two transfers —
-        // first partial (kill early), second full.
-        let dest = self
-            .data_dir
-            .join("dest")
-            .join(runner.name())
-            .join(workload.kind.to_string())
-            .join("resume");
-
-        let _ = std::fs::remove_dir_all(&dest);
-        std::fs::create_dir_all(&dest).expect("create dest dir");
-
-        let mut m = RunMetrics::new(
-            runner.name(),
-            &format!("{}-resume", workload.kind),
-            &self.runner_options.network_label(),
-            0,
-            "warm",
-        );
-        m.is_resume = true;
-
-        tracing::info!("    [resume] {} {}...", runner.name(), workload.kind,);
-
-        // For a proper resume test we'd need to kill mid-transfer and restart.
-        // Since we can't easily interrupt external tools uniformly, we simulate:
-        // 1. Do a full transfer (measures resumed-from-nothing).
-        // 2. Note: a real resume test would need per-tool interrupt support.
-        match runner.transfer(workload, &dest, &mut m) {
-            Ok(()) => {
-                m.notes
-                    .push_str(" | resume scenario (full transfer, dest pre-exists on retry)");
-                tracing::info!(
-                    "    → {:.2} MiB/s, {:.3}s, correct={}",
-                    m.throughput_mibs,
-                    m.wall_clock_secs,
-                    m.correct,
-                );
-            }
-            Err(e) => {
-                tracing::error!("    → RESUME FAILED: {e}");
-                m.notes = format!("FAILED: {e}");
-            }
-        }
-
-        let _ = std::fs::remove_dir_all(&dest);
-        vec![m]
     }
 }

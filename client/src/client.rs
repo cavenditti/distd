@@ -3,10 +3,9 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
-    time::Duration,
 };
 
-use tokio::time::{sleep, Instant};
+use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::{
@@ -40,7 +39,6 @@ where
     T: ChunkStorage,
 {
     pub async fn new(
-        server_public_key: &[u8; 32],
         storage: T,
         settings: Settings,
         mut state: ClientState,
@@ -50,26 +48,41 @@ where
             .client_uuid
             .as_ref()
             .and_then(|uuid_str| Uuid::from_str(uuid_str).ok());
+        let configured_certificate = settings
+            .server
+            .certificate_fingerprint
+            .as_deref()
+            .map(blake3::Hash::from_hex)
+            .transpose()
+            .map_err(|_| ClientError::UnpinnedServer)?
+            .map(|fingerprint| *fingerprint.as_bytes());
+        let persisted_certificate = state
+            .persistent
+            .server_certificates
+            .get(&settings.server.url)
+            .and_then(|fingerprint| blake3::Hash::from_hex(fingerprint).ok())
+            .map(|fingerprint| *fingerprint.as_bytes());
+        let expected_certificate = configured_certificate.or(persisted_certificate);
+        if expected_certificate.is_none() && !settings.server.allow_tofu {
+            return Err(ClientError::UnpinnedServer);
+        }
 
-        let server = loop {
-            match Server::new(
-                &settings.server.url,
-                &settings.client.name,
-                client_uuid,
-                server_public_key,
-            )
-            .await
-            {
-                Ok(server) => break server,
-                Err(e) => {
-                    const T: u64 = 5;
-                    tracing::warn!("Error: '{e}', retrying in {T} seconds");
-                    sleep(Duration::from_secs(T)).await;
-                }
-            }
-        };
+        let server = Server::new(
+            &settings.server.url,
+            &settings.client.name,
+            client_uuid,
+            expected_certificate,
+            settings.server.enrollment_token.as_deref(),
+        )
+        .await?;
 
         state.persistent.client_uuid = Some(server.client_uuid().to_string());
+        state.persistent.server_certificates.insert(
+            settings.server.url.clone(),
+            blake3::Hash::from_bytes(server.pub_key)
+                .to_hex()
+                .to_string(),
+        );
         state.persistent.commit().unwrap();
 
         let items = server.metadata().await.items;
@@ -124,10 +137,11 @@ impl Client<FsStorage> {
     async fn sync_transfer(
         &mut self,
         target: ItemMetadata,
+        destination: PathBuf,
         from: &[Hash],
     ) -> Result<Item, ClientError> {
         let t0 = Instant::now();
-        let (manifest, chunk_infos, received_chunks) =
+        let (manifest, chunk_infos, received_chunks, wire_bytes) =
             self.server.sync_artifact(&target.artifact_id, from).await?;
         let network_elapsed = t0.elapsed();
 
@@ -142,7 +156,7 @@ impl Client<FsStorage> {
             .storage
             .receive_sync_item(
                 target.name,
-                target.path,
+                destination,
                 target.revision,
                 target.description,
                 &manifest,
@@ -154,7 +168,7 @@ impl Client<FsStorage> {
         let store_elapsed = t1.elapsed();
 
         tracing::info!(
-            "distd_sync_payload_bytes={payload_bytes} distd_sync_received_chunks={} distd_network_ms={} distd_store_ms={}",
+            "distd_sync_wire_bytes={wire_bytes} distd_sync_payload_bytes={payload_bytes} distd_sync_received_chunks={} distd_network_ms={} distd_store_ms={}",
             received_chunk_count,
             network_elapsed.as_millis(),
             store_elapsed.as_millis(),
@@ -166,8 +180,8 @@ impl Client<FsStorage> {
     pub async fn get(&mut self, target: &Path, path: &Path) -> Result<Item, ClientError> {
         tracing::debug!("sync: {target:?} {path:?}");
 
-        let path = self.storage.path(path);
-        let (_, from) = self.local_diff_basis(&path);
+        let resolved_path = self.storage.path(path).map_err(ClientError::Core)?;
+        let (_, from) = self.local_diff_basis(&resolved_path);
 
         let server_metadata = self.server.metadata().await;
         // Look up by artifact_id (target path string used as artifact_id)
@@ -185,7 +199,9 @@ impl Client<FsStorage> {
         );
         let now = Instant::now();
 
-        let item = self.sync_transfer(item_metadata.clone(), &from).await?;
+        let item = self
+            .sync_transfer(item_metadata.clone(), path.to_path_buf(), &from)
+            .await?;
 
         tracing::info!(
             "Got {} v{}, {} bytes after {:.4}s",
@@ -198,7 +214,11 @@ impl Client<FsStorage> {
         Ok(item)
     }
 
-    async fn update(&mut self, new_item_metadata: &ItemMetadata) -> Result<Item, ClientError> {
+    async fn update(
+        &mut self,
+        new_item_metadata: &ItemMetadata,
+        destination: &Path,
+    ) -> Result<Item, ClientError> {
         tracing::info!(
             "Updating item '{}' at '{}'",
             new_item_metadata.name,
@@ -206,7 +226,7 @@ impl Client<FsStorage> {
         );
         let now = Instant::now();
 
-        let local_path = self.storage.path(&new_item_metadata.path);
+        let local_path = self.storage.path(destination).map_err(ClientError::Core)?;
         let (from_version, from) = self.local_diff_basis(&local_path);
 
         tracing::info!(
@@ -216,7 +236,9 @@ impl Client<FsStorage> {
             from.len()
         );
 
-        let item = self.sync_transfer(new_item_metadata.clone(), &from).await?;
+        let item = self
+            .sync_transfer(new_item_metadata.clone(), destination.to_path_buf(), &from)
+            .await?;
 
         tracing::info!(
             "Got {} v{}, {} bytes after {:.4}s",
@@ -246,7 +268,7 @@ impl Client<FsStorage> {
 
                 tracing::debug!("Syncing '{artifact_id}'");
                 let old_item = items.get(&artifact_id).ok_or(ClientError::Storage)?;
-                let item = self.update(old_item).await?;
+                let item = self.update(old_item, path).await?;
                 latest.insert(artifact_id, *item.root());
             }
         }
@@ -289,7 +311,7 @@ pub mod cli {
         let storage = FsStorage::new(storage_root);
         //let storage = HashMapStorage::default(); // use this for benchmarking in order to avoid potential fs-related bottlenecks
         tracing::trace!("Client storage initialized");
-        let client = Client::new(&[0u8; 32], storage, settings, state).await?;
+        let client = Client::new(storage, settings, state).await?;
         tracing::trace!("Client initialized");
 
         match cmd.as_str() {

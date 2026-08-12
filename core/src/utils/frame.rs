@@ -35,6 +35,9 @@ where
     M: Message,
 {
     let payload_len = message.encoded_len();
+    if payload_len > MAX_FRAME_PAYLOAD_BYTES {
+        return Err(FrameError::FrameTooLarge);
+    }
     let frame_len = u32::try_from(payload_len).map_err(|_| FrameError::FrameTooLarge)?;
 
     let mut out = Vec::with_capacity(4 + payload_len);
@@ -71,6 +74,9 @@ where
             .try_into()
             .map_err(|_| FrameError::MalformedFrame)?,
     ) as usize;
+    if frame_len > MAX_FRAME_PAYLOAD_BYTES {
+        return Err(FrameError::FrameTooLarge);
+    }
     let total_len = 4 + frame_len;
     if buffer.len() < total_len {
         return Ok(None);
@@ -108,6 +114,9 @@ where
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf).await?;
     let frame_len = u32::from_be_bytes(len_buf) as usize;
+    if frame_len > MAX_FRAME_PAYLOAD_BYTES {
+        return Err(FrameError::FrameTooLarge);
+    }
     let mut payload = vec![0u8; frame_len];
     reader.read_exact(&mut payload).await?;
     Ok(M::decode(payload.as_slice())?)
@@ -166,7 +175,10 @@ where
 mod tests {
     use crate::proto::{sync_message::Msg, ManifestRequest, SyncMessage};
 
-    use super::{decode_length_delimited, encode_length_delimited, try_decode_length_delimited};
+    use super::{
+        decode_length_delimited, encode_length_delimited, read_length_delimited_async,
+        try_decode_length_delimited, FrameError, MAX_FRAME_PAYLOAD_BYTES,
+    };
 
     fn message(artifact_id: &str) -> SyncMessage {
         SyncMessage {
@@ -183,6 +195,24 @@ mod tests {
         let decoded = decode_length_delimited::<SyncMessage>(&encoded).unwrap();
 
         assert_eq!(decoded, message("artifact-a"));
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_frame_before_reading_payload() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut writer, mut reader) = tokio::io::duplex(8);
+        tokio::spawn(async move {
+            writer
+                .write_all(&((MAX_FRAME_PAYLOAD_BYTES as u32) + 1).to_be_bytes())
+                .await
+                .unwrap();
+        });
+
+        let error = read_length_delimited_async::<_, SyncMessage>(&mut reader)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, FrameError::FrameTooLarge));
     }
 
     #[test]

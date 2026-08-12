@@ -110,4 +110,5 @@ message ClientRegister {
   string name = 1;
   string version = 2;
   optional bytes uuid = 3;
+  optional string enrollment_token = 4;
 }

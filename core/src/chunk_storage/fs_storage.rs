@@ -196,6 +196,14 @@ impl Handle {
         self.position = offset + buf.len() as u64;
         Ok(())
     }
+
+    pub fn set_len(&mut self, length: u64) -> Result<(), Error> {
+        self.buf_writer.flush().map_err(Error::IoError)?;
+        self.buf_writer
+            .get_mut()
+            .set_len(length)
+            .map_err(Error::IoError)
+    }
 }
 
 /// Chunk stored in multiple files
@@ -352,22 +360,33 @@ impl FsStorageState {
     }
 
     /// Returns the stored path of any path relative to root
-    fn path(&self, path: &Path) -> PathBuf {
-        if path.starts_with(&self.root) {
-            path.to_path_buf()
-        } else {
-            crate::utils::path::join(&self.root, path)
+    fn path(&self, path: &Path) -> Result<PathBuf, Error> {
+        let resolved = crate::utils::path::resolve_beneath(&self.root, path)?;
+        let relative = resolved
+            .strip_prefix(&self.root)
+            .map_err(|_| Error::MissingData)?;
+        let mut current = self.root.clone();
+        for component in relative.components() {
+            current.push(component.as_os_str());
+            match std::fs::symlink_metadata(&current) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(InvalidParameter::Generic {
+                        expected: "a destination without symbolic-link components".to_string(),
+                        got: path.to_string_lossy().into_owned(),
+                    }
+                    .into());
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
         }
+        Ok(resolved)
     }
 
     /// Full on-disk path for an item
     fn item_path(&self, item: &Item) -> Result<PathBuf, Error> {
-        let full_path = self.root.join(
-            item.metadata
-                .path
-                .strip_prefix("/")
-                .unwrap_or(&item.metadata.path),
-        );
+        let full_path = self.path(&item.metadata.path)?;
         create_dir_all(full_path.parent().unwrap_or(&full_path))?;
         tracing::debug!(
             "Created path {:?}",
@@ -550,13 +569,8 @@ impl Default for FsStorage {
 }
 
 impl FsStorage {
-    fn artifact_entry_path(root: &Path, relative_path: &Path) -> PathBuf {
-        relative_path
-            .components()
-            .fold(root.to_path_buf(), |mut acc, component| {
-                acc.push(component.as_os_str());
-                acc
-            })
+    fn artifact_entry_path(root: &Path, relative_path: &Path) -> Result<PathBuf, Error> {
+        crate::utils::path::resolve_beneath(root, relative_path)
     }
 
     fn combine_sync_nodes(&self, left: Arc<Node>, right: Arc<Node>) -> Result<Arc<Node>, Error> {
@@ -713,7 +727,7 @@ impl FsStorage {
         let mut next_chunk_index = 0u32;
 
         for (relative_path, data) in files {
-            let full_path = Self::artifact_entry_path(root_path, relative_path);
+            let full_path = self.path(&Self::artifact_entry_path(root_path, relative_path)?)?;
             create_dir_all(full_path.parent().ok_or(Error::MissingData)?)?;
 
             let start = next_chunk_index;
@@ -760,6 +774,7 @@ impl FsStorage {
         chunk_infos: &[ChunkInfo],
         available_hashes: &HashSet<Hash>,
         received_chunks: &mut VecDeque<Vec<u8>>,
+        staged_data: &mut HashMap<Hash, Arc<Vec<u8>>>,
     ) -> Result<(Vec<ChunkInfo>, Arc<Node>), Error> {
         let mut partials = Vec::with_capacity(chunk_infos.len());
         let mut chunks = Vec::with_capacity(chunk_infos.len());
@@ -775,8 +790,10 @@ impl FsStorage {
                 chunks.push(chunk_info);
 
                 if available_hashes.contains(&chunk_info.hash) {
-                    self.read_chunk_data(&chunk_info.hash)
-                        .ok_or_else(|| Error::Storage(StorageError::TreeReconstruct))?;
+                    let data = self
+                        .read_chunk_data(&chunk_info.hash)
+                        .ok_or(Error::Storage(StorageError::TreeReconstruct))?;
+                    staged_data.insert(chunk_info.hash, data);
                 } else {
                     let data = received_chunks
                         .pop_front()
@@ -784,7 +801,9 @@ impl FsStorage {
                     if do_hash(&data) != chunk_info.hash {
                         return Err(Error::Storage(StorageError::TreeReconstruct));
                     }
-                    self.cache_chunk_data(chunk_info.hash, Arc::new(data));
+                    let data = Arc::new(data);
+                    self.cache_chunk_data(chunk_info.hash, data.clone());
+                    staged_data.insert(chunk_info.hash, data);
                 }
 
                 partials.push(Arc::new(Node::Skipped {
@@ -803,50 +822,155 @@ impl FsStorage {
         item_root: &Path,
         manifest: &Manifest,
         chunks: &[ChunkInfo],
+        staged_data: &HashMap<Hash, Arc<Vec<u8>>>,
     ) -> Result<(), Error> {
-        let mut unique_hashes = HashSet::default();
-        let mut activation_paths = Vec::new();
-        let mut activation_ranges = Vec::new();
+        let parent = item_root.parent().ok_or(Error::MissingData)?;
+        create_dir_all(parent)?;
+        let item_name = item_root.file_name().ok_or(Error::MissingData)?;
+        let staging_root = parent.join(format!(
+            ".{}.distd-stage-{}",
+            item_name.to_string_lossy(),
+            uuid::Uuid::new_v4()
+        ));
+
+        let mut staged_files = Vec::new();
+        let mut final_files = Vec::new();
+        let mut ranges = Vec::new();
 
         if manifest.entries.is_empty() {
-            activation_paths.push(item_root.to_path_buf());
-            activation_ranges.push((0usize, chunks.len()));
-            unique_hashes.extend(chunks.iter().map(|chunk| chunk.hash));
+            staged_files.push(staging_root.clone());
+            final_files.push(item_root.to_path_buf());
+            ranges.push((0usize, chunks.len()));
         } else {
-            let mut ensured_parents = HashSet::default();
+            create_dir_all(&staging_root)?;
+            let mut expected_start = 0usize;
+            let mut seen_paths = HashSet::default();
             for entry in &manifest.entries {
-                let relative_path = PathBuf::from(&entry.relative_path);
-                let full_path = Self::artifact_entry_path(item_root, &relative_path);
-                let parent = full_path.parent().ok_or(Error::MissingData)?;
-                if ensured_parents.insert(parent.to_path_buf()) {
-                    create_dir_all(parent)?;
+                let relative_path =
+                    crate::utils::path::validate_relative(Path::new(&entry.relative_path))?;
+                if !seen_paths.insert(relative_path.clone()) {
+                    return Err(Error::Storage(StorageError::TreeReconstruct));
                 }
 
                 let start = entry.chunk_range.0 as usize;
                 let end = entry.chunk_range.1 as usize;
-                activation_paths.push(full_path);
-                activation_ranges.push((start, end));
-                unique_hashes.extend(chunks.iter().take(end).skip(start).map(|chunk| chunk.hash));
+                if start != expected_start || end < start || end > chunks.len() {
+                    return Err(Error::Storage(StorageError::TreeReconstruct));
+                }
+                let actual_size = chunks[start..end]
+                    .iter()
+                    .map(|chunk| chunk.size)
+                    .sum::<u64>();
+                if actual_size != entry.size {
+                    return Err(Error::Storage(StorageError::TreeReconstruct));
+                }
+                expected_start = end;
+
+                staged_files.push(Self::artifact_entry_path(&staging_root, &relative_path)?);
+                final_files.push(Self::artifact_entry_path(item_root, &relative_path)?);
+                ranges.push((start, end));
+            }
+            if expected_start != chunks.len() {
+                return Err(Error::Storage(StorageError::TreeReconstruct));
             }
         }
 
-        {
-            let mut inner = self.inner.write().unwrap();
-            for (path, (start, end)) in activation_paths
-                .iter()
-                .zip(activation_ranges.iter().copied())
-            {
-                inner.pre_allocate(path, &chunks[start..end])?;
+        let materialize_result = staged_files
+            .iter()
+            .zip(ranges.iter().copied())
+            .try_for_each(|(path, (start, end))| {
+                if let Some(parent) = path.parent() {
+                    create_dir_all(parent)?;
+                }
+                let mut file = File::create(path)?;
+                for chunk in &chunks[start..end] {
+                    let data = staged_data
+                        .get(&chunk.hash)
+                        .ok_or(Error::Storage(StorageError::TreeReconstruct))?;
+                    if data.len() as u64 != chunk.size || do_hash(data.as_ref()) != chunk.hash {
+                        return Err(Error::Storage(StorageError::TreeReconstruct));
+                    }
+                    file.write_all(data.as_ref())?;
+                }
+                file.set_len(chunks[start..end].iter().map(|chunk| chunk.size).sum())?;
+                file.sync_all()?;
+                Ok::<(), Error>(())
+            });
+
+        if let Err(error) = materialize_result {
+            Self::remove_staging_path(&staging_root);
+            return Err(error);
+        }
+
+        if let Err(error) = Self::atomic_replace(&staging_root, item_root) {
+            Self::remove_staging_path(&staging_root);
+            return Err(error);
+        }
+
+        let mut inner = self.inner.write().unwrap();
+        for entries in inner.data.values_mut() {
+            entries.retain(|entry| !entry.path.starts_with(item_root));
+        }
+        inner.data.retain(|_, entries| !entries.is_empty());
+        for (path, (start, end)) in final_files.iter().zip(ranges.iter().copied()) {
+            let mut offset = 0u64;
+            for chunk in &chunks[start..end] {
+                inner
+                    .data
+                    .entry(chunk.hash)
+                    .or_default()
+                    .push(Arc::new(InFileChunk {
+                        info: *chunk,
+                        path: path.clone(),
+                        offset,
+                        populated: Arc::new(AtomicBool::new(true)),
+                    }));
+                offset += chunk.size;
             }
         }
+        inner.mark_dirty();
+        drop(inner);
 
-        for hash in unique_hashes {
-            let data = self
-                .read_chunk_data(&hash)
-                .ok_or_else(|| Error::Storage(StorageError::TreeReconstruct))?;
-            self.store_chunk(hash, data.as_ref()).map_err(Error::from)?;
+        let mut handles = self.handles.write().unwrap();
+        handles.retain(|path, _| !path.starts_with(item_root));
+        for path in final_files {
+            handles.insert(path.clone(), Arc::new(Mutex::new(Handle::new(&path)?)));
+        }
+        Ok(())
+    }
+
+    fn remove_staging_path(path: &Path) {
+        if path.is_dir() {
+            let _ = fs::remove_dir_all(path);
+        } else {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    fn atomic_replace(staging: &Path, destination: &Path) -> Result<(), Error> {
+        let parent = destination.parent().ok_or(Error::MissingData)?;
+        let name = destination.file_name().ok_or(Error::MissingData)?;
+        let backup = parent.join(format!(
+            ".{}.distd-backup-{}",
+            name.to_string_lossy(),
+            uuid::Uuid::new_v4()
+        ));
+        let had_destination = destination.exists();
+        if had_destination {
+            fs::rename(destination, &backup)?;
         }
 
+        if let Err(error) = fs::rename(staging, destination) {
+            if had_destination {
+                let _ = fs::rename(&backup, destination);
+            }
+            return Err(error.into());
+        }
+
+        if had_destination {
+            Self::remove_staging_path(&backup);
+        }
+        File::open(parent)?.sync_all()?;
         Ok(())
     }
 
@@ -993,9 +1117,10 @@ impl FsStorage {
             return Err(Error::Storage(StorageError::TreeReconstruct));
         }
 
-        let stored_path = self.path(&path);
+        let stored_path = self.path(&path)?;
         let available_hashes: HashSet<Hash> = local_hashes.iter().copied().collect();
         let mut received_chunks: VecDeque<Vec<u8>> = received_chunks.into();
+        let mut staged_data = HashMap::default();
         let (chunks, root) = if manifest.entries.is_empty() {
             let mut partials = Vec::with_capacity(chunk_infos.len());
             let mut chunks = Vec::with_capacity(chunk_infos.len());
@@ -1004,8 +1129,10 @@ impl FsStorage {
                 chunks.push(chunk_info);
 
                 let node = if available_hashes.contains(&chunk_info.hash) {
-                    self.read_chunk_data(&chunk_info.hash)
-                        .ok_or_else(|| Error::Storage(StorageError::TreeReconstruct))?;
+                    let data = self
+                        .read_chunk_data(&chunk_info.hash)
+                        .ok_or(Error::Storage(StorageError::TreeReconstruct))?;
+                    staged_data.insert(chunk_info.hash, data);
                     Arc::new(Node::Skipped {
                         hash: chunk_info.hash,
                         size: chunk_info.size,
@@ -1017,7 +1144,9 @@ impl FsStorage {
                     if do_hash(&data) != chunk_info.hash {
                         return Err(Error::Storage(StorageError::TreeReconstruct));
                     }
-                    self.cache_chunk_data(chunk_info.hash, Arc::new(data));
+                    let data = Arc::new(data);
+                    self.cache_chunk_data(chunk_info.hash, data.clone());
+                    staged_data.insert(chunk_info.hash, data);
                     Arc::new(Node::Skipped {
                         hash: chunk_info.hash,
                         size: chunk_info.size,
@@ -1035,6 +1164,7 @@ impl FsStorage {
                 chunk_infos,
                 &available_hashes,
                 &mut received_chunks,
+                &mut staged_data,
             )?
         };
 
@@ -1046,7 +1176,7 @@ impl FsStorage {
             return Err(Error::Storage(StorageError::TreeReconstruct));
         }
 
-        self.activate_staged_chunks(&stored_path, manifest, &chunks)?;
+        self.activate_staged_chunks(&stored_path, manifest, &chunks, &staged_data)?;
 
         let item = Item::make_with_entries(
             name,
@@ -1200,7 +1330,7 @@ impl FsStorage {
 
     /// Returns the stored path of any path relative to root
     #[must_use]
-    pub fn path(&self, path: &Path) -> PathBuf {
+    pub fn path(&self, path: &Path) -> Result<PathBuf, Error> {
         self.inner.read().unwrap().path(path)
     }
 
@@ -1213,11 +1343,15 @@ impl FsStorage {
     #[must_use]
     pub fn item_for_path(&self, path: &Path) -> Option<Item> {
         let inner = self.inner.read().unwrap();
-        let full_path = inner.path(path);
+        let full_path = inner.path(path).ok()?;
         inner
             .items
             .iter()
-            .filter(|item| inner.path(&item.metadata.path) == full_path)
+            .filter(|item| {
+                inner
+                    .path(&item.metadata.path)
+                    .is_ok_and(|item_path| item_path == full_path)
+            })
             .cloned()
             .max_by_key(|item| (item.metadata.revision, item.chunks.len(), item.size()))
     }
@@ -1430,7 +1564,7 @@ impl ChunkStorage for FsStorage {
     {
         tracing::debug!("Create item {name} with path {path:?}");
         let mut inner = self.inner.write().unwrap();
-        let stored_path = inner.path(&path);
+        let stored_path = inner.path(&path)?;
         create_dir_all(stored_path.parent().ok_or(Error::MissingData)?)?;
         let chunks: Vec<ChunkInfo> = chunk_algorithm
             .chunk_boundaries(file.as_ref())
@@ -1446,6 +1580,12 @@ impl ChunkStorage for FsStorage {
         inner.pre_allocate(&stored_path, &chunks)?;
         drop(inner);
         self.ensure_handle(&stored_path)?;
+        if let Some(handle) = self.handle_for_path(&stored_path) {
+            handle
+                .lock()
+                .unwrap()
+                .set_len(chunks.iter().map(|chunk| chunk.size).sum())?;
+        }
         tracing::info!("Preallocated on disk {:?}", stored_path);
 
         let (hash_tree, chunks) = self.build_compact_tree(file.as_ref(), chunk_algorithm)?;
@@ -1484,10 +1624,19 @@ impl ChunkStorage for FsStorage {
 
         files.sort_by(|left, right| left.0.cmp(&right.0));
 
-        let item_root = self.path(&path);
+        let item_root = self.path(&path)?;
         create_dir_all(&item_root)?;
         let (hash_tree, chunks, entries) =
             self.build_compact_tree_from_files(&item_root, &files, chunk_algorithm)?;
+        for entry in &entries {
+            let path = self.path(&Self::artifact_entry_path(
+                &item_root,
+                Path::new(&entry.relative_path),
+            )?)?;
+            if let Some(handle) = self.handle_for_path(&path) {
+                handle.lock().unwrap().set_len(entry.size)?;
+            }
+        }
         let mut inner = self.inner.write().unwrap();
         let item = Item::make_with_entries(
             name,
@@ -1520,7 +1669,7 @@ impl ChunkStorage for FsStorage {
     {
         tracing::debug!("Create item {name} with path {path:?}");
         let mut inner = self.inner.write().unwrap();
-        let stored_path = inner.path(&path);
+        let stored_path = inner.path(&path)?;
         inner.pre_allocate(&stored_path, &root.flatten_with_sizes()?)?;
         drop(inner);
         self.ensure_handle(&stored_path)?;
@@ -1548,7 +1697,7 @@ impl ChunkStorage for FsStorage {
         Self: Sized,
         T: Stream<Item = Node> + std::marker::Unpin,
     {
-        let stored_path = self.path(&path);
+        let stored_path = self.path(&path)?;
         self.ensure_handle(&stored_path)?;
         tracing::trace!("Receiving item at '{}'", stored_path.to_string_lossy());
         let mut i = 0;
@@ -2124,6 +2273,95 @@ mod tests {
         for _ in 0..10 {
             fs_storage_persistance();
         }
+    }
+
+    #[test]
+    fn rejects_destinations_outside_the_storage_root() {
+        let root = temp_path();
+        let storage = FsStorage::new(root.clone());
+        let escaped_name = format!("distd-escaped-{}", uuid::Uuid::new_v4());
+        let escaped = root.parent().unwrap().join(&escaped_name);
+
+        let result = storage.create_item(
+            "unsafe-item".to_string(),
+            PathBuf::from("..").join(&escaped_name),
+            0,
+            None,
+            bytes::Bytes::from_static(b"must stay contained"),
+            ChunkAlgorithm::default(),
+        );
+
+        assert!(result.is_err());
+        assert!(!escaped.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symbolic_link_destinations() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_path();
+        let outside = temp_path();
+        let storage = FsStorage::new(root.clone());
+        symlink(&outside, root.join("link")).unwrap();
+
+        assert!(storage.path(Path::new("link/file")).is_err());
+        assert!(!outside.join("file").exists());
+    }
+
+    #[test]
+    fn sync_activation_truncates_a_shorter_revision() {
+        use crate::chunk_storage::hashmap_storage::HashMapStorage;
+
+        let root = temp_path();
+        let storage = FsStorage::with_cache_config(
+            root.clone(),
+            FsStorageCacheConfig {
+                max_chunk_bytes: 1,
+                max_tree_entries: 16,
+            },
+        );
+        storage
+            .create_item(
+                "artifact".to_string(),
+                PathBuf::from("artifact.bin"),
+                0,
+                None,
+                bytes::Bytes::from(vec![1u8; CHUNK_SIZE * 3]),
+                ChunkAlgorithm::default(),
+            )
+            .unwrap();
+
+        let replacement = vec![9u8; CHUNK_SIZE / 2];
+        let source = HashMapStorage::default();
+        let (replacement_root, chunks) = source
+            .chunk_tree(&replacement, ChunkAlgorithm::default())
+            .unwrap();
+        let manifest = Manifest::from_tree(
+            "artifact".to_string(),
+            1,
+            &replacement_root,
+            &chunks,
+            ChunkAlgorithm::default(),
+        );
+
+        storage
+            .receive_sync_item(
+                "artifact".to_string(),
+                PathBuf::from("artifact.bin"),
+                1,
+                None,
+                &manifest,
+                &chunks,
+                &[],
+                vec![replacement.clone()],
+            )
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(root.join("artifact.bin")).unwrap(),
+            replacement
+        );
     }
 
     #[cfg(feature = "nightly-bench")]

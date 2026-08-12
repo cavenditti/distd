@@ -4,11 +4,12 @@ members = ["core", "server", "client", "bench"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-authors = [""]
-description = ""
-documentation = "https://example.com/bar"
+rust-version = "1.96"
+authors = ["Carlo"]
+description = "Authenticated single-origin artifact synchronization over QUIC"
+documentation = "https://docs.rs/distd_core"
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = 0 }
@@ -27,7 +28,7 @@ tracing = { version = "0.1.40" }
 tracing-subscriber = { version = "0.3.16" }
 test-log = { version = "0.2", default-features = false, features = ["trace"] }
 clap = { version = "4", features = ["derive"] }
-config = { version = "0.14.0", default-features = false, features = ["json"] }
+config = { version = "0.14.0", default-features = false, features = ["json", "toml"] }
 dirs = { version = "5.0" }
 rustc-hash = { version = "2.0", default-features = false, features = ["std"]}
 

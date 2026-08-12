@@ -219,6 +219,9 @@ pub fn decode_sync_payload(
     } else {
         uncompressed_size as usize
     };
+    if expected_size > MAX_SYNC_DECOMPRESSED_BYTES {
+        return Err(PayloadCompressionError::SizeTooLarge);
+    }
 
     match compression {
         SYNC_PAYLOAD_COMPRESSION_NONE => {

@@ -31,9 +31,13 @@ pub fn config_dir() -> PathBuf {
 /// This function will panic if the directory cannot be created.
 #[inline]
 pub fn cache_dir() -> PathBuf {
-    let d = user_cache_dir()
-        .expect("Cannot find config directory")
-        .join("distd");
+    let d = std::env::var_os("DISTD_CACHE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            user_cache_dir()
+                .expect("Cannot find cache directory")
+                .join("distd")
+        });
     tracing::debug!("Cache dir: {}", d.to_string_lossy());
     if !d.is_dir() {
         std::fs::create_dir_all(&d).unwrap();

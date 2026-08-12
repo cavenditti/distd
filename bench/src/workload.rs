@@ -171,7 +171,7 @@ fn generate_one(base: &Path, kind: &WorkloadKind, params: &WorkloadParams) -> Wo
     }
 }
 
-/// Helpers ─────────────────────────────────────────────
+// Helpers ─────────────────────────────────────────────
 
 fn write_random_file(path: &Path, size: usize) {
     if let Some(parent) = path.parent() {
@@ -611,21 +611,18 @@ fn mutate_file_blocks(path: &Path, fraction: f64) {
         .expect("open for mutation");
     let len = f.metadata().expect("metadata").len() as usize;
     let block_size = 256 * 1024; // match distd's CHUNK_SIZE
-    let num_blocks = (len + block_size - 1) / block_size;
+    let num_blocks = len.div_ceil(block_size);
     let blocks_to_mutate = ((num_blocks as f64) * fraction).ceil() as usize;
 
     let mut rng = rand::thread_rng();
     let mut buf = vec![0u8; block_size];
 
     // Pick evenly spaced blocks to mutate for reproducibility
-    let step = if blocks_to_mutate > 0 {
-        num_blocks / blocks_to_mutate
-    } else {
-        num_blocks + 1
-    };
+    let step = num_blocks
+        .checked_div(blocks_to_mutate)
+        .unwrap_or(num_blocks + 1);
 
-    let mut mutated = 0;
-    for block_idx in (0..num_blocks).step_by(step.max(1)) {
+    for (mutated, block_idx) in (0..num_blocks).step_by(step.max(1)).enumerate() {
         if mutated >= blocks_to_mutate {
             break;
         }
@@ -634,7 +631,6 @@ fn mutate_file_blocks(path: &Path, fraction: f64) {
         rng.fill_bytes(&mut buf[..this_block]);
         f.seek(SeekFrom::Start(offset as u64)).expect("seek");
         f.write_all(&buf[..this_block]).expect("write block");
-        mutated += 1;
     }
 }
 
@@ -716,13 +712,13 @@ fn write_compressible_file(path: &Path, size: usize, seed: u64) {
         let remaining = size - written;
         let take = remaining.min(template.len());
         let mut block = template[..take].to_vec();
-        if chunk_index % 7 == 0 {
+        if chunk_index.is_multiple_of(7) {
             let zero_prefix = block.len().min(4096);
             for byte in block.iter_mut().take(zero_prefix) {
                 *byte = 0;
             }
         }
-        if chunk_index % 5 == 0 && block.len() > 128 {
+        if chunk_index.is_multiple_of(5) && block.len() > 128 {
             let marker = format!("seed={seed};chunk={chunk_index};path={}\n", path.display());
             let copy_len = marker.len().min(block.len());
             block[..copy_len].copy_from_slice(&marker.as_bytes()[..copy_len]);

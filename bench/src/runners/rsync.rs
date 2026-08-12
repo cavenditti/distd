@@ -186,3 +186,28 @@ fn parse_rsync_total_sent(stdout: &str) -> Option<u64> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::parse_rsync_total_sent;
+
+    #[test]
+    fn parses_macos_and_gnu_transfer_statistics() {
+        assert_eq!(
+            parse_rsync_total_sent("sent 65,698 bytes  received 42 bytes"),
+            Some(65_698)
+        );
+        assert_eq!(
+            parse_rsync_total_sent("Total sent: 12,345 bytes"),
+            Some(12_345)
+        );
+    }
+
+    #[test]
+    fn falls_back_to_transferred_file_size() {
+        assert_eq!(
+            parse_rsync_total_sent("Total transferred file size: 4,096 bytes"),
+            Some(4_096)
+        );
+    }
+}

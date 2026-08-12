@@ -10,6 +10,12 @@ pub use distd_core::utils::settings::{cache_dir, config_dir};
 #[allow(unused)]
 pub struct Server {
     pub url: String,
+    #[serde(default)]
+    pub enrollment_token: Option<String>,
+    #[serde(default)]
+    pub certificate_fingerprint: Option<String>,
+    #[serde(default)]
+    pub allow_tofu: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -70,5 +76,50 @@ impl Settings {
 
         // You can deserialize (and thus freeze) the entire configuration as
         s.try_deserialize().map_err(ClientError::InvaldConfig)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use config::{Config, File, FileFormat};
+
+    use super::Settings;
+
+    #[test]
+    fn parses_the_documented_toml_format() {
+        let settings: Settings = Config::builder()
+            .add_source(File::from_str(
+                r#"
+                    debug = true
+
+                    [fsstorage]
+                    enabled = true
+                    root = "client-root"
+
+                    [server]
+                    url = "quic://localhost:50051"
+                    enrollment_token = "enroll"
+                    certificate_fingerprint = "7f195bcd309d34acd3b62561311b3b59436127a8323b43f0eb798f943b7bdf96"
+                    allow_tofu = false
+
+                    [log]
+                    level = "INFO"
+                    log_path = "client.log"
+
+                    [client]
+                    name = "test-client"
+                    sync = ["artifact"]
+                "#,
+                FileFormat::Toml,
+            ))
+            .build()
+            .expect("build TOML configuration")
+            .try_deserialize()
+            .expect("deserialize TOML settings");
+
+        assert_eq!(settings.server.url, "quic://localhost:50051");
+        assert_eq!(settings.client.sync, [PathBuf::from("artifact")]);
     }
 }

@@ -1,5 +1,5 @@
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use distd_core::proto::{
     sync_message::Msg, ClientKeepAlive, ClientRegister, ManifestRequest, ManifestResponse,
@@ -21,50 +21,68 @@ use uuid::Uuid;
 use crate::error::{ServerConnection, ServerRequest};
 
 #[derive(Debug)]
-struct AcceptAnyServerCertVerifier;
+struct PinnedServerCertVerifier {
+    expected: Option<[u8; 32]>,
+    observed: Mutex<Option<[u8; 32]>>,
+    supported: rustls::crypto::WebPkiSupportedAlgorithms,
+}
 
-impl ServerCertVerifier for AcceptAnyServerCertVerifier {
+impl PinnedServerCertVerifier {
+    fn new(expected: Option<[u8; 32]>) -> Self {
+        Self {
+            expected,
+            observed: Mutex::new(None),
+            supported: rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        }
+    }
+
+    fn observed(&self) -> Option<[u8; 32]> {
+        *self.observed.lock().unwrap()
+    }
+}
+
+impl ServerCertVerifier for PinnedServerCertVerifier {
     fn verify_server_cert(
         &self,
-        _end_entity: &CertificateDer<'_>,
+        end_entity: &CertificateDer<'_>,
         _intermediates: &[CertificateDer<'_>],
         _server_name: &ServerName<'_>,
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, TlsError> {
+        let fingerprint = *blake3::hash(end_entity.as_ref()).as_bytes();
+        if self
+            .expected
+            .is_some_and(|expected| expected != fingerprint)
+        {
+            return Err(TlsError::General(
+                "server certificate does not match the pinned identity".to_string(),
+            ));
+        }
+        *self.observed.lock().unwrap() = Some(fingerprint);
         Ok(ServerCertVerified::assertion())
     }
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, TlsError> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.supported)
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, TlsError> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.supported)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::ED25519,
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PSS_SHA512,
-            SignatureScheme::RSA_PKCS1_SHA256,
-            SignatureScheme::RSA_PKCS1_SHA384,
-            SignatureScheme::RSA_PKCS1_SHA512,
-        ]
+        self.supported.supported_schemes()
     }
 }
 
@@ -77,10 +95,15 @@ fn parse_quic_target(url: &str) -> Result<(SocketAddr, String), ServerRequest> {
                 "unsupported QUIC URL: {url}"
             )))
         })?;
-    let addr = stripped
+    let addresses = stripped
         .to_socket_addrs()
         .map_err(ServerConnection::from)?
-        .next()
+        .collect::<Vec<_>>();
+    let addr = addresses
+        .iter()
+        .copied()
+        .find(SocketAddr::is_ipv4)
+        .or_else(|| addresses.first().copied())
         .ok_or_else(|| {
             ServerRequest::Connection(ServerConnection::Quic(format!("cannot resolve {stripped}")))
         })?;
@@ -104,29 +127,57 @@ pub struct QuicTransportClient {
     _endpoint: Endpoint,
     connection: quinn::Connection,
     client_uuid: Arc<RwLock<Option<Uuid>>>,
+    certificate_fingerprint: [u8; 32],
 }
 
 #[derive(Debug)]
 pub struct QuicSyncSession {
     send: quinn::SendStream,
     recv: quinn::RecvStream,
+    connection: quinn::Connection,
+    starting_received_bytes: u64,
 }
 
 impl QuicTransportClient {
-    pub async fn connect(url: &str, client_uuid: Option<Uuid>) -> Result<Self, ServerRequest> {
+    pub async fn connect(
+        url: &str,
+        client_uuid: Option<Uuid>,
+        expected_certificate: Option<[u8; 32]>,
+    ) -> Result<Self, ServerRequest> {
         let (addr, server_name) = parse_quic_target(url)?;
-        let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
+        let bind_addr = if addr.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
+        let mut endpoint = Endpoint::client(bind_addr.parse().unwrap())
             .map_err(|err| ServerRequest::Connection(ServerConnection::Quic(err.to_string())))?;
 
+        let verifier = Arc::new(PinnedServerCertVerifier::new(expected_certificate));
         let rustls_config = rustls::ClientConfig::builder()
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCertVerifier))
+            .with_custom_certificate_verifier(verifier.clone())
             .with_no_client_auth();
-        let client_config = ClientConfig::new(Arc::new(
+        let mut client_config = ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(rustls_config).map_err(|err| {
                 ServerRequest::Connection(ServerConnection::Quic(err.to_string()))
             })?,
         ));
+
+        let mut transport = quinn::TransportConfig::default();
+        transport.receive_window(quinn::VarInt::from_u32(64 * 1024 * 1024));
+        transport.stream_receive_window(quinn::VarInt::from_u32(32 * 1024 * 1024));
+        transport.send_window(64 * 1024 * 1024);
+        transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
+        transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(32));
+        transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(0));
+        transport.initial_rtt(std::time::Duration::from_millis(1));
+        let mut bbr = quinn::congestion::BbrConfig::default();
+        bbr.initial_window(1024 * 1024);
+        transport.congestion_controller_factory(std::sync::Arc::new(bbr));
+
+        client_config.transport_config(std::sync::Arc::new(transport));
+
         endpoint.set_default_client_config(client_config);
 
         let connection = endpoint
@@ -134,12 +185,22 @@ impl QuicTransportClient {
             .map_err(|err| ServerRequest::Connection(ServerConnection::Quic(err.to_string())))?
             .await
             .map_err(|err| ServerRequest::Connection(ServerConnection::Quic(err.to_string())))?;
+        let certificate_fingerprint = verifier.observed().ok_or_else(|| {
+            ServerRequest::Connection(ServerConnection::Quic(
+                "server did not present a certificate".to_string(),
+            ))
+        })?;
 
         Ok(Self {
             _endpoint: endpoint,
             connection,
             client_uuid: Arc::new(RwLock::new(client_uuid)),
+            certificate_fingerprint,
         })
+    }
+
+    pub fn certificate_fingerprint(&self) -> [u8; 32] {
+        self.certificate_fingerprint
     }
 
     pub async fn set_client_uuid(&self, client_uuid: Uuid) {
@@ -205,6 +266,7 @@ impl QuicTransportClient {
         &self,
         manifest_request: ManifestRequest,
     ) -> Result<(ManifestResponse, QuicSyncSession), ServerRequest> {
+        let starting_received_bytes = self.connection.stats().udp_rx.bytes;
         let (mut send, mut recv) = self.open_bi(TransportOp::Sync).await?;
         write_length_delimited_async(&mut send, &manifest_request)
             .await
@@ -212,7 +274,15 @@ impl QuicTransportClient {
 
         let manifest = read_sync_manifest_response(&mut recv).await?;
 
-        Ok((manifest, QuicSyncSession { send, recv }))
+        Ok((
+            manifest,
+            QuicSyncSession {
+                send,
+                recv,
+                connection: self.connection.clone(),
+                starting_received_bytes,
+            },
+        ))
     }
 }
 
@@ -236,7 +306,7 @@ impl QuicSyncSession {
         mut self,
         possession: PossessionBitfield,
         chunk_sizes: &[usize],
-    ) -> Result<Vec<Vec<u8>>, ServerRequest> {
+    ) -> Result<(Vec<Vec<u8>>, u64), ServerRequest> {
         write_length_delimited_async(&mut self.send, &possession)
             .await
             .map_err(|err| ServerRequest::Quic(err.to_string()))?;
@@ -257,7 +327,13 @@ impl QuicSyncSession {
             }
         }
 
-        Ok(received)
+        let wire_bytes = self
+            .connection
+            .stats()
+            .udp_rx
+            .bytes
+            .saturating_sub(self.starting_received_bytes);
+        Ok((received, wire_bytes))
     }
 }
 
@@ -306,12 +382,21 @@ fn decode_sync_message_into(
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_sync_message_into, read_sync_manifest_response};
+    use super::{decode_sync_message_into, parse_quic_target, read_sync_manifest_response};
     use distd_core::proto::{
         sync_message::Msg, BulkData, ChunkData, ManifestResponse, PayloadCompression, SyncMessage,
     };
     use distd_core::utils::frame::write_length_delimited_async;
     use tokio::io::duplex;
+
+    #[test]
+    fn localhost_prefers_an_ipv4_target_for_the_ipv4_server_listener() {
+        let (address, server_name) =
+            parse_quic_target("quic://localhost:50051").expect("resolve localhost");
+
+        assert!(address.is_ipv4());
+        assert_eq!(server_name, "localhost");
+    }
 
     #[tokio::test]
     async fn reads_manifest_response_from_sync_message_frame() {

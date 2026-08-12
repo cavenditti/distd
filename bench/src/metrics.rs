@@ -29,13 +29,13 @@ pub struct RunMetrics {
     // Data
     /// Total source bytes (the artifact being transferred).
     pub source_bytes: u64,
-    /// Bytes actually transferred on the wire (if measurable, else same as source_bytes).
+    /// Bytes actually transferred on the wire, or zero when unavailable.
     pub bytes_transferred: u64,
 
     // Resources
     /// Peak RSS growth in bytes during the operation, relative to the initial sample.
     pub peak_rss_bytes: u64,
-    /// Approximate CPU-seconds consumed.
+    /// CPU-seconds estimated by integrating periodic per-process CPU samples.
     pub cpu_seconds: f64,
 
     // Disk/store
@@ -95,8 +95,9 @@ pub struct ProcessMonitor {
     system: System,
     baseline_rss: u64,
     peak_rss_delta: u64,
-    start: Instant,
-    cpu_time_start: f64,
+    last_sample: Instant,
+    last_cpu_percent: f64,
+    integrated_cpu_seconds: f64,
 }
 
 impl ProcessMonitor {
@@ -125,13 +126,16 @@ impl ProcessMonitor {
             system,
             baseline_rss,
             peak_rss_delta: 0,
-            start: Instant::now(),
-            cpu_time_start: cpu_start,
+            last_sample: Instant::now(),
+            last_cpu_percent: cpu_start,
+            integrated_cpu_seconds: 0.0,
         }
     }
 
     /// Sample current process metrics. Call periodically during the benchmark.
     pub fn sample(&mut self) {
+        let now = Instant::now();
+        let interval = now.duration_since(self.last_sample).as_secs_f64();
         let refresh = ProcessRefreshKind::new().with_memory().with_cpu();
         self.system
             .refresh_processes_specifics(ProcessesToUpdate::Some(&self.pids), true, refresh);
@@ -144,24 +148,22 @@ impl ProcessMonitor {
             .sum();
         let rss_delta = rss.saturating_sub(self.baseline_rss);
         self.peak_rss_delta = self.peak_rss_delta.max(rss_delta);
+        let cpu_percent: f64 = self
+            .pids
+            .iter()
+            .filter_map(|pid| self.system.process(*pid))
+            .map(|process| process.cpu_usage() as f64)
+            .sum();
+        self.integrated_cpu_seconds +=
+            ((self.last_cpu_percent + cpu_percent) / 2.0) / 100.0 * interval;
+        self.last_cpu_percent = cpu_percent;
+        self.last_sample = now;
     }
 
     /// Finalize and return (peak_rss_growth_bytes, cpu_seconds).
     pub fn finish(&mut self) -> (u64, f64) {
         self.sample();
-        let elapsed = self.start.elapsed().as_secs_f64();
-        // sysinfo reports cumulative cpu_usage as a percentage of one core
-        let cpu_now: f64 = self
-            .pids
-            .iter()
-            .filter_map(|pid| self.system.process(*pid))
-            .map(|p| p.cpu_usage() as f64)
-            .sum();
-        // Rough approximation: average CPU% × elapsed time
-        let avg_cpu_pct = (cpu_now + self.cpu_time_start) / 2.0;
-        let cpu_seconds = avg_cpu_pct / 100.0 * elapsed;
-
-        (self.peak_rss_delta, cpu_seconds)
+        (self.peak_rss_delta, self.integrated_cpu_seconds)
     }
 }
 

@@ -1,14 +1,18 @@
-use std::{fmt::Debug, net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc};
+use std::{
+    collections::HashSet, fmt::Debug, net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc,
+};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use axum::{
+    body::Body,
     extract::{
         connect_info::IntoMakeServiceWithConnectInfo, ConnectInfo, DefaultBodyLimit, Multipart,
         Path, Query, State,
     },
-    http::StatusCode,
+    http::{Method, Request, StatusCode},
+    middleware::{self, Next},
     response::IntoResponse,
     routing::get, //, post},
     Json,
@@ -25,6 +29,7 @@ use distd_core::{
     feed::{Feed, Name as FeedName},
     hash::Hash,
     metadata::Server as ServerMetadata,
+    utils::path::validate_relative,
     utils::serde::empty_string_as_none,
     version::Version,
 };
@@ -33,6 +38,42 @@ use crate::Client;
 use crate::Server as RawServer;
 
 type Server<T> = Arc<RawServer<T>>;
+
+fn bearer_token(request: &Request<Body>) -> Option<&str> {
+    request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+}
+
+async fn authorize_rest(request: Request<Body>, next: Next) -> impl IntoResponse {
+    if matches!(request.uri().path(), "/" | "/version") {
+        return next.run(request).await;
+    }
+
+    let variable = if request.method() == Method::POST && request.uri().path() == "/items" {
+        "DISTD_PUBLISH_TOKEN"
+    } else {
+        "DISTD_ADMIN_TOKEN"
+    };
+    let Ok(expected) = std::env::var(variable) else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    if expected.trim().is_empty() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let Some(provided) = bearer_token(&request) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if ring::constant_time::verify_slices_are_equal(expected.as_bytes(), provided.as_bytes())
+        .is_err()
+    {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    next.run(request).await
+}
 
 #[derive(Deserialize, Serialize)]
 struct ClientPostObj {
@@ -208,25 +249,12 @@ struct ItemPostObj {
     pub description: Option<String>,
     pub path: PathBuf,
     pub name: String,
+    pub artifact_id: Option<String>,
     pub chunking: Option<String>,
 }
 
 fn sanitize_relative_upload_path(path: &str) -> Option<PathBuf> {
-    let candidate = PathBuf::from(path);
-    if candidate.is_absolute() {
-        return None;
-    }
-    if candidate.components().any(|component| {
-        matches!(
-            component,
-            std::path::Component::ParentDir
-                | std::path::Component::RootDir
-                | std::path::Component::Prefix(_)
-        )
-    }) {
-        return None;
-    }
-    Some(candidate)
+    validate_relative(std::path::Path::new(path)).ok()
 }
 
 /// Publish an item
@@ -238,20 +266,34 @@ async fn publish_item<T>(
 where
     T: ChunkStorage + Sync + Send + Debug,
 {
+    let destination = validate_relative(&item_data.path).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let artifact_id = item_data
+        .artifact_id
+        .clone()
+        .unwrap_or_else(|| item_data.name.clone());
+    if artifact_id.is_empty() || artifact_id.len() > 256 || item_data.name.len() > 256 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let mut uploaded_files = Vec::new();
+    let mut uploaded_paths = HashSet::new();
 
     while let Some(field) = multipart
         .next_field()
         .await
-        .expect("Failed to get next field!")
+        .map_err(|_| StatusCode::BAD_REQUEST)?
     {
-        if field.name().unwrap() != "item" {
+        if field.name() != Some("item") {
             continue;
         }
-        let file_name = field
-            .file_name()
-            .and_then(sanitize_relative_upload_path)
-            .unwrap_or_else(|| PathBuf::from("item"));
+        let file_name = match field.file_name() {
+            Some(file_name) => {
+                sanitize_relative_upload_path(file_name).ok_or(StatusCode::BAD_REQUEST)?
+            }
+            None => PathBuf::from("item"),
+        };
+        if !uploaded_paths.insert(file_name.clone()) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
         let data = field
             .bytes()
             .await
@@ -285,9 +327,10 @@ where
     let result = if uploaded_files.len() == 1 {
         let (_, file) = uploaded_files.pop().unwrap();
         server
-            .publish_item(
+            .publish_item_as(
+                artifact_id,
                 item_data.name,
-                item_data.path,
+                destination,
                 item_data.description,
                 file,
                 chunk_algorithm,
@@ -295,9 +338,10 @@ where
             .await
     } else {
         server
-            .publish_item_from_files(
+            .publish_item_from_files_as(
+                artifact_id,
                 item_data.name,
-                item_data.path,
+                destination,
                 item_data.description,
                 uploaded_files,
                 chunk_algorithm,
@@ -371,10 +415,11 @@ where
         .route("/feeds/{feed_name}", get(get_one_feed))
         .route("/metadata", get(get_metadata))
         .with_state(Arc::new(server))
-        .layer(DefaultBodyLimit::max(1024 * 1024 * 1024 * 48))
+        .layer(middleware::from_fn(authorize_rest))
+        .layer(DefaultBodyLimit::max(512 * 1024 * 1024))
         .layer(
             TraceLayer::new_for_http()
-                .make_span_with(DefaultMakeSpan::new().include_headers(true))
+                .make_span_with(DefaultMakeSpan::new().include_headers(false))
                 .on_request(DefaultOnRequest::new().level(tracing::Level::TRACE))
                 .on_response(
                     DefaultOnResponse::new()

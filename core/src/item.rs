@@ -126,6 +126,13 @@ pub struct Item {
 }
 
 impl Item {
+    #[must_use]
+    pub fn with_artifact_id(mut self, artifact_id: ArtifactId) -> Self {
+        self.metadata.artifact_id.clone_from(&artifact_id);
+        self.manifest.artifact_id = artifact_id;
+        self
+    }
+
     /// Create a new Item from its metadata and `Node`
     ///
     /// Calling `create_item` on a `ChunkStorage` object encapsulates this and its the recommended way to create

@@ -6,6 +6,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use crate::settings::cache_dir;
 
@@ -21,6 +22,9 @@ pub fn state_path() -> PathBuf {
 pub struct ClientPersistentState {
     /// Client Uuid assigned to client from server, as a string
     pub client_uuid: Option<String>,
+    /// Trust-on-first-use certificate pins keyed by server URL.
+    #[serde(default)]
+    pub server_certificates: HashMap<String, String>,
 }
 
 impl ClientPersistentState {
@@ -40,7 +44,10 @@ impl Default for ClientPersistentState {
             .ok()
             .and_then(|file| serde_json::from_reader(file).ok())
             .inspect(|state| tracing::trace!("Client persistent state: {:?}", state))
-            .unwrap_or(ClientPersistentState { client_uuid: None })
+            .unwrap_or(ClientPersistentState {
+                client_uuid: None,
+                server_certificates: HashMap::new(),
+            })
     }
 }
 

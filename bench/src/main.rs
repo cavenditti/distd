@@ -51,7 +51,7 @@ struct Cli {
     #[arg(long)]
     cold_cache: bool,
 
-    /// Include restart/resume scenario (kill client mid-transfer, restart)
+    /// Reserved for a future interrupt-and-resume workload (currently rejected)
     #[arg(long)]
     resume: bool,
 

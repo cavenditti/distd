@@ -1,120 +1,131 @@
 # distd
 
-distd (short for **dist**ribute**d**, or **dist**ribution **d**aemon) is a tool for updates distribution.
+`distd` v0.2 is an authenticated, single-origin artifact synchronizer. A root
+server publishes versioned single-file or directory artifacts; clients compare
+ordered BLAKE3 chunk manifests and transfer only chunks they do not possess over
+QUIC.
 
-> [!CAUTION]
-> pre-alpha software, use at your own risk
+> [!WARNING]
+> This is a security-hardened research prototype, not a production update
+> framework. It does not yet authenticate the software publisher or provide a
+> rollback policy.
 
-## Rationale
-This is meant to efficiently store updates deltas and push updates to clients, optimizing bandwidth usage at all levels
-and reducing requirements on the providing server(s).
+## What v0.2 implements
 
-This is meant to cover use cases of rsync, zsync and casync, while providing an integrated solution to replicate
-the (eventually private storage repo) and keep all items deduplicated.
+| Capability | Status |
+| --- | --- |
+| QUIC artifact synchronization | Implemented |
+| Fixed and content-defined chunk profiles | Implemented |
+| Possession-bitfield delta transfer | Implemented |
+| Single-file and directory manifests | Implemented |
+| Immutable artifact version lookup | Implemented |
+| Persistent server TLS identity and metadata | Implemented |
+| Explicit TLS certificate pinning | Default client policy |
+| Token-gated client enrollment and HTTP administration | Implemented |
+| Verified staging and atomic destination replacement | Implemented |
+| P2P distribution, swarms, or a distribution tree | Not implemented |
+| Publisher/build signatures and rollback policy | Not implemented |
+
+The term “PPSPP-style” in the code refers only to the manifest → possession
+bitfield → missing-chunk exchange. There is currently no peer discovery,
+multi-source scheduling, HAVE propagation, or swarm protocol.
 
 ## Requirements
-- Rust 1.82.0-nightly with cargo
 
-## Architecture
-- Every participating node is a peer, they may act both as server and client
-- It's layered, forming a distribution tree basically: clients may act as servers for clients in a lower level
-- Within a layer (i.e. nodes at the same level of the tree with mutual visibility) it works as a p2p network
-- Root server computes BLAKE3 hash trees (and assigns a 64-bit uid to each hash? To reduce overhead)
+The repository pins Rust 1.96.0 for normal development. The optional
+`nightly-bench` feature requires a current nightly toolchain.
 
-- Client-server sync uses QUIC; HTTP is retained for publish and metadata-facing REST endpoints
+## Secure local setup
 
-
-> [!NOTE]
-> We're computing the full hash-tree of each file, intermediate hashes are different than just calling
-> `blake3::hash(some_bytes)` for that sub-tree. This is because BLAKE3 is meant to be resistant to
-> length-extension attacks but we are not using it for MAC and will ignore the Subtree-freeness of BLAKE3
-
-### Design considerations
-- ~~Items are identified by name and may have conflicting paths. This is because the path is the intended installation
-    path for that item and may not be unique.~~ Each Item is identified by its path, if an Item has to end up in
-    multiple paths it's just duplicated (data is de-duplicated anyway)
-
-
-## Current state
-I started this as a mean to get better at Rust programming, some code is somewhat convoluted and not everything is
-ironed out and properly tested.
-
-Currently the are some serious limitations, missing functionalities and performance is abysmal.
-Most important part missing is the "chunk-adapter" to make chunking content-aware
-
-
-## TODO:
-### Short term:
-- [x] ~~Implement merkle-tree computing~~
-- [x] ~~Make tests not independent of CHUNK_SIZE~~
-- [x] ~~Refactor hash-tree computing~~ (may be improved)
-- [x] ~~Give each Item its own tree of hashes instead of Vec~~ (kinda done, we have the Arc to the root Node
-    while keeping the list of all the leaf hashes)
-- [x] ~~Make order between ChunkInfo and Node (even just renaming them may be enough)~~
-- [x] ~~Implement diff algorithm comparing merkle-trees~~ won't do it
-    > [!NOTE]
-    > We may get away with this, as we have all leaf hashes and their differences. Shouldn't really be needed unless
-    > there is the need to compute rolling hashes or doing something more fancy (in that case the approach would be
-    > different anyway)
-- [x] ~~Overall code clean up~~ kinda
-- [x] ~~Make storage agnostic about hash computation, it's not its business~~
-- [x] ~~Implement FsStorage, to store items directly in the filesystem without deduplication (will be used by client)~~
-        **needs extensive testing**
-- [x] Allow upload of item's revisions on server
-- [x] Replace some Option with Result to have better visibility on errors (in progress), mostly in chunk storage
-- [x] Logging
-- [x] Minimal client (very minimal :)
-- [x] ~~Simplify client-server API~~ not really simplified but it's ok
-- [x] Rename `StoredChunkRef` to `Node`
-- [ ] Ephemeral token for client auth
-- [~] Server and Client persistence (client uuid, server registered clients and items, etc.)
-    - [x] FsStorage persistance (for client)
-    - [x] Client internal persistance
-    - [ ] Server persistance
-- [ ] Config
-- [x] Evaluate whether to assign a 64-bit uid to each hash to reduce network overhead or not (won't do now :)
-
-### Medium term:
-- [ ] Doc comments
-- [ ] Tests for everything
-- [ ] Basic authentication and keys management
-
-### Long term TODO:
-- [ ] Implement (a subset of) PPSPP in Rust, see [PyPPSPP](https://github.com/justas-/PyPPSPP) as reference
-- [ ] ~~Add TLS, or use QUIC everywhere~~ tonic takes care of this
-- [ ] Make sure the approach is fine tuned for EROFS images, so that they can be chunked efficiently.
-- [x] ~~Replace ptree with something unintrusive when running tests~~ Just ditched it for now, trees are going to be too big anyway.
-- [ ] no-std variant for client?
-- [ ] Set up cross-compilation for arm
-- [ ] Compression?
-
-#### P2P (TODO)
-This works pretty much like a partitioned Bittorent swarm, but:
-- It uses BLAKE3 instead of SHA1 o SHA256
-- Only uses ~~µTP~~ kind-of-PPSPP over UDP transport [see at RFC7574 on ietf.org](https://datatracker.ietf.org/doc/rfc7574/)
-- The equivalent of torrent/metainfo files are msgpack(?)-encoded instead of bencode-encoded
-- Every node is a peer in one or more swarm(s).
-- ~~chunk/piece size is currently hardcoded~~
-
-## Current state
-### Code organization
-- distd_core contains common data structures and algorithms, as well as protobuf files and auto-generated implementations.
-- distd_server is responsible of chunking, hashing and first serving the file
-- distd_client fetches files from the server
-
-## Benchmarks
-The benchmark harness can now shape localhost traffic without requiring OS-level traffic control. This is intended for transport experiments where loopback is too optimistic.
-
-Example:
+The server refuses to start without an enrollment token. HTTP publication and
+administrative routes also remain unavailable unless their tokens are set.
 
 ```bash
-cargo run -p distd_bench --release -- \
-    --tools distd \
-    --workloads low-delta,high-delta \
-    --net-delay-ms 40 \
-    --net-jitter-ms 5 \
-    --net-bandwidth-mbps 40 \
-    --net-loss-percent 0.5
+export DISTD_ENROLLMENT_TOKEN="$(openssl rand -hex 32)"
+export DISTD_PUBLISH_TOKEN="$(openssl rand -hex 32)"
+export DISTD_ADMIN_TOKEN="$(openssl rand -hex 32)"
+export DISTD_SERVER_STATE_DIR="$PWD/.distd-server-state"
+export DISTD_STORAGE=fs
+export DISTD_STORAGE_ROOT="$PWD/.distd-server-storage"
+cargo run -p distd_server
 ```
 
-Benchmark network shaping applies to the QUIC sync path. Delay, jitter, bandwidth limits, and packet loss all affect the proxied QUIC traffic.
+On startup the server logs the BLAKE3 fingerprint of its persistent QUIC
+certificate. Copy that value into `server.certificate_fingerprint` in
+`ClientSettings.toml`, along with the enrollment token. Explicit pinning is
+required by default. `allow_tofu = true` exists for isolated development, but
+the first connection is then vulnerable to interception.
+
+Fetch an artifact by stable ID into a client-selected relative destination:
+
+```bash
+cargo run -p distd_client -- get artifact-id local/path
+```
+
+Remote metadata never selects the client destination. Absolute paths, `..`, and
+symbolic-link components are rejected by filesystem storage.
+
+Publish through the authenticated HTTP endpoint:
+
+```bash
+curl --fail-with-body \
+  -H "Authorization: Bearer $DISTD_PUBLISH_TOKEN" \
+  -F 'item=@./release.bin' \
+  'http://127.0.0.1:3000/items?artifact_id=my-app&name=MyApp&path=server/release.bin'
+```
+
+Reusing `artifact_id` creates a new immutable version only when its content or
+relevant metadata changes. `name` and `path` may change without changing the
+artifact identity.
+
+## Architecture
+
+- `distd_core`: chunking, manifests, hash trees, bounded framing, and storage.
+- `distd_server`: authenticated REST publication, persistent metadata, and QUIC
+  synchronization.
+- `distd_client`: pinned server connection, possession negotiation, verification,
+  and atomic local activation.
+- `distd_bench`: isolated experimental harness and QUIC network shaper.
+
+Clients verify every received chunk and the complete manifest root before
+materializing a staging tree. Activation replaces the previous file or directory
+with a same-filesystem rename, so shorter files and removed directory entries do
+not survive an update.
+
+## Validation
+
+```bash
+cargo fmt --all -- --check
+cargo check --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings -A clippy::all -A clippy::pedantic -A clippy::nursery -A clippy::restriction -D clippy::correctness -D clippy::suspicious
+cargo test --workspace --locked
+cargo +nightly test --workspace --all-features --locked
+```
+
+CI runs the same stable checks and the nightly feature suite.
+
+## Benchmark limits
+
+The harness gives each run isolated client/server state and reports QUIC UDP
+bytes rather than decoded payload size. Its userspace shaper applies only to the
+distd QUIC path; local `rsync` and other runners are not automatically placed
+behind an equivalent network. Results across unlike transport paths must not be
+presented as controlled network comparisons.
+
+“Resume” remains a planned workload. A complete transfer is not labeled as a
+resume measurement.
+
+## Remaining v0.2 limitations
+
+- Multipart publication is authenticated and capped at 512 MiB, but fields are
+  still buffered in memory before chunking.
+- A client retains all missing chunks for an artifact until atomic activation;
+  individual frames are bounded, but artifact-wide sync memory is not yet bounded.
+- Certificate pinning authenticates the distribution server, not the original
+  software publisher. Signed manifests are still required for that boundary.
+- Server metadata and chunk storage must be backed up and restored together.
+- Client UUIDs are session authorization handles; after a server restart,
+  clients re-enroll using the configured enrollment secret.
+- Filesystem containment rejects existing symlink components but does not claim
+  protection from a hostile local process racing filesystem operations.
+- No license has been selected for the repository yet.

@@ -32,6 +32,12 @@ enum SyncContinuation {
 }
 
 impl TransportClient {
+    fn certificate_fingerprint(&self) -> [u8; 32] {
+        match self {
+            Self::Quic(client) => client.certificate_fingerprint(),
+        }
+    }
+
     async fn register(
         &mut self,
         request: distd_core::proto::ClientRegister,
@@ -74,7 +80,7 @@ impl SyncContinuation {
         self,
         possession: proto::PossessionBitfield,
         chunk_sizes: &[usize],
-    ) -> Result<Vec<Vec<u8>>, ServerRequest> {
+    ) -> Result<(Vec<Vec<u8>>, u64), ServerRequest> {
         match self {
             Self::Quic(session) => {
                 session
@@ -117,6 +123,8 @@ pub struct Server {
     /// Client name
     client_name: String,
 
+    enrollment_token: Option<String>,
+
     /// Shared data
     shared: Arc<RwLock<SharedServer>>,
 
@@ -149,21 +157,26 @@ impl Server {
         //pub_key: &PublicKey,
         client_name: &str,
         client_uuid: Option<Uuid>,
-        pub_key: &[u8; 32],
+        expected_certificate: Option<[u8; 32]>,
+        enrollment_token: Option<&str>,
     ) -> Result<Self, ServerRequest> {
-        let transport = Self::make_transport(url, &client_uuid.unwrap_or_else(Uuid::nil)).await?;
+        let transport = Self::make_transport(
+            url,
+            &client_uuid.unwrap_or_else(Uuid::nil),
+            expected_certificate,
+        )
+        .await?;
         tracing::debug!("Connected to server");
+        let certificate_fingerprint = transport.certificate_fingerprint();
 
         let timeout = Duration::new(5, 0); // TODO make this configurable
 
         let mut server = Self {
-            pub_key: pub_key
-                .as_ref()
-                .try_into()
-                .map_err(|_| ServerRequest::BadPubKey)?,
+            pub_key: certificate_fingerprint,
             url: url.to_string(),
             client_uuid,
             client_name: client_name.to_string(),
+            enrollment_token: enrollment_token.map(str::to_owned),
             shared: Arc::new(RwLock::new(SharedServer {
                 metadata: ServerMetadata::default(),
                 transport,
@@ -183,10 +196,18 @@ impl Server {
         self.client_uuid.unwrap_or(Uuid::nil())
     }
 
-    async fn make_transport(url: &str, uuid: &Uuid) -> Result<TransportClient, ServerRequest> {
-        QuicTransportClient::connect(url, if uuid.is_nil() { None } else { Some(*uuid) })
-            .await
-            .map(TransportClient::Quic)
+    async fn make_transport(
+        url: &str,
+        uuid: &Uuid,
+        expected_certificate: Option<[u8; 32]>,
+    ) -> Result<TransportClient, ServerRequest> {
+        QuicTransportClient::connect(
+            url,
+            if uuid.is_nil() { None } else { Some(*uuid) },
+            expected_certificate,
+        )
+        .await
+        .map(TransportClient::Quic)
     }
 
     /// Register a new client
@@ -200,6 +221,7 @@ impl Server {
                 name: self.client_name.to_string(),
                 version: VERSION.to_string(),
                 uuid: self.client_uuid.map(|uuid| uuid.as_bytes().to_vec()),
+                enrollment_token: self.enrollment_token.clone(),
             })
             .await?;
         tracing::trace!("Parsed `Register` response");
@@ -260,7 +282,7 @@ impl Server {
         &self,
         artifact_id: &str,
         local_hashes: &[Hash],
-    ) -> Result<(Manifest, Vec<ChunkInfo>, Vec<Vec<u8>>), ServerRequest> {
+    ) -> Result<(Manifest, Vec<ChunkInfo>, Vec<Vec<u8>>, u64), ServerRequest> {
         let mut shared = self.shared.write().await;
         let manifest_request = proto::ManifestRequest {
             artifact_id: artifact_id.to_string(),
@@ -327,7 +349,7 @@ impl Server {
             .map(|chunk| chunk.size as usize)
             .collect();
 
-        let received = continuation
+        let (received, wire_bytes) = continuation
             .send_possession_and_collect_chunks(
                 proto::PossessionBitfield {
                     bitfield: local_bitfield.to_bytes(),
@@ -336,18 +358,23 @@ impl Server {
             )
             .await?;
 
-        Ok((manifest, chunk_infos, received))
+        Ok((manifest, chunk_infos, received, wire_bytes))
     }
 
     /// Fetch metadata from server in a loop
-    pub async fn fetch_loop(self) {
+    pub async fn fetch_loop(mut self) {
         loop {
             tokio::time::sleep(self.timeout).await;
             if self.fetch().await.is_err() {
                 // try to re-establish connection to server
-                if let Ok(client) = Self::make_transport(&self.url, &self.client_uuid()).await {
+                if let Ok(client) =
+                    Self::make_transport(&self.url, &self.client_uuid(), Some(self.pub_key)).await
+                {
                     tracing::info!("Connected to server");
                     self.shared.write().await.transport = client;
+                    if let Err(error) = self.register().await {
+                        tracing::warn!("Cannot re-enroll with server: {error}");
+                    }
                 } else {
                     tracing::warn!(
                         "Cannot connect to server, retrying in {} seconds",

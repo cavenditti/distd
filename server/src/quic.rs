@@ -1,5 +1,7 @@
 use std::fmt::Debug;
 use std::net::SocketAddr;
+#[cfg(not(test))]
+use std::path::PathBuf;
 
 use distd_core::chunk_storage::ChunkStorage;
 use distd_core::proto::sync_message::Msg;
@@ -21,13 +23,78 @@ use crate::error::Server as ServerError;
 use crate::Server;
 
 fn make_server_config() -> Result<quinn::ServerConfig, ServerError> {
+    let (cert_der, key_der) = server_identity()?;
+    tracing::info!(
+        fingerprint = %blake3::hash(cert_der.as_ref()).to_hex(),
+        "loaded QUIC server identity"
+    );
+    let mut config = quinn::ServerConfig::with_single_cert(vec![cert_der], key_der)
+        .map_err(|err| ServerError::Quic(err.to_string()))?;
+
+    let mut transport = quinn::TransportConfig::default();
+    transport.receive_window(quinn::VarInt::from_u32(64 * 1024 * 1024));
+    transport.stream_receive_window(quinn::VarInt::from_u32(32 * 1024 * 1024));
+    transport.send_window(64 * 1024 * 1024);
+    transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
+    transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(32));
+    transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(0));
+    transport.initial_rtt(std::time::Duration::from_millis(1));
+    let mut bbr = quinn::congestion::BbrConfig::default();
+    bbr.initial_window(1024 * 1024);
+    transport.congestion_controller_factory(std::sync::Arc::new(bbr));
+
+    config.transport_config(std::sync::Arc::new(transport));
+    Ok(config)
+}
+
+#[cfg(test)]
+fn server_identity() -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>), ServerError> {
+    generate_server_identity()
+}
+
+#[cfg(not(test))]
+fn server_identity() -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>), ServerError> {
+    let state_dir = std::env::var("DISTD_SERVER_STATE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| distd_core::utils::settings::cache_dir().join("server-state"));
+    std::fs::create_dir_all(&state_dir)?;
+    let cert_path = state_dir.join("quic-cert.der");
+    let key_path = state_dir.join("quic-key.der");
+
+    if cert_path.is_file() && key_path.is_file() {
+        let cert = CertificateDer::from(std::fs::read(cert_path)?);
+        let key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(std::fs::read(key_path)?));
+        return Ok((cert, key));
+    }
+
+    let (cert, key) = generate_server_identity()?;
+    atomic_write(&cert_path, cert.as_ref())?;
+    let secret = key.secret_der();
+    atomic_write(&key_path, secret)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok((cert, key))
+}
+
+fn generate_server_identity(
+) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>), ServerError> {
     let certified =
         generate_simple_self_signed(vec![String::from("localhost"), String::from("127.0.0.1")])
             .map_err(|err| ServerError::Quic(err.to_string()))?;
-    let cert_der = CertificateDer::from(certified.cert.der().clone());
-    let key_der = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()));
-    quinn::ServerConfig::with_single_cert(vec![cert_der], key_der)
-        .map_err(|err| ServerError::Quic(err.to_string()))
+    Ok((
+        CertificateDer::from(certified.cert.der().clone()),
+        PrivateKeyDer::from(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der())),
+    ))
+}
+
+#[cfg(not(test))]
+fn atomic_write(path: &std::path::Path, contents: &[u8]) -> Result<(), std::io::Error> {
+    let temporary = path.with_extension("tmp");
+    std::fs::write(&temporary, contents)?;
+    std::fs::rename(temporary, path)
 }
 
 async fn finish_send(send: &mut SendStream) -> Result<(), ServerError> {
@@ -294,10 +361,16 @@ mod tests {
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCertVerifier))
             .with_no_client_auth();
-        let client_config = ClientConfig::new(Arc::new(
+        let mut client_config = ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(rustls_config)
                 .expect("quic client config"),
         ));
+
+        let mut transport = quinn::TransportConfig::default();
+        transport.receive_window(quinn::VarInt::from_u32(64 * 1024 * 1024));
+        transport.stream_receive_window(quinn::VarInt::from_u32(32 * 1024 * 1024));
+        client_config.transport_config(std::sync::Arc::new(transport));
+
         endpoint.set_default_client_config(client_config);
 
         for _ in 0..20 {
@@ -333,7 +406,8 @@ mod tests {
         SocketAddr,
         Server<HashMapStorage>,
     ) {
-        let server = Server::new_ephemeral(HashMapStorage::default());
+        let server = Server::new_ephemeral(HashMapStorage::default())
+            .with_enrollment_token("integration-token");
         let endpoint = Endpoint::server(
             make_server_config().expect("server config"),
             "127.0.0.1:0".parse().unwrap(),
@@ -379,6 +453,7 @@ mod tests {
                 name: "test-client".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 uuid: None,
+                enrollment_token: Some("integration-token".to_string()),
             },
         )
         .await

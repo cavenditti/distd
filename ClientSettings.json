@@ -4,7 +4,10 @@
     "root": "here"
   },
   "server": {
-    "url": "quic://localhost:50051"
+    "url": "quic://localhost:50051",
+    "enrollment_token": "replace-with-a-secret-enrollment-token",
+    "certificate_fingerprint": "replace-with-the-server-certificate-blake3-fingerprint",
+    "allow_tofu": false
   },
   "log": {
     "level": "INFO"

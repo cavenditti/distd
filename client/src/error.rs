@@ -63,6 +63,9 @@ pub enum ServerRequest {
 
 #[derive(Error, Debug)]
 pub enum Client {
+    #[error("server certificate is not pinned; configure server.certificate_fingerprint")]
+    UnpinnedServer,
+
     #[error("No command specified")]
     MissingCmd,
 

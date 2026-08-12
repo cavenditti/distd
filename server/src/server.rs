@@ -27,18 +27,18 @@ use ring::{
     rand,
     signature::{self},
 };
-use tokio::sync::RwLock;
+use serde::{Deserialize, Serialize};
+use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tracing::span;
 use uuid::Uuid;
 
 use crate::client::{Client, Name as ClientName};
 use crate::error::Server as ServerError;
 use distd_core::feed::{Feed, Name as FeedName};
-use distd_core::hash::hash as do_hash;
 use distd_core::version::Version;
 
 /// Data structure used internally by server, may be converted to `ServerMetadata`
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InternalMetadata {
     // TODO
     // server version
@@ -47,6 +47,28 @@ pub struct InternalMetadata {
     pub feeds: HashMap<FeedName, Feed>,
     // Item map — keyed by ArtifactId
     pub items: HashMap<ArtifactId, Item>,
+    #[serde(default)]
+    pub versions: HashMap<ArtifactId, BTreeMap<u64, Item>>,
+}
+
+impl InternalMetadata {
+    pub fn load(path: &Path) -> Result<Self, ServerError> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let bytes = std::fs::read(path)?;
+        let mut metadata: Self =
+            bitcode::deserialize(&bytes).map_err(|error| ServerError::State(error.to_string()))?;
+        for (artifact_id, item) in metadata.items.clone() {
+            metadata
+                .versions
+                .entry(artifact_id)
+                .or_default()
+                .entry(item.manifest.version)
+                .or_insert(item);
+        }
+        Ok(metadata)
+    }
 }
 
 impl From<InternalMetadata> for ServerMetadata {
@@ -74,6 +96,7 @@ where
 {
     key_pair: Arc<Ed25519KeyPair>, // needs server restart to be changed
     uuid_nonce: String,            // needs server restart to be changed
+    enrollment_token: Option<Arc<str>>,
 
     /// global server metadata
     pub metadata: Arc<RwLock<InternalMetadata>>,
@@ -81,6 +104,8 @@ where
     pub storage: Arc<T>,
     /// Client map
     pub clients: Arc<RwLock<BTreeMap<Uuid, Client>>>,
+    publish_lock: Arc<AsyncMutex<()>>,
+    metadata_path: Option<Arc<PathBuf>>,
 }
 
 impl<T> Clone for Server<T>
@@ -91,9 +116,12 @@ where
         Self {
             key_pair: Arc::clone(&self.key_pair),
             uuid_nonce: self.uuid_nonce.clone(),
+            enrollment_token: self.enrollment_token.clone(),
             metadata: Arc::clone(&self.metadata),
             storage: Arc::clone(&self.storage),
             clients: Arc::clone(&self.clients),
+            publish_lock: Arc::clone(&self.publish_lock),
+            metadata_path: self.metadata_path.clone(),
         }
     }
 }
@@ -102,6 +130,21 @@ impl<T> Server<T>
 where
     T: ChunkStorage + Sync + Send + Debug,
 {
+    async fn persist_metadata(&self) -> Result<(), ServerError> {
+        let Some(path) = self.metadata_path.as_deref() else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let bytes = bitcode::serialize(&*self.metadata.read().await)
+            .map_err(|error| ServerError::State(error.to_string()))?;
+        let temporary = path.with_extension("tmp");
+        std::fs::write(&temporary, bytes)?;
+        std::fs::rename(temporary, path)?;
+        Ok(())
+    }
+
     /// Create a new server instance with a loaded key pair, initial metadata and storage.
     ///
     /// The `uuid_nonce` is derived from a random UUID (not from the key bytes) so that it
@@ -117,9 +160,12 @@ where
         Ok(Self {
             key_pair: Arc::new(key_pair),
             uuid_nonce,
+            enrollment_token: None,
             metadata: Arc::new(RwLock::new(metadata)),
             storage: Arc::new(storage),
             clients: Arc::new(RwLock::new(BTreeMap::new())),
+            publish_lock: Arc::new(AsyncMutex::new(())),
+            metadata_path: None,
         })
     }
 
@@ -128,16 +174,36 @@ where
     /// **Not recommended for production.** In production use [`Server::new`] and persist the key
     /// on disk so that the server identity is stable across restarts.
     pub fn new_ephemeral(storage: T) -> Self {
+        Self::new_ephemeral_with_metadata(storage, InternalMetadata::default())
+    }
+
+    pub fn new_ephemeral_with_metadata(storage: T, metadata: InternalMetadata) -> Self {
         let rng = rand::SystemRandom::new();
         let pkcs8_bytes = signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
         let key_pair = signature::Ed25519KeyPair::from_pkcs8(pkcs8_bytes.as_ref()).unwrap();
         Self {
             key_pair: Arc::new(key_pair),
             uuid_nonce: Uuid::new_v4().to_string(),
-            metadata: Arc::new(RwLock::new(InternalMetadata::default())),
+            enrollment_token: None,
+            metadata: Arc::new(RwLock::new(metadata)),
             storage: Arc::new(storage),
             clients: Arc::new(RwLock::new(BTreeMap::new())),
+            publish_lock: Arc::new(AsyncMutex::new(())),
+            metadata_path: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_enrollment_token(mut self, token: impl Into<Arc<str>>) -> Self {
+        let token = token.into();
+        self.enrollment_token = (!token.trim().is_empty()).then_some(token);
+        self
+    }
+
+    #[must_use]
+    pub fn with_metadata_persistence(mut self, path: PathBuf) -> Self {
+        self.metadata_path = Some(Arc::new(path));
+        self
     }
 }
 
@@ -161,12 +227,29 @@ where
         addr: SocketAddr,
         request: ClientRegister,
     ) -> Result<ProtoServerMetadata, String> {
+        let requested_uuid = request.uuid.as_deref().map(slice_to_uuid);
+        let known_uuid = match requested_uuid {
+            Some(uuid) if self.clients.read().await.contains_key(&uuid) => Some(uuid),
+            _ => None,
+        };
+        if known_uuid.is_none() {
+            let expected = self
+                .enrollment_token
+                .as_deref()
+                .ok_or_else(|| String::from("Client enrollment is disabled"))?;
+            let provided = request
+                .enrollment_token
+                .as_deref()
+                .ok_or_else(|| String::from("Invalid enrollment token"))?;
+            ring::constant_time::verify_slices_are_equal(expected.as_bytes(), provided.as_bytes())
+                .map_err(|_| String::from("Invalid enrollment token"))?;
+        }
         let uuid = self
             .register_client(
                 request.name,
                 addr,
                 Version::from_str(&request.version).ok(),
-                request.uuid.map(|x| slice_to_uuid(&x)),
+                known_uuid,
             )
             .await
             .map_err(|_| String::from("Cannot assign new UUID"))?;
@@ -198,7 +281,14 @@ where
     ) -> Result<(proto::ManifestResponse, Item), String> {
         let item = {
             let md = self.metadata.read().await;
-            md.items.get(&manifest_req.artifact_id).cloned()
+            match manifest_req.version {
+                Some(version) => md
+                    .versions
+                    .get(&manifest_req.artifact_id)
+                    .and_then(|versions| versions.get(&version))
+                    .cloned(),
+                None => md.items.get(&manifest_req.artifact_id).cloned(),
+            }
         }
         .ok_or_else(|| format!("Unknown artifact: {}", manifest_req.artifact_id))?;
 
@@ -396,13 +486,18 @@ where
     pub async fn expose_feed(&self, feed: Feed) -> Result<FeedName, RegisterError> {
         let mut metadata = self.metadata.write().await;
         let name = feed.name.clone();
-        match metadata.feeds.entry(name.clone()) {
+        let result = match metadata.feeds.entry(name.clone()) {
             std::collections::hash_map::Entry::Vacant(e) => {
                 e.insert(feed);
                 Ok(name)
             }
             std::collections::hash_map::Entry::Occupied(_) => Err(RegisterError),
+        };
+        drop(metadata);
+        if result.is_ok() && self.persist_metadata().await.is_err() {
+            return Err(RegisterError);
         }
+        result
     }
 
     /// Publish a new item
@@ -422,45 +517,54 @@ where
         file: Bytes,
         chunk_algorithm: ChunkAlgorithm,
     ) -> Result<Item, ServerError> {
-        // Derive artifact_id from name (matches Item::new default)
-        let artifact_id: ArtifactId = name.clone();
-
-        // Get last revision, if any. 0 otherwise
-        let revision = self
-            .metadata
-            .read()
+        let artifact_id = name.clone();
+        self.publish_item_as(artifact_id, name, path, description, file, chunk_algorithm)
             .await
-            .items
-            .get(&artifact_id)
-            .map(|i| i.metadata.revision + 1)
-            .unwrap_or_default();
+    }
 
-        // Check if already exists and if so just return the old one
-        let root = &do_hash(&file);
-        if let Some(old) = self.metadata.read().await.items.get(&artifact_id) {
-            if old.metadata.name == name
-                && old.metadata.path == path
-                && old.metadata.description == description
-                && &old.metadata.root.hash == root
-            {
-                return Ok(old.clone());
-            }
-        }
-
-        // Create item and return it
+    pub async fn publish_item_as(
+        &self,
+        artifact_id: ArtifactId,
+        name: ItemName,
+        path: PathBuf,
+        description: Option<String>,
+        file: Bytes,
+        chunk_algorithm: ChunkAlgorithm,
+    ) -> Result<Item, ServerError> {
+        let _publish_guard = self.publish_lock.lock().await;
+        let previous = self.metadata.read().await.items.get(&artifact_id).cloned();
+        let revision = previous
+            .as_ref()
+            .map_or(0, |item| item.metadata.revision.saturating_add(1));
         let item = self
             .storage
             .create_item(name, path, revision, description, file, chunk_algorithm)
             .map_err(|e| {
                 tracing::error!("Storage error: {e}");
                 ServerError::ChunkInsertError
-            })?;
+            })?
+            .with_artifact_id(artifact_id.clone());
 
-        self.metadata
-            .write()
-            .await
-            .items
-            .insert(artifact_id, item.clone());
+        if let Some(old) = previous {
+            if old.metadata.name == item.metadata.name
+                && old.metadata.path == item.metadata.path
+                && old.metadata.description == item.metadata.description
+                && old.metadata.root == item.metadata.root
+                && old.manifest.chunk_algorithm == item.manifest.chunk_algorithm
+            {
+                return Ok(old);
+            }
+        }
+
+        let mut metadata = self.metadata.write().await;
+        metadata.items.insert(artifact_id.clone(), item.clone());
+        metadata
+            .versions
+            .entry(artifact_id)
+            .or_default()
+            .insert(item.manifest.version, item.clone());
+        drop(metadata);
+        self.persist_metadata().await?;
 
         Ok(item)
     }
@@ -471,18 +575,35 @@ where
         name: ItemName,
         path: PathBuf,
         description: Option<String>,
+        files: Vec<(PathBuf, Bytes)>,
+        chunk_algorithm: ChunkAlgorithm,
+    ) -> Result<Item, ServerError> {
+        let artifact_id = name.clone();
+        self.publish_item_from_files_as(
+            artifact_id,
+            name,
+            path,
+            description,
+            files,
+            chunk_algorithm,
+        )
+        .await
+    }
+
+    pub async fn publish_item_from_files_as(
+        &self,
+        artifact_id: ArtifactId,
+        name: ItemName,
+        path: PathBuf,
+        description: Option<String>,
         mut files: Vec<(PathBuf, Bytes)>,
         chunk_algorithm: ChunkAlgorithm,
     ) -> Result<Item, ServerError> {
-        let artifact_id: ArtifactId = name.clone();
-        let revision = self
-            .metadata
-            .read()
-            .await
-            .items
-            .get(&artifact_id)
-            .map(|i| i.metadata.revision + 1)
-            .unwrap_or_default();
+        let _publish_guard = self.publish_lock.lock().await;
+        let previous = self.metadata.read().await.items.get(&artifact_id).cloned();
+        let revision = previous
+            .as_ref()
+            .map_or(0, |item| item.metadata.revision.saturating_add(1));
 
         files.sort_by(|left, right| left.0.cmp(&right.0));
 
@@ -492,13 +613,30 @@ where
             .map_err(|e| {
                 tracing::error!("Storage error: {e}");
                 ServerError::ChunkInsertError
-            })?;
+            })?
+            .with_artifact_id(artifact_id.clone());
 
-        self.metadata
-            .write()
-            .await
-            .items
-            .insert(artifact_id, item.clone());
+        if let Some(old) = previous {
+            if old.metadata.name == item.metadata.name
+                && old.metadata.path == item.metadata.path
+                && old.metadata.description == item.metadata.description
+                && old.metadata.root == item.metadata.root
+                && old.manifest.entries == item.manifest.entries
+                && old.manifest.chunk_algorithm == item.manifest.chunk_algorithm
+            {
+                return Ok(old);
+            }
+        }
+
+        let mut metadata = self.metadata.write().await;
+        metadata.items.insert(artifact_id.clone(), item.clone());
+        metadata
+            .versions
+            .entry(artifact_id)
+            .or_default()
+            .insert(item.manifest.version, item.clone());
+        drop(metadata);
+        self.persist_metadata().await?;
 
         Ok(item)
     }
@@ -618,7 +756,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::build_sync_payload_batches;
+    use super::{build_sync_payload_batches, Server};
+    use axum::body::Bytes;
+    use distd_core::chunk_storage::hashmap_storage::HashMapStorage;
+    use distd_core::chunks::ChunkAlgorithm;
+    use distd_core::proto::ManifestRequest;
     use distd_core::proto::{sync_message::Msg, PayloadCompression};
 
     #[test]
@@ -670,5 +812,59 @@ mod tests {
             }
             other => panic!("expected bulk message, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn adaptive_publication_is_idempotent_and_versions_are_retrievable() {
+        let server = Server::new_ephemeral(HashMapStorage::default());
+        let algorithm = ChunkAlgorithm::fastcdc_default();
+        let original = Bytes::from(vec![7u8; 2 * 1024 * 1024]);
+
+        let first = server
+            .publish_item_as(
+                "stable-id".to_string(),
+                "display-name".to_string(),
+                "artifact.bin".into(),
+                None,
+                original.clone(),
+                algorithm,
+            )
+            .await
+            .unwrap();
+        let duplicate = server
+            .publish_item_as(
+                "stable-id".to_string(),
+                "display-name".to_string(),
+                "artifact.bin".into(),
+                None,
+                original,
+                algorithm,
+            )
+            .await
+            .unwrap();
+        assert_eq!(duplicate.metadata.revision, first.metadata.revision);
+
+        let second = server
+            .publish_item_as(
+                "stable-id".to_string(),
+                "renamed-display".to_string(),
+                "renamed.bin".into(),
+                None,
+                Bytes::from(vec![8u8; 2 * 1024 * 1024]),
+                algorithm,
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.metadata.artifact_id, "stable-id");
+        assert_eq!(second.metadata.revision, first.metadata.revision + 1);
+
+        let (_, historical) = server
+            .sync_manifest_response(ManifestRequest {
+                artifact_id: "stable-id".to_string(),
+                version: Some(first.manifest.version),
+            })
+            .await
+            .unwrap();
+        assert_eq!(historical.metadata.root, first.metadata.root);
     }
 }
