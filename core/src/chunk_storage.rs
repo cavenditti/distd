@@ -22,6 +22,18 @@ use crate::{
 
 static NEXT_RECEIVED_BACKING_ID: AtomicU64 = AtomicU64::new(1);
 
+fn next_received_backing_id() -> u64 {
+    next_received_backing_id_from(&NEXT_RECEIVED_BACKING_ID)
+}
+
+fn next_received_backing_id_from(counter: &AtomicU64) -> u64 {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .unwrap_or_else(|_| panic!("received chunk backing identity space exhausted"))
+}
+
 fn prepared_tree(chunks: &[ChunkInfo]) -> Result<ChunkInfo, Error> {
     let mut partials = chunks.to_vec();
     if partials.is_empty() {
@@ -229,7 +241,7 @@ impl ReceivedChunk {
         Self {
             bytes: Bytes::from(data),
             backing: Arc::new(ReceivedBacking {
-                id: NEXT_RECEIVED_BACKING_ID.fetch_add(1, Ordering::Relaxed),
+                id: next_received_backing_id(),
                 allocation_bytes,
             }),
         }
@@ -245,7 +257,7 @@ impl ReceivedChunk {
         Self {
             bytes: Bytes::from_static(data),
             backing: Arc::new(ReceivedBacking {
-                id: NEXT_RECEIVED_BACKING_ID.fetch_add(1, Ordering::Relaxed),
+                id: next_received_backing_id(),
                 allocation_bytes: 0,
             }),
         }
@@ -813,8 +825,17 @@ mod tests {
 
     use bytes::{Bytes, BytesMut};
     use rand::{self, RngCore};
+    use std::sync::atomic::AtomicU64;
 
     use crate::{chunk_storage::hashmap_storage::HashMapStorage, chunks::CHUNK_SIZE, hash::hash};
+
+    #[test]
+    fn received_backing_identity_exhaustion_is_fail_stop() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(next_received_backing_id_from(&counter), u64::MAX - 1);
+        assert!(std::panic::catch_unwind(|| next_received_backing_id_from(&counter)).is_err());
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
 
     struct VerificationStorage {
         chunks: Vec<Option<Vec<u8>>>,

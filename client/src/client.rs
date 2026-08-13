@@ -17,9 +17,10 @@ use crate::{
 };
 
 use distd_core::{
-    chunk_storage::{fs_storage::FsStorage, ChunkStorage},
+    chunk_storage::{fs_storage::FsStorage, ChunkStorage, ReceivedChunk},
+    chunks::ChunkInfo,
     hash::Hash,
-    item::Item,
+    item::{Item, Manifest},
     metadata::Item as ItemMetadata,
 };
 
@@ -230,22 +231,17 @@ impl Client<FsStorage> {
             .sum::<u64>();
 
         let t1 = Instant::now();
-        let storage = Arc::clone(&self.storage);
         let local_basis_count = from.len();
-        let from = from.to_vec();
-        let item = tokio::task::spawn_blocking(move || {
-            storage.receive_sync_item_shared(
-                target.name,
-                destination,
-                target.revision,
-                target.description,
-                &manifest,
-                &chunk_infos,
-                &from,
-                received_chunks,
-            )
-        })
-        .await??;
+        let item = commit_sync_storage(
+            Arc::clone(&self.storage),
+            target,
+            destination,
+            manifest,
+            chunk_infos,
+            from.to_vec(),
+            received_chunks,
+        )
+        .await?;
         let store_elapsed = t1.elapsed();
 
         tracing::info!(
@@ -356,6 +352,31 @@ impl Client<FsStorage> {
             }
         }
     }
+}
+
+async fn commit_sync_storage(
+    storage: Arc<FsStorage>,
+    target: ItemMetadata,
+    destination: PathBuf,
+    manifest: Manifest,
+    chunk_infos: Vec<ChunkInfo>,
+    from: Vec<Hash>,
+    received_chunks: Vec<ReceivedChunk>,
+) -> Result<Item, ClientError> {
+    tokio::task::spawn_blocking(move || {
+        storage.receive_sync_item_shared(
+            target.name,
+            destination,
+            target.revision,
+            target.description,
+            &manifest,
+            &chunk_infos,
+            &from,
+            received_chunks,
+        )
+    })
+    .await?
+    .map_err(ClientError::from)
 }
 
 pub mod cli {
@@ -628,5 +649,152 @@ mod trust_tests {
         assert_eq!(authority_b.client_uuid, Some(record_b.client_uuid));
         assert_eq!(authority_b.certificate_pin, Some(record_b.certificate_pin));
         assert_ne!(authority_a.client_uuid, authority_b.client_uuid);
+    }
+}
+
+#[cfg(test)]
+mod chunk_cache_tests {
+    use std::{io::Read, path::Path, sync::Arc};
+
+    use distd_core::{
+        chunk_storage::{
+            fs_storage::{FsStorage, FsStorageCacheConfig},
+            hashmap_storage::HashMapStorage,
+            ChunkStorage, ReceivedChunk,
+        },
+        chunks::{ChunkAlgorithm, CHUNK_SIZE},
+        hash::Hash,
+        item::Item,
+    };
+
+    use super::commit_sync_storage;
+
+    fn prepared_revision(
+        source: &HashMapStorage,
+        destination: &Path,
+        revision: u32,
+        bytes: &[u8],
+    ) -> Item {
+        let root = source.insert(bytes.to_vec().into()).unwrap();
+        Item::new(
+            "cache-ceiling".to_string(),
+            destination.to_path_buf(),
+            revision,
+            None,
+            &root,
+            ChunkAlgorithm::Fixed256K,
+        )
+        .with_artifact_id("cache-ceiling".to_string())
+    }
+
+    fn assert_empty_bounded_cache(storage: &FsStorage) {
+        let stats = storage.chunk_cache_stats();
+        assert_eq!(stats.max_bytes, 1);
+        assert_eq!(stats.current_bytes, 0);
+        assert_eq!(stats.peak_bytes, 0);
+        assert_eq!(stats.retained_entries, 0);
+        assert_eq!(stats.recency_entries, 0);
+        assert_eq!(stats.shared_backings, 0);
+        assert_eq!(stats.shared_cached_views, 0);
+        assert!(stats.invariants_hold);
+    }
+
+    fn read_all(mut file: std::fs::File) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        bytes
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn production_sync_commit_respects_one_byte_cache_with_shared_bulk_views() {
+        let temporary = tempfile::tempdir().unwrap();
+        let destination = temporary.path().join("cache-ceiling.bin");
+        let storage = Arc::new(
+            FsStorage::with_cache_config(
+                temporary.path().to_path_buf(),
+                FsStorageCacheConfig {
+                    max_chunk_bytes: 1,
+                    max_tree_entries: 1,
+                },
+            )
+            .unwrap(),
+        );
+        let source = HashMapStorage::default();
+
+        let initial_bytes = (0..CHUNK_SIZE * 2)
+            .map(|index| ((index * 17) % 251) as u8)
+            .collect::<Vec<_>>();
+        let initial = prepared_revision(&source, &destination, 1, &initial_bytes);
+        let initial_bulk = ReceivedChunk::from_vec(initial_bytes.clone());
+        let held_initial_bulk = initial_bulk.clone();
+        let initial_views = vec![
+            initial_bulk.slice(0..CHUNK_SIZE),
+            initial_bulk.slice(CHUNK_SIZE..initial_bytes.len()),
+        ];
+        let first = commit_sync_storage(
+            Arc::clone(&storage),
+            initial.metadata.clone(),
+            destination.clone(),
+            initial.manifest.clone(),
+            initial.chunks.clone(),
+            Vec::new(),
+            initial_views,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.metadata.root, initial.metadata.root);
+        assert_eq!(held_initial_bulk.as_ref(), initial_bytes);
+        assert_empty_bounded_cache(&storage);
+
+        let mut changed_bytes = initial_bytes.clone();
+        for (offset, byte) in changed_bytes[CHUNK_SIZE..].iter_mut().enumerate() {
+            *byte = byte.wrapping_add(29) ^ (offset as u8);
+        }
+        let changed = prepared_revision(&source, &destination, 2, &changed_bytes);
+        let changed_bulk = ReceivedChunk::copy_from_slice(&changed_bytes[CHUNK_SIZE..]);
+        let held_changed_bulk = changed_bulk.clone();
+        let local_hashes = first
+            .chunks
+            .iter()
+            .map(|chunk| chunk.hash)
+            .collect::<Vec<Hash>>();
+        let second = commit_sync_storage(
+            Arc::clone(&storage),
+            changed.metadata.clone(),
+            destination.clone(),
+            changed.manifest.clone(),
+            changed.chunks.clone(),
+            local_hashes,
+            vec![changed_bulk],
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.metadata.root, changed.metadata.root);
+        assert_eq!(held_changed_bulk.as_ref(), &changed_bytes[CHUNK_SIZE..]);
+        assert_empty_bounded_cache(&storage);
+
+        let active = storage
+            .open_active_revision(&destination)
+            .unwrap()
+            .expect("changed revision is active");
+        assert_eq!(read_all(active.open_file().unwrap()), changed_bytes);
+        drop(active);
+        drop(storage);
+
+        let reopened = FsStorage::with_cache_config(
+            temporary.path().to_path_buf(),
+            FsStorageCacheConfig {
+                max_chunk_bytes: 1,
+                max_tree_entries: 1,
+            },
+        )
+        .unwrap();
+        let active = reopened
+            .open_active_revision(&destination)
+            .unwrap()
+            .expect("changed revision survives restart");
+        assert_eq!(active.item().metadata.root, changed.metadata.root);
+        assert_eq!(read_all(active.open_file().unwrap()), changed_bytes);
+        assert_empty_bounded_cache(&reopened);
     }
 }

@@ -276,6 +276,30 @@ struct SharedBackingUsage {
     cached_views: usize,
 }
 
+#[derive(Debug)]
+struct HotChunkEntry {
+    data: ChunkData,
+    older: Option<Hash>,
+    newer: Option<Hash>,
+}
+
+/// Test and integration observability for the filesystem hot-chunk cache.
+///
+/// This reports cache-owned payload allocations only. Payloads still held by
+/// callers after eviction are deliberately outside the cache accounting.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChunkCacheStats {
+    pub max_bytes: usize,
+    pub current_bytes: usize,
+    pub peak_bytes: usize,
+    pub retained_entries: usize,
+    pub recency_entries: usize,
+    pub shared_backings: usize,
+    pub shared_cached_views: usize,
+    pub invariants_hold: bool,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct FsStorageCacheConfig {
     pub max_chunk_bytes: usize,
@@ -291,12 +315,14 @@ impl Default for FsStorageCacheConfig {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct HotChunkCache {
     max_bytes: usize,
     total_bytes: usize,
-    order: VecDeque<Hash>,
-    entries: HashMap<Hash, ChunkData>,
+    peak_bytes: usize,
+    oldest: Option<Hash>,
+    newest: Option<Hash>,
+    entries: HashMap<Hash, HotChunkEntry>,
     shared_backings: HashMap<u64, SharedBackingUsage>,
 }
 
@@ -396,15 +422,17 @@ impl HotChunkCache {
         Self {
             max_bytes,
             total_bytes: 0,
-            order: VecDeque::new(),
+            peak_bytes: 0,
+            oldest: None,
+            newest: None,
             entries: HashMap::default(),
             shared_backings: HashMap::default(),
         }
     }
 
     fn get(&mut self, hash: &Hash) -> Option<ChunkData> {
-        let data = self.entries.get(hash)?.clone();
-        self.order.push_back(*hash);
+        let data = self.entries.get(hash)?.data.clone();
+        self.touch(*hash);
         Some(data)
     }
 
@@ -417,58 +445,92 @@ impl HotChunkCache {
     }
 
     fn insert(&mut self, hash: Hash, data: ChunkData) {
-        if self.max_bytes == 0 {
+        if self.max_bytes == 0 || data.as_ref().is_empty() {
             return;
         }
 
         let allocation_bytes = match &data {
-            ChunkData::Owned(data) => data.len(),
+            ChunkData::Owned(data) => data.capacity(),
             ChunkData::Shared(data) => data.backing_allocation_bytes(),
         };
         if allocation_bytes > self.max_bytes {
             return;
         }
 
-        if let Some(old) = self.entries.remove(&hash) {
-            self.uncharge(&old);
-            self.order.retain(|queued| queued != &hash);
+        self.remove(hash);
+
+        loop {
+            let additional = self.additional_charge(&data);
+            if fits_within(self.total_bytes, additional, self.max_bytes) {
+                break;
+            }
+            let Some(oldest) = self.oldest else {
+                return;
+            };
+            self.remove(oldest);
         }
 
         self.charge(&data);
-        self.entries.insert(hash, data);
-        self.order.push_back(hash);
+        let older = self.newest;
+        self.entries.insert(
+            hash,
+            HotChunkEntry {
+                data,
+                older,
+                newer: None,
+            },
+        );
+        if let Some(previous) = older {
+            self.entries
+                .get_mut(&previous)
+                .expect("hot chunk cache newest entry must exist")
+                .newer = Some(hash);
+        } else {
+            self.oldest = Some(hash);
+        }
+        self.newest = Some(hash);
+    }
 
-        while self.total_bytes > self.max_bytes {
-            let Some(oldest_hash) = self.order.pop_front() else {
-                break;
-            };
-            let remove = match self.entries.get(&oldest_hash) {
-                Some(ChunkData::Owned(current)) => Arc::strong_count(current) == 1,
-                Some(ChunkData::Shared(_)) => true,
-                None => false,
-            };
-            if remove {
-                if let Some(old) = self.entries.remove(&oldest_hash) {
-                    self.uncharge(&old);
-                }
-            }
+    fn additional_charge(&self, data: &ChunkData) -> usize {
+        match data {
+            ChunkData::Owned(data) => data.capacity(),
+            ChunkData::Shared(data) if self.shared_backings.contains_key(&data.backing_id()) => 0,
+            ChunkData::Shared(data) => data.backing_allocation_bytes(),
         }
     }
 
     fn charge(&mut self, data: &ChunkData) {
         match data {
             ChunkData::Owned(data) => {
-                self.total_bytes = self.total_bytes.saturating_add(data.len());
+                let total = self
+                    .total_bytes
+                    .checked_add(data.capacity())
+                    .expect("hot chunk cache owned accounting overflow");
+                assert!(
+                    total <= self.max_bytes,
+                    "hot chunk cache admitted owned payload above ceiling"
+                );
+                self.total_bytes = total;
             }
             ChunkData::Shared(data) => {
-                let id = data.backing_id();
-                if let Some(usage) = self.shared_backings.get_mut(&id) {
-                    usage.cached_views += 1;
+                if let Some(usage) = self.shared_backings.get_mut(&data.backing_id()) {
+                    usage.cached_views = usage
+                        .cached_views
+                        .checked_add(1)
+                        .expect("hot chunk cache shared view accounting overflow");
                 } else {
                     let allocation_bytes = data.backing_allocation_bytes();
-                    self.total_bytes = self.total_bytes.saturating_add(allocation_bytes);
+                    let total = self
+                        .total_bytes
+                        .checked_add(allocation_bytes)
+                        .expect("hot chunk cache shared accounting overflow");
+                    assert!(
+                        total <= self.max_bytes,
+                        "hot chunk cache admitted shared payload above ceiling"
+                    );
+                    self.total_bytes = total;
                     self.shared_backings.insert(
-                        id,
+                        data.backing_id(),
                         SharedBackingUsage {
                             allocation_bytes,
                             cached_views: 1,
@@ -477,12 +539,16 @@ impl HotChunkCache {
                 }
             }
         }
+        self.peak_bytes = self.peak_bytes.max(self.total_bytes);
     }
 
     fn uncharge(&mut self, data: &ChunkData) {
         match data {
             ChunkData::Owned(data) => {
-                self.total_bytes = self.total_bytes.saturating_sub(data.len());
+                self.total_bytes = self
+                    .total_bytes
+                    .checked_sub(data.capacity())
+                    .expect("hot chunk cache owned accounting underflow");
             }
             ChunkData::Shared(data) => {
                 let id = data.backing_id();
@@ -490,18 +556,209 @@ impl HotChunkCache {
                     .shared_backings
                     .get_mut(&id)
                     .map(|usage| {
-                        usage.cached_views -= 1;
+                        usage.cached_views = usage
+                            .cached_views
+                            .checked_sub(1)
+                            .expect("hot chunk cache shared view accounting underflow");
                         usage.cached_views == 0
                     })
-                    .unwrap_or(false);
+                    .expect("hot chunk cache shared backing accounting missing");
                 if remove {
                     if let Some(usage) = self.shared_backings.remove(&id) {
-                        self.total_bytes = self.total_bytes.saturating_sub(usage.allocation_bytes);
+                        self.total_bytes = self
+                            .total_bytes
+                            .checked_sub(usage.allocation_bytes)
+                            .expect("hot chunk cache shared accounting underflow");
                     }
                 }
             }
         }
     }
+
+    fn touch(&mut self, hash: Hash) {
+        if self.newest == Some(hash) {
+            return;
+        }
+        let (older, newer) = {
+            let entry = self
+                .entries
+                .get(&hash)
+                .expect("hot chunk cache touched entry must exist");
+            (entry.older, entry.newer)
+        };
+        if let Some(older) = older {
+            self.entries
+                .get_mut(&older)
+                .expect("hot chunk cache older entry must exist")
+                .newer = newer;
+        } else {
+            self.oldest = newer;
+        }
+        if let Some(newer) = newer {
+            self.entries
+                .get_mut(&newer)
+                .expect("hot chunk cache newer entry must exist")
+                .older = older;
+        }
+
+        let previous_newest = self.newest;
+        {
+            let entry = self
+                .entries
+                .get_mut(&hash)
+                .expect("hot chunk cache touched entry must exist");
+            entry.older = previous_newest;
+            entry.newer = None;
+        }
+        if let Some(previous_newest) = previous_newest {
+            self.entries
+                .get_mut(&previous_newest)
+                .expect("hot chunk cache newest entry must exist")
+                .newer = Some(hash);
+        } else {
+            self.oldest = Some(hash);
+        }
+        self.newest = Some(hash);
+    }
+
+    fn remove(&mut self, hash: Hash) -> Option<ChunkData> {
+        let (older, newer) = self
+            .entries
+            .get(&hash)
+            .map(|entry| (entry.older, entry.newer))?;
+        if let Some(older) = older {
+            self.entries
+                .get_mut(&older)
+                .expect("hot chunk cache older entry must exist")
+                .newer = newer;
+        } else {
+            self.oldest = newer;
+        }
+        if let Some(newer) = newer {
+            self.entries
+                .get_mut(&newer)
+                .expect("hot chunk cache newer entry must exist")
+                .older = older;
+        } else {
+            self.newest = older;
+        }
+        let entry = self
+            .entries
+            .remove(&hash)
+            .expect("hot chunk cache removed entry must exist");
+        self.uncharge(&entry.data);
+        Some(entry.data)
+    }
+
+    fn stats(&self) -> ChunkCacheStats {
+        let (recency_entries, invariants_hold) = self.check_invariants();
+        let shared_cached_views = self
+            .shared_backings
+            .values()
+            .try_fold(0usize, |total, usage| total.checked_add(usage.cached_views));
+        ChunkCacheStats {
+            max_bytes: self.max_bytes,
+            current_bytes: self.total_bytes,
+            peak_bytes: self.peak_bytes,
+            retained_entries: self.entries.len(),
+            recency_entries,
+            shared_backings: self.shared_backings.len(),
+            shared_cached_views: shared_cached_views.unwrap_or(usize::MAX),
+            invariants_hold: invariants_hold && shared_cached_views.is_some(),
+        }
+    }
+
+    fn check_invariants(&self) -> (usize, bool) {
+        let mut valid = self.total_bytes <= self.max_bytes
+            && self.total_bytes <= self.peak_bytes
+            && self.peak_bytes <= self.max_bytes
+            && self.oldest.is_none() == self.entries.is_empty()
+            && self.newest.is_none() == self.entries.is_empty();
+        let mut seen = HashSet::default();
+        let mut current = self.oldest;
+        let mut expected_older = None;
+        while let Some(hash) = current {
+            if !seen.insert(hash) {
+                valid = false;
+                break;
+            }
+            let Some(entry) = self.entries.get(&hash) else {
+                valid = false;
+                break;
+            };
+            if entry.older != expected_older {
+                valid = false;
+            }
+            expected_older = Some(hash);
+            current = entry.newer;
+        }
+        valid &= expected_older == self.newest && seen.len() == self.entries.len();
+
+        let mut recomputed_total = 0usize;
+        let mut recomputed_shared: HashMap<u64, SharedBackingUsage> = HashMap::default();
+        for entry in self.entries.values() {
+            match &entry.data {
+                ChunkData::Owned(data) => {
+                    let Some(total) = recomputed_total.checked_add(data.capacity()) else {
+                        valid = false;
+                        break;
+                    };
+                    recomputed_total = total;
+                }
+                ChunkData::Shared(data) => {
+                    let usage =
+                        recomputed_shared
+                            .entry(data.backing_id())
+                            .or_insert(SharedBackingUsage {
+                                allocation_bytes: data.backing_allocation_bytes(),
+                                cached_views: 0,
+                            });
+                    if usage.allocation_bytes != data.backing_allocation_bytes() {
+                        valid = false;
+                    }
+                    if let Some(cached_views) = usage.cached_views.checked_add(1) {
+                        usage.cached_views = cached_views;
+                    } else {
+                        valid = false;
+                    }
+                }
+            }
+        }
+        for usage in recomputed_shared.values() {
+            if let Some(total) = recomputed_total.checked_add(usage.allocation_bytes) {
+                recomputed_total = total;
+            } else {
+                valid = false;
+            }
+        }
+        valid &= recomputed_total == self.total_bytes;
+        valid &= recomputed_shared.len() == self.shared_backings.len();
+        valid &= recomputed_shared.iter().all(|(id, expected)| {
+            self.shared_backings.get(id).is_some_and(|actual| {
+                actual.allocation_bytes == expected.allocation_bytes
+                    && actual.cached_views == expected.cached_views
+            })
+        });
+        (seen.len(), valid)
+    }
+
+    #[cfg(test)]
+    fn recency_hashes(&self) -> Vec<Hash> {
+        let mut hashes = Vec::with_capacity(self.entries.len());
+        let mut current = self.oldest;
+        while let Some(hash) = current {
+            if hashes.len() == self.entries.len() {
+                break;
+            }
+            hashes.push(hash);
+            current = self.entries.get(&hash).and_then(|entry| entry.newer);
+        }
+        hashes
+    }
+}
+
+fn fits_within(current: usize, additional: usize, maximum: usize) -> bool {
+    current <= maximum && additional <= maximum - current
 }
 
 pub fn open_file(path: &Path) -> Result<File, Error> {
@@ -2229,6 +2486,12 @@ impl Default for FsStorage {
 }
 
 impl FsStorage {
+    /// Return cache-owned payload accounting for integration assertions.
+    #[doc(hidden)]
+    pub fn chunk_cache_stats(&self) -> ChunkCacheStats {
+        self.chunk_cache.lock().unwrap().stats()
+    }
+
     fn activation_root(&self) -> PathBuf {
         self.inner
             .read()
@@ -6346,6 +6609,8 @@ mod tests {
     };
     use std::str::FromStr;
 
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+
     use super::*;
 
     fn print_fsstorage(storage: &FsStorage) {
@@ -7607,6 +7872,338 @@ mod tests {
     }
 
     #[test]
+    fn hot_chunk_cache_external_owned_clones_never_block_hard_bound_eviction() {
+        let first = Arc::new(vec![1u8; 8]);
+        let first_hash = do_hash(first.as_ref());
+        let second = Arc::new(vec![2u8; 8]);
+        let second_hash = do_hash(second.as_ref());
+        let mut cache = HotChunkCache::new(8);
+
+        cache.insert_owned(first_hash, first.clone());
+        let caller_clone = match cache.get(&first_hash).unwrap() {
+            ChunkData::Owned(data) => data,
+            ChunkData::Shared(_) => unreachable!(),
+        };
+        cache.insert_owned(second_hash, second.clone());
+
+        assert_eq!(caller_clone.as_slice(), &[1u8; 8]);
+        assert_eq!(first.as_slice(), &[1u8; 8]);
+        assert!(!cache.entries.contains_key(&first_hash));
+        assert!(cache.entries.contains_key(&second_hash));
+        assert_eq!(cache.total_bytes, 8);
+        assert!(cache.stats().invariants_hold);
+    }
+
+    #[test]
+    fn hot_chunk_cache_capacity_charge_and_bypass_preserve_existing_same_key() {
+        let mut retained_vec = Vec::with_capacity(8);
+        retained_vec.extend_from_slice(b"kept");
+        let retained = Arc::new(retained_vec);
+        let hash = do_hash(retained.as_ref());
+        let mut cache = HotChunkCache::new(8);
+        cache.insert_owned(hash, retained.clone());
+
+        let mut oversized = Vec::with_capacity(9);
+        oversized.extend_from_slice(b"new");
+        cache.insert_owned(hash, Arc::new(oversized));
+        cache.insert_owned(hash, Arc::new(Vec::new()));
+
+        assert_eq!(cache.total_bytes, retained.capacity());
+        assert_eq!(cache.entries.get(&hash).unwrap().data.as_ref(), b"kept");
+        assert!(cache.stats().invariants_hold);
+
+        let mut disabled = HotChunkCache::new(0);
+        disabled.insert_owned(hash, retained);
+        assert_eq!(disabled.stats().retained_entries, 0);
+        assert_eq!(disabled.stats().peak_bytes, 0);
+        assert!(disabled.stats().invariants_hold);
+    }
+
+    #[test]
+    fn hot_chunk_cache_recency_is_one_node_per_key_after_one_hundred_thousand_hits() {
+        let first = Arc::new(vec![1u8; 4]);
+        let second = Arc::new(vec![2u8; 4]);
+        let first_hash = do_hash(first.as_ref());
+        let second_hash = do_hash(second.as_ref());
+        let mut cache = HotChunkCache::new(8);
+        cache.insert_owned(first_hash, first);
+        cache.insert_owned(second_hash, second);
+
+        for _ in 0..100_000 {
+            assert!(cache.get(&first_hash).is_some());
+        }
+
+        assert_eq!(cache.recency_hashes(), vec![second_hash, first_hash]);
+        assert_eq!(cache.stats().retained_entries, 2);
+        assert_eq!(cache.stats().recency_entries, 2);
+        assert!(cache.stats().invariants_hold);
+    }
+
+    #[test]
+    fn hot_chunk_cache_overflow_admission_predicate_is_nonwrapping() {
+        assert!(fits_within(usize::MAX - 1, 1, usize::MAX));
+        assert!(!fits_within(usize::MAX - 1, 2, usize::MAX));
+        assert!(!fits_within(usize::MAX, 1, usize::MAX));
+        assert!(!fits_within(1, 0, 0));
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ModelCacheData {
+        Owned(usize),
+        Shared { backing: u64, allocation: usize },
+    }
+
+    #[derive(Debug)]
+    struct ModelHotChunkCache {
+        max_bytes: usize,
+        current_bytes: usize,
+        peak_bytes: usize,
+        order: Vec<Hash>,
+        entries: HashMap<Hash, ModelCacheData>,
+        shared_views: HashMap<u64, (usize, usize)>,
+    }
+
+    impl ModelHotChunkCache {
+        fn new(max_bytes: usize) -> Self {
+            Self {
+                max_bytes,
+                current_bytes: 0,
+                peak_bytes: 0,
+                order: Vec::new(),
+                entries: HashMap::default(),
+                shared_views: HashMap::default(),
+            }
+        }
+
+        fn get(&mut self, hash: Hash) -> bool {
+            if !self.entries.contains_key(&hash) {
+                return false;
+            }
+            self.order.retain(|current| current != &hash);
+            self.order.push(hash);
+            true
+        }
+
+        fn insert(&mut self, hash: Hash, data: ModelCacheData, payload_len: usize) {
+            let allocation = match data {
+                ModelCacheData::Owned(capacity) => capacity,
+                ModelCacheData::Shared { allocation, .. } => allocation,
+            };
+            if self.max_bytes == 0 || payload_len == 0 || allocation > self.max_bytes {
+                return;
+            }
+            self.remove(hash);
+            loop {
+                let additional = match data {
+                    ModelCacheData::Owned(capacity) => capacity,
+                    ModelCacheData::Shared {
+                        backing,
+                        allocation,
+                    } => usize::from(!self.shared_views.contains_key(&backing)) * allocation,
+                };
+                if fits_within(self.current_bytes, additional, self.max_bytes) {
+                    break;
+                }
+                let Some(oldest) = self.order.first().copied() else {
+                    return;
+                };
+                self.remove(oldest);
+            }
+            match data {
+                ModelCacheData::Owned(capacity) => self.current_bytes += capacity,
+                ModelCacheData::Shared {
+                    backing,
+                    allocation,
+                } => {
+                    let usage = self.shared_views.entry(backing).or_insert_with(|| {
+                        self.current_bytes += allocation;
+                        (allocation, 0)
+                    });
+                    usage.1 += 1;
+                }
+            }
+            self.entries.insert(hash, data);
+            self.order.push(hash);
+            self.peak_bytes = self.peak_bytes.max(self.current_bytes);
+        }
+
+        fn remove(&mut self, hash: Hash) {
+            let Some(data) = self.entries.remove(&hash) else {
+                return;
+            };
+            self.order.retain(|current| current != &hash);
+            match data {
+                ModelCacheData::Owned(capacity) => self.current_bytes -= capacity,
+                ModelCacheData::Shared { backing, .. } => {
+                    let usage = self.shared_views.get_mut(&backing).unwrap();
+                    usage.1 -= 1;
+                    if usage.1 == 0 {
+                        let (allocation, _) = self.shared_views.remove(&backing).unwrap();
+                        self.current_bytes -= allocation;
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hot_chunk_cache_randomized_matches_independent_ownership_and_lru_model() {
+        let shared_backings = [
+            ReceivedChunk::from_vec(vec![11u8; 7]),
+            ReceivedChunk::from_vec(vec![22u8; 13]),
+            ReceivedChunk::from_vec(vec![33u8; 23]),
+        ];
+        for (scenario, maximum) in [0, 1, 7, 16, 31, usize::MAX].into_iter().enumerate() {
+            let mut rng = StdRng::seed_from_u64(0x5eed_0000 + scenario as u64);
+            let mut cache = HotChunkCache::new(maximum);
+            let mut model = ModelHotChunkCache::new(maximum);
+            let mut external_owned = Vec::new();
+            let mut external_shared = Vec::new();
+
+            for step in 0..4_000usize {
+                match rng.gen_range(0..4) {
+                    0 => {
+                        let len = rng.gen_range(0..25);
+                        let fill = rng.gen_range(0..8) as u8;
+                        let mut bytes = Vec::with_capacity(len + rng.gen_range(0..5));
+                        bytes.resize(len, fill);
+                        let capacity = bytes.capacity();
+                        let hash = do_hash(&bytes);
+                        let data = Arc::new(bytes);
+                        if rng.gen_bool(0.4) {
+                            external_owned.push(data.clone());
+                        }
+                        cache.insert_owned(hash, data);
+                        model.insert(hash, ModelCacheData::Owned(capacity), len);
+                    }
+                    1 => {
+                        let backing = &shared_backings[rng.gen_range(0..shared_backings.len())];
+                        let start = rng.gen_range(0..backing.len());
+                        let end = rng.gen_range(start + 1..=backing.len());
+                        let view = backing.slice(start..end);
+                        let hash = do_hash(view.as_ref());
+                        if rng.gen_bool(0.4) {
+                            external_shared.push(view.clone());
+                        }
+                        cache.insert_shared(hash, view.clone());
+                        model.insert(
+                            hash,
+                            ModelCacheData::Shared {
+                                backing: view.backing_id(),
+                                allocation: view.backing_allocation_bytes(),
+                            },
+                            view.len(),
+                        );
+                    }
+                    2 => {
+                        let candidate = if model.order.is_empty() || rng.gen_bool(0.25) {
+                            do_hash(&(step as u64).to_le_bytes())
+                        } else {
+                            model.order[rng.gen_range(0..model.order.len())]
+                        };
+                        let actual = cache.get(&candidate);
+                        let expected = model.get(candidate);
+                        assert_eq!(actual.is_some(), expected);
+                        if let Some(actual) = actual {
+                            match actual {
+                                ChunkData::Owned(data) => external_owned.push(data),
+                                ChunkData::Shared(data) => external_shared.push(data),
+                            }
+                        }
+                    }
+                    _ => {
+                        external_owned.truncate(rng.gen_range(0..=external_owned.len()));
+                        external_shared.truncate(rng.gen_range(0..=external_shared.len()));
+                    }
+                }
+
+                let stats = cache.stats();
+                assert!(stats.invariants_hold, "scenario {scenario}, step {step}");
+                assert_eq!(stats.current_bytes, model.current_bytes);
+                assert_eq!(stats.peak_bytes, model.peak_bytes);
+                assert_eq!(stats.retained_entries, model.entries.len());
+                assert_eq!(stats.recency_entries, model.order.len());
+                assert_eq!(cache.recency_hashes(), model.order);
+                for (hash, expected) in &model.entries {
+                    let actual = &cache.entries.get(hash).unwrap().data;
+                    let actual = match actual {
+                        ChunkData::Owned(data) => ModelCacheData::Owned(data.capacity()),
+                        ChunkData::Shared(data) => ModelCacheData::Shared {
+                            backing: data.backing_id(),
+                            allocation: data.backing_allocation_bytes(),
+                        },
+                    };
+                    assert_eq!(actual, *expected);
+                }
+                assert_eq!(stats.shared_backings, model.shared_views.len());
+                for (backing, (allocation, cached_views)) in &model.shared_views {
+                    let actual = cache.shared_backings.get(backing).unwrap();
+                    assert_eq!(actual.allocation_bytes, *allocation);
+                    assert_eq!(actual.cached_views, *cached_views);
+                }
+                assert_eq!(
+                    stats.shared_cached_views,
+                    model.shared_views.values().map(|usage| usage.1).sum()
+                );
+                assert!(stats.current_bytes <= maximum);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "local release hot-chunk cache performance reference"]
+    fn hot_chunk_cache_reference_performance() {
+        use std::time::{Duration, Instant};
+
+        assert!(
+            !cfg!(debug_assertions),
+            "hot-chunk cache performance reference must run with --release"
+        );
+        const WARM_HITS: usize = 1_000_000;
+        const REPLACEMENTS: usize = 10_000;
+
+        let hash = do_hash(b"warm-cache-key");
+        let first = Arc::new(vec![1u8; 4 * 1024]);
+        let second = Arc::new(vec![2u8; 4 * 1024]);
+        let mut cache = HotChunkCache::new(8 * 1024);
+        cache.insert_owned(hash, first.clone());
+
+        let hits_started = Instant::now();
+        for _ in 0..WARM_HITS {
+            std::hint::black_box(cache.get(&hash).expect("warm entry must remain cached"));
+        }
+        let hits_elapsed = hits_started.elapsed();
+
+        let replacements_started = Instant::now();
+        let mut replacement_samples = Vec::with_capacity(REPLACEMENTS);
+        for index in 0..REPLACEMENTS {
+            let started = Instant::now();
+            cache.insert_owned(
+                hash,
+                if index.is_multiple_of(2) {
+                    second.clone()
+                } else {
+                    first.clone()
+                },
+            );
+            replacement_samples.push(started.elapsed());
+        }
+        let replacements_elapsed = replacements_started.elapsed();
+        replacement_samples.sort_unstable();
+        let median = replacement_samples[REPLACEMENTS / 2];
+        let p95 = replacement_samples[(REPLACEMENTS * 95).div_ceil(100) - 1];
+
+        println!(
+            "hot_chunk_cache_reference_performance hits={WARM_HITS} hits_elapsed={hits_elapsed:?} replacements={REPLACEMENTS} replacements_elapsed={replacements_elapsed:?} replacement_median={median:?} replacement_p95={p95:?} stats={:?}",
+            cache.stats()
+        );
+        assert!(hits_elapsed <= Duration::from_millis(100));
+        assert!(median <= Duration::from_micros(10));
+        assert!(p95 <= Duration::from_micros(100));
+        assert!(cache.stats().invariants_hold);
+    }
+
+    #[test]
     fn hot_chunk_cache_evicts_every_view_before_unaccounting_shared_backing() {
         let backing = ReceivedChunk::from_vec(Vec::from(&b"abcdefghijkl"[..]));
         let first = backing.slice(0..4);
@@ -7678,8 +8275,8 @@ mod tests {
 
         let cache = storage.chunk_cache.lock().unwrap();
         assert_eq!(
-            cache.order,
-            VecDeque::from([a_hash, c_hash]),
+            cache.recency_hashes(),
+            vec![a_hash, c_hash],
             "repeated A must refresh after B, so later pressure evicts B"
         );
         assert_eq!(
@@ -8170,13 +8767,69 @@ mod tests {
         let cache = storage.chunk_cache.lock().unwrap();
         assert_eq!(cache.total_bytes, data.len());
         for chunk in &tree.1 {
-            let ChunkData::Shared(cached) = cache.entries.get(&chunk.hash).unwrap() else {
+            let ChunkData::Shared(cached) = &cache.entries.get(&chunk.hash).unwrap().data else {
                 panic!("received chunk was copied into owned cache storage");
             };
             assert_eq!(cached.backing_id(), backing_id);
         }
         drop(cache);
         assert_eq!(std::fs::read(root.join("shared.bin")).unwrap(), data);
+    }
+
+    #[test]
+    fn fs_storage_tiny_chunk_cache_never_exceeds_ceiling_during_shared_activation() {
+        use crate::chunk_storage::hashmap_storage::HashMapStorage;
+
+        let root = temp_path();
+        let storage = FsStorage::with_cache_config(
+            root.clone(),
+            FsStorageCacheConfig {
+                max_chunk_bytes: 5,
+                max_tree_entries: 1,
+            },
+        )
+        .unwrap();
+        let source = HashMapStorage::default();
+        let bytes = b"abcdefghijklmnop".to_vec();
+        let (tree, chunks) = source
+            .chunk_tree(&bytes, ChunkAlgorithm::fixed_aligned(4, 1))
+            .unwrap();
+        let manifest = Manifest::from_tree(
+            "tiny-cache".to_string(),
+            1,
+            &tree,
+            &chunks,
+            ChunkAlgorithm::fixed_aligned(4, 1),
+        );
+        let backing = ReceivedChunk::from_vec(bytes.clone());
+        let received = (0..4)
+            .map(|index| backing.slice(index * 4..index * 4 + 4))
+            .collect();
+
+        let item = storage
+            .receive_sync_item_shared(
+                "tiny-cache".to_string(),
+                PathBuf::from("tiny-cache.bin"),
+                1,
+                None,
+                &manifest,
+                &chunks,
+                &[],
+                received,
+            )
+            .unwrap();
+
+        assert_eq!(fs::read(root.join("tiny-cache.bin")).unwrap(), bytes);
+        assert_eq!(
+            storage.get_chunk_by_index(&item.metadata.root.hash, 3),
+            Some(b"mnop".to_vec())
+        );
+        let stats = storage.chunk_cache_stats();
+        assert_eq!(stats.max_bytes, 5);
+        assert!(stats.current_bytes <= 5);
+        assert!(stats.peak_bytes <= 5);
+        assert_eq!(stats.retained_entries, stats.recency_entries);
+        assert!(stats.invariants_hold);
     }
 
     #[test]
