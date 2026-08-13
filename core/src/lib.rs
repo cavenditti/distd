@@ -4,6 +4,7 @@
 
 pub mod chunk_storage;
 pub mod chunks;
+pub mod durable_state;
 pub mod error;
 pub mod feed;
 pub mod hash;

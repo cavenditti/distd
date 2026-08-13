@@ -27,6 +27,9 @@ pub enum Error {
 
     #[error("Storage error: '{0}'")]
     Storage(#[from] StorageError),
+
+    #[error("Durable-state error: '{0}'")]
+    DurableState(#[from] crate::durable_state::DurableStateError),
 }
 
 /// Invalid parameter error

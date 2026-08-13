@@ -312,7 +312,7 @@ pub mod cli {
 
         let Ok(storage_root) = PathBuf::from_str(&settings.fsstorage.root);
         tracing::trace!("Storage root: {}", storage_root.to_string_lossy());
-        let storage = FsStorage::new(storage_root);
+        let storage = FsStorage::new(storage_root)?;
         //let storage = HashMapStorage::default(); // use this for benchmarking in order to avoid potential fs-related bottlenecks
         tracing::trace!("Client storage initialized");
         let client = Client::new(storage, settings, state).await?;

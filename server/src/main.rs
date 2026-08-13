@@ -174,18 +174,20 @@ async fn main() {
                 chunk_cache_mb,
                 tree_cache_entries,
             );
-            let server = Server::new_ephemeral_with_metadata(
-                FsStorage::with_cache_config(
-                    root,
-                    FsStorageCacheConfig {
-                        max_chunk_bytes: chunk_cache_mb.saturating_mul(1024 * 1024),
-                        max_tree_entries: tree_cache_entries,
-                    },
-                ),
-                metadata.clone(),
+            let storage = FsStorage::with_cache_config(
+                root,
+                FsStorageCacheConfig {
+                    max_chunk_bytes: chunk_cache_mb.saturating_mul(1024 * 1024),
+                    max_tree_entries: tree_cache_entries,
+                },
             )
-            .with_enrollment_token(enrollment_token.clone())
-            .with_metadata_persistence(metadata_path.clone());
+            .unwrap_or_else(|error| {
+                eprintln!("Cannot initialize filesystem storage: {error}");
+                std::process::exit(2);
+            });
+            let server = Server::new_ephemeral_with_metadata(storage, metadata.clone())
+                .with_enrollment_token(enrollment_token.clone())
+                .with_metadata_persistence(metadata_path.clone());
             run_server(server, http_addr, quic_settings).await;
         }
         #[cfg(feature = "redb")]

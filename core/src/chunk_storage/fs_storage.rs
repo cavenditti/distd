@@ -1,4 +1,5 @@
 use std::{
+    cmp::Ordering,
     collections::VecDeque,
     fs::{self, create_dir_all, remove_file, File},
     io::{BufWriter, Read, Seek, Write},
@@ -14,6 +15,10 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::{
     chunk_storage::StorageError,
     chunks::{ChunkAlgorithm, ChunkInfo, CHUNK_SIZE},
+    durable_state::{
+        read_bounded_file, read_enveloped_state, replace_enveloped_state, DurableStateKind,
+        MAX_DURABLE_STATE_PAYLOAD,
+    },
     error::{Error, InvalidParameter},
     hash::{hash as do_hash, merge_hashes, Hash, HashTreeCapable},
     item::{FileEntry, Item, Manifest, Name as ItemName},
@@ -24,6 +29,10 @@ use super::{ChunkStorage, Node, ReceivedChunk};
 
 const DEFAULT_CHUNK_CACHE_BYTES: usize = 512 * 1024 * 1024;
 const DEFAULT_TREE_CACHE_ENTRIES: usize = 65_536;
+const FS_STORAGE_PAYLOAD_SCHEMA: u16 = 1;
+const FS_STORAGE_ROOT_DOMAIN: &[u8] = b"distd fs storage root identity v1\0";
+const FS_STORAGE_MAX_LINK_RECORDS: usize = 65_536;
+const FS_STORAGE_MAX_LINK_DEPTH: usize = 256;
 
 #[derive(Clone, Debug)]
 enum ChunkData {
@@ -250,6 +259,17 @@ pub fn open_file(path: &Path) -> Result<File, Error> {
         .map_err(Error::IoError)
 }
 
+fn open_existing_file(path: &Path) -> Result<File, Error> {
+    File::options()
+        .read(true)
+        .write(true)
+        .append(false)
+        .truncate(false)
+        .open(path)
+        .inspect_err(|e| tracing::error!("Cannot open existing file at {:?}: {}", path, e))
+        .map_err(Error::IoError)
+}
+
 #[derive(Debug)]
 struct Handle {
     pub buf_writer: BufWriter<File>,
@@ -260,6 +280,13 @@ impl Handle {
     pub fn new(path: &Path) -> Result<Self, Error> {
         Ok(Self {
             buf_writer: BufWriter::with_capacity(CHUNK_SIZE * 8, open_file(path)?),
+            position: 0,
+        })
+    }
+
+    fn existing(path: &Path) -> Result<Self, Error> {
+        Ok(Self {
+            buf_writer: BufWriter::with_capacity(CHUNK_SIZE * 8, open_existing_file(path)?),
             position: 0,
         })
     }
@@ -387,6 +414,142 @@ impl InFileChunk {
 
 // ─── Inner serialisable state ─────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FsStorageChunkV1 {
+    info: ChunkInfo,
+    relative_path: PathBuf,
+    offset: u64,
+    populated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FsStorageDataEntryV1 {
+    hash: Hash,
+    chunks: Vec<FsStorageChunkV1>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FsStorageLinkEntryV1 {
+    hash: Hash,
+    nodes: Vec<FsStorageNodeV1>,
+}
+
+/// Post-order flat node records. Parent indices must refer only to earlier
+/// records, so payload decoding never recurses through attacker-controlled
+/// bytes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+enum FsStorageNodeV1 {
+    Parent {
+        hash: Hash,
+        size: u64,
+        left: u32,
+        right: u32,
+    },
+    Skipped {
+        hash: Hash,
+        size: u64,
+    },
+}
+
+/// Canonical schema-1 payload. Constructor-owned paths and runtime-only state
+/// deliberately do not appear here.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FsStorageStateV1 {
+    root_identity: [u8; 32],
+    items: Vec<Item>,
+    data: Vec<FsStorageDataEntryV1>,
+    links: Vec<FsStorageLinkEntryV1>,
+}
+
+/// Frozen reader for the only supported pre-envelope layout.
+/// Field order and field types match `FsStorageState` at a5d7c997 exactly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyFsStorageState {
+    root: PathBuf,
+    items: HashSet<Item>,
+    persistance_path: PathBuf,
+    data: HashMap<Hash, Vec<Arc<InFileChunk>>>,
+    links: HashMap<Hash, Arc<Node>>,
+}
+
+fn invalid_state(message: impl Into<String>) -> Error {
+    Error::Other(format!(
+        "invalid filesystem-storage state: {}",
+        message.into()
+    ))
+}
+
+fn bitcode_identity<T: Serialize>(value: &T) -> Result<Vec<u8>, Error> {
+    bitcode::serialize(value).map_err(|error| InvalidParameter::from(error).into())
+}
+
+fn sort_by_bitcode_identity<T: Serialize + Clone>(values: &mut Vec<T>) -> Result<(), Error> {
+    let mut identified = values
+        .drain(..)
+        .map(|value| Ok((bitcode_identity(&value)?, value)))
+        .collect::<Result<Vec<_>, Error>>()?;
+    identified.sort_by(|left, right| left.0.cmp(&right.0));
+    if identified.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err(invalid_state("duplicate encoded identity"));
+    }
+    values.extend(identified.into_iter().map(|(_, value)| value));
+    Ok(())
+}
+
+fn require_canonical_order<T: Serialize>(values: &[T]) -> Result<(), Error> {
+    let identities = values
+        .iter()
+        .map(bitcode_identity)
+        .collect::<Result<Vec<_>, _>>()?;
+    if identities
+        .windows(2)
+        .any(|pair| pair[0].cmp(&pair[1]) != Ordering::Less)
+    {
+        return Err(invalid_state(
+            "encoded identities are duplicated or not in canonical order",
+        ));
+    }
+    Ok(())
+}
+
+fn canonical_root_bytes(root: &Path) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        root.as_os_str().as_bytes().to_vec()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        root.as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        root.as_os_str().to_string_lossy().as_bytes().to_vec()
+    }
+}
+
+fn fs_storage_root_identity(root: &Path) -> Result<[u8; 32], Error> {
+    let root = fs::canonicalize(root)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(FS_STORAGE_ROOT_DOMAIN);
+    hasher.update(&canonical_root_bytes(&root));
+    Ok(*hasher.finalize().as_bytes())
+}
+
+fn identity_filename(identity: &[u8; 32]) -> String {
+    let mut name = String::with_capacity(64 + ".state".len());
+    for byte in identity {
+        use std::fmt::Write as _;
+        write!(&mut name, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    name.push_str(".state");
+    name
+}
+
 /// All mutable state for [`FsStorage`], kept behind an `RwLock` for interior mutability.
 ///
 /// This is the type that is persisted to disk; [`FsStorage`] itself is a thin wrapper.
@@ -410,11 +573,604 @@ struct FsStorageState {
     #[serde(skip_serializing)]
     #[serde(skip_deserializing)]
     dirty: bool,
+    #[serde(default)]
+    #[serde(skip_serializing)]
+    #[serde(skip_deserializing)]
+    generation: u64,
+}
+
+fn relative_state_path(root: &Path, path: &Path) -> Result<PathBuf, Error> {
+    let resolved = if path.is_absolute() && !path.starts_with(root) {
+        let canonical_root = fs::canonicalize(root)?;
+        let canonical_path = fs::canonicalize(path)?;
+        let relative = canonical_path.strip_prefix(&canonical_root).map_err(|_| {
+            invalid_state(format!(
+                "path {} is outside the configured root",
+                path.display()
+            ))
+        })?;
+        root.join(crate::utils::path::validate_relative(relative)?)
+    } else {
+        crate::utils::path::resolve_beneath(root, path)?
+    };
+    resolved
+        .strip_prefix(root)
+        .map(Path::to_path_buf)
+        .map_err(|_| {
+            invalid_state(format!(
+                "path {} is outside the configured root",
+                path.display()
+            ))
+        })
+}
+
+fn validate_item_paths(root: &Path, item: &mut Item) -> Result<(), Error> {
+    item.metadata.path = relative_state_path(root, &item.metadata.path)?;
+    for entry in &item.manifest.entries {
+        crate::utils::path::validate_relative(Path::new(&entry.relative_path))?;
+    }
+    Ok(())
+}
+
+fn validate_existing_chunk_path(
+    root: &Path,
+    relative_path: &Path,
+    populated: bool,
+    offset: u64,
+    size: u64,
+) -> Result<PathBuf, Error> {
+    let relative_path = crate::utils::path::validate_relative(relative_path)?;
+    let path = root.join(&relative_path);
+    let mut current = root.to_path_buf();
+    for component in relative_path.components() {
+        current.push(component.as_os_str());
+        let metadata = fs::symlink_metadata(&current)?;
+        if metadata.file_type().is_symlink() {
+            return Err(invalid_state(format!(
+                "chunk path {} contains a symbolic link",
+                relative_path.display()
+            )));
+        }
+    }
+    let metadata = fs::metadata(&path)?;
+    if !metadata.is_file() {
+        return Err(invalid_state(format!(
+            "chunk path {} is not a regular file",
+            relative_path.display()
+        )));
+    }
+    let canonical_root = fs::canonicalize(root)?;
+    let canonical_path = fs::canonicalize(&path)?;
+    if !canonical_path.starts_with(&canonical_root) {
+        return Err(invalid_state(format!(
+            "chunk path {} resolves outside the configured root",
+            relative_path.display()
+        )));
+    }
+    let end = offset
+        .checked_add(size)
+        .ok_or_else(|| invalid_state("chunk byte range overflows u64"))?;
+    if populated && end > metadata.len() {
+        return Err(invalid_state(format!(
+            "populated chunk range {offset}..{end} exceeds {} bytes in {}",
+            metadata.len(),
+            relative_path.display()
+        )));
+    }
+    Ok(path)
+}
+
+fn validate_link_node(
+    node: &Node,
+    data: &HashMap<Hash, Vec<Arc<InFileChunk>>>,
+    links: &HashMap<Hash, Arc<Node>>,
+) -> Result<(), Error> {
+    let mut stack = vec![(node, 0usize)];
+    while let Some((node, depth)) = stack.pop() {
+        if depth > 256 {
+            return Err(invalid_state(
+                "link tree exceeds the maximum supported depth",
+            ));
+        }
+        match node {
+            Node::Parent {
+                hash,
+                size,
+                left,
+                right,
+            } => {
+                let expected_size = left
+                    .size()
+                    .checked_add(right.size())
+                    .ok_or_else(|| invalid_state("link node size overflows u64"))?;
+                if *size != expected_size || *hash != merge_hashes(left.hash(), right.hash()) {
+                    return Err(invalid_state("link node hash or size is inconsistent"));
+                }
+                stack.push((right, depth + 1));
+                stack.push((left, depth + 1));
+            }
+            Node::Skipped { hash, size } => {
+                let has_chunk = data.get(hash).is_some_and(|entries| {
+                    entries.iter().any(|entry| {
+                        entry.info.size == *size
+                            && entry.populated.load(std::sync::atomic::Ordering::Relaxed)
+                    })
+                });
+                let has_link = links.get(hash).is_some_and(|linked| linked.size() == *size);
+                if !has_chunk && !has_link {
+                    return Err(invalid_state(format!(
+                        "link leaf {hash} has no populated chunk or parent of size {size}"
+                    )));
+                }
+            }
+            Node::Stored { .. } => {
+                return Err(invalid_state(
+                    "persisted links cannot contain stored payload bytes",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn relink_state_nodes(state: &mut FsStorageState) -> Result<(), Error> {
+    fn relink_hash(
+        hash: Hash,
+        expected_size: u64,
+        data: &HashMap<Hash, Vec<Arc<InFileChunk>>>,
+        raw_links: &HashMap<Hash, Arc<Node>>,
+        memo: &mut HashMap<Hash, Arc<Node>>,
+        visiting: &mut HashSet<Hash>,
+        depth: usize,
+    ) -> Result<Arc<Node>, Error> {
+        if let Some(node) = memo.get(&hash) {
+            if node.size() != expected_size {
+                return Err(invalid_state("reused link size is inconsistent"));
+            }
+            return Ok(node.clone());
+        }
+        if let Some(entry) = data.get(&hash).and_then(|entries| {
+            entries.iter().find(|entry| {
+                entry.info.size == expected_size
+                    && entry.populated.load(std::sync::atomic::Ordering::Relaxed)
+            })
+        }) {
+            return Node::try_from(entry).map(Arc::new);
+        }
+        if !visiting.insert(hash) {
+            return Err(invalid_state("link graph contains a cycle"));
+        }
+        let raw = raw_links
+            .get(&hash)
+            .ok_or_else(|| invalid_state(format!("cannot reconstruct link leaf {hash}")))?;
+        if raw.size() != expected_size {
+            return Err(invalid_state("referenced link size is inconsistent"));
+        }
+        let rebuilt = relink_node(raw, data, raw_links, memo, visiting, depth + 1)?;
+        visiting.remove(&hash);
+        memo.insert(hash, rebuilt.clone());
+        Ok(rebuilt)
+    }
+
+    fn relink_node(
+        node: &Node,
+        data: &HashMap<Hash, Vec<Arc<InFileChunk>>>,
+        raw_links: &HashMap<Hash, Arc<Node>>,
+        memo: &mut HashMap<Hash, Arc<Node>>,
+        visiting: &mut HashSet<Hash>,
+        depth: usize,
+    ) -> Result<Arc<Node>, Error> {
+        if depth > 256 {
+            return Err(invalid_state(
+                "link tree exceeds the maximum supported depth",
+            ));
+        }
+        match node {
+            Node::Parent {
+                hash,
+                size,
+                left,
+                right,
+            } => Ok(Arc::new(Node::Parent {
+                hash: *hash,
+                size: *size,
+                left: relink_node(left, data, raw_links, memo, visiting, depth + 1)?,
+                right: relink_node(right, data, raw_links, memo, visiting, depth + 1)?,
+            })),
+            Node::Skipped { hash, size } => {
+                relink_hash(*hash, *size, data, raw_links, memo, visiting, depth)
+            }
+            Node::Stored { .. } => Err(invalid_state(
+                "persisted links cannot contain stored payload bytes",
+            )),
+        }
+    }
+
+    let old_links = std::mem::take(&mut state.links);
+    let mut links = HashMap::default();
+    let mut visiting = HashSet::default();
+    for (hash, node) in &old_links {
+        let rebuilt = relink_hash(
+            *hash,
+            node.size(),
+            &state.data,
+            &old_links,
+            &mut links,
+            &mut visiting,
+            0,
+        )?;
+        if rebuilt.hash() != hash {
+            return Err(invalid_state("link map key does not match node hash"));
+        }
+    }
+    state.links = links;
+    Ok(())
+}
+
+fn push_flat_link_record(
+    records: &mut Vec<FsStorageNodeV1>,
+    record: FsStorageNodeV1,
+) -> Result<u32, Error> {
+    if records.len() >= FS_STORAGE_MAX_LINK_RECORDS {
+        return Err(invalid_state(
+            "link graph exceeds the persisted record bound",
+        ));
+    }
+    let index = u32::try_from(records.len()).map_err(InvalidParameter::from)?;
+    records.push(record);
+    Ok(index)
+}
+
+fn flatten_link_node(node: &Node) -> Result<Vec<FsStorageNodeV1>, Error> {
+    fn visit(node: &Node, records: &mut Vec<FsStorageNodeV1>, depth: usize) -> Result<u32, Error> {
+        if depth > FS_STORAGE_MAX_LINK_DEPTH {
+            return Err(invalid_state("link graph exceeds the persisted bounds"));
+        }
+        match node {
+            Node::Parent {
+                hash,
+                size,
+                left,
+                right,
+            } => {
+                let left = visit(left, records, depth + 1)?;
+                let right = visit(right, records, depth + 1)?;
+                push_flat_link_record(
+                    records,
+                    FsStorageNodeV1::Parent {
+                        hash: *hash,
+                        size: *size,
+                        left,
+                        right,
+                    },
+                )
+            }
+            Node::Skipped { hash, size } => push_flat_link_record(
+                records,
+                FsStorageNodeV1::Skipped {
+                    hash: *hash,
+                    size: *size,
+                },
+            ),
+            Node::Stored { .. } => Err(invalid_state(
+                "persisted links cannot contain stored payload bytes",
+            )),
+        }
+    }
+
+    let mut records = Vec::new();
+    visit(node, &mut records, 0)?;
+    Ok(records)
+}
+
+fn validate_flat_link(records: &[FsStorageNodeV1]) -> Result<(), Error> {
+    if records.is_empty() || records.len() > FS_STORAGE_MAX_LINK_RECORDS {
+        return Err(invalid_state("flat link record count is invalid"));
+    }
+
+    let mut identities = Vec::with_capacity(records.len());
+    let mut depths = Vec::with_capacity(records.len());
+    for (index, record) in records.iter().enumerate() {
+        match record {
+            FsStorageNodeV1::Skipped { hash, size } => {
+                identities.push((*hash, *size));
+                depths.push(0usize);
+            }
+            FsStorageNodeV1::Parent {
+                hash,
+                size,
+                left,
+                right,
+            } => {
+                let left = *left as usize;
+                let right = *right as usize;
+                if left >= index || right >= index {
+                    return Err(invalid_state(
+                        "flat link parent indices must refer to earlier records",
+                    ));
+                }
+                let (left_hash, left_size) = identities[left];
+                let (right_hash, right_size) = identities[right];
+                let expected_size = left_size
+                    .checked_add(right_size)
+                    .ok_or_else(|| invalid_state("flat link size overflows"))?;
+                if *size != expected_size || *hash != merge_hashes(&left_hash, &right_hash) {
+                    return Err(invalid_state("flat link hash or size is inconsistent"));
+                }
+                let depth = depths[left]
+                    .max(depths[right])
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_state("flat link depth overflows"))?;
+                if depth > FS_STORAGE_MAX_LINK_DEPTH {
+                    return Err(invalid_state("flat link exceeds maximum depth"));
+                }
+                identities.push((*hash, *size));
+                depths.push(depth);
+            }
+        }
+    }
+
+    // Every record must participate in the final-root DAG. This rejects
+    // otherwise-valid orphan records without constructing recursive Arcs.
+    let mut reachable = vec![false; records.len()];
+    let mut stack = vec![records.len() - 1];
+    while let Some(index) = stack.pop() {
+        if std::mem::replace(&mut reachable[index], true) {
+            continue;
+        }
+        if let FsStorageNodeV1::Parent { left, right, .. } = &records[index] {
+            stack.push(*left as usize);
+            stack.push(*right as usize);
+        }
+    }
+    if reachable.iter().any(|reachable| !reachable) {
+        return Err(invalid_state(
+            "flat link contains records outside the root DAG",
+        ));
+    }
+    Ok(())
+}
+
+fn materialize_flat_link(records: Vec<FsStorageNodeV1>) -> Result<Arc<Node>, Error> {
+    validate_flat_link(&records)?;
+    let mut nodes: Vec<Arc<Node>> = Vec::with_capacity(records.len());
+    for record in records {
+        let node = match record {
+            FsStorageNodeV1::Skipped { hash, size } => Arc::new(Node::Skipped { hash, size }),
+            FsStorageNodeV1::Parent {
+                hash,
+                size,
+                left,
+                right,
+            } => {
+                let left = nodes
+                    .get(left as usize)
+                    .ok_or_else(|| invalid_state("flat link left index is not earlier"))?
+                    .clone();
+                let right = nodes
+                    .get(right as usize)
+                    .ok_or_else(|| invalid_state("flat link right index is not earlier"))?
+                    .clone();
+                let expected_size = left
+                    .size()
+                    .checked_add(right.size())
+                    .ok_or_else(|| invalid_state("flat link size overflows"))?;
+                if size != expected_size || hash != merge_hashes(left.hash(), right.hash()) {
+                    return Err(invalid_state("flat link hash or size is inconsistent"));
+                }
+                Arc::new(Node::Parent {
+                    hash,
+                    size,
+                    left,
+                    right,
+                })
+            }
+        };
+        nodes.push(node);
+    }
+    nodes
+        .pop()
+        .ok_or_else(|| invalid_state("flat link has no root"))
+}
+
+impl FsStorageStateV1 {
+    fn from_runtime(state: &FsStorageState) -> Result<Self, Error> {
+        let root_identity = fs_storage_root_identity(&state.root)?;
+
+        let mut items = state.items.iter().cloned().collect::<Vec<_>>();
+        for item in &mut items {
+            validate_item_paths(&state.root, item)?;
+        }
+        sort_by_bitcode_identity(&mut items)?;
+
+        let mut data = Vec::with_capacity(state.data.len());
+        for (hash, entries) in &state.data {
+            let mut chunks = Vec::with_capacity(entries.len());
+            for entry in entries {
+                if entry.info.hash != *hash {
+                    return Err(invalid_state("chunk map key does not match chunk hash"));
+                }
+                let relative_path = relative_state_path(&state.root, &entry.path)?;
+                chunks.push(FsStorageChunkV1 {
+                    info: entry.info,
+                    relative_path,
+                    offset: entry.offset,
+                    populated: entry.populated.load(std::sync::atomic::Ordering::Relaxed),
+                });
+            }
+            sort_by_bitcode_identity(&mut chunks)?;
+            data.push(FsStorageDataEntryV1 {
+                hash: *hash,
+                chunks,
+            });
+        }
+        sort_by_bitcode_identity(&mut data)?;
+
+        let mut links = state
+            .links
+            .iter()
+            .map(|(hash, node)| {
+                Ok(FsStorageLinkEntryV1 {
+                    hash: *hash,
+                    nodes: flatten_link_node(node)?,
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        for entry in &links {
+            let node = materialize_flat_link(entry.nodes.clone())?;
+            if node.hash() != &entry.hash {
+                return Err(invalid_state("link map key does not match node hash"));
+            }
+            validate_link_node(&node, &state.data, &state.links)?;
+        }
+        sort_by_bitcode_identity(&mut links)?;
+
+        Ok(Self {
+            root_identity,
+            items,
+            data,
+            links,
+        })
+    }
+
+    fn into_runtime(
+        mut self,
+        root: PathBuf,
+        persistance_path: PathBuf,
+    ) -> Result<FsStorageState, Error> {
+        if self.root_identity != fs_storage_root_identity(&root)? {
+            return Err(invalid_state(
+                "root identity does not match constructor root",
+            ));
+        }
+        require_canonical_order(&self.items)?;
+        require_canonical_order(&self.data)?;
+        require_canonical_order(&self.links)?;
+
+        let mut items = HashSet::default();
+        for mut item in self.items.drain(..) {
+            validate_item_paths(&root, &mut item)?;
+            if !items.insert(item) {
+                return Err(invalid_state("duplicate item"));
+            }
+        }
+
+        let mut data = HashMap::default();
+        for entry in self.data {
+            require_canonical_order(&entry.chunks)?;
+            if entry.chunks.is_empty() {
+                return Err(invalid_state("chunk map entry is empty"));
+            }
+            let mut chunks = Vec::with_capacity(entry.chunks.len());
+            for chunk in entry.chunks {
+                if chunk.info.hash != entry.hash {
+                    return Err(invalid_state("chunk map key does not match chunk hash"));
+                }
+                let path = validate_existing_chunk_path(
+                    &root,
+                    &chunk.relative_path,
+                    chunk.populated,
+                    chunk.offset,
+                    chunk.info.size,
+                )?;
+                chunks.push(Arc::new(InFileChunk {
+                    info: chunk.info,
+                    path,
+                    offset: chunk.offset,
+                    populated: Arc::new(AtomicBool::new(chunk.populated)),
+                }));
+            }
+            if data.insert(entry.hash, chunks).is_some() {
+                return Err(invalid_state("duplicate chunk-map hash"));
+            }
+        }
+
+        let mut links = HashMap::default();
+        for entry in self.links {
+            let node = materialize_flat_link(entry.nodes)?;
+            if node.hash() != &entry.hash {
+                return Err(invalid_state("link map key does not match node hash"));
+            }
+            if links.insert(entry.hash, node).is_some() {
+                return Err(invalid_state("duplicate link-map hash"));
+            }
+        }
+        for node in links.values() {
+            validate_link_node(node, &data, &links)?;
+        }
+
+        let mut state = FsStorageState {
+            root,
+            items,
+            persistance_path,
+            data,
+            links,
+            root_index: HashMap::default(),
+            dirty: false,
+            generation: 0,
+        };
+        relink_state_nodes(&mut state)?;
+        state.rebuild_indexes();
+        Ok(state)
+    }
+}
+
+impl LegacyFsStorageState {
+    fn into_v1(self, root: &Path, expected_legacy_path: &Path) -> Result<FsStorageStateV1, Error> {
+        let legacy_root = fs::canonicalize(&self.root)?;
+        let constructor_root = fs::canonicalize(root)?;
+        if legacy_root != constructor_root {
+            return Err(invalid_state(format!(
+                "legacy root {} does not match constructor root {}",
+                self.root.display(),
+                root.display()
+            )));
+        }
+        if self.persistance_path != expected_legacy_path {
+            return Err(invalid_state(format!(
+                "legacy persistence path {} does not match its source {}",
+                self.persistance_path.display(),
+                expected_legacy_path.display()
+            )));
+        }
+
+        for entries in self.data.values() {
+            for entry in entries {
+                if !entry.path.is_absolute() {
+                    return Err(invalid_state(format!(
+                        "legacy chunk path {} is not absolute",
+                        entry.path.display()
+                    )));
+                }
+                let relative = relative_state_path(root, &entry.path)?;
+                validate_existing_chunk_path(
+                    root,
+                    &relative,
+                    entry.populated.load(std::sync::atomic::Ordering::Relaxed),
+                    entry.offset,
+                    entry.info.size,
+                )?;
+            }
+        }
+
+        let runtime = FsStorageState {
+            root: root.to_path_buf(),
+            items: self.items,
+            persistance_path: expected_legacy_path.to_path_buf(),
+            data: self.data,
+            links: self.links,
+            root_index: HashMap::default(),
+            dirty: false,
+            generation: 0,
+        };
+        FsStorageStateV1::from_runtime(&runtime)
+    }
 }
 
 impl FsStorageState {
     fn mark_dirty(&mut self) {
         self.dirty = true;
+        self.generation = self.generation.wrapping_add(1);
     }
 
     fn rebuild_indexes(&mut self) {
@@ -442,14 +1198,59 @@ impl FsStorageState {
     fn insert_item(&mut self, item: Item) {
         self.items.replace(item);
         self.rebuild_indexes();
+        self.mark_dirty();
     }
 
     fn remove_item(&mut self, item: &Item) -> bool {
         let removed = self.items.remove(item);
         if removed {
             self.rebuild_indexes();
+            self.mark_dirty();
         }
         removed
+    }
+
+    fn retain_links_reachable_from_items(&mut self) {
+        fn visit(
+            node: &Node,
+            links: &HashMap<Hash, Arc<Node>>,
+            retained: &mut HashSet<Hash>,
+            depth: usize,
+        ) {
+            if depth > 256 {
+                return;
+            }
+            match node {
+                Node::Parent { left, right, .. } => {
+                    if !retained.insert(*node.hash()) {
+                        return;
+                    }
+                    visit(left, links, retained, depth + 1);
+                    visit(right, links, retained, depth + 1);
+                }
+                Node::Skipped { hash, .. } => {
+                    if retained.insert(*hash) {
+                        if let Some(Node::Parent { left, right, .. }) =
+                            links.get(hash).map(Arc::as_ref)
+                        {
+                            visit(left, links, retained, depth + 1);
+                            visit(right, links, retained, depth + 1);
+                        }
+                    }
+                }
+                Node::Stored { .. } => {
+                    retained.insert(*node.hash());
+                }
+            }
+        }
+
+        let mut retained = HashSet::default();
+        for item in &self.items {
+            if let Some(root) = self.links.get(&item.metadata.root.hash) {
+                visit(root, &self.links, &mut retained, 0);
+            }
+        }
+        self.links.retain(|hash, _| retained.contains(hash));
     }
 
     /// Returns the stored path of any path relative to root
@@ -488,31 +1289,8 @@ impl FsStorageState {
         Ok(full_path)
     }
 
-    /// Retrieve a stored `Node` by reading from disk
-    fn get_data(&self, hash: &Hash) -> Option<Arc<Node>> {
-        self.data
-            .get(hash)
-            .and_then(|entries| entries.first())
-            .and_then(|x| Node::try_from(x).ok())
-            .map(Arc::new)
-    }
-
     fn item_for_root(&self, root: &Hash) -> Option<Item> {
         self.root_index.get(root).cloned()
-    }
-
-    /// Atomically persist state to disk (write to *.tmp then rename)
-    fn persist(&mut self) -> Result<(), Error> {
-        let buf = bitcode::serialize(self)
-            .inspect_err(|e| tracing::error!("Serialization error: {}", e))
-            .map_err(InvalidParameter::from)?;
-        let tmp = self.persistance_path.with_extension("tmp");
-        fs::write(&tmp, &buf)
-            .inspect_err(|e| tracing::error!("Cannot write persistence tmp file: {}", e))?;
-        fs::rename(&tmp, &self.persistance_path)
-            .inspect_err(|e| tracing::error!("Cannot rename persistence file: {}", e))?;
-        self.dirty = false;
-        Ok(())
     }
 
     /// Pre-allocate a single `ChunkInfo` slot on disk
@@ -645,6 +1423,7 @@ impl FsStorageState {
 #[derive(Debug)]
 pub struct FsStorage {
     inner: RwLock<FsStorageState>,
+    persistence_lock: Mutex<()>,
     handles: RwLock<HashMap<PathBuf, Arc<Mutex<Handle>>>>,
     chunk_cache: Mutex<HotChunkCache>,
     tree_cache: Mutex<HotNodeCache>,
@@ -654,6 +1433,7 @@ impl Default for FsStorage {
     fn default() -> Self {
         Self {
             inner: RwLock::new(FsStorageState::default()),
+            persistence_lock: Mutex::new(()),
             handles: RwLock::new(HashMap::default()),
             chunk_cache: Mutex::new(HotChunkCache::new(DEFAULT_CHUNK_CACHE_BYTES)),
             tree_cache: Mutex::new(HotNodeCache::new(DEFAULT_TREE_CACHE_ENTRIES)),
@@ -1328,142 +2108,152 @@ impl FsStorage {
         )?;
 
         let mut inner = self.inner.write().unwrap();
-        inner.items.insert(item.clone());
+        inner
+            .items
+            .retain(|existing| existing.metadata.artifact_id != item.metadata.artifact_id);
+        inner.insert_item(item.clone());
+        inner.retain_links_reachable_from_items();
         drop(inner);
         self.persist()?;
         Ok(item)
     }
 
     fn persist(&self) -> Result<(), Error> {
+        let _single_writer = self.persistence_lock.lock().unwrap();
         self.flush_handles()?;
-        self.inner.write().unwrap().persist()
+        let (canonical, generation, persistence_path) = {
+            let inner = self.inner.read().unwrap();
+            (
+                FsStorageStateV1::from_runtime(&inner)?,
+                inner.generation,
+                inner.persistance_path.clone(),
+            )
+        };
+        let payload = bitcode::serialize(&canonical)
+            .inspect_err(|error| tracing::error!("Serialization error: {error}"))
+            .map_err(InvalidParameter::from)?;
+        replace_enveloped_state(
+            &persistence_path,
+            DurableStateKind::FsStorage,
+            FS_STORAGE_PAYLOAD_SCHEMA,
+            &payload,
+            MAX_DURABLE_STATE_PAYLOAD,
+        )?;
+        let mut inner = self.inner.write().unwrap();
+        if inner.generation == generation {
+            inner.dirty = false;
+        }
+        Ok(())
     }
 
     /// Create a new `FsStorage` with a root path.
     ///
     /// If persistence data exists it will be reloaded; otherwise an empty storage is created.
-    /// Falls back to an empty storage (with a warning) if persistence data is corrupt.
-    #[must_use]
-    pub fn new(root: PathBuf) -> Self {
+    /// Any unreadable, corrupt, or semantically invalid state fails closed.
+    pub fn new(root: PathBuf) -> Result<Self, Error> {
         Self::with_cache_config(root, FsStorageCacheConfig::default())
     }
 
-    #[must_use]
-    pub fn with_cache_config(root: PathBuf, cache_config: FsStorageCacheConfig) -> Self {
+    pub fn with_cache_config(
+        requested_root: PathBuf,
+        cache_config: FsStorageCacheConfig,
+    ) -> Result<Self, Error> {
         let persistance_dir = cache_dir().join("chunk_storage").join("fs_storage");
-        let persistance_path = persistance_dir.join(root.to_string_lossy().replace('/', "___"));
-        create_dir_all(&persistance_dir).unwrap();
-        create_dir_all(&root)
-            .inspect(|()| tracing::info!("Created root path '{}'", root.to_string_lossy()))
-            .unwrap();
+        let legacy_path =
+            persistance_dir.join(requested_root.to_string_lossy().replace('/', "___"));
+        create_dir_all(&persistance_dir)?;
+        create_dir_all(&requested_root).inspect(|()| {
+            tracing::info!("Created root path '{}'", requested_root.to_string_lossy());
+        })?;
+        let root = if requested_root.is_absolute() {
+            requested_root.clone()
+        } else {
+            std::env::current_dir()?.join(&requested_root)
+        };
+        let root_identity = fs_storage_root_identity(&root)?;
+        let persistance_path = persistance_dir.join(identity_filename(&root_identity));
 
-        if let Ok(file) = std::fs::read(&persistance_path) {
-            tracing::debug!("FsStorage data found, loading…");
+        let state = match fs::symlink_metadata(&persistance_path) {
+            Ok(_) => {
+                tracing::debug!("FsStorage envelope found, loading…");
+                let payload = read_enveloped_state(
+                    &persistance_path,
+                    DurableStateKind::FsStorage,
+                    FS_STORAGE_PAYLOAD_SCHEMA,
+                    MAX_DURABLE_STATE_PAYLOAD,
+                )?;
+                let canonical: FsStorageStateV1 =
+                    bitcode::deserialize(&payload).map_err(InvalidParameter::from)?;
+                canonical.into_runtime(root.clone(), persistance_path.clone())?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match fs::symlink_metadata(&legacy_path) {
+                    Ok(_) => {
+                        tracing::info!("Legacy FsStorage state found, migrating…");
+                        let bytes = read_bounded_file(&legacy_path, MAX_DURABLE_STATE_PAYLOAD)?;
+                        let legacy: LegacyFsStorageState =
+                            bitcode::deserialize(&bytes).map_err(InvalidParameter::from)?;
+                        let expected = legacy.into_v1(&root, &legacy_path)?;
+                        let payload =
+                            bitcode::serialize(&expected).map_err(InvalidParameter::from)?;
+                        replace_enveloped_state(
+                            &persistance_path,
+                            DurableStateKind::FsStorage,
+                            FS_STORAGE_PAYLOAD_SCHEMA,
+                            &payload,
+                            MAX_DURABLE_STATE_PAYLOAD,
+                        )?;
 
-            match bitcode::deserialize::<FsStorageState>(&file) {
-                Err(e) => {
-                    tracing::warn!(
-                        "Cannot deserialize FsStorage persistence data: {e}; starting fresh"
-                    );
-                }
-                Ok(mut s) => {
-                    s.rebuild_indexes();
-                    let mut handles_map = HashMap::default();
-                    for hash in s.data.keys().copied().collect::<Vec<_>>() {
-                        if let Some(entries) = s.data.get(&hash) {
-                            for entry in entries {
-                                handles_map
-                                    .entry(entry.path.clone())
-                                    .or_insert(Handle::new(&entry.path).unwrap());
-                            }
+                        let reread_payload = read_enveloped_state(
+                            &persistance_path,
+                            DurableStateKind::FsStorage,
+                            FS_STORAGE_PAYLOAD_SCHEMA,
+                            MAX_DURABLE_STATE_PAYLOAD,
+                        )?;
+                        let actual: FsStorageStateV1 = bitcode::deserialize(&reread_payload)
+                            .map_err(InvalidParameter::from)?;
+                        if actual != expected {
+                            return Err(invalid_state(
+                                "migrated state did not reread with semantic equivalence",
+                            ));
+                        }
+                        actual.into_runtime(root.clone(), persistance_path.clone())?
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        tracing::debug!("No previous FsStorage state found, creating a new one");
+                        FsStorageState {
+                            root,
+                            persistance_path,
+                            ..Default::default()
                         }
                     }
-
-                    // Re-link parent nodes after deserialization
-                    fn node_relink(
-                        s: &mut FsStorageState,
-                        already_processed: &mut HashMap<Hash, Arc<Node>>,
-                        node: &Arc<Node>,
-                    ) -> Option<Arc<Node>> {
-                        if already_processed.contains_key(node.hash()) {
-                            return already_processed.get(node.hash()).cloned();
-                        }
-                        match node.as_ref() {
-                            Node::Parent {
-                                hash, left, right, ..
-                            } => {
-                                let n = Arc::new(Node::Parent {
-                                    hash: *node.hash(),
-                                    size: node.size(),
-                                    left: node_relink(s, already_processed, left)?,
-                                    right: node_relink(s, already_processed, right)?,
-                                });
-                                s.links.insert(*hash, n.clone());
-                                already_processed.insert(*hash, n.clone());
-                                Some(n)
-                            }
-                            Node::Skipped { hash, .. } => {
-                                let n = s.get_data(hash)?;
-                                already_processed.insert(*hash, n.clone());
-                                Some(n)
-                            }
-                            Node::Stored { .. } => panic!("Nodes in links should never be Stored"),
-                        }
-                    }
-
-                    let mut already_processed = HashMap::default();
-                    let mut old_links = s.links.clone();
-                    const MAX_ITER: u32 = 10;
-                    let mut i: u32 = 0;
-                    while !old_links.is_empty() && i <= MAX_ITER {
-                        if i % 5 == 0 {
-                            tracing::trace!(
-                                "Trying to fill-in old nodes: {} nodes remaining",
-                                old_links.len()
-                            );
-                        }
-                        i += 1;
-                        for n in old_links.clone().values() {
-                            node_relink(&mut s, &mut already_processed, n)
-                                .map(|n| old_links.remove(n.hash()));
-                        }
-                    }
-
-                    if old_links.is_empty() {
-                        tracing::debug!("Loaded FsStorage.");
-                        return Self {
-                            inner: RwLock::new(s),
-                            handles: RwLock::new(
-                                handles_map
-                                    .into_iter()
-                                    .map(|(path, handle)| (path, Arc::new(Mutex::new(handle))))
-                                    .collect(),
-                            ),
-                            chunk_cache: Mutex::new(HotChunkCache::new(
-                                cache_config.max_chunk_bytes,
-                            )),
-                            tree_cache: Mutex::new(HotNodeCache::new(
-                                cache_config.max_tree_entries,
-                            )),
-                        };
-                    }
-                    tracing::debug!("Cannot reload FsStorage; starting fresh");
+                    Err(error) => return Err(error.into()),
                 }
             }
-        } else {
-            tracing::debug!("No previous valid FsStorage data found, creating a new one");
+            Err(error) => return Err(error.into()),
+        };
+
+        // Opening writable handles is deliberately last: bounded decode and all
+        // constructor-root/path semantics are validated before this point.
+        let mut handles = HashMap::default();
+        for entries in state.data.values() {
+            for entry in entries {
+                if !handles.contains_key(&entry.path) {
+                    handles.insert(
+                        entry.path.clone(),
+                        Arc::new(Mutex::new(Handle::existing(&entry.path)?)),
+                    );
+                }
+            }
         }
 
-        Self {
-            inner: RwLock::new(FsStorageState {
-                root,
-                persistance_path,
-                ..Default::default()
-            }),
-            handles: RwLock::new(HashMap::default()),
+        Ok(Self {
+            inner: RwLock::new(state),
+            persistence_lock: Mutex::new(()),
+            handles: RwLock::new(handles),
             chunk_cache: Mutex::new(HotChunkCache::new(cache_config.max_chunk_bytes)),
             tree_cache: Mutex::new(HotNodeCache::new(cache_config.max_tree_entries)),
-        }
+        })
     }
 
     /// Returns the stored path of any path relative to root
@@ -1616,6 +2406,10 @@ impl ChunkStorage for FsStorage {
     }
 
     fn store_chunk(&self, hash: Hash, chunk: &[u8]) -> Result<Arc<Node>, StorageError> {
+        // `InFileChunk::write` flips its populated atomic. Serialize that
+        // transition with persistence so no envelope can publish populated
+        // metadata before the corresponding bytes have been flushed.
+        let _persistence = self.persistence_lock.lock().unwrap();
         let infile_chunks = {
             let inner = self.inner.read().unwrap();
             inner
@@ -2040,7 +2834,8 @@ mod tests {
                 max_chunk_bytes: 8,
                 max_tree_entries: 1,
             },
-        );
+        )
+        .unwrap();
         let first_a = ReceivedChunk::from_vec(b"aaaa".to_vec());
         let b = ReceivedChunk::from_vec(b"bbbb".to_vec());
         let refreshed_a = ReceivedChunk::from_vec(b"aaaa".to_vec());
@@ -2147,7 +2942,7 @@ mod tests {
 
         // create storage in a temporary directory
         let tempdir = temp_path();
-        let storage = FsStorage::new(tempdir.clone());
+        let storage = FsStorage::new(tempdir.clone()).unwrap();
 
         // make an item with a known content, a single chunk of all ones
         let item = make_ones_item().unwrap();
@@ -2197,7 +2992,7 @@ mod tests {
     fn fs_storage_round_trip() {
         // create storage in a temporary directory
         let tempdir = temp_path();
-        let storage = FsStorage::new(tempdir.clone());
+        let storage = FsStorage::new(tempdir.clone()).unwrap();
 
         let item = new_dummy_item::<FsStorage, 1u8, 1_000_000>(&storage).unwrap();
         println!("Created item: {item:?}");
@@ -2226,7 +3021,7 @@ mod tests {
     #[test]
     fn fs_storage_create_item_preserves_logical_path() {
         let tempdir = temp_path();
-        let storage = FsStorage::new(tempdir.clone());
+        let storage = FsStorage::new(tempdir.clone()).unwrap();
         let logical_path = PathBuf::from("bench-artifact");
 
         let item = storage
@@ -2256,7 +3051,8 @@ mod tests {
                 max_chunk_bytes: CHUNK_SIZE * 2,
                 max_tree_entries: FsStorageCacheConfig::default().max_tree_entries,
             },
-        );
+        )
+        .unwrap();
         let data: Vec<u8> = (0..(CHUNK_SIZE * 3 + 17))
             .map(|index| ((index * 5) % 251) as u8)
             .collect();
@@ -2287,7 +3083,7 @@ mod tests {
     #[test]
     fn fs_storage_create_item_supports_fastcdc_chunks() {
         let tempdir = temp_path();
-        let storage = FsStorage::new(tempdir.clone());
+        let storage = FsStorage::new(tempdir.clone()).unwrap();
         let data: Vec<u8> = (0..(CHUNK_SIZE * 3 + CHUNK_SIZE / 2))
             .map(|index| ((index * 17) % 251) as u8)
             .collect();
@@ -2322,7 +3118,7 @@ mod tests {
         use crate::chunk_storage::hashmap_storage::HashMapStorage;
 
         let tempdir = temp_path();
-        let storage = FsStorage::new(tempdir.clone());
+        let storage = FsStorage::new(tempdir.clone()).unwrap();
         let source = HashMapStorage::default();
         let data = vec![7u8; CHUNK_SIZE * 4 + 123];
         let root = source.insert(data.clone().into()).unwrap();
@@ -2354,7 +3150,7 @@ mod tests {
         use crate::item::Manifest;
 
         let tempdir = temp_path();
-        let storage = FsStorage::new(tempdir.clone());
+        let storage = FsStorage::new(tempdir.clone()).unwrap();
         let source = HashMapStorage::default();
 
         let v1: Vec<u8> = (0..(CHUNK_SIZE * 8))
@@ -2469,7 +3265,7 @@ mod tests {
         use crate::item::Manifest;
 
         let tempdir = temp_path();
-        let storage = FsStorage::new(tempdir.clone());
+        let storage = FsStorage::new(tempdir.clone()).unwrap();
         let source = HashMapStorage::default();
 
         let data: Vec<u8> = (0..(CHUNK_SIZE * 5 + 123))
@@ -2516,7 +3312,7 @@ mod tests {
         use crate::item::Manifest;
 
         let root = temp_path();
-        let storage = FsStorage::new(root.clone());
+        let storage = FsStorage::new(root.clone()).unwrap();
         let source = HashMapStorage::default();
         let mut data = vec![1u8; CHUNK_SIZE];
         data.extend(vec![2u8; CHUNK_SIZE]);
@@ -2570,7 +3366,7 @@ mod tests {
 
         // create storage and let it go out of scope
         {
-            let storage = FsStorage::new(tempdir.clone());
+            let storage = FsStorage::new(tempdir.clone()).unwrap();
 
             // save item and hash
             item = Some(new_dummy_item::<FsStorage, 1u8, 1_000_000>(&storage).unwrap());
@@ -2583,7 +3379,7 @@ mod tests {
 
         // Then re-create storage and retrieve the data
         println!("Reloading storage");
-        let storage = FsStorage::new(tempdir.clone());
+        let storage = FsStorage::new(tempdir.clone()).unwrap();
         print_fsstorage(&storage);
 
         // Check for contained item
@@ -2622,9 +3418,407 @@ mod tests {
     }
 
     #[test]
+    fn canonical_state_encoding_ignores_hash_insertion_order() {
+        let requested_root = temp_path();
+        fs::create_dir_all(&requested_root).unwrap();
+        let root = fs::canonicalize(&requested_root).unwrap();
+        let first_path = root.join("first.bin");
+        let second_path = root.join("second.bin");
+        fs::write(&first_path, b"first").unwrap();
+        fs::write(&second_path, b"second").unwrap();
+        let first_info = ChunkInfo {
+            hash: do_hash(b"first"),
+            size: 5,
+        };
+        let second_info = ChunkInfo {
+            hash: do_hash(b"second"),
+            size: 6,
+        };
+
+        let make_state = |reverse: bool| {
+            let mut data = HashMap::default();
+            let mut entries = vec![
+                (first_info, first_path.clone()),
+                (second_info, second_path.clone()),
+            ];
+            if reverse {
+                entries.reverse();
+            }
+            for (info, path) in entries {
+                data.insert(
+                    info.hash,
+                    vec![Arc::new(InFileChunk {
+                        info,
+                        path,
+                        offset: 0,
+                        populated: Arc::new(AtomicBool::new(true)),
+                    })],
+                );
+            }
+            FsStorageState {
+                root: root.clone(),
+                persistance_path: PathBuf::from("ignored"),
+                data,
+                ..Default::default()
+            }
+        };
+
+        let forward =
+            bitcode::serialize(&FsStorageStateV1::from_runtime(&make_state(false)).unwrap())
+                .unwrap();
+        let reverse =
+            bitcode::serialize(&FsStorageStateV1::from_runtime(&make_state(true)).unwrap())
+                .unwrap();
+        assert_eq!(forward, reverse);
+    }
+
+    #[test]
+    fn current_payload_golden_fixture_is_stable() {
+        let payload = bitcode::serialize(&FsStorageStateV1 {
+            root_identity: [0x11; 32],
+            items: Vec::new(),
+            data: Vec::new(),
+            links: Vec::new(),
+        })
+        .unwrap();
+        let hex = payload
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(
+            hex,
+            "1111111111111111111111111111111111111111111111111111111111111111000000"
+        );
+    }
+
+    #[test]
+    fn flat_link_writer_accepts_exact_record_limit_and_rejects_one_more() {
+        let mut records = Vec::with_capacity(FS_STORAGE_MAX_LINK_RECORDS);
+        for index in 0..FS_STORAGE_MAX_LINK_RECORDS {
+            let pushed = push_flat_link_record(
+                &mut records,
+                FsStorageNodeV1::Skipped {
+                    hash: Hash::from_bytes([index as u8; 32]),
+                    size: 1,
+                },
+            )
+            .unwrap();
+            assert_eq!(pushed as usize, index);
+        }
+        assert_eq!(records.len(), FS_STORAGE_MAX_LINK_RECORDS);
+        assert!(push_flat_link_record(
+            &mut records,
+            FsStorageNodeV1::Skipped {
+                hash: Hash::from_bytes([0xff; 32]),
+                size: 1,
+            },
+        )
+        .is_err());
+        assert_eq!(records.len(), FS_STORAGE_MAX_LINK_RECORDS);
+    }
+
+    #[test]
+    fn over_depth_flat_link_is_rejected_before_materialization() {
+        let mut records = vec![
+            FsStorageNodeV1::Skipped {
+                hash: do_hash(b"root-left"),
+                size: 1,
+            },
+            FsStorageNodeV1::Skipped {
+                hash: do_hash(b"root-right"),
+                size: 1,
+            },
+        ];
+        let mut previous = 0_u32;
+        for depth in 1..=FS_STORAGE_MAX_LINK_DEPTH + 1 {
+            let leaf = u32::try_from(records.len()).unwrap();
+            let leaf_hash = do_hash(&depth.to_le_bytes());
+            records.push(FsStorageNodeV1::Skipped {
+                hash: leaf_hash,
+                size: 1,
+            });
+            let (left_hash, left_size) = match &records[previous as usize] {
+                FsStorageNodeV1::Skipped { hash, size }
+                | FsStorageNodeV1::Parent { hash, size, .. } => (*hash, *size),
+            };
+            let hash = merge_hashes(&left_hash, &leaf_hash);
+            let parent = u32::try_from(records.len()).unwrap();
+            records.push(FsStorageNodeV1::Parent {
+                hash,
+                size: left_size + 1,
+                left: previous,
+                right: leaf,
+            });
+            previous = parent;
+        }
+
+        let error = materialize_flat_link(records).unwrap_err();
+        assert!(error.to_string().contains("maximum depth"));
+    }
+
+    #[test]
+    fn frozen_nonempty_legacy_fixture_is_compatible() {
+        // Produced once from source a5d7c997 with the Cargo.lock-pinned
+        // Bitcode 0.6.3. Keeping literal bytes prevents reader and fixture
+        // writer from drifting together.
+        const HEX: &str = concat!(
+            "0c2f6c65676163792f726f6f74010b6c65676163792d6974656d0b6c65676163792d6974656d010e66726f7a656e206669787475726504070c61727469666163742e62696e060bf97187ad3fe0c34440687ef66bf7ac80ca91407d72ff7966f4c6d6f1c6e0f29b022bcc7d6a00a8e18932022bcc7d6a00a8e1893205302e322e30000b6c65676163792d6974656d0607f97187ad3fe0c34440687ef66bf7ac80ca91407d72ff7966f4c6d6f1c6e0f29b060b04010000000400000001060bf97187ad3fe0c34440687ef66bf7ac80ca91407d72ff7966f4c6d6f1c6e0f29b0d2f6c65676163792f737461746501f97187ad3fe0c34440687ef66bf7ac80ca91407d72ff7966f4c6d6f1c6e0f29b01060bf97187ad3fe0c34440687ef66bf7ac80ca91407d72ff7966f4c6d6f1c6e0f29b192f6c65676163792f726f6f742f61727469666163742e62696e06000101f97187ad3fe0c34440687ef66bf7ac80ca91407d72ff7966f4c6d6f1c6e0f29b02f97187ad3fe0c34440687ef66bf7ac80ca91407d72ff7966f4c6d6f1c6e0f29b060b"
+        );
+        let bytes = (0..HEX.len())
+            .step_by(2)
+            .map(|offset| u8::from_str_radix(&HEX[offset..offset + 2], 16).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            blake3::hash(&bytes).to_hex().as_str(),
+            "d4b23e5e1c4ec21a40e44a15530277bf97c5ecdcf73bb0b72edc57510cbeab9d"
+        );
+        let legacy: LegacyFsStorageState = bitcode::deserialize(&bytes).unwrap();
+        assert_eq!(legacy.root, Path::new("/legacy/root"));
+        assert_eq!(legacy.persistance_path, Path::new("/legacy/state"));
+        assert_eq!(legacy.items.len(), 1);
+        assert_eq!(legacy.data.len(), 1);
+        assert_eq!(legacy.links.len(), 1);
+
+        // The frozen bytes intentionally contain absolute historical paths,
+        // so relocate only the decoded path authority for a portable migration
+        // run. All non-path historical values still originate in HEX above.
+        let requested_root = temp_path();
+        fs::create_dir_all(&requested_root).unwrap();
+        let root = fs::canonicalize(&requested_root).unwrap();
+        let artifact_path = root.join("artifact.bin");
+        fs::write(&artifact_path, b"legacy-data").unwrap();
+        let persistance_dir = cache_dir().join("chunk_storage").join("fs_storage");
+        fs::create_dir_all(&persistance_dir).unwrap();
+        let legacy_path =
+            persistance_dir.join(requested_root.to_string_lossy().replace('/', "___"));
+        let current_path =
+            persistance_dir.join(identity_filename(&fs_storage_root_identity(&root).unwrap()));
+
+        let mut relocatable = legacy;
+        relocatable.root = root.clone();
+        relocatable.persistance_path = legacy_path.clone();
+        for entries in relocatable.data.values_mut() {
+            for entry in entries {
+                Arc::make_mut(entry).path = artifact_path.clone();
+            }
+        }
+        let expected = relocatable.clone().into_v1(&root, &legacy_path).unwrap();
+        assert_eq!(expected.items.len(), 1);
+        assert_eq!(expected.data.len(), 1);
+        assert_eq!(expected.links.len(), 1);
+        assert_eq!(expected.items[0].metadata.path, Path::new("artifact.bin"));
+        assert_eq!(
+            expected.data[0].chunks[0].relative_path,
+            Path::new("artifact.bin")
+        );
+        assert!(expected.data[0].chunks[0].populated);
+        let expected_runtime_projection = FsStorageStateV1::from_runtime(
+            &expected
+                .clone()
+                .into_runtime(root.clone(), current_path.clone())
+                .unwrap(),
+        )
+        .unwrap();
+
+        let relocated_legacy_bytes = bitcode::serialize(&relocatable).unwrap();
+        fs::write(&legacy_path, &relocated_legacy_bytes).unwrap();
+        let storage = FsStorage::new(requested_root.clone()).unwrap();
+        assert_eq!(fs::read(&legacy_path).unwrap(), relocated_legacy_bytes);
+
+        let current_payload = read_enveloped_state(
+            &current_path,
+            DurableStateKind::FsStorage,
+            FS_STORAGE_PAYLOAD_SCHEMA,
+            MAX_DURABLE_STATE_PAYLOAD,
+        )
+        .unwrap();
+        let current: FsStorageStateV1 = bitcode::deserialize(&current_payload).unwrap();
+        assert_eq!(current, expected);
+        let runtime_projection = {
+            let inner = storage.inner.read().unwrap();
+            assert_eq!(inner.items.len(), 1);
+            assert_eq!(inner.data.len(), 1);
+            FsStorageStateV1::from_runtime(&inner).unwrap()
+        };
+        assert_eq!(runtime_projection, expected_runtime_projection);
+        drop(storage);
+
+        let restarted = FsStorage::new(requested_root).unwrap();
+        let restart_projection =
+            FsStorageStateV1::from_runtime(&restarted.inner.read().unwrap()).unwrap();
+        assert_eq!(restart_projection, expected_runtime_projection);
+        assert_eq!(fs::read(legacy_path).unwrap(), relocated_legacy_bytes);
+    }
+
+    #[test]
+    #[ignore = "local APFS performance reference; run explicitly in release mode"]
+    fn durable_state_reference_performance() {
+        use std::time::Instant;
+
+        let requested_root = temp_path();
+        fs::create_dir_all(&requested_root).unwrap();
+        let root = fs::canonicalize(&requested_root).unwrap();
+        let mut state = FsStorageState {
+            root: root.clone(),
+            persistance_path: root.join("state"),
+            ..Default::default()
+        };
+        for item_index in 0..1_000_u32 {
+            let relative = PathBuf::from(format!("item-{item_index:04}.bin"));
+            let path = root.join(&relative);
+            fs::write(&path, [0_u8; 4]).unwrap();
+            let mut chunks = Vec::new();
+            for chunk_index in 0..4_u32 {
+                let identity = [item_index.to_le_bytes(), chunk_index.to_le_bytes()].concat();
+                let info = ChunkInfo {
+                    hash: do_hash(&identity),
+                    size: 1,
+                };
+                chunks.push(info);
+                state.data.insert(
+                    info.hash,
+                    vec![Arc::new(InFileChunk {
+                        info,
+                        path: path.clone(),
+                        offset: u64::from(chunk_index),
+                        populated: Arc::new(AtomicBool::new(true)),
+                    })],
+                );
+            }
+            state.items.insert(
+                Item::make(
+                    format!("item-{item_index:04}"),
+                    relative,
+                    item_index,
+                    None,
+                    ChunkInfo {
+                        hash: do_hash(&item_index.to_le_bytes()),
+                        size: 4,
+                    },
+                    chunks,
+                    ChunkAlgorithm::default(),
+                )
+                .unwrap(),
+            );
+        }
+
+        let started = Instant::now();
+        let canonical = FsStorageStateV1::from_runtime(&state).unwrap();
+        let payload = bitcode::serialize(&canonical).unwrap();
+        let framed = crate::durable_state::encode_envelope(
+            DurableStateKind::FsStorage,
+            FS_STORAGE_PAYLOAD_SCHEMA,
+            &payload,
+            MAX_DURABLE_STATE_PAYLOAD,
+        )
+        .unwrap();
+        let encode = started.elapsed();
+
+        let started = Instant::now();
+        let decoded = crate::durable_state::decode_envelope(
+            &framed,
+            DurableStateKind::FsStorage,
+            FS_STORAGE_PAYLOAD_SCHEMA,
+            MAX_DURABLE_STATE_PAYLOAD,
+        )
+        .unwrap();
+        let decoded: FsStorageStateV1 = bitcode::deserialize(decoded).unwrap();
+        let _runtime = decoded
+            .into_runtime(root.clone(), root.join("decoded-state"))
+            .unwrap();
+        let decode = started.elapsed();
+
+        let mut commits = Vec::new();
+        for _ in 0..20 {
+            let started = Instant::now();
+            replace_enveloped_state(
+                &root.join("state"),
+                DurableStateKind::FsStorage,
+                FS_STORAGE_PAYLOAD_SCHEMA,
+                &payload,
+                MAX_DURABLE_STATE_PAYLOAD,
+            )
+            .unwrap();
+            commits.push(started.elapsed());
+        }
+        commits.sort_unstable();
+        let p95 = commits[18];
+        eprintln!(
+            "payload={} encode_ms={:.3} decode_ms={:.3} commit_p95_ms={:.3}",
+            payload.len(),
+            encode.as_secs_f64() * 1_000.0,
+            decode.as_secs_f64() * 1_000.0,
+            p95.as_secs_f64() * 1_000.0
+        );
+        assert!(encode.as_secs_f64() < 0.050);
+        assert!(decode.as_secs_f64() < 0.120);
+        assert!(p95.as_secs_f64() < 0.015);
+    }
+
+    #[test]
+    fn migrates_only_legacy_path_and_retains_legacy_bytes() {
+        let requested_root = temp_path();
+        fs::create_dir_all(&requested_root).unwrap();
+        let root = fs::canonicalize(&requested_root).unwrap();
+        let persistance_dir = cache_dir().join("chunk_storage").join("fs_storage");
+        fs::create_dir_all(&persistance_dir).unwrap();
+        let legacy_path =
+            persistance_dir.join(requested_root.to_string_lossy().replace('/', "___"));
+        let current_path =
+            persistance_dir.join(identity_filename(&fs_storage_root_identity(&root).unwrap()));
+        assert_ne!(legacy_path, current_path);
+
+        let legacy = LegacyFsStorageState {
+            root: root.clone(),
+            items: HashSet::default(),
+            persistance_path: legacy_path.clone(),
+            data: HashMap::default(),
+            links: HashMap::default(),
+        };
+        let legacy_bytes = bitcode::serialize(&legacy).unwrap();
+        fs::write(&legacy_path, &legacy_bytes).unwrap();
+
+        let storage = FsStorage::new(requested_root.clone()).unwrap();
+        assert_eq!(storage.inner.read().unwrap().persistance_path, current_path);
+        assert_eq!(fs::read(&legacy_path).unwrap(), legacy_bytes);
+        assert!(current_path.exists());
+        drop(storage);
+
+        let reloaded = FsStorage::new(requested_root).unwrap();
+        assert!(reloaded.inner.read().unwrap().items.is_empty());
+        assert_eq!(fs::read(&legacy_path).unwrap(), legacy_bytes);
+    }
+
+    #[test]
+    fn corrupt_current_state_never_falls_back_to_legacy() {
+        let requested_root = temp_path();
+        fs::create_dir_all(&requested_root).unwrap();
+        let root = fs::canonicalize(&requested_root).unwrap();
+        let persistance_dir = cache_dir().join("chunk_storage").join("fs_storage");
+        fs::create_dir_all(&persistance_dir).unwrap();
+        let legacy_path =
+            persistance_dir.join(requested_root.to_string_lossy().replace('/', "___"));
+        let current_path =
+            persistance_dir.join(identity_filename(&fs_storage_root_identity(&root).unwrap()));
+        let legacy = LegacyFsStorageState {
+            root,
+            items: HashSet::default(),
+            persistance_path: legacy_path.clone(),
+            data: HashMap::default(),
+            links: HashMap::default(),
+        };
+        fs::write(&legacy_path, bitcode::serialize(&legacy).unwrap()).unwrap();
+        let corrupt = b"not an envelope";
+        fs::write(&current_path, corrupt).unwrap();
+
+        assert!(FsStorage::new(requested_root).is_err());
+        assert_eq!(fs::read(current_path).unwrap(), corrupt);
+    }
+
+    #[test]
     fn rejects_destinations_outside_the_storage_root() {
         let root = temp_path();
-        let storage = FsStorage::new(root.clone());
+        let storage = FsStorage::new(root.clone()).unwrap();
         let escaped_name = format!("distd-escaped-{}", uuid::Uuid::new_v4());
         let escaped = root.parent().unwrap().join(&escaped_name);
 
@@ -2648,7 +3842,7 @@ mod tests {
 
         let root = temp_path();
         let outside = temp_path();
-        let storage = FsStorage::new(root.clone());
+        let storage = FsStorage::new(root.clone()).unwrap();
         symlink(&outside, root.join("link")).unwrap();
 
         assert!(storage.path(Path::new("link/file")).is_err());
@@ -2666,7 +3860,8 @@ mod tests {
                 max_chunk_bytes: 1,
                 max_tree_entries: 16,
             },
-        );
+        )
+        .unwrap();
         storage
             .create_item(
                 "artifact".to_string(),
@@ -2715,7 +3910,7 @@ mod tests {
         use crate::chunk_storage::hashmap_storage::HashMapStorage;
 
         let root = temp_path();
-        let storage = FsStorage::new(root.clone());
+        let storage = FsStorage::new(root.clone()).unwrap();
         let original = vec![1u8; CHUNK_SIZE];
         storage
             .create_item(
@@ -2786,7 +3981,7 @@ mod tests {
     #[bench]
     fn bench_fs_storage(b: &mut test::Bencher) {
         let tempdir = temp_path();
-        let storage = FsStorage::new(tempdir.clone());
+        let storage = FsStorage::new(tempdir.clone()).unwrap();
         b.iter(|| {
             let item = new_dummy_item::<FsStorage, 1u8, 1_000_000>(&storage).unwrap();
             let stored = storage
