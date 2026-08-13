@@ -2,7 +2,7 @@ use rustc_hash::FxHashMap;
 use std::sync::{Arc, RwLock};
 
 use crate::chunk_storage::ChunkStorage;
-use crate::hash::{Hash, HashTreeCapable};
+use crate::hash::{hash as do_hash, merge_hashes, Hash, HashTreeCapable};
 
 use super::{Node, StorageError};
 
@@ -27,9 +27,22 @@ impl ChunkStorage for HashMapStorage {
     }
 
     fn store_chunk(&self, hash: Hash, chunk: &[u8]) -> Result<Arc<Node>, StorageError> {
+        if do_hash(chunk) != hash {
+            return Err(StorageError::ImmutableConflict);
+        }
         let mut data = self.data.write().unwrap();
         if let Some(node) = data.get(&hash) {
-            return Ok(node.clone());
+            return match node.as_ref() {
+                Node::Stored {
+                    hash: existing_hash,
+                    data: existing_data,
+                } if *existing_hash == hash && existing_data.as_slice() == chunk => {
+                    Ok(node.clone())
+                }
+                Node::Stored { .. } | Node::Parent { .. } | Node::Skipped { .. } => {
+                    Err(StorageError::ImmutableConflict)
+                }
+            };
         }
         let node = Arc::new(Node::Stored {
             hash,
@@ -45,9 +58,27 @@ impl ChunkStorage for HashMapStorage {
         left: Arc<Node>,
         right: Arc<Node>,
     ) -> Result<Arc<Node>, StorageError> {
+        if merge_hashes(left.hash(), right.hash()) != hash {
+            return Err(StorageError::ImmutableConflict);
+        }
         let mut data = self.data.write().unwrap();
         if let Some(node) = data.get(&hash) {
-            return Ok(node.clone());
+            return match node.as_ref() {
+                Node::Parent {
+                    hash: existing_hash,
+                    left: existing_left,
+                    right: existing_right,
+                    ..
+                } if *existing_hash == hash
+                    && existing_left.as_ref() == left.as_ref()
+                    && existing_right.as_ref() == right.as_ref() =>
+                {
+                    Ok(node.clone())
+                }
+                Node::Stored { .. } | Node::Parent { .. } | Node::Skipped { .. } => {
+                    Err(StorageError::ImmutableConflict)
+                }
+            };
         }
         let size = left.size() + right.size();
         let node = Arc::new(Node::Parent {
@@ -98,4 +129,28 @@ mod tests {
     }
 
     crate::chunk_storage::tests::chunk_storage_tests!(HashMapStorage, make_hashmap_storage);
+
+    #[test]
+    fn rejects_mismatched_or_conflicting_immutable_keys() {
+        let storage = HashMapStorage::default();
+        let bytes = b"original";
+        let content_hash = do_hash(bytes);
+        storage.store_chunk(content_hash, bytes).unwrap();
+
+        assert!(matches!(
+            storage.store_chunk(content_hash, b"different"),
+            Err(StorageError::ImmutableConflict)
+        ));
+        assert!(matches!(
+            storage.store_chunk(do_hash(b"different"), bytes),
+            Err(StorageError::ImmutableConflict)
+        ));
+
+        let left = storage.insert_chunk(b"left").unwrap();
+        let right = storage.insert_chunk(b"right").unwrap();
+        assert!(matches!(
+            storage.store_link(do_hash(b"not a parent"), left, right),
+            Err(StorageError::ImmutableConflict)
+        ));
+    }
 }

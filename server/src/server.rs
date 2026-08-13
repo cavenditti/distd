@@ -28,7 +28,7 @@ use ring::{
     signature::{self},
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex as AsyncMutex, RwLock};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, RwLock};
 use tracing::span;
 use uuid::Uuid;
 
@@ -60,15 +60,69 @@ impl InternalMetadata {
         let mut metadata: Self =
             bitcode::deserialize(&bytes).map_err(|error| ServerError::State(error.to_string()))?;
         for (artifact_id, item) in metadata.items.clone() {
-            metadata
-                .versions
-                .entry(artifact_id)
-                .or_default()
-                .entry(item.manifest.version)
-                .or_insert(item);
+            validate_item_identity(&artifact_id, &item)?;
+            let versions = metadata.versions.entry(artifact_id.clone()).or_default();
+            for (version, historical) in versions.iter() {
+                validate_item_identity(&artifact_id, historical)?;
+                if *version != historical.manifest.version {
+                    return Err(ServerError::State(format!(
+                        "artifact {artifact_id} history key disagrees with its item version"
+                    )));
+                }
+            }
+            match versions.last_key_value() {
+                None => {
+                    versions.insert(item.manifest.version, item);
+                }
+                Some((version, historical))
+                    if *version == item.manifest.version && historical == &item => {}
+                Some(_) => {
+                    return Err(ServerError::State(format!(
+                    "current artifact {artifact_id} does not equal its highest historical revision"
+                )))
+                }
+            }
+        }
+        for (artifact_id, versions) in &metadata.versions {
+            if !metadata.items.contains_key(artifact_id) {
+                return Err(ServerError::State(format!(
+                    "artifact {artifact_id} has history without a current revision"
+                )));
+            }
+            for (version, historical) in versions {
+                validate_item_identity(artifact_id, historical)?;
+                if *version != historical.manifest.version {
+                    return Err(ServerError::State(format!(
+                        "artifact {artifact_id} history key disagrees with its item version"
+                    )));
+                }
+            }
         }
         Ok(metadata)
     }
+}
+
+fn validate_item_identity(artifact_id: &str, item: &Item) -> Result<(), ServerError> {
+    if item.metadata.artifact_id != artifact_id
+        || item.manifest.artifact_id != artifact_id
+        || item.manifest.version != u64::from(item.metadata.revision)
+    {
+        return Err(ServerError::State(format!(
+            "artifact {artifact_id} metadata identity is inconsistent"
+        )));
+    }
+    Ok(())
+}
+
+fn same_version_relevant_metadata(left: &Item, right: &Item) -> bool {
+    left.metadata.artifact_id == right.metadata.artifact_id
+        && left.metadata.name == right.metadata.name
+        && left.metadata.path == right.metadata.path
+        && left.metadata.description == right.metadata.description
+        && left.metadata.root == right.metadata.root
+        && left.manifest.entries == right.manifest.entries
+        && left.manifest.chunk_algorithm == right.manifest.chunk_algorithm
+        && left.chunks == right.chunks
 }
 
 impl From<InternalMetadata> for ServerMetadata {
@@ -104,7 +158,8 @@ where
     pub storage: Arc<T>,
     /// Client map
     pub clients: Arc<RwLock<BTreeMap<Uuid, Client>>>,
-    publish_lock: Arc<AsyncMutex<()>>,
+    publish_locks: Arc<AsyncMutex<HashMap<ArtifactId, Arc<AsyncMutex<()>>>>>,
+    metadata_persist_lock: Arc<AsyncMutex<()>>,
     metadata_path: Option<Arc<PathBuf>>,
 }
 
@@ -120,7 +175,8 @@ where
             metadata: Arc::clone(&self.metadata),
             storage: Arc::clone(&self.storage),
             clients: Arc::clone(&self.clients),
-            publish_lock: Arc::clone(&self.publish_lock),
+            publish_locks: Arc::clone(&self.publish_locks),
+            metadata_persist_lock: Arc::clone(&self.metadata_persist_lock),
             metadata_path: self.metadata_path.clone(),
         }
     }
@@ -128,20 +184,109 @@ where
 
 impl<T> Server<T>
 where
-    T: ChunkStorage + Sync + Send + Debug,
+    T: ChunkStorage + Sync + Send + Debug + 'static,
 {
-    async fn persist_metadata(&self) -> Result<(), ServerError> {
+    async fn persist_metadata_snapshot(
+        &self,
+        metadata: &InternalMetadata,
+    ) -> Result<(), ServerError> {
         let Some(path) = self.metadata_path.as_deref() else {
             return Ok(());
         };
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+        let bytes =
+            bitcode::serialize(metadata).map_err(|error| ServerError::State(error.to_string()))?;
+        let path = PathBuf::clone(path);
+        tokio::task::spawn_blocking(move || {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let temporary = path.with_extension("tmp");
+            std::fs::write(&temporary, bytes)?;
+            std::fs::rename(temporary, path)?;
+            Ok::<(), std::io::Error>(())
+        })
+        .await
+        .map_err(|error| ServerError::State(format!("metadata worker failed: {error}")))??;
+        Ok(())
+    }
+
+    async fn commit_publication_metadata(
+        &self,
+        artifact_id: ArtifactId,
+        expected_previous: Option<&Item>,
+        item: Item,
+    ) -> Result<(), ServerError> {
+        let _persist_guard = self.metadata_persist_lock.lock().await;
+        let mut next = self.metadata.read().await.clone();
+        let actual_previous = current_publication_item(&next, &artifact_id)?;
+        if actual_previous.as_ref() != expected_previous {
+            return Err(ServerError::State(
+                "publication history changed before metadata commit".to_string(),
+            ));
         }
-        let bytes = bitcode::serialize(&*self.metadata.read().await)
-            .map_err(|error| ServerError::State(error.to_string()))?;
-        let temporary = path.with_extension("tmp");
-        std::fs::write(&temporary, bytes)?;
-        std::fs::rename(temporary, path)?;
+        let versions = next.versions.entry(artifact_id.clone()).or_default();
+        if versions.is_empty() {
+            if let Some(previous) = actual_previous {
+                match versions.entry(previous.manifest.version) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(previous);
+                    }
+                    std::collections::btree_map::Entry::Occupied(_) => unreachable!(),
+                }
+            }
+        }
+        match versions.entry(item.manifest.version) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(item.clone());
+            }
+            std::collections::btree_map::Entry::Occupied(_) => {
+                return Err(ServerError::State(
+                    "new publication conflicts with an existing immutable revision".to_string(),
+                ));
+            }
+        }
+        next.items.insert(artifact_id, item);
+        self.persist_metadata_snapshot(&next).await?;
+        *self.metadata.write().await = next;
+        Ok(())
+    }
+
+    async fn ensure_publication_history(
+        &self,
+        artifact_id: &str,
+        item: &Item,
+    ) -> Result<(), ServerError> {
+        if self
+            .metadata
+            .read()
+            .await
+            .versions
+            .get(artifact_id)
+            .is_some_and(|versions| versions.get(&item.manifest.version) == Some(item))
+        {
+            return Ok(());
+        }
+        let _persist_guard = self.metadata_persist_lock.lock().await;
+        let mut next = self.metadata.read().await.clone();
+        if next.items.get(artifact_id) != Some(item) {
+            return Err(ServerError::State(
+                "publication changed before historical backfill".to_string(),
+            ));
+        }
+        let versions = next.versions.entry(artifact_id.to_string()).or_default();
+        match versions.entry(item.manifest.version) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(item.clone());
+            }
+            std::collections::btree_map::Entry::Occupied(entry) if entry.get() == item => {}
+            std::collections::btree_map::Entry::Occupied(_) => {
+                return Err(ServerError::State(
+                    "publication history conflicts during backfill".to_string(),
+                ));
+            }
+        }
+        self.persist_metadata_snapshot(&next).await?;
+        *self.metadata.write().await = next;
         Ok(())
     }
 
@@ -164,7 +309,8 @@ where
             metadata: Arc::new(RwLock::new(metadata)),
             storage: Arc::new(storage),
             clients: Arc::new(RwLock::new(BTreeMap::new())),
-            publish_lock: Arc::new(AsyncMutex::new(())),
+            publish_locks: Arc::new(AsyncMutex::new(HashMap::new())),
+            metadata_persist_lock: Arc::new(AsyncMutex::new(())),
             metadata_path: None,
         })
     }
@@ -188,7 +334,8 @@ where
             metadata: Arc::new(RwLock::new(metadata)),
             storage: Arc::new(storage),
             clients: Arc::new(RwLock::new(BTreeMap::new())),
-            publish_lock: Arc::new(AsyncMutex::new(())),
+            publish_locks: Arc::new(AsyncMutex::new(HashMap::new())),
+            metadata_persist_lock: Arc::new(AsyncMutex::new(())),
             metadata_path: None,
         }
     }
@@ -205,6 +352,18 @@ where
         self.metadata_path = Some(Arc::new(path));
         self
     }
+
+    async fn publication_guard(&self, artifact_id: &str) -> OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.publish_locks.lock().await;
+            Arc::clone(
+                locks
+                    .entry(artifact_id.to_string())
+                    .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
+            )
+        };
+        lock.lock_owned().await
+    }
 }
 
 #[derive(Debug)]
@@ -212,7 +371,7 @@ pub struct RegisterError;
 
 impl<T> Server<T>
 where
-    T: ChunkStorage + Sync + Send + Debug,
+    T: ChunkStorage + Sync + Send + Debug + 'static,
 {
     pub async fn authenticate_client_uuid(&self, uuid: Option<Uuid>) -> Result<Uuid, String> {
         let uuid = uuid.ok_or_else(|| String::from("Unauthenticated"))?;
@@ -484,7 +643,8 @@ where
 
     #[allow(clippy::missing_panics_doc)]
     pub async fn expose_feed(&self, feed: Feed) -> Result<FeedName, RegisterError> {
-        let mut metadata = self.metadata.write().await;
+        let _persist_guard = self.metadata_persist_lock.lock().await;
+        let mut metadata = self.metadata.read().await.clone();
         let name = feed.name.clone();
         let result = match metadata.feeds.entry(name.clone()) {
             std::collections::hash_map::Entry::Vacant(e) => {
@@ -493,9 +653,11 @@ where
             }
             std::collections::hash_map::Entry::Occupied(_) => Err(RegisterError),
         };
-        drop(metadata);
-        if result.is_ok() && self.persist_metadata().await.is_err() {
-            return Err(RegisterError);
+        if result.is_ok() {
+            if self.persist_metadata_snapshot(&metadata).await.is_err() {
+                return Err(RegisterError);
+            }
+            *self.metadata.write().await = metadata;
         }
         result
     }
@@ -530,41 +692,55 @@ where
         description: Option<String>,
         file: Bytes,
         chunk_algorithm: ChunkAlgorithm,
-    ) -> Result<Item, ServerError> {
-        let _publish_guard = self.publish_lock.lock().await;
-        let previous = self.metadata.read().await.items.get(&artifact_id).cloned();
-        let revision = previous
-            .as_ref()
-            .map_or(0, |item| item.metadata.revision.saturating_add(1));
-        let item = self
+    ) -> Result<Item, ServerError>
+    where
+        T: 'static,
+    {
+        let prepared = self
             .storage
-            .create_item(name, path, revision, description, file, chunk_algorithm)
-            .map_err(|e| {
-                tracing::error!("Storage error: {e}");
+            .prepare_revision(
+                artifact_id.clone(),
+                name,
+                path,
+                0,
+                description,
+                file.clone(),
+                chunk_algorithm,
+            )
+            .map_err(|error| {
+                tracing::error!("Cannot prepare revision: {error}");
                 ServerError::ChunkInsertError
-            })?
-            .with_artifact_id(artifact_id.clone());
-
-        if let Some(old) = previous {
-            if old.metadata.name == item.metadata.name
-                && old.metadata.path == item.metadata.path
-                && old.metadata.description == item.metadata.description
-                && old.metadata.root == item.metadata.root
-                && old.manifest.chunk_algorithm == item.manifest.chunk_algorithm
-            {
-                return Ok(old);
+            })?;
+        let _publish_guard = self.publication_guard(&artifact_id).await;
+        let previous = {
+            let metadata = self.metadata.read().await;
+            current_publication_item(&metadata, &artifact_id)?
+        };
+        if let Some(old) = previous.as_ref() {
+            if same_version_relevant_metadata(old, &prepared) {
+                self.ensure_publication_history(&artifact_id, old).await?;
+                return Ok(old.clone());
             }
         }
+        let revision = previous.as_ref().map_or(Ok(0), |item| {
+            item.metadata
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| ServerError::State("artifact revision is exhausted".to_string()))
+        })?;
+        let storage = Arc::clone(&self.storage);
+        let item = tokio::task::spawn_blocking(move || {
+            storage.commit_revision(prepared.with_revision(revision), file)
+        })
+        .await
+        .map_err(|error| ServerError::State(format!("revision storage worker failed: {error}")))?
+        .map_err(|error| {
+            tracing::error!("Storage error: {error}");
+            ServerError::ChunkInsertError
+        })?;
 
-        let mut metadata = self.metadata.write().await;
-        metadata.items.insert(artifact_id.clone(), item.clone());
-        metadata
-            .versions
-            .entry(artifact_id)
-            .or_default()
-            .insert(item.manifest.version, item.clone());
-        drop(metadata);
-        self.persist_metadata().await?;
+        self.commit_publication_metadata(artifact_id, previous.as_ref(), item.clone())
+            .await?;
 
         Ok(item)
     }
@@ -598,45 +774,57 @@ where
         description: Option<String>,
         mut files: Vec<(PathBuf, Bytes)>,
         chunk_algorithm: ChunkAlgorithm,
-    ) -> Result<Item, ServerError> {
-        let _publish_guard = self.publish_lock.lock().await;
-        let previous = self.metadata.read().await.items.get(&artifact_id).cloned();
-        let revision = previous
-            .as_ref()
-            .map_or(0, |item| item.metadata.revision.saturating_add(1));
-
+    ) -> Result<Item, ServerError>
+    where
+        T: 'static,
+    {
         files.sort_by(|left, right| left.0.cmp(&right.0));
-
-        let item = self
+        let prepared = self
             .storage
-            .create_item_from_files(name, path, revision, description, files, chunk_algorithm)
-            .map_err(|e| {
-                tracing::error!("Storage error: {e}");
+            .prepare_revision_from_files(
+                artifact_id.clone(),
+                name,
+                path,
+                0,
+                description,
+                files.clone(),
+                chunk_algorithm,
+            )
+            .map_err(|error| {
+                tracing::error!("Cannot prepare directory revision: {error}");
                 ServerError::ChunkInsertError
-            })?
-            .with_artifact_id(artifact_id.clone());
+            })?;
 
-        if let Some(old) = previous {
-            if old.metadata.name == item.metadata.name
-                && old.metadata.path == item.metadata.path
-                && old.metadata.description == item.metadata.description
-                && old.metadata.root == item.metadata.root
-                && old.manifest.entries == item.manifest.entries
-                && old.manifest.chunk_algorithm == item.manifest.chunk_algorithm
-            {
-                return Ok(old);
+        let _publish_guard = self.publication_guard(&artifact_id).await;
+        let previous = {
+            let metadata = self.metadata.read().await;
+            current_publication_item(&metadata, &artifact_id)?
+        };
+        if let Some(old) = previous.as_ref() {
+            if same_version_relevant_metadata(old, &prepared) {
+                self.ensure_publication_history(&artifact_id, old).await?;
+                return Ok(old.clone());
             }
         }
+        let revision = previous.as_ref().map_or(Ok(0), |item| {
+            item.metadata
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| ServerError::State("artifact revision is exhausted".to_string()))
+        })?;
+        let storage = Arc::clone(&self.storage);
+        let item = tokio::task::spawn_blocking(move || {
+            storage.commit_revision_from_files(prepared.with_revision(revision), files)
+        })
+        .await
+        .map_err(|error| ServerError::State(format!("revision storage worker failed: {error}")))?
+        .map_err(|error| {
+            tracing::error!("Storage error: {error}");
+            ServerError::ChunkInsertError
+        })?;
 
-        let mut metadata = self.metadata.write().await;
-        metadata.items.insert(artifact_id.clone(), item.clone());
-        metadata
-            .versions
-            .entry(artifact_id)
-            .or_default()
-            .insert(item.manifest.version, item.clone());
-        drop(metadata);
-        self.persist_metadata().await?;
+        self.commit_publication_metadata(artifact_id, previous.as_ref(), item.clone())
+            .await?;
 
         Ok(item)
     }
@@ -645,6 +833,43 @@ where
     #[must_use]
     pub fn public_key(&self) -> &[u8] {
         self.key_pair.public_key().as_ref()
+    }
+}
+
+fn current_publication_item(
+    metadata: &InternalMetadata,
+    artifact_id: &str,
+) -> Result<Option<Item>, ServerError> {
+    let current = metadata.items.get(artifact_id).cloned();
+    if let Some(current) = &current {
+        validate_item_identity(artifact_id, current)?;
+    }
+    let historical = if let Some(versions) = metadata.versions.get(artifact_id) {
+        for (version, item) in versions {
+            validate_item_identity(artifact_id, item)?;
+            if *version != item.manifest.version {
+                return Err(ServerError::State(format!(
+                    "artifact {artifact_id} history key disagrees with its item version"
+                )));
+            }
+        }
+        versions
+            .last_key_value()
+            .map(|(version, item)| (*version, item.clone()))
+    } else {
+        None
+    };
+    match (&current, &historical) {
+        (None, None) => Ok(None),
+        (Some(current), Some((version, historical)))
+            if current == historical && *version == current.manifest.version =>
+        {
+            Ok(current.clone().into())
+        }
+        (Some(current), None) => Ok(current.clone().into()),
+        (None, Some(_)) | (Some(_), Some(_)) => Err(ServerError::State(format!(
+            "artifact {artifact_id} current revision disagrees with immutable history"
+        ))),
     }
 }
 
@@ -756,9 +981,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{build_sync_payload_batches, Server};
+    use super::{build_sync_payload_batches, InternalMetadata, Server, ServerError};
     use axum::body::Bytes;
     use distd_core::chunk_storage::hashmap_storage::HashMapStorage;
+    use distd_core::chunk_storage::ChunkStorage;
     use distd_core::chunks::ChunkAlgorithm;
     use distd_core::proto::ManifestRequest;
     use distd_core::proto::{sync_message::Msg, PayloadCompression};
@@ -866,5 +1092,305 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(historical.metadata.root, first.metadata.root);
+    }
+
+    #[tokio::test]
+    async fn filesystem_exact_versions_survive_same_path_publication_and_restart() {
+        use distd_core::chunk_storage::fs_storage::FsStorage;
+
+        let root = std::env::temp_dir().join(format!(
+            "distd-server-revision-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let storage = FsStorage::new(root.clone()).unwrap();
+        let server = Server::new_ephemeral(storage);
+        let algorithm = ChunkAlgorithm::default();
+        let first_bytes = Bytes::from(vec![1u8; distd_core::chunks::CHUNK_SIZE * 2]);
+        let mut second_vec = first_bytes.to_vec();
+        second_vec[distd_core::chunks::CHUNK_SIZE] = 2;
+        let second_bytes = Bytes::from(second_vec);
+
+        let first = server
+            .publish_item_as(
+                "stable-id".to_string(),
+                "display".to_string(),
+                "same.bin".into(),
+                None,
+                first_bytes.clone(),
+                algorithm,
+            )
+            .await
+            .unwrap();
+        let second = server
+            .publish_item_as(
+                "stable-id".to_string(),
+                "display".to_string(),
+                "same.bin".into(),
+                None,
+                second_bytes.clone(),
+                algorithm,
+            )
+            .await
+            .unwrap();
+        let metadata = server.metadata.read().await.clone();
+        drop(server);
+
+        let restarted =
+            Server::new_ephemeral_with_metadata(FsStorage::new(root).unwrap(), metadata);
+        for (item, expected) in [(&first, &first_bytes), (&second, &second_bytes)] {
+            let (_, exact) = restarted
+                .sync_manifest_response(ManifestRequest {
+                    artifact_id: "stable-id".to_string(),
+                    version: Some(item.manifest.version),
+                })
+                .await
+                .unwrap();
+            let actual = exact
+                .chunks
+                .iter()
+                .enumerate()
+                .flat_map(|(index, _)| {
+                    restarted
+                        .storage
+                        .get_chunk_by_index(&exact.metadata.root.hash, index as u32)
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected.as_ref());
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_change_versions_identical_bytes_and_revision_exhaustion_fails() {
+        let server = Server::new_ephemeral(HashMapStorage::default());
+        let bytes = Bytes::from_static(b"same payload");
+        let algorithm = ChunkAlgorithm::default();
+        let first = server
+            .publish_item_as(
+                "stable-id".to_string(),
+                "first".to_string(),
+                "same.bin".into(),
+                None,
+                bytes.clone(),
+                algorithm,
+            )
+            .await
+            .unwrap();
+        let second = server
+            .publish_item_as(
+                "stable-id".to_string(),
+                "renamed".to_string(),
+                "same.bin".into(),
+                None,
+                bytes.clone(),
+                algorithm,
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.metadata.revision, first.metadata.revision + 1);
+
+        let mut exhausted = second.clone().with_revision(u32::MAX);
+        exhausted.metadata.artifact_id = "exhausted".to_string();
+        exhausted.manifest.artifact_id = "exhausted".to_string();
+        server
+            .metadata
+            .write()
+            .await
+            .items
+            .insert("exhausted".to_string(), exhausted);
+        let error = server
+            .publish_item_as(
+                "exhausted".to_string(),
+                "different".to_string(),
+                "same.bin".into(),
+                None,
+                bytes,
+                algorithm,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ServerError::State(message) if message.contains("exhausted")));
+    }
+
+    #[tokio::test]
+    async fn metadata_load_rejects_current_behind_history_and_mismatched_version_keys() {
+        let server = Server::new_ephemeral(HashMapStorage::default());
+        let algorithm = ChunkAlgorithm::default();
+        let first = server
+            .publish_item_as(
+                "stable-id".to_string(),
+                "display".to_string(),
+                "artifact.bin".into(),
+                None,
+                Bytes::from_static(b"revision zero"),
+                algorithm,
+            )
+            .await
+            .unwrap();
+        let second = server
+            .publish_item_as(
+                "stable-id".to_string(),
+                "display".to_string(),
+                "artifact.bin".into(),
+                None,
+                Bytes::from_static(b"revision one"),
+                algorithm,
+            )
+            .await
+            .unwrap();
+
+        let mut behind = server.metadata.read().await.clone();
+        behind.items.insert("stable-id".to_string(), first);
+        let behind_path = std::env::temp_dir().join(format!(
+            "distd-server-behind-history-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&behind_path, bitcode::serialize(&behind).unwrap()).unwrap();
+        let behind_error = InternalMetadata::load(&behind_path).unwrap_err();
+        assert!(matches!(
+            behind_error,
+            ServerError::State(message) if message.contains("highest historical revision")
+        ));
+
+        let mut mismatched_key = server.metadata.read().await.clone();
+        let versions = mismatched_key.versions.get_mut("stable-id").unwrap();
+        versions.remove(&second.manifest.version);
+        versions.insert(second.manifest.version + 1, second);
+        let mismatched_path =
+            std::env::temp_dir().join(format!("distd-server-version-key-{}", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &mismatched_path,
+            bitcode::serialize(&mismatched_key).unwrap(),
+        )
+        .unwrap();
+        let mismatched_error = InternalMetadata::load(&mismatched_path).unwrap_err();
+        assert!(matches!(
+            mismatched_error,
+            ServerError::State(message) if message.contains("history key disagrees")
+        ));
+    }
+
+    #[tokio::test]
+    async fn publication_backfills_current_only_history_and_rejects_malformed_live_history() {
+        let algorithm = ChunkAlgorithm::default();
+        let seed = Server::new_ephemeral(HashMapStorage::default());
+        let first = seed
+            .publish_item_as(
+                "stable-id".to_string(),
+                "display".to_string(),
+                "artifact.bin".into(),
+                None,
+                Bytes::from_static(b"revision zero"),
+                algorithm,
+            )
+            .await
+            .unwrap();
+
+        let mut current_only = InternalMetadata::default();
+        current_only
+            .items
+            .insert("stable-id".to_string(), first.clone());
+        let server = Server::new_ephemeral_with_metadata(HashMapStorage::default(), current_only);
+        let duplicate = server
+            .publish_item_as(
+                "stable-id".to_string(),
+                "display".to_string(),
+                "artifact.bin".into(),
+                None,
+                Bytes::from_static(b"revision zero"),
+                algorithm,
+            )
+            .await
+            .unwrap();
+        assert_eq!(duplicate, first);
+        let (_, exact_first) = server
+            .sync_manifest_response(ManifestRequest {
+                artifact_id: "stable-id".to_string(),
+                version: Some(first.manifest.version),
+            })
+            .await
+            .unwrap();
+        assert_eq!(exact_first, first);
+        let second = server
+            .publish_item_as(
+                "stable-id".to_string(),
+                "display".to_string(),
+                "artifact.bin".into(),
+                None,
+                Bytes::from_static(b"revision one"),
+                algorithm,
+            )
+            .await
+            .unwrap();
+        let metadata = server.metadata.read().await;
+        let versions = metadata.versions.get("stable-id").unwrap();
+        assert_eq!(versions.get(&first.manifest.version), Some(&first));
+        assert_eq!(versions.get(&second.manifest.version), Some(&second));
+        drop(metadata);
+
+        let mut malformed = server.metadata.read().await.clone();
+        let versions = malformed.versions.get_mut("stable-id").unwrap();
+        let historical = versions.remove(&second.manifest.version).unwrap();
+        versions.insert(second.manifest.version + 1, historical);
+        let storage = HashMapStorage::default();
+        let malformed_server = Server::new_ephemeral_with_metadata(storage, malformed.clone());
+        let error = malformed_server
+            .publish_item_as(
+                "stable-id".to_string(),
+                "display".to_string(),
+                "artifact.bin".into(),
+                None,
+                Bytes::from_static(b"revision two"),
+                algorithm,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ServerError::State(message) if message.contains("history key disagrees")
+        ));
+        assert!(malformed_server.storage.chunks().is_empty());
+        assert_eq!(
+            malformed_server
+                .metadata
+                .read()
+                .await
+                .versions
+                .get("stable-id"),
+            malformed.versions.get("stable-id")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_metadata_persistence_never_becomes_idempotent_success() {
+        let parent_file = std::env::temp_dir().join(format!(
+            "distd-server-metadata-parent-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&parent_file, b"not a directory").unwrap();
+        let metadata_path = parent_file.join("metadata.state");
+        let server = Server::new_ephemeral(HashMapStorage::default())
+            .with_metadata_persistence(metadata_path.clone());
+        let algorithm = ChunkAlgorithm::default();
+
+        for _ in 0..2 {
+            let result = server
+                .publish_item_as(
+                    "stable-id".to_string(),
+                    "display".to_string(),
+                    "artifact.bin".into(),
+                    None,
+                    Bytes::from_static(b"durable candidate"),
+                    algorithm,
+                )
+                .await;
+            assert!(result.is_err());
+            assert!(server.metadata.read().await.items.is_empty());
+            assert!(server.metadata.read().await.versions.is_empty());
+        }
+
+        let restarted = InternalMetadata::load(&metadata_path).unwrap();
+        assert!(restarted.items.is_empty());
+        assert!(restarted.versions.is_empty());
     }
 }

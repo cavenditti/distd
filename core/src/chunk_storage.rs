@@ -17,10 +17,89 @@ use crate::hash::{hash, Hash, HashTreeCapable};
 use crate::{
     chunks::{ChunkAlgorithm, ChunkInfo},
     hash::merge_hashes,
-    item::{Item, Name as ItemName},
+    item::{ArtifactId, FileEntry, Item, Name as ItemName},
 };
 
 static NEXT_RECEIVED_BACKING_ID: AtomicU64 = AtomicU64::new(1);
+
+fn prepared_tree(chunks: &[ChunkInfo]) -> Result<ChunkInfo, Error> {
+    let mut partials = chunks.to_vec();
+    if partials.is_empty() {
+        return Err(Error::MissingData);
+    }
+    while partials.len() > 1 {
+        let n = partials.len();
+        for (to, index) in (0..n - 1).step_by(2).enumerate() {
+            partials[to] = ChunkInfo {
+                hash: merge_hashes(&partials[index].hash, &partials[index + 1].hash),
+                size: partials[index]
+                    .size
+                    .checked_add(partials[index + 1].size)
+                    .ok_or_else(|| Error::Other("revision size overflows u64".to_string()))?,
+            };
+        }
+        let half = n / 2;
+        if n % 2 != 0 {
+            partials.swap(half, n - 1);
+            partials.truncate(half + 1);
+        } else {
+            partials.truncate(half);
+        }
+    }
+    Ok(partials.swap_remove(0))
+}
+
+fn prepared_chunks(data: &[u8], chunk_algorithm: ChunkAlgorithm) -> Vec<ChunkInfo> {
+    if data.is_empty() {
+        return vec![ChunkInfo {
+            hash: hash(&[]),
+            size: 0,
+        }];
+    }
+    chunk_algorithm
+        .chunk_boundaries(data)
+        .into_iter()
+        .map(|(offset, length)| ChunkInfo {
+            hash: hash(&data[offset..offset + length]),
+            size: length as u64,
+        })
+        .collect()
+}
+
+fn same_revision(candidate: &Item, actual: &Item) -> bool {
+    candidate.metadata.artifact_id == actual.metadata.artifact_id
+        && candidate.metadata.name == actual.metadata.name
+        && candidate.metadata.description == actual.metadata.description
+        && candidate.metadata.revision == actual.metadata.revision
+        && candidate.metadata.path == actual.metadata.path
+        && candidate.metadata.root == actual.metadata.root
+        && candidate.manifest == actual.manifest
+        && candidate.chunks == actual.chunks
+}
+
+fn validate_revision_authority(artifact_id: &str, path: &PathBuf) -> Result<PathBuf, Error> {
+    if artifact_id.is_empty() || artifact_id.len() > 256 {
+        return Err(Error::Other(
+            "artifact ID must contain between 1 and 256 UTF-8 bytes".to_string(),
+        ));
+    }
+    let path = crate::utils::path::validate_relative(path)?;
+    if path.to_str().is_none() {
+        return Err(Error::Other(
+            "revision logical paths must be valid UTF-8".to_string(),
+        ));
+    }
+    if path
+        .components()
+        .next()
+        .is_some_and(|component| component.as_os_str() == ".distd-revisions-v1")
+    {
+        return Err(Error::Other(
+            "revision logical path uses the reserved storage namespace".to_string(),
+        ));
+    }
+    Ok(path)
+}
 
 #[derive(Clone, Debug)]
 struct ReceivedBacking {
@@ -158,6 +237,9 @@ pub enum StorageError {
 
     #[error("Cannot reconstruct tree from storage")]
     TreeReconstruct,
+
+    #[error("immutable content-addressed storage key conflicts with supplied content")]
+    ImmutableConflict,
 }
 
 /// Defines a backend used to store hashes and chunks ad key-value pairs
@@ -302,6 +384,197 @@ pub trait ChunkStorage: HashTreeCapable<Arc<Node>, Error> {
         Err(Error::Other(
             "multi-file artifacts are unsupported by this storage".to_string(),
         ))
+    }
+
+    /// Build the exact revision metadata without mutating storage.
+    fn prepare_revision(
+        &self,
+        artifact_id: ArtifactId,
+        name: ItemName,
+        path: PathBuf,
+        revision: u32,
+        description: Option<String>,
+        file: Bytes,
+        chunk_algorithm: ChunkAlgorithm,
+    ) -> Result<Item, Error>
+    where
+        Self: Sized,
+    {
+        let path = validate_revision_authority(&artifact_id, &path)?;
+        let chunks = prepared_chunks(file.as_ref(), chunk_algorithm);
+        let root = prepared_tree(&chunks)?;
+        Ok(Item::make(
+            name,
+            path,
+            revision,
+            description,
+            root,
+            chunks,
+            chunk_algorithm,
+        )?
+        .with_artifact_id(artifact_id))
+    }
+
+    /// Build exact multi-file revision metadata without mutating storage.
+    fn prepare_revision_from_files(
+        &self,
+        artifact_id: ArtifactId,
+        name: ItemName,
+        path: PathBuf,
+        revision: u32,
+        description: Option<String>,
+        files: Vec<(PathBuf, Bytes)>,
+        chunk_algorithm: ChunkAlgorithm,
+    ) -> Result<Item, Error>
+    where
+        Self: Sized,
+    {
+        let path = validate_revision_authority(&artifact_id, &path)?;
+        if files.is_empty() {
+            return Err(Error::MissingData);
+        }
+        let mut files = files
+            .into_iter()
+            .map(|(relative_path, data)| {
+                let relative_path = crate::utils::path::validate_relative(&relative_path)?;
+                if relative_path.to_str().is_none() {
+                    return Err(Error::Other(
+                        "directory revision paths must be valid UTF-8".to_string(),
+                    ));
+                }
+                if relative_path.components().next().is_some_and(|component| {
+                    component.as_os_str() == std::ffi::OsStr::new(".distd-revisions-v1")
+                }) {
+                    return Err(Error::Other(
+                        "directory revision path uses the reserved storage namespace".to_string(),
+                    ));
+                }
+                Ok((relative_path, data))
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        if files.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err(Error::Other(
+                "directory revision contains duplicate paths".to_string(),
+            ));
+        }
+        let mut chunks = Vec::new();
+        let mut entries = Vec::with_capacity(files.len());
+        for (relative_path, data) in files {
+            let relative_path = relative_path
+                .to_str()
+                .expect("validated directory revision path is UTF-8");
+            let start = u32::try_from(chunks.len())
+                .map_err(|_| Error::Other("revision has too many chunks".to_string()))?;
+            chunks.extend(prepared_chunks(data.as_ref(), chunk_algorithm));
+            let end = u32::try_from(chunks.len())
+                .map_err(|_| Error::Other("revision has too many chunks".to_string()))?;
+            entries.push(FileEntry {
+                relative_path: relative_path.to_string(),
+                size: data.len() as u64,
+                chunk_range: (start, end),
+            });
+        }
+        let root = prepared_tree(&chunks)?;
+        Ok(Item::make_with_entries(
+            name,
+            path,
+            revision,
+            description,
+            root,
+            chunks,
+            entries,
+            chunk_algorithm,
+        )?
+        .with_artifact_id(artifact_id))
+    }
+
+    /// Durably store a previously prepared single-file revision.
+    fn commit_revision(&self, item: Item, file: Bytes) -> Result<Item, Error>
+    where
+        Self: Sized,
+    {
+        let expected = self.prepare_revision(
+            item.metadata.artifact_id.clone(),
+            item.metadata.name.clone(),
+            item.metadata.path.clone(),
+            item.metadata.revision,
+            item.metadata.description.clone(),
+            file.clone(),
+            item.manifest.chunk_algorithm,
+        )?;
+        if !same_revision(&item, &expected) {
+            return Err(Error::Other(
+                "prepared revision does not match supplied bytes".to_string(),
+            ));
+        }
+        let (root, chunks) = self.chunk_tree(file.as_ref(), item.manifest.chunk_algorithm)?;
+        if root.chunk_info() != item.metadata.root || chunks != item.chunks {
+            return Err(Error::Other(
+                "stored revision does not match prepared metadata".to_string(),
+            ));
+        }
+        Ok(item)
+    }
+
+    /// Durably store a previously prepared multi-file revision.
+    fn commit_revision_from_files(
+        &self,
+        item: Item,
+        mut files: Vec<(PathBuf, Bytes)>,
+    ) -> Result<Item, Error>
+    where
+        Self: Sized,
+    {
+        let expected = self.prepare_revision_from_files(
+            item.metadata.artifact_id.clone(),
+            item.metadata.name.clone(),
+            item.metadata.path.clone(),
+            item.metadata.revision,
+            item.metadata.description.clone(),
+            files.clone(),
+            item.manifest.chunk_algorithm,
+        )?;
+        if !same_revision(&item, &expected) {
+            return Err(Error::Other(
+                "prepared directory revision does not match supplied files".to_string(),
+            ));
+        }
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut partials = Vec::new();
+        for (_, data) in files {
+            if data.is_empty() {
+                partials.push(self.insert_chunk(&[])?);
+                continue;
+            }
+            for (offset, length) in item
+                .manifest
+                .chunk_algorithm
+                .chunk_boundaries(data.as_ref())
+            {
+                partials.push(self.insert_chunk(&data[offset..offset + length])?);
+            }
+        }
+        while partials.len() > 1 {
+            let n = partials.len();
+            for (to, index) in (0..n - 1).step_by(2).enumerate() {
+                partials[to] = self.link(partials[index].clone(), partials[index + 1].clone())?;
+            }
+            let half = n / 2;
+            if n % 2 != 0 {
+                partials.swap(half, n - 1);
+                partials.truncate(half + 1);
+            } else {
+                partials.truncate(half);
+            }
+        }
+        let root = partials.pop().ok_or(Error::MissingData)?;
+        if root.chunk_info() != item.metadata.root {
+            return Err(Error::Other(
+                "stored directory revision does not match prepared metadata".to_string(),
+            ));
+        }
+        Ok(item)
     }
 
     /// Build a new Item from its metadata and root node

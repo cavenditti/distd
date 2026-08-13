@@ -1,7 +1,7 @@
 use std::{
     cmp::Ordering,
     collections::VecDeque,
-    fs::{self, create_dir_all, remove_file, File},
+    fs::{self, create_dir_all, remove_file, File, OpenOptions},
     io::{BufWriter, Read, Seek, Write},
     path::{Path, PathBuf},
     sync::{atomic::AtomicBool, Arc, Mutex, RwLock},
@@ -31,6 +31,7 @@ const DEFAULT_CHUNK_CACHE_BYTES: usize = 512 * 1024 * 1024;
 const DEFAULT_TREE_CACHE_ENTRIES: usize = 65_536;
 const FS_STORAGE_PAYLOAD_SCHEMA: u16 = 1;
 const FS_STORAGE_ROOT_DOMAIN: &[u8] = b"distd fs storage root identity v1\0";
+const FS_STORAGE_REVISION_NAMESPACE: &str = ".distd-revisions-v1";
 const FS_STORAGE_MAX_LINK_RECORDS: usize = 65_536;
 const FS_STORAGE_MAX_LINK_DEPTH: usize = 256;
 
@@ -660,6 +661,165 @@ fn validate_existing_chunk_path(
     Ok(path)
 }
 
+fn hash_file_range(path: &Path, offset: u64, size: u64) -> Result<Hash, Error> {
+    let mut file = File::open(path)?;
+    file.seek(std::io::SeekFrom::Start(offset))?;
+    let size = usize::try_from(size).map_err(InvalidParameter::from)?;
+    let mut bytes = vec![0; size];
+    file.read_exact(&mut bytes)?;
+    Ok(do_hash(&bytes))
+}
+
+fn verify_populated_chunk_hashes(data: &HashMap<Hash, Vec<Arc<InFileChunk>>>) -> Result<(), Error> {
+    for (hash, entries) in data {
+        for entry in entries {
+            if entry.populated.load(std::sync::atomic::Ordering::Relaxed)
+                && hash_file_range(&entry.path, entry.offset, entry.info.size)? != *hash
+            {
+                return Err(invalid_state(format!(
+                    "populated bytes in {} do not match chunk hash {hash}",
+                    entry.path.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn recompute_item_root(chunks: &[ChunkInfo]) -> Result<ChunkInfo, Error> {
+    if chunks.is_empty() {
+        return Err(invalid_state("item chunk list is empty"));
+    }
+    let mut partials = chunks.to_vec();
+    while partials.len() > 1 {
+        let n = partials.len();
+        for (to, index) in (0..n - 1).step_by(2).enumerate() {
+            partials[to] = ChunkInfo {
+                hash: merge_hashes(&partials[index].hash, &partials[index + 1].hash),
+                size: partials[index]
+                    .size
+                    .checked_add(partials[index + 1].size)
+                    .ok_or_else(|| invalid_state("item root size overflows u64"))?,
+            };
+        }
+        let half = n / 2;
+        if n % 2 != 0 {
+            partials.swap(half, n - 1);
+            partials.truncate(half + 1);
+        } else {
+            partials.truncate(half);
+        }
+    }
+    Ok(partials.swap_remove(0))
+}
+
+fn validate_retained_items(
+    items: &HashSet<Item>,
+    data: &HashMap<Hash, Vec<Arc<InFileChunk>>>,
+) -> Result<(), Error> {
+    let mut revision_identities = HashSet::default();
+    for item in items {
+        if item.metadata.artifact_id != item.manifest.artifact_id {
+            return Err(invalid_state(
+                "item metadata and manifest artifact IDs differ",
+            ));
+        }
+        if u64::from(item.metadata.revision) != item.manifest.version {
+            return Err(invalid_state("item metadata and manifest revisions differ"));
+        }
+        if !revision_identities.insert((item.metadata.artifact_id.clone(), item.manifest.version)) {
+            return Err(invalid_state(
+                "duplicate artifact ID and manifest version identity",
+            ));
+        }
+        let chunk_count = u32::try_from(item.chunks.len())
+            .map_err(|_| invalid_state("item has too many chunks"))?;
+        if chunk_count == 0 || item.manifest.chunk_count != chunk_count {
+            return Err(invalid_state("item manifest chunk count is inconsistent"));
+        }
+        if item.manifest.chunk_size != item.manifest.chunk_algorithm.nominal_chunk_size() {
+            return Err(invalid_state(
+                "item manifest nominal chunk size is inconsistent",
+            ));
+        }
+        let root = recompute_item_root(&item.chunks)?;
+        if item.metadata.root != root
+            || item.manifest.root_hash != root.hash
+            || item.manifest.total_size != root.size
+        {
+            return Err(invalid_state("item root or total size is inconsistent"));
+        }
+
+        let mut cursor = 0usize;
+        let mut previous_path: Option<PathBuf> = None;
+        let mut normalized_paths = HashSet::default();
+        for entry in &item.manifest.entries {
+            let normalized =
+                crate::utils::path::validate_relative(Path::new(&entry.relative_path))?;
+            if normalized.to_str() != Some(entry.relative_path.as_str()) {
+                return Err(invalid_state(
+                    "item entry path is not in canonical relative form",
+                ));
+            }
+            if normalized
+                .components()
+                .next()
+                .is_some_and(|component| component.as_os_str() == FS_STORAGE_REVISION_NAMESPACE)
+            {
+                return Err(invalid_state(
+                    "item entry path uses the reserved revision namespace",
+                ));
+            }
+            if !normalized_paths.insert(normalized.clone()) {
+                return Err(invalid_state(
+                    "item entry paths alias after canonical normalization",
+                ));
+            }
+            if previous_path
+                .as_ref()
+                .is_some_and(|previous| previous >= &normalized)
+            {
+                return Err(invalid_state(
+                    "item entry paths are duplicated or not strictly ordered",
+                ));
+            }
+            previous_path = Some(normalized);
+            let start = usize::try_from(entry.chunk_range.0).map_err(InvalidParameter::from)?;
+            let end = usize::try_from(entry.chunk_range.1).map_err(InvalidParameter::from)?;
+            if start != cursor || end <= start || end > item.chunks.len() {
+                return Err(invalid_state("item entry chunk ranges are inconsistent"));
+            }
+            let size = item.chunks[start..end]
+                .iter()
+                .try_fold(0_u64, |total, chunk| total.checked_add(chunk.size))
+                .ok_or_else(|| invalid_state("item entry size overflows u64"))?;
+            if size != entry.size {
+                return Err(invalid_state("item entry size is inconsistent"));
+            }
+            cursor = end;
+        }
+        if !item.manifest.entries.is_empty() && cursor != item.chunks.len() {
+            return Err(invalid_state("item entries do not cover every chunk"));
+        }
+
+        for chunk in &item.chunks {
+            let source = data.get(&chunk.hash).and_then(|entries| {
+                entries.iter().find(|entry| {
+                    entry.info == *chunk
+                        && entry.populated.load(std::sync::atomic::Ordering::Relaxed)
+                })
+            });
+            if source.is_none() {
+                return Err(invalid_state(format!(
+                    "item references unavailable populated chunk {}",
+                    chunk.hash
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_link_node(
     node: &Node,
     data: &HashMap<Hash, Vec<Arc<InFileChunk>>>,
@@ -704,9 +864,19 @@ fn validate_link_node(
                 }
             }
             Node::Stored { .. } => {
-                return Err(invalid_state(
-                    "persisted links cannot contain stored payload bytes",
-                ));
+                let hash = *node.hash();
+                let size = node.size();
+                let has_chunk = data.get(&hash).is_some_and(|entries| {
+                    entries.iter().any(|entry| {
+                        entry.info.size == size
+                            && entry.populated.load(std::sync::atomic::Ordering::Relaxed)
+                    })
+                });
+                if !has_chunk {
+                    return Err(invalid_state(
+                        "persisted link leaf has no matching populated chunk",
+                    ));
+                }
             }
         }
     }
@@ -780,9 +950,15 @@ fn relink_state_nodes(state: &mut FsStorageState) -> Result<(), Error> {
             Node::Skipped { hash, size } => {
                 relink_hash(*hash, *size, data, raw_links, memo, visiting, depth)
             }
-            Node::Stored { .. } => Err(invalid_state(
-                "persisted links cannot contain stored payload bytes",
-            )),
+            Node::Stored { hash, data: bytes } => relink_hash(
+                *hash,
+                bytes.len() as u64,
+                data,
+                raw_links,
+                memo,
+                visiting,
+                depth,
+            ),
         }
     }
 
@@ -852,9 +1028,13 @@ fn flatten_link_node(node: &Node) -> Result<Vec<FsStorageNodeV1>, Error> {
                     size: *size,
                 },
             ),
-            Node::Stored { .. } => Err(invalid_state(
-                "persisted links cannot contain stored payload bytes",
-            )),
+            Node::Stored { hash, data } => push_flat_link_record(
+                records,
+                FsStorageNodeV1::Skipped {
+                    hash: *hash,
+                    size: data.len() as u64,
+                },
+            ),
         }
     }
 
@@ -1084,6 +1264,8 @@ impl FsStorageStateV1 {
                 return Err(invalid_state("duplicate chunk-map hash"));
             }
         }
+        verify_populated_chunk_hashes(&data)?;
+        validate_retained_items(&items, &data)?;
 
         let mut links = HashMap::default();
         for entry in self.links {
@@ -1163,6 +1345,8 @@ impl LegacyFsStorageState {
             dirty: false,
             generation: 0,
         };
+        verify_populated_chunk_hashes(&runtime.data)?;
+        validate_retained_items(&runtime.items, &runtime.data)?;
         FsStorageStateV1::from_runtime(&runtime)
     }
 }
@@ -1365,21 +1549,28 @@ impl FsStorageState {
         left: Arc<Node>,
         right: Arc<Node>,
     ) -> Result<Arc<Node>, StorageError> {
-        let size = left.size() + right.size();
-        let res = self
-            .links
-            .entry(hash)
-            .or_insert_with(|| {
-                Arc::new(Node::Parent {
-                    hash,
-                    left,
-                    right,
-                    size,
-                })
-            })
-            .clone();
+        let size = left
+            .size()
+            .checked_add(right.size())
+            .ok_or(StorageError::ImmutableConflict)?;
+        if merge_hashes(left.hash(), right.hash()) != hash {
+            return Err(StorageError::ImmutableConflict);
+        }
+        let expected = Arc::new(Node::Parent {
+            hash,
+            left,
+            right,
+            size,
+        });
+        if let Some(existing) = self.links.get(&hash) {
+            if existing != &expected {
+                return Err(StorageError::ImmutableConflict);
+            }
+            return Ok(existing.clone());
+        }
+        self.links.insert(hash, expected.clone());
         self.mark_dirty();
-        Ok(res)
+        Ok(expected)
     }
 
     fn store_compact_link(
@@ -1444,6 +1635,186 @@ impl Default for FsStorage {
 impl FsStorage {
     fn artifact_entry_path(root: &Path, relative_path: &Path) -> Result<PathBuf, Error> {
         crate::utils::path::resolve_beneath(root, relative_path)
+    }
+
+    fn revision_chunk_path(&self, hash: &Hash) -> Result<PathBuf, Error> {
+        self.path(
+            &Path::new(FS_STORAGE_REVISION_NAMESPACE)
+                .join("chunks")
+                .join(format!("{hash}.chunk")),
+        )
+    }
+
+    fn verify_cas_chunk(path: &Path, expected: &ChunkInfo) -> Result<(), Error> {
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(invalid_state(format!(
+                "immutable chunk path {} is not a regular file",
+                path.display()
+            )));
+        }
+        if metadata.len() != expected.size
+            || hash_file_range(path, 0, expected.size)? != expected.hash
+        {
+            return Err(invalid_state(format!(
+                "immutable chunk path {} conflicts with hash {}",
+                path.display(),
+                expected.hash
+            )));
+        }
+        Ok(())
+    }
+
+    fn commit_cas_chunk(&self, expected: ChunkInfo, bytes: &[u8]) -> Result<(), Error> {
+        if bytes.len() as u64 != expected.size || do_hash(bytes) != expected.hash {
+            return Err(invalid_state(
+                "supplied revision bytes do not match prepared chunk metadata",
+            ));
+        }
+        let path = self.revision_chunk_path(&expected.hash)?;
+        let parent = path.parent().ok_or(Error::MissingData)?;
+        create_dir_all(parent)?;
+        match fs::symlink_metadata(&path) {
+            Ok(_) => Self::verify_cas_chunk(&path, &expected)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let staging =
+                    parent.join(format!(".{}.{}.tmp", expected.hash, uuid::Uuid::new_v4()));
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&staging)?;
+                if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+                    drop(file);
+                    let _ = remove_file(&staging);
+                    return Err(error.into());
+                }
+                drop(file);
+                match fs::hard_link(&staging, &path) {
+                    Ok(()) => {
+                        remove_file(&staging)?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        remove_file(&staging)?;
+                        Self::verify_cas_chunk(&path, &expected)?;
+                    }
+                    Err(error) => {
+                        let _ = remove_file(&staging);
+                        return Err(error.into());
+                    }
+                }
+                #[cfg(unix)]
+                File::open(parent)?.sync_all()?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+
+        let mut inner = self.inner.write().unwrap();
+        let locations = inner.data.entry(expected.hash).or_default();
+        if !locations.iter().any(|entry| entry.path == path) {
+            locations.insert(
+                0,
+                Arc::new(InFileChunk {
+                    info: expected,
+                    path,
+                    offset: 0,
+                    populated: Arc::new(AtomicBool::new(true)),
+                }),
+            );
+            inner.mark_dirty();
+        }
+        Ok(())
+    }
+
+    fn finish_cas_revision(&self, item: Item) -> Result<Item, Error> {
+        let partials = item
+            .chunks
+            .iter()
+            .map(|chunk| {
+                Arc::new(Node::Skipped {
+                    hash: chunk.hash,
+                    size: chunk.size,
+                })
+            })
+            .collect();
+        let root = self.finalize_sync_partials(partials)?;
+        if root.chunk_info() != item.metadata.root {
+            return Err(invalid_state(
+                "prepared revision root does not match its chunk sequence",
+            ));
+        }
+        self.inner.write().unwrap().insert_item(item.clone());
+        self.persist()?;
+        Ok(item)
+    }
+
+    fn migrate_referenced_chunks_to_cas(&self) -> Result<bool, Error> {
+        let referenced = self
+            .inner
+            .read()
+            .unwrap()
+            .items
+            .iter()
+            .flat_map(|item| item.chunks.iter().copied())
+            .collect::<HashSet<_>>();
+        if referenced.is_empty() {
+            return Ok(false);
+        }
+
+        let mut migrated = false;
+        for chunk in &referenced {
+            let cas_path = self.revision_chunk_path(&chunk.hash)?;
+            let source = {
+                let inner = self.inner.read().unwrap();
+                inner.data.get(&chunk.hash).and_then(|entries| {
+                    entries
+                        .iter()
+                        .find(|entry| {
+                            entry.info == *chunk
+                                && entry.populated.load(std::sync::atomic::Ordering::Relaxed)
+                        })
+                        .cloned()
+                })
+            };
+            let source = source.ok_or_else(|| {
+                invalid_state(format!(
+                    "item references unavailable populated chunk {}",
+                    chunk.hash
+                ))
+            })?;
+            if source.path == cas_path && source.offset == 0 {
+                Self::verify_cas_chunk(&cas_path, chunk)?;
+                continue;
+            }
+            let size = usize::try_from(chunk.size).map_err(InvalidParameter::from)?;
+            let mut bytes = vec![0; size];
+            let mut file = File::open(&source.path)?;
+            file.seek(std::io::SeekFrom::Start(source.offset))?;
+            file.read_exact(&mut bytes)?;
+            self.commit_cas_chunk(*chunk, &bytes)?;
+            migrated = true;
+        }
+
+        if migrated {
+            let mut inner = self.inner.write().unwrap();
+            for chunk in &referenced {
+                let cas_path = inner.path(
+                    &Path::new(FS_STORAGE_REVISION_NAMESPACE)
+                        .join("chunks")
+                        .join(format!("{}.chunk", chunk.hash)),
+                )?;
+                if let Some(entries) = inner.data.get_mut(&chunk.hash) {
+                    if let Some(index) = entries
+                        .iter()
+                        .position(|entry| entry.path == cas_path && entry.offset == 0)
+                    {
+                        let cas_entry = entries.remove(index);
+                        entries.insert(0, cas_entry);
+                    }
+                }
+            }
+            inner.mark_dirty();
+        }
+        Ok(migrated)
     }
 
     fn combine_sync_nodes(&self, left: Arc<Node>, right: Arc<Node>) -> Result<Arc<Node>, Error> {
@@ -1619,7 +1990,12 @@ impl FsStorage {
 
             let start = next_chunk_index;
             let mut offset = 0u64;
-            for (chunk_offset, length) in chunk_algorithm.chunk_boundaries(data.as_ref()) {
+            let boundaries = if data.is_empty() {
+                vec![(0, 0)]
+            } else {
+                chunk_algorithm.chunk_boundaries(data.as_ref())
+            };
+            for (chunk_offset, length) in boundaries {
                 let chunk = &data.as_ref()[chunk_offset..chunk_offset + length];
                 let hash = do_hash(chunk);
                 let chunk_info = ChunkInfo {
@@ -2247,13 +2623,17 @@ impl FsStorage {
             }
         }
 
-        Ok(Self {
+        let storage = Self {
             inner: RwLock::new(state),
             persistence_lock: Mutex::new(()),
             handles: RwLock::new(handles),
             chunk_cache: Mutex::new(HotChunkCache::new(cache_config.max_chunk_bytes)),
             tree_cache: Mutex::new(HotNodeCache::new(cache_config.max_tree_entries)),
-        })
+        };
+        if storage.migrate_referenced_chunks_to_cas()? {
+            storage.persist()?;
+        }
+        Ok(storage)
     }
 
     /// Returns the stored path of any path relative to root
@@ -2406,18 +2786,69 @@ impl ChunkStorage for FsStorage {
     }
 
     fn store_chunk(&self, hash: Hash, chunk: &[u8]) -> Result<Arc<Node>, StorageError> {
+        if do_hash(chunk) != hash {
+            return Err(StorageError::ImmutableConflict);
+        }
         // `InFileChunk::write` flips its populated atomic. Serialize that
         // transition with persistence so no envelope can publish populated
         // metadata before the corresponding bytes have been flushed.
         let _persistence = self.persistence_lock.lock().unwrap();
-        let infile_chunks = {
+        self.flush_handles()
+            .map_err(|_| StorageError::ChunkInsertError)?;
+        let (root, infile_chunks) = {
             let inner = self.inner.read().unwrap();
-            inner
-                .data
-                .get(&hash)
-                .cloned()
-                .ok_or(StorageError::ChunkInsertError)?
+            (
+                inner.root.clone(),
+                inner
+                    .data
+                    .get(&hash)
+                    .cloned()
+                    .ok_or(StorageError::ChunkInsertError)?,
+            )
         };
+
+        // Validate every target before the first write. A single altered or
+        // inconsistent backing must not permit partial mutation of siblings.
+        for infile_chunk in &infile_chunks {
+            if infile_chunk.info.hash != hash || infile_chunk.info.size != chunk.len() as u64 {
+                tracing::error!(
+                    "immutable chunk metadata mismatch: {:?} supplied {}",
+                    infile_chunk.info,
+                    chunk.len()
+                );
+                return Err(StorageError::ImmutableConflict);
+            }
+            if infile_chunk
+                .populated
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                let relative = relative_state_path(&root, &infile_chunk.path)
+                    .inspect_err(|error| {
+                        tracing::error!("immutable backing relative path: {error}")
+                    })
+                    .map_err(|_| StorageError::ImmutableConflict)?;
+                let path = validate_existing_chunk_path(
+                    &root,
+                    &relative,
+                    true,
+                    infile_chunk.offset,
+                    infile_chunk.info.size,
+                )
+                .inspect_err(|error| tracing::error!("immutable backing validation: {error}"))
+                .map_err(|_| StorageError::ImmutableConflict)?;
+                let actual = hash_file_range(&path, infile_chunk.offset, infile_chunk.info.size)
+                    .inspect_err(|error| tracing::error!("immutable backing read: {error}"))
+                    .map_err(|_| StorageError::ImmutableConflict)?;
+                if actual != hash {
+                    tracing::error!(
+                        "immutable backing hash mismatch: expected {hash}, got {actual} at {}+{}",
+                        path.display(),
+                        infile_chunk.offset
+                    );
+                    return Err(StorageError::ImmutableConflict);
+                }
+            }
+        }
 
         for infile_chunk in &infile_chunks {
             tracing::trace!("infile chunk {infile_chunk:?}");
@@ -2518,10 +2949,7 @@ impl ChunkStorage for FsStorage {
                 .unwrap()
                 .set_len(chunks.iter().map(|chunk| chunk.size).sum())?;
         }
-        tracing::info!("Preallocated on disk {:?}", stored_path);
-
         let (hash_tree, chunks) = self.build_compact_tree(file.as_ref(), chunk_algorithm)?;
-        let mut inner = self.inner.write().unwrap();
         let item = Item::make(
             name,
             path,
@@ -2531,9 +2959,7 @@ impl ChunkStorage for FsStorage {
             chunks,
             chunk_algorithm,
         )?;
-        tracing::debug!("New item: {item}");
-        inner.insert_item(item.clone());
-        drop(inner);
+        self.inner.write().unwrap().insert_item(item.clone());
         self.persist()?;
         Ok(item)
     }
@@ -2569,7 +2995,6 @@ impl ChunkStorage for FsStorage {
                 handle.lock().unwrap().set_len(entry.size)?;
             }
         }
-        let mut inner = self.inner.write().unwrap();
         let item = Item::make_with_entries(
             name,
             path,
@@ -2580,11 +3005,122 @@ impl ChunkStorage for FsStorage {
             entries,
             chunk_algorithm,
         )?;
-        tracing::debug!("New item: {item}");
-        inner.insert_item(item.clone());
-        drop(inner);
+        self.inner.write().unwrap().insert_item(item.clone());
         self.persist()?;
         Ok(item)
+    }
+
+    fn commit_revision(&self, item: Item, file: bytes::Bytes) -> Result<Item, Error>
+    where
+        Self: Sized,
+    {
+        let expected = self.prepare_revision(
+            item.metadata.artifact_id.clone(),
+            item.metadata.name.clone(),
+            item.metadata.path.clone(),
+            item.metadata.revision,
+            item.metadata.description.clone(),
+            file.clone(),
+            item.manifest.chunk_algorithm,
+        )?;
+        if !super::same_revision(&item, &expected) {
+            return Err(invalid_state(
+                "prepared revision does not exactly match supplied bytes",
+            ));
+        }
+        let boundaries = if file.is_empty() {
+            vec![(0, 0)]
+        } else {
+            item.manifest
+                .chunk_algorithm
+                .chunk_boundaries(file.as_ref())
+        };
+        if boundaries.len() != item.chunks.len() {
+            return Err(invalid_state(
+                "supplied revision has a different chunk count than prepared metadata",
+            ));
+        }
+        for ((offset, length), chunk) in boundaries.into_iter().zip(item.chunks.iter().copied()) {
+            self.commit_cas_chunk(chunk, &file[offset..offset + length])?;
+        }
+        self.finish_cas_revision(item)
+    }
+
+    fn commit_revision_from_files(
+        &self,
+        item: Item,
+        mut files: Vec<(PathBuf, bytes::Bytes)>,
+    ) -> Result<Item, Error>
+    where
+        Self: Sized,
+    {
+        let expected = self.prepare_revision_from_files(
+            item.metadata.artifact_id.clone(),
+            item.metadata.name.clone(),
+            item.metadata.path.clone(),
+            item.metadata.revision,
+            item.metadata.description.clone(),
+            files.clone(),
+            item.manifest.chunk_algorithm,
+        )?;
+        if !super::same_revision(&item, &expected) {
+            return Err(invalid_state(
+                "prepared directory revision does not exactly match supplied files",
+            ));
+        }
+        if files.is_empty() {
+            return Err(Error::MissingData);
+        }
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        if files.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err(invalid_state("directory revision contains duplicate paths"));
+        }
+        let supplied_entry_count = files.len();
+        let mut next_chunk = 0usize;
+        for (entry_index, (path, data)) in files.into_iter().enumerate() {
+            let path = crate::utils::path::validate_relative(&path)?;
+            let path = path
+                .to_str()
+                .ok_or_else(|| invalid_state("directory revision paths must be valid UTF-8"))?;
+            let start = u32::try_from(next_chunk).map_err(InvalidParameter::from)?;
+            let boundaries = if data.is_empty() {
+                vec![(0, 0)]
+            } else {
+                item.manifest
+                    .chunk_algorithm
+                    .chunk_boundaries(data.as_ref())
+            };
+            for (offset, length) in boundaries {
+                let chunk = item.chunks.get(next_chunk).copied().ok_or_else(|| {
+                    invalid_state("supplied directory has more chunks than prepared metadata")
+                })?;
+                self.commit_cas_chunk(chunk, &data[offset..offset + length])?;
+                next_chunk += 1;
+            }
+            let end = u32::try_from(next_chunk).map_err(InvalidParameter::from)?;
+            let expected_entry = item.manifest.entries.get(entry_index).ok_or_else(|| {
+                invalid_state("supplied directory has more entries than prepared metadata")
+            })?;
+            if expected_entry.relative_path != path
+                || expected_entry.size != data.len() as u64
+                || expected_entry.chunk_range != (start, end)
+            {
+                return Err(invalid_state(
+                    "supplied directory entry does not match prepared metadata",
+                ));
+            }
+        }
+        if item.manifest.entries.len() != supplied_entry_count {
+            return Err(invalid_state(
+                "supplied directory entry count does not match prepared metadata",
+            ));
+        }
+        if next_chunk != item.chunks.len() {
+            return Err(invalid_state(
+                "supplied directory has fewer chunks than prepared metadata",
+            ));
+        }
+        self.finish_cas_revision(item)
     }
 
     fn build_item(
@@ -2754,6 +3290,670 @@ mod tests {
             populated: Arc::default(),
         };
         (data, hash, infile_chunk)
+    }
+
+    #[test]
+    fn immutable_revisions_with_same_logical_path_survive_restart() {
+        let root = temp_path();
+        let storage = FsStorage::new(root.clone()).unwrap();
+        let algorithm = ChunkAlgorithm::default();
+        let first_bytes = bytes::Bytes::from(vec![1u8; CHUNK_SIZE * 2]);
+        let mut second_vec = first_bytes.to_vec();
+        second_vec[CHUNK_SIZE] = 2;
+        let second_bytes = bytes::Bytes::from(second_vec);
+
+        let first = storage
+            .prepare_revision(
+                "stable".to_string(),
+                "display".to_string(),
+                PathBuf::from("same.bin"),
+                0,
+                None,
+                first_bytes.clone(),
+                algorithm,
+            )
+            .unwrap();
+        let first = storage.commit_revision(first, first_bytes.clone()).unwrap();
+        let second = storage
+            .prepare_revision(
+                "stable".to_string(),
+                "display".to_string(),
+                PathBuf::from("same.bin"),
+                1,
+                None,
+                second_bytes.clone(),
+                algorithm,
+            )
+            .unwrap();
+        let second = storage
+            .commit_revision(second, second_bytes.clone())
+            .unwrap();
+
+        assert_eq!(
+            storage
+                .get(&first.metadata.root.hash)
+                .unwrap()
+                .clone_data()
+                .unwrap(),
+            first_bytes.to_vec()
+        );
+        assert_eq!(
+            storage
+                .get(&second.metadata.root.hash)
+                .unwrap()
+                .clone_data()
+                .unwrap(),
+            second_bytes.to_vec()
+        );
+        drop(storage);
+
+        let restarted = FsStorage::new(root).unwrap();
+        assert_eq!(
+            restarted
+                .get(&first.metadata.root.hash)
+                .unwrap()
+                .clone_data()
+                .unwrap(),
+            first_bytes.to_vec()
+        );
+        assert_eq!(
+            restarted
+                .get(&second.metadata.root.hash)
+                .unwrap()
+                .clone_data()
+                .unwrap(),
+            second_bytes.to_vec()
+        );
+    }
+
+    #[test]
+    fn immutable_directory_revision_keeps_removed_and_renamed_entries() {
+        let root = temp_path();
+        let storage = FsStorage::new(root.clone()).unwrap();
+        let algorithm = ChunkAlgorithm::default();
+        let first_files = vec![
+            (PathBuf::from("a.txt"), bytes::Bytes::from_static(b"alpha")),
+            (PathBuf::from("gone.txt"), bytes::Bytes::from_static(b"old")),
+        ];
+        let second_files = vec![
+            (
+                PathBuf::from("renamed.txt"),
+                bytes::Bytes::from_static(b"alpha"),
+            ),
+            (PathBuf::from("new.txt"), bytes::Bytes::from_static(b"new")),
+        ];
+        let first = storage
+            .prepare_revision_from_files(
+                "directory".to_string(),
+                "directory".to_string(),
+                PathBuf::from("same-dir"),
+                0,
+                None,
+                first_files.clone(),
+                algorithm,
+            )
+            .unwrap();
+        let first = storage
+            .commit_revision_from_files(first, first_files)
+            .unwrap();
+        let second = storage
+            .prepare_revision_from_files(
+                "directory".to_string(),
+                "directory".to_string(),
+                PathBuf::from("same-dir"),
+                1,
+                None,
+                second_files.clone(),
+                algorithm,
+            )
+            .unwrap();
+        storage
+            .commit_revision_from_files(second, second_files)
+            .unwrap();
+        drop(storage);
+
+        let restarted = FsStorage::new(root).unwrap();
+        assert_eq!(
+            restarted.get_chunk_by_index(&first.metadata.root.hash, 0),
+            Some(b"alpha".to_vec())
+        );
+        assert_eq!(
+            restarted.get_chunk_by_index(&first.metadata.root.hash, 1),
+            Some(b"old".to_vec())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn immutable_chunk_cas_rejects_symbolic_link_conflict() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_path();
+        let storage = FsStorage::new(root.clone()).unwrap();
+        let bytes = bytes::Bytes::from_static(b"cas-conflict");
+        let item = storage
+            .prepare_revision(
+                "stable".to_string(),
+                "stable".to_string(),
+                PathBuf::from("logical"),
+                0,
+                None,
+                bytes.clone(),
+                ChunkAlgorithm::default(),
+            )
+            .unwrap();
+        let cas_path = storage.revision_chunk_path(&item.chunks[0].hash).unwrap();
+        fs::create_dir_all(cas_path.parent().unwrap()).unwrap();
+        let outside = temp_path();
+        fs::write(&outside, bytes.as_ref()).unwrap();
+        symlink(&outside, &cas_path).unwrap();
+
+        assert!(storage.commit_revision(item, bytes).is_err());
+    }
+
+    #[test]
+    fn immutable_revision_delta_adds_only_unique_chunk_bytes() {
+        fn file_bytes(path: &Path) -> u64 {
+            fs::read_dir(path)
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .map(|entry| {
+                    let metadata = entry.metadata().unwrap();
+                    if metadata.is_dir() {
+                        file_bytes(&entry.path())
+                    } else {
+                        metadata.len()
+                    }
+                })
+                .sum()
+        }
+
+        let root = temp_path();
+        let storage = FsStorage::new(root.clone()).unwrap();
+        let algorithm = ChunkAlgorithm::default();
+        let first_bytes = bytes::Bytes::from(vec![1u8; 16 * 1024 * 1024]);
+        let first = storage
+            .prepare_revision(
+                "stable".to_string(),
+                "stable".to_string(),
+                PathBuf::from("logical"),
+                0,
+                None,
+                first_bytes.clone(),
+                algorithm,
+            )
+            .unwrap();
+        storage.commit_revision(first, first_bytes.clone()).unwrap();
+        let before = file_bytes(&root.join(FS_STORAGE_REVISION_NAMESPACE));
+
+        let mut changed = first_bytes.to_vec();
+        changed[CHUNK_SIZE] = 2;
+        let changed = bytes::Bytes::from(changed);
+        let second = storage
+            .prepare_revision(
+                "stable".to_string(),
+                "stable".to_string(),
+                PathBuf::from("logical"),
+                1,
+                None,
+                changed.clone(),
+                algorithm,
+            )
+            .unwrap();
+        storage.commit_revision(second, changed).unwrap();
+        let added = file_bytes(&root.join(FS_STORAGE_REVISION_NAMESPACE)) - before;
+
+        assert!(added <= (CHUNK_SIZE as u64 * 11) / 10);
+    }
+
+    #[test]
+    fn forged_revisions_are_rejected_before_cas_or_index_mutation() {
+        let root = temp_path();
+        let storage = FsStorage::new(root.clone()).unwrap();
+        let bytes = bytes::Bytes::from_static(b"forged-revision");
+        let mut forged = storage
+            .prepare_revision(
+                "stable".to_string(),
+                "display".to_string(),
+                PathBuf::from("logical.bin"),
+                0,
+                None,
+                bytes.clone(),
+                ChunkAlgorithm::default(),
+            )
+            .unwrap();
+        let root_hash = forged.metadata.root.hash;
+        let cas_path = storage.revision_chunk_path(&forged.chunks[0].hash).unwrap();
+        forged.manifest.artifact_id = "forged-authority".to_string();
+
+        assert!(storage.commit_revision(forged, bytes).is_err());
+        assert!(!cas_path.exists());
+        assert!(storage.get(&root_hash).is_none());
+
+        let files = vec![(
+            PathBuf::from("entry.txt"),
+            bytes::Bytes::from_static(b"directory"),
+        )];
+        let mut forged_directory = storage
+            .prepare_revision_from_files(
+                "stable-directory".to_string(),
+                "display".to_string(),
+                PathBuf::from("logical-dir"),
+                0,
+                None,
+                files.clone(),
+                ChunkAlgorithm::default(),
+            )
+            .unwrap();
+        let directory_root = forged_directory.metadata.root.hash;
+        let directory_cas = storage
+            .revision_chunk_path(&forged_directory.chunks[0].hash)
+            .unwrap();
+        forged_directory.manifest.entries[0].size += 1;
+
+        assert!(storage
+            .commit_revision_from_files(forged_directory, files)
+            .is_err());
+        assert!(!directory_cas.exists());
+        assert!(storage.get(&directory_root).is_none());
+    }
+
+    #[test]
+    fn generic_storage_rejects_forged_chunk_and_link_keys_without_mutation() {
+        let storage = FsStorage::new(temp_path()).unwrap();
+        let bytes = b"chunk";
+        let forged_hash = do_hash(b"different");
+        assert!(matches!(
+            storage.store_chunk(forged_hash, bytes),
+            Err(StorageError::ImmutableConflict)
+        ));
+        assert!(!storage
+            .inner
+            .read()
+            .unwrap()
+            .data
+            .contains_key(&forged_hash));
+
+        let left = Arc::new(Node::Skipped {
+            hash: do_hash(b"left"),
+            size: 4,
+        });
+        let right = Arc::new(Node::Skipped {
+            hash: do_hash(b"right"),
+            size: 5,
+        });
+        let correct = merge_hashes(left.hash(), right.hash());
+        assert!(matches!(
+            storage.store_link(do_hash(b"wrong"), left.clone(), right.clone()),
+            Err(StorageError::ImmutableConflict)
+        ));
+        assert!(storage.inner.read().unwrap().links.is_empty());
+
+        storage
+            .store_link(correct, left.clone(), right.clone())
+            .unwrap();
+        let conflicting_left = Arc::new(Node::Skipped {
+            hash: *left.hash(),
+            size: left.size() + 1,
+        });
+        assert!(matches!(
+            storage.store_link(correct, conflicting_left, right),
+            Err(StorageError::ImmutableConflict)
+        ));
+        assert_eq!(storage.inner.read().unwrap().links.len(), 1);
+    }
+
+    #[test]
+    fn store_chunk_rejects_altered_populated_backing_before_sibling_mutation() {
+        let root = temp_path();
+        let storage = FsStorage::new(root.clone()).unwrap();
+        let supplied = b"verified";
+        let info = ChunkInfo {
+            hash: do_hash(supplied),
+            size: supplied.len() as u64,
+        };
+        let altered_path = root.join("altered.bin");
+        let untouched_path = root.join("untouched.bin");
+        storage.pre_allocate_chunk(&altered_path, &info, 0).unwrap();
+        storage
+            .pre_allocate_chunk(&untouched_path, &info, 0)
+            .unwrap();
+        fs::write(&altered_path, b"tampered").unwrap();
+        let untouched = vec![0x5a; supplied.len()];
+        fs::write(&untouched_path, &untouched).unwrap();
+        {
+            let inner = storage.inner.read().unwrap();
+            inner.data[&info.hash]
+                .iter()
+                .find(|entry| entry.path == altered_path)
+                .unwrap()
+                .populated
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        assert!(matches!(
+            storage.store_chunk(info.hash, supplied),
+            Err(StorageError::ImmutableConflict)
+        ));
+        assert_eq!(fs::read(&altered_path).unwrap(), b"tampered");
+        assert_eq!(fs::read(&untouched_path).unwrap(), untouched);
+        let inner = storage.inner.read().unwrap();
+        assert!(!inner.data[&info.hash]
+            .iter()
+            .find(|entry| entry.path == untouched_path)
+            .unwrap()
+            .populated
+            .load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn store_chunk_rejects_unpopulated_size_mismatch_without_write() {
+        let root = temp_path();
+        let storage = FsStorage::new(root.clone()).unwrap();
+        let supplied = b"short";
+        let info = ChunkInfo {
+            hash: do_hash(supplied),
+            size: supplied.len() as u64 + 1,
+        };
+        let path = root.join("sized.bin");
+        storage.pre_allocate_chunk(&path, &info, 0).unwrap();
+        let original = vec![0x33; supplied.len() + 1];
+        fs::write(&path, &original).unwrap();
+
+        assert!(matches!(
+            storage.store_chunk(info.hash, supplied),
+            Err(StorageError::ImmutableConflict)
+        ));
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(!storage.inner.read().unwrap().data[&info.hash][0]
+            .populated
+            .load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn duplicate_current_revision_identity_fails_without_rewriting_source() {
+        let root = temp_path();
+        let storage = FsStorage::new(root.clone()).unwrap();
+        for bytes in [
+            bytes::Bytes::from_static(b"first"),
+            bytes::Bytes::from_static(b"second"),
+        ] {
+            let item = storage
+                .prepare_revision(
+                    "same-artifact".to_string(),
+                    "display".to_string(),
+                    PathBuf::from("logical"),
+                    0,
+                    None,
+                    bytes.clone(),
+                    ChunkAlgorithm::default(),
+                )
+                .unwrap();
+            storage.commit_revision(item, bytes).unwrap();
+        }
+        let current_path = storage.inner.read().unwrap().persistance_path.clone();
+        let source = fs::read(&current_path).unwrap();
+        drop(storage);
+
+        assert!(FsStorage::new(root).is_err());
+        assert_eq!(fs::read(current_path).unwrap(), source);
+    }
+
+    #[test]
+    fn normalized_alias_in_current_directory_fails_without_rewriting_source() {
+        let root = temp_path();
+        let storage = FsStorage::new(root.clone()).unwrap();
+        let files = vec![(
+            PathBuf::from("nested/file.txt"),
+            bytes::Bytes::from_static(b"entry"),
+        )];
+        let item = storage
+            .prepare_revision_from_files(
+                "directory".to_string(),
+                "directory".to_string(),
+                PathBuf::from("logical"),
+                0,
+                None,
+                files.clone(),
+                ChunkAlgorithm::default(),
+            )
+            .unwrap();
+        storage.commit_revision_from_files(item, files).unwrap();
+        let current_path = storage.inner.read().unwrap().persistance_path.clone();
+        let payload = read_enveloped_state(
+            &current_path,
+            DurableStateKind::FsStorage,
+            FS_STORAGE_PAYLOAD_SCHEMA,
+            MAX_DURABLE_STATE_PAYLOAD,
+        )
+        .unwrap();
+        let mut state: FsStorageStateV1 = bitcode::deserialize(&payload).unwrap();
+        state.items[0].manifest.entries[0].relative_path = "nested/./file.txt".to_string();
+        let payload = bitcode::serialize(&state).unwrap();
+        replace_enveloped_state(
+            &current_path,
+            DurableStateKind::FsStorage,
+            FS_STORAGE_PAYLOAD_SCHEMA,
+            &payload,
+            MAX_DURABLE_STATE_PAYLOAD,
+        )
+        .unwrap();
+        let source = fs::read(&current_path).unwrap();
+        drop(storage);
+
+        assert!(FsStorage::new(root).is_err());
+        assert_eq!(fs::read(current_path).unwrap(), source);
+    }
+
+    #[test]
+    fn semantically_invalid_current_item_fails_without_rewriting_source() {
+        let root = temp_path();
+        let storage = FsStorage::new(root.clone()).unwrap();
+        let bytes = bytes::Bytes::from_static(b"current-state");
+        let item = storage
+            .prepare_revision(
+                "stable".to_string(),
+                "stable".to_string(),
+                PathBuf::from("logical"),
+                0,
+                None,
+                bytes.clone(),
+                ChunkAlgorithm::default(),
+            )
+            .unwrap();
+        storage.commit_revision(item, bytes).unwrap();
+        let current_path = storage.inner.read().unwrap().persistance_path.clone();
+        let payload = read_enveloped_state(
+            &current_path,
+            DurableStateKind::FsStorage,
+            FS_STORAGE_PAYLOAD_SCHEMA,
+            MAX_DURABLE_STATE_PAYLOAD,
+        )
+        .unwrap();
+        let mut state: FsStorageStateV1 = bitcode::deserialize(&payload).unwrap();
+        state.items[0].manifest.chunk_count += 1;
+        let payload = bitcode::serialize(&state).unwrap();
+        replace_enveloped_state(
+            &current_path,
+            DurableStateKind::FsStorage,
+            FS_STORAGE_PAYLOAD_SCHEMA,
+            &payload,
+            MAX_DURABLE_STATE_PAYLOAD,
+        )
+        .unwrap();
+        let invalid_source = fs::read(&current_path).unwrap();
+        drop(storage);
+
+        assert!(FsStorage::new(root).is_err());
+        assert_eq!(fs::read(current_path).unwrap(), invalid_source);
+    }
+
+    #[test]
+    fn semantically_invalid_legacy_item_fails_without_rewriting_source() {
+        let requested_root = temp_path();
+        fs::create_dir_all(&requested_root).unwrap();
+        let root = fs::canonicalize(&requested_root).unwrap();
+        let bytes = b"legacy-invalid";
+        let info = ChunkInfo {
+            hash: do_hash(bytes),
+            size: bytes.len() as u64,
+        };
+        let artifact_path = root.join("artifact.bin");
+        fs::write(&artifact_path, bytes).unwrap();
+        let mut item = Item::make(
+            "legacy".to_string(),
+            PathBuf::from("artifact.bin"),
+            0,
+            None,
+            info,
+            vec![info],
+            ChunkAlgorithm::default(),
+        )
+        .unwrap();
+        item.manifest.version = 1;
+        let persistance_dir = cache_dir().join("chunk_storage").join("fs_storage");
+        fs::create_dir_all(&persistance_dir).unwrap();
+        let legacy_path =
+            persistance_dir.join(requested_root.to_string_lossy().replace('/', "___"));
+        let current_path =
+            persistance_dir.join(identity_filename(&fs_storage_root_identity(&root).unwrap()));
+        let legacy = LegacyFsStorageState {
+            root,
+            items: HashSet::from_iter([item]),
+            persistance_path: legacy_path.clone(),
+            data: HashMap::from_iter([(
+                info.hash,
+                vec![Arc::new(InFileChunk {
+                    info,
+                    path: artifact_path,
+                    offset: 0,
+                    populated: Arc::new(AtomicBool::new(true)),
+                })],
+            )]),
+            links: HashMap::default(),
+        };
+        let source = bitcode::serialize(&legacy).unwrap();
+        fs::write(&legacy_path, &source).unwrap();
+
+        assert!(FsStorage::new(requested_root).is_err());
+        assert_eq!(fs::read(legacy_path).unwrap(), source);
+        assert!(!current_path.exists());
+    }
+
+    #[test]
+    fn duplicate_legacy_revision_identity_fails_without_rewriting_source() {
+        let requested_root = temp_path();
+        fs::create_dir_all(&requested_root).unwrap();
+        let root = fs::canonicalize(&requested_root).unwrap();
+        let mut items = HashSet::default();
+        let mut data = HashMap::default();
+        for (index, bytes) in [b"legacy-one".as_slice(), b"legacy-two".as_slice()]
+            .into_iter()
+            .enumerate()
+        {
+            let info = ChunkInfo {
+                hash: do_hash(bytes),
+                size: bytes.len() as u64,
+            };
+            let relative = PathBuf::from(format!("artifact-{index}.bin"));
+            let path = root.join(&relative);
+            fs::write(&path, bytes).unwrap();
+            let item = Item::make(
+                "same-artifact".to_string(),
+                relative,
+                0,
+                None,
+                info,
+                vec![info],
+                ChunkAlgorithm::default(),
+            )
+            .unwrap();
+            items.insert(item);
+            data.insert(
+                info.hash,
+                vec![Arc::new(InFileChunk {
+                    info,
+                    path,
+                    offset: 0,
+                    populated: Arc::new(AtomicBool::new(true)),
+                })],
+            );
+        }
+        let persistance_dir = cache_dir().join("chunk_storage").join("fs_storage");
+        fs::create_dir_all(&persistance_dir).unwrap();
+        let legacy_path =
+            persistance_dir.join(requested_root.to_string_lossy().replace('/', "___"));
+        let current_path =
+            persistance_dir.join(identity_filename(&fs_storage_root_identity(&root).unwrap()));
+        let source = bitcode::serialize(&LegacyFsStorageState {
+            root,
+            items,
+            persistance_path: legacy_path.clone(),
+            data,
+            links: HashMap::default(),
+        })
+        .unwrap();
+        fs::write(&legacy_path, &source).unwrap();
+
+        assert!(FsStorage::new(requested_root).is_err());
+        assert_eq!(fs::read(legacy_path).unwrap(), source);
+        assert!(!current_path.exists());
+    }
+
+    #[test]
+    fn normalized_alias_in_legacy_directory_fails_without_rewriting_source() {
+        let requested_root = temp_path();
+        fs::create_dir_all(&requested_root).unwrap();
+        let root = fs::canonicalize(&requested_root).unwrap();
+        let bytes = b"legacy-directory";
+        let info = ChunkInfo {
+            hash: do_hash(bytes),
+            size: bytes.len() as u64,
+        };
+        let artifact_path = root.join("artifact.bin");
+        fs::write(&artifact_path, bytes).unwrap();
+        let item = Item::make_with_entries(
+            "directory".to_string(),
+            PathBuf::from("logical"),
+            0,
+            None,
+            info,
+            vec![info],
+            vec![FileEntry {
+                relative_path: "nested/./file.txt".to_string(),
+                size: info.size,
+                chunk_range: (0, 1),
+            }],
+            ChunkAlgorithm::default(),
+        )
+        .unwrap();
+        let persistance_dir = cache_dir().join("chunk_storage").join("fs_storage");
+        fs::create_dir_all(&persistance_dir).unwrap();
+        let legacy_path =
+            persistance_dir.join(requested_root.to_string_lossy().replace('/', "___"));
+        let current_path =
+            persistance_dir.join(identity_filename(&fs_storage_root_identity(&root).unwrap()));
+        let source = bitcode::serialize(&LegacyFsStorageState {
+            root,
+            items: HashSet::from_iter([item]),
+            persistance_path: legacy_path.clone(),
+            data: HashMap::from_iter([(
+                info.hash,
+                vec![Arc::new(InFileChunk {
+                    info,
+                    path: artifact_path,
+                    offset: 0,
+                    populated: Arc::new(AtomicBool::new(true)),
+                })],
+            )]),
+            links: HashMap::default(),
+        })
+        .unwrap();
+        fs::write(&legacy_path, &source).unwrap();
+
+        assert!(FsStorage::new(requested_root).is_err());
+        assert_eq!(fs::read(legacy_path).unwrap(), source);
+        assert!(!current_path.exists());
     }
 
     #[test]
@@ -3579,14 +4779,17 @@ mod tests {
         assert_eq!(legacy.data.len(), 1);
         assert_eq!(legacy.links.len(), 1);
 
-        // The frozen bytes intentionally contain absolute historical paths,
-        // so relocate only the decoded path authority for a portable migration
-        // run. All non-path historical values still originate in HEX above.
+        // The frozen bytes intentionally contain absolute historical paths and
+        // no external payload bytes. Relocate path and byte authority into a
+        // portable, self-consistent representation before exercising the real
+        // constructor migration; the literal decode assertions above remain
+        // the compatibility check for the historical DTO.
         let requested_root = temp_path();
         fs::create_dir_all(&requested_root).unwrap();
         let root = fs::canonicalize(&requested_root).unwrap();
         let artifact_path = root.join("artifact.bin");
-        fs::write(&artifact_path, b"legacy-data").unwrap();
+        let fixture_bytes = b"legacy-data";
+        fs::write(&artifact_path, fixture_bytes).unwrap();
         let persistance_dir = cache_dir().join("chunk_storage").join("fs_storage");
         fs::create_dir_all(&persistance_dir).unwrap();
         let legacy_path =
@@ -3597,11 +4800,37 @@ mod tests {
         let mut relocatable = legacy;
         relocatable.root = root.clone();
         relocatable.persistance_path = legacy_path.clone();
-        for entries in relocatable.data.values_mut() {
-            for entry in entries {
-                Arc::make_mut(entry).path = artifact_path.clone();
-            }
+        let relocated_info = ChunkInfo {
+            hash: do_hash(fixture_bytes),
+            size: fixture_bytes.len() as u64,
+        };
+        let mut relocated_items = HashSet::default();
+        for mut item in relocatable.items.drain() {
+            item.metadata.root = relocated_info;
+            item.manifest.root_hash = relocated_info.hash;
+            item.manifest.total_size = relocated_info.size;
+            item.chunks = vec![relocated_info];
+            relocated_items.insert(item);
         }
+        relocatable.items = relocated_items;
+        let mut relocated_entries = relocatable.data.drain().next().unwrap().1;
+        for entry in &mut relocated_entries {
+            let entry = Arc::make_mut(entry);
+            entry.info = relocated_info;
+            entry.path = artifact_path.clone();
+            entry.offset = 0;
+        }
+        relocatable
+            .data
+            .insert(relocated_info.hash, relocated_entries);
+        relocatable.links.clear();
+        relocatable.links.insert(
+            relocated_info.hash,
+            Arc::new(Node::Skipped {
+                hash: relocated_info.hash,
+                size: relocated_info.size,
+            }),
+        );
         let expected = relocatable.clone().into_v1(&root, &legacy_path).unwrap();
         assert_eq!(expected.items.len(), 1);
         assert_eq!(expected.data.len(), 1);
@@ -3612,14 +4841,6 @@ mod tests {
             Path::new("artifact.bin")
         );
         assert!(expected.data[0].chunks[0].populated);
-        let expected_runtime_projection = FsStorageStateV1::from_runtime(
-            &expected
-                .clone()
-                .into_runtime(root.clone(), current_path.clone())
-                .unwrap(),
-        )
-        .unwrap();
-
         let relocated_legacy_bytes = bitcode::serialize(&relocatable).unwrap();
         fs::write(&legacy_path, &relocated_legacy_bytes).unwrap();
         let storage = FsStorage::new(requested_root.clone()).unwrap();
@@ -3633,20 +4854,26 @@ mod tests {
         )
         .unwrap();
         let current: FsStorageStateV1 = bitcode::deserialize(&current_payload).unwrap();
-        assert_eq!(current, expected);
         let runtime_projection = {
             let inner = storage.inner.read().unwrap();
             assert_eq!(inner.items.len(), 1);
             assert_eq!(inner.data.len(), 1);
             FsStorageStateV1::from_runtime(&inner).unwrap()
         };
-        assert_eq!(runtime_projection, expected_runtime_projection);
+        assert_eq!(current, runtime_projection);
+        assert_eq!(current.items, expected.items);
+        assert!(current.data[0].chunks.iter().any(|chunk| {
+            chunk
+                .relative_path
+                .starts_with(FS_STORAGE_REVISION_NAMESPACE)
+                && chunk.populated
+        }));
         drop(storage);
 
         let restarted = FsStorage::new(requested_root).unwrap();
         let restart_projection =
             FsStorageStateV1::from_runtime(&restarted.inner.read().unwrap()).unwrap();
-        assert_eq!(restart_projection, expected_runtime_projection);
+        assert_eq!(restart_projection, current);
         assert_eq!(fs::read(legacy_path).unwrap(), relocated_legacy_bytes);
     }
 

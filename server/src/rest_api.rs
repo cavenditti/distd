@@ -101,7 +101,7 @@ async fn register_client<T>(
     State(server): State<Server<T>>,
 ) -> Result<impl IntoResponse, StatusCode>
 where
-    T: ChunkStorage + Sync + Send + Debug,
+    T: ChunkStorage + Sync + Send + Debug + 'static,
 {
     server
         .register_client(
@@ -264,7 +264,7 @@ async fn publish_item<T>(
     mut multipart: Multipart,
 ) -> Result<impl IntoResponse, StatusCode>
 where
-    T: ChunkStorage + Sync + Send + Debug,
+    T: ChunkStorage + Sync + Send + Debug + 'static,
 {
     let destination = validate_relative(&item_data.path).map_err(|_| StatusCode::BAD_REQUEST)?;
     let artifact_id = item_data

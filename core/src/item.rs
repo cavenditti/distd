@@ -133,6 +133,15 @@ impl Item {
         self
     }
 
+    /// Bind a side-effect-free prepared item to the revision selected by the
+    /// publication coordinator.
+    #[must_use]
+    pub fn with_revision(mut self, revision: u32) -> Self {
+        self.metadata.revision = revision;
+        self.manifest.version = u64::from(revision);
+        self
+    }
+
     /// Create a new Item from its metadata and `Node`
     ///
     /// Calling `create_item` on a `ChunkStorage` object encapsulates this and its the recommended way to create
