@@ -532,6 +532,7 @@ dependencies = [
  "flate2",
  "libc",
  "rand 0.8.5",
+ "ring",
  "serde",
  "serde_json",
  "sysinfo",
