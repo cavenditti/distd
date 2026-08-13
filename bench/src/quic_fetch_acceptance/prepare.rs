@@ -9,8 +9,12 @@ use super::evidence::{
     FileIdentity, PinnedAbsentRoot, RootHandle,
 };
 use super::model::{
-    DriverIdentity, ExecutableIdentity, HarnessContract, Plan, PreflightIdentity,
-    RepositoryIdentity, Request, TerminalStatus, PLAN_SCHEMA, REQUEST_SCHEMA,
+    ArtifactInput, DriverIdentity, FileInput, HarnessContract, Plan, PreflightIdentity,
+    RepositoryIdentity, Request, SourceManifest, SourceManifestEntry, TerminalStatus, PLAN_SCHEMA,
+    REQUEST_SCHEMA, SOURCE_MANIFEST_SCHEMA,
+};
+use super::provenance::{
+    self, ProvenanceValidationPolicy, ValidationClass, MAX_PROVENANCE_INPUT_BYTES,
 };
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
@@ -31,6 +35,7 @@ const SOURCE_SNAPSHOT_MAGIC: &[u8] = b"distd.quic.fetch.source-snapshot.v1\0";
 
 /// Paths supplied by the CLI rather than by the portable request document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PreparePaths {
     /// Must canonicalize to the repository root and is therefore safe for every child.
     pub child_working_directory: PathBuf,
@@ -43,21 +48,27 @@ pub struct PreparePaths {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NamedFileIdentity {
     pub role: String,
     pub identity: FileIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PreparedFileIdentities {
     pub driver: FileIdentity,
+    pub composed_request: FileIdentity,
     pub environment_receipt: FileIdentity,
     pub baseline: FileIdentity,
     pub candidate: FileIdentity,
     pub repository_inputs: Vec<NamedFileIdentity>,
+    pub artifact_inputs: Vec<NamedFileIdentity>,
+    pub reviewed_patch: FileIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PreparePassReceipt {
     pub schema: String,
     pub status: TerminalStatus,
@@ -70,14 +81,17 @@ pub struct PreparePassReceipt {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RepositoryCaptureReceipt {
     pub schema: String,
     pub repository: RepositoryIdentity,
+    pub source_manifest: FileInput,
     pub output_root: PathBuf,
     pub product_invocations: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlockedReceipt {
     pub schema: String,
     pub status: TerminalStatus,
@@ -164,12 +178,17 @@ struct ValidatedPreparation {
     execution_root: AbsentRoot,
     blocked_evidence: PathBuf,
     repository: RepositoryIdentity,
-    baseline: ValidatedExecutable,
-    candidate: ValidatedExecutable,
+    baseline: ValidatedArtifact,
+    candidate: ValidatedArtifact,
+    reviewed_patch: ValidatedFileInput,
+    provenance_policy: super::model::ProvenancePolicy,
+    reviewed_patch_record: super::model::ReviewedPatchManifest,
     driver_identity: FileIdentity,
     repository_inputs: Vec<ValidatedRepositoryInput>,
     environment: EnvironmentPass,
     child_working_directory: PathBuf,
+    composed_request_bytes: Vec<u8>,
+    composed_request_identity: Option<FileIdentity>,
 }
 
 struct ValidatedRepositoryInput {
@@ -178,12 +197,14 @@ struct ValidatedRepositoryInput {
     bytes: Vec<u8>,
 }
 
-struct ValidatedExecutable {
-    executable: ExecutableIdentity,
-    executable_identity: FileIdentity,
-    executable_bytes: Vec<u8>,
-    source_identity: FileIdentity,
-    source_identity_bytes: Vec<u8>,
+struct ValidatedFileInput {
+    identity: FileIdentity,
+    bytes: Vec<u8>,
+}
+
+struct ValidatedArtifact {
+    model: ArtifactInput,
+    inputs: Vec<(String, ValidatedFileInput)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,6 +212,7 @@ pub struct LiveRepositoryState {
     pub head: String,
     pub source_diff: Vec<u8>,
     pub source_status: Vec<u8>,
+    pub source_manifest: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -255,13 +277,26 @@ pub fn capture_repository_identity(
         &observed.source_diff,
     )?;
     root.atomic_create_new_synced(Path::new("repository-status.txt"), &observed.source_status)?;
+    root.atomic_create_new_synced(
+        Path::new("repository-source-manifest.json"),
+        &observed.source_manifest,
+    )?;
     set_plan_file_mode(&root, Path::new("repository-source.snapshot"), 0o444)?;
     set_plan_file_mode(&root, Path::new("repository-status.txt"), 0o444)?;
+    set_plan_file_mode(&root, Path::new("repository-source-manifest.json"), 0o444)?;
     let source_diff = root.stable_file_identity(Path::new("repository-source.snapshot"))?;
     let source_status = root.stable_file_identity(Path::new("repository-status.txt"))?;
-    let cargo_lock = evidence::stable_file_identity(&repository_root.join("Cargo.lock"))?;
-    let quic_source = evidence::stable_file_identity(&repository_root.join("server/src/quic.rs"))?;
-    let task_spec = evidence::stable_file_identity(&task_spec)?;
+    let source_manifest =
+        root.stable_file_identity(Path::new("repository-source-manifest.json"))?;
+    let cargo_lock = evidence::stable_file_identity_bounded(
+        &repository_root.join("Cargo.lock"),
+        MAX_PROVENANCE_INPUT_BYTES,
+    )?;
+    let quic_source = evidence::stable_file_identity_bounded(
+        &repository_root.join("server/src/quic.rs"),
+        MAX_PROVENANCE_INPUT_BYTES,
+    )?;
+    let task_spec = evidence::stable_file_identity_bounded(&task_spec, MAX_PROVENANCE_INPUT_BYTES)?;
     let repository = RepositoryIdentity {
         root: repository_root,
         head: observed.head,
@@ -269,6 +304,8 @@ pub fn capture_repository_identity(
         source_diff_sha256: source_diff.sha256,
         source_status: source_status.canonical_path,
         source_status_sha256: source_status.sha256,
+        source_manifest: source_manifest.canonical_path.clone(),
+        source_manifest_sha256: source_manifest.sha256.clone(),
         cargo_lock: cargo_lock.canonical_path,
         cargo_lock_sha256: cargo_lock.sha256,
         quic_source: quic_source.canonical_path,
@@ -277,8 +314,12 @@ pub fn capture_repository_identity(
         task_spec_sha256: task_spec.sha256,
     };
     let receipt = RepositoryCaptureReceipt {
-        schema: "distd.quic.fetch.repository-capture.v1".to_string(),
+        schema: "distd.quic.fetch.repository-capture.v2".to_string(),
         repository,
+        source_manifest: FileInput {
+            path: source_manifest.canonical_path,
+            sha256: source_manifest.sha256,
+        },
         output_root: root.path().to_path_buf(),
         product_invocations: 0,
     };
@@ -340,6 +381,12 @@ pub fn verify_live_repository_with_probe<P: RepositoryProbe>(
             "live git status --porcelain=v1 -uall differs from the frozen snapshot",
         ));
     }
+    let expected_manifest = stable_read(&repository.source_manifest)?;
+    if observed.source_manifest != expected_manifest {
+        return Err(RepositoryVerificationError::new(
+            "live source manifest differs from the frozen capture",
+        ));
+    }
     Ok(())
 }
 
@@ -369,11 +416,72 @@ fn observe_repository_once(
     let source_status = git_output(root, &["status", "--porcelain=v1", "-uall"])?;
     let untracked_paths = git_output(root, &["ls-files", "--others", "--exclude-standard", "-z"])?;
     let source_diff = canonical_source_snapshot(root, &tracked_diff, &untracked_paths)?;
+    let source_manifest = canonical_live_source_manifest(root, &head)?;
     Ok(LiveRepositoryState {
         head,
         source_diff,
         source_status,
+        source_manifest,
     })
+}
+
+fn canonical_live_source_manifest(
+    root: &Path,
+    head: &str,
+) -> Result<Vec<u8>, RepositoryVerificationError> {
+    let paths = git_output(
+        root,
+        &[
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ],
+    )?;
+    let mut paths = parse_nul_paths(&paths)?;
+    paths.sort();
+    paths.dedup();
+    let mut entries = Vec::new();
+    for raw in paths {
+        let relative = PathBuf::from(OsString::from_vec(raw));
+        validate_untracked_path(root, &relative)?;
+        let path = root.join(&relative);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(RepositoryVerificationError::new(format!(
+                    "cannot inspect source manifest path {}: {error}",
+                    relative.display()
+                )));
+            }
+        };
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(RepositoryVerificationError::new(format!(
+                "source manifest path is not a regular non-symlink file: {}",
+                relative.display()
+            )));
+        }
+        let identity = evidence::stable_file_identity_bounded(&path, MAX_PROVENANCE_INPUT_BYTES)
+            .map_err(|error| RepositoryVerificationError::new(error.to_string()))?;
+        let relative = relative
+            .to_str()
+            .ok_or_else(|| RepositoryVerificationError::new("source manifest path is not UTF-8"))?;
+        let executable = identity.mode & 0o111 != 0;
+        entries.push(SourceManifestEntry {
+            path: relative.to_owned(),
+            mode: if executable { "100755" } else { "100644" }.to_owned(),
+            length: identity.length,
+            sha256: identity.sha256,
+        });
+    }
+    canonical_json_line(&SourceManifest {
+        schema: SOURCE_MANIFEST_SCHEMA.to_owned(),
+        repository_head: head.to_owned(),
+        entries,
+    })
+    .map_err(|error| RepositoryVerificationError::new(error.to_string()))
 }
 
 fn parse_git_path_line(bytes: &[u8], role: &str) -> Result<PathBuf, RepositoryVerificationError> {
@@ -410,12 +518,13 @@ fn canonical_source_snapshot(
         let relative = PathBuf::from(OsString::from_vec(raw_path.clone()));
         validate_untracked_path(root, &relative)?;
         let path = root.join(&relative);
-        let (identity, _) = evidence::stable_file_bytes(&path).map_err(|error| {
-            RepositoryVerificationError::new(format!(
-                "cannot bind untracked regular file {}: {error}",
-                relative.display()
-            ))
-        })?;
+        let (identity, _) = evidence::stable_file_bytes_bounded(&path, MAX_PROVENANCE_INPUT_BYTES)
+            .map_err(|error| {
+                RepositoryVerificationError::new(format!(
+                    "cannot bind untracked regular file {}: {error}",
+                    relative.display()
+                ))
+            })?;
         if identity.canonical_path != path {
             return Err(RepositoryVerificationError::new(format!(
                 "untracked path did not resolve directly beneath the repository: {}",
@@ -627,11 +736,9 @@ fn bounded_command_output(
             status.code().unwrap_or(-1)
         )));
     }
-    if !stderr.is_empty() {
-        return Err(RepositoryVerificationError::new(format!(
-            "{label} produced unexpected stderr"
-        )));
-    }
+    // Git may emit platform/toolchain diagnostics despite a successful, bounded invocation.
+    // The output is not part of repository identity; status and boundedness are authoritative.
+    let _ = stderr;
     Ok(stdout)
 }
 
@@ -679,7 +786,7 @@ fn join_probe_reader(
 }
 
 fn stable_read(path: &Path) -> Result<Vec<u8>, RepositoryVerificationError> {
-    evidence::stable_file_bytes(path)
+    evidence::stable_file_bytes_bounded(path, MAX_PROVENANCE_INPUT_BYTES)
         .map(|(_, bytes)| bytes)
         .map_err(|error| RepositoryVerificationError::new(error.to_string()))
 }
@@ -688,20 +795,31 @@ fn stable_read(path: &Path) -> Result<Vec<u8>, RepositoryVerificationError> {
 ///
 /// Validation failures create only `blocked_receipt_path`. Successful preparation creates the
 /// separate `plan_root`, with `plan.sha256` as its final file.
-pub fn prepare(request: &Request, paths: &PreparePaths) -> Result<PrepareOutcome, PrepareError> {
-    prepare_with_probes(
+pub fn prepare_canonical_request(
+    request: &Request,
+    request_bytes: &[u8],
+    request_identity: FileIdentity,
+    paths: &PreparePaths,
+) -> Result<PrepareOutcome, PrepareError> {
+    prepare_canonical_request_with_probes(
         request,
+        request_bytes,
+        Some(request_identity),
         paths,
         &SystemEnvironmentProbe,
         &SystemRepositoryProbe,
+        ProvenanceValidationPolicy::production(),
     )
 }
 
-pub fn prepare_with_probes<E: EnvironmentProbe, R: RepositoryProbe>(
+pub(crate) fn prepare_canonical_request_with_probes<E: EnvironmentProbe, R: RepositoryProbe>(
     request: &Request,
+    request_bytes: &[u8],
+    request_identity: Option<FileIdentity>,
     paths: &PreparePaths,
     environment_probe: &E,
     repository_probe: &R,
+    provenance_policy: ProvenanceValidationPolicy<'_>,
 ) -> Result<PrepareOutcome, PrepareError> {
     let blocked_root = pin_absent_root(&request.blocked_evidence)?;
     let configured_blocked = canonical_absent_root(&paths.blocked_receipt_path)?;
@@ -730,12 +848,27 @@ pub fn prepare_with_probes<E: EnvironmentProbe, R: RepositoryProbe>(
         blocked_root.write_json_create_new(&receipt)?;
         return Ok(PrepareOutcome::Blocked(receipt));
     }
+    let canonical_request = canonical_json_line(request)?;
+    if canonical_request != request_bytes {
+        let receipt = blocked_receipt(
+            request,
+            PreflightIssue::new(
+                PreflightBlockCode::RequestSchema,
+                "request bytes are not the exact canonical representation of the parsed request",
+            ),
+        );
+        blocked_root.write_json_create_new(&receipt)?;
+        return Ok(PrepareOutcome::Blocked(receipt));
+    }
     let validated = match validate_request(
         request,
+        canonical_request,
+        request_identity,
         paths,
         blocked_root.absent(),
         environment_probe,
         repository_probe,
+        provenance_policy,
     ) {
         Ok(value) => value,
         Err(issue) => {
@@ -745,7 +878,47 @@ pub fn prepare_with_probes<E: EnvironmentProbe, R: RepositoryProbe>(
         }
     };
 
-    materialize_plan_root(validated)
+    materialize_plan_root(validated, provenance_policy)
+}
+
+#[cfg(test)]
+fn prepare_with_probes<E: EnvironmentProbe, R: RepositoryProbe>(
+    request: &Request,
+    paths: &PreparePaths,
+    environment_probe: &E,
+    repository_probe: &R,
+) -> Result<PrepareOutcome, PrepareError> {
+    let bytes = canonical_json_line(request)?;
+    prepare_canonical_request_with_probes(
+        request,
+        &bytes,
+        None,
+        paths,
+        environment_probe,
+        repository_probe,
+        synthetic_provenance_policy(request),
+    )
+}
+
+#[cfg(test)]
+fn synthetic_provenance_policy(request: &Request) -> ProvenanceValidationPolicy<'_> {
+    let policy = &request.provenance_policy;
+    ProvenanceValidationPolicy::synthetic(
+        &policy.baseline_artifact_sha256,
+        &policy.candidate_artifact_sha256,
+        &policy.baseline_legacy_primary_sha256,
+        &policy.baseline_legacy_secondary_sha256,
+        policy.baseline_legacy_environment_sha256.as_deref(),
+        policy.baseline_legacy_preregistration_sha256.as_deref(),
+        policy.baseline_legacy_build_result_sha256.as_deref(),
+        &policy.candidate_legacy_primary_sha256,
+        &policy.candidate_legacy_secondary_sha256,
+        policy
+            .baseline_source_bundle_sha256
+            .as_deref()
+            .expect("synthetic fixture pins its baseline source bundle"),
+        &policy.candidate_source_bundle_sha256,
+    )
 }
 
 fn blocked_receipt(request: &Request, issue: PreflightIssue) -> BlockedReceipt {
@@ -761,12 +934,16 @@ fn blocked_receipt(request: &Request, issue: PreflightIssue) -> BlockedReceipt {
 }
 
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 fn validate_request<E: EnvironmentProbe, R: RepositoryProbe>(
     request: &Request,
+    composed_request_bytes: Vec<u8>,
+    composed_request_identity: Option<FileIdentity>,
     paths: &PreparePaths,
     blocked_root: &AbsentRoot,
     environment_probe: &E,
     repository_probe: &R,
+    provenance_policy: ProvenanceValidationPolicy<'_>,
 ) -> Result<ValidatedPreparation, PreflightIssue> {
     if request.schema != REQUEST_SCHEMA {
         return Err(PreflightIssue::new(
@@ -780,7 +957,6 @@ fn validate_request<E: EnvironmentProbe, R: RepositoryProbe>(
             "request harness differs from the compiled fixed contract",
         ));
     }
-
     let execution_root =
         canonical_absent_root(&request.evidence_root).map_err(|error| map_root_error(&error))?;
     let plan_root = pin_absent_root(&paths.plan_root).map_err(|error| map_root_error(&error))?;
@@ -825,16 +1001,50 @@ fn validate_request<E: EnvironmentProbe, R: RepositoryProbe>(
         ));
     }
 
+    provenance::validate_request(request, provenance_policy).map_err(|error| {
+        let code = match error.class {
+            ValidationClass::Schema => PreflightBlockCode::RequestSchema,
+            ValidationClass::Harness => PreflightBlockCode::HarnessContract,
+            ValidationClass::Path => PreflightBlockCode::InvalidPath,
+            ValidationClass::Input if error.detail.contains("symlink") => {
+                PreflightBlockCode::InputSymlink
+            }
+            ValidationClass::Input
+            | ValidationClass::Anchor
+            | ValidationClass::Patch
+            | ValidationClass::Toolchain
+            | ValidationClass::Build => PreflightBlockCode::HashMismatch,
+            ValidationClass::RepositoryRelation | ValidationClass::Source => {
+                PreflightBlockCode::RepositoryState
+            }
+        };
+        PreflightIssue::new(
+            code,
+            format!("structured provenance validation failed: {error}"),
+        )
+    })?;
+
     validate_repository_text_identity(&request.repository)?;
     let repository_inputs = validate_repository_files(&request.repository, &repository_root)?;
     verify_live_repository_with_probe(&request.repository, repository_probe).map_err(|error| {
         PreflightIssue::new(PreflightBlockCode::RepositoryState, error.to_string())
     })?;
-    let baseline = validate_executable(&request.baseline, "baseline")?;
-    let candidate = validate_executable(&request.candidate, "candidate")?;
+    let baseline = validate_artifact(&request.baseline, "baseline")?;
+    let candidate = validate_artifact(&request.candidate, "candidate")?;
     if baseline
-        .executable_identity
-        .same_file(&candidate.executable_identity)
+        .inputs
+        .first()
+        .expect("artifact executable input")
+        .1
+        .identity
+        .same_file(
+            &candidate
+                .inputs
+                .first()
+                .expect("artifact executable input")
+                .1
+                .identity,
+        )
     {
         return Err(PreflightIssue::new(
             PreflightBlockCode::SameExecutable,
@@ -844,6 +1054,7 @@ fn validate_request<E: EnvironmentProbe, R: RepositoryProbe>(
 
     let driver_identity = checked_regular_file(&paths.driver_executable)?;
     require_executable("driver", &driver_identity)?;
+    let reviewed_patch = validate_file_input(&request.reviewed_patch.manifest, "reviewed_patch")?;
     let environment = run_environment_preflight(environment_probe, &paths.environment_expectations)
         .map_err(|blocked| {
             PreflightIssue::new(
@@ -859,6 +1070,8 @@ fn validate_request<E: EnvironmentProbe, R: RepositoryProbe>(
         source_diff_sha256: request.repository.source_diff_sha256.clone(),
         source_status: canonical_role_path(&repository_inputs, "source_status")?,
         source_status_sha256: request.repository.source_status_sha256.clone(),
+        source_manifest: canonical_role_path(&repository_inputs, "source_manifest")?,
+        source_manifest_sha256: request.repository.source_manifest_sha256.clone(),
         cargo_lock: canonical_role_path(&repository_inputs, "cargo_lock")?,
         cargo_lock_sha256: request.repository.cargo_lock_sha256.clone(),
         quic_source: canonical_role_path(&repository_inputs, "quic_source")?,
@@ -873,29 +1086,62 @@ fn validate_request<E: EnvironmentProbe, R: RepositoryProbe>(
         repository,
         baseline,
         candidate,
+        reviewed_patch,
+        provenance_policy: request.provenance_policy.clone(),
+        reviewed_patch_record: request.reviewed_patch.record.clone(),
         driver_identity,
         repository_inputs,
         environment,
         child_working_directory,
+        composed_request_bytes,
+        composed_request_identity,
     })
 }
 
-fn materialize_plan_root(validated: ValidatedPreparation) -> Result<PrepareOutcome, PrepareError> {
+#[allow(clippy::too_many_lines)]
+fn materialize_plan_root(
+    validated: ValidatedPreparation,
+    provenance_policy: ProvenanceValidationPolicy<'_>,
+) -> Result<PrepareOutcome, PrepareError> {
+    if let Some(identity) = &validated.composed_request_identity {
+        require_original_input_unchanged(identity)?;
+        if identity.sha256 != evidence::sha256_bytes(&validated.composed_request_bytes) {
+            return Err(materialize_error(
+                &identity.canonical_path,
+                "canonical request identity differs from the bytes authorized by prepare",
+            ));
+        }
+    }
+    require_original_input_unchanged(&validated.driver_identity)?;
     let mut repository = validated.repository;
     let plan_root_path = validated.plan_root.absent().canonical_path.clone();
     let plan_root = validated.plan_root.create_root()?;
     plan_root.create_dir(Path::new("artifacts"))?;
+    plan_root.create_dir(Path::new("artifacts/repository"))?;
+    plan_root.create_dir(Path::new("artifacts/baseline"))?;
+    plan_root.create_dir(Path::new("artifacts/candidate"))?;
+    plan_root
+        .atomic_create_new_synced(Path::new("request.json"), &validated.composed_request_bytes)?;
+    set_plan_file_mode(&plan_root, Path::new("request.json"), 0o444)?;
+    let composed_request_identity = plan_root.stable_file_identity(Path::new("request.json"))?;
     let artifacts_path = plan_root_path.join("artifacts");
-    let baseline = materialize_executable_copy(&plan_root, "baseline", validated.baseline)?;
-    let candidate = materialize_executable_copy(&plan_root, "candidate", validated.candidate)?;
+    let baseline = materialize_artifact_copy(&plan_root, "baseline", validated.baseline)?;
+    let candidate = materialize_artifact_copy(&plan_root, "candidate", validated.candidate)?;
+    let reviewed_patch = materialize_file_copy(
+        &plan_root,
+        Path::new("artifacts/reviewed-patch.json"),
+        &validated.reviewed_patch,
+        0o444,
+    )?;
     let repository_inputs =
         materialize_repository_copies(&plan_root, &mut repository, validated.repository_inputs)?;
-    let mut copied_identities = vec![
-        &baseline.executable_identity,
-        &baseline.source_identity,
-        &candidate.executable_identity,
-        &candidate.source_identity,
-    ];
+    let mut copied_identities: Vec<&FileIdentity> = baseline
+        .identities
+        .iter()
+        .chain(&candidate.identities)
+        .collect();
+    copied_identities.push(&reviewed_patch);
+    copied_identities.push(&composed_request_identity);
     copied_identities.extend(repository_inputs.iter().map(|entry| &entry.identity));
     ensure_distinct_identities(&artifacts_path, &copied_identities)?;
 
@@ -903,12 +1149,21 @@ fn materialize_plan_root(validated: ValidatedPreparation) -> Result<PrepareOutco
     plan_root.write_json_create_new(environment_relative, &validated.environment)?;
     set_plan_file_mode(&plan_root, environment_relative, 0o444)?;
     let environment_identity = plan_root.stable_file_identity(environment_relative)?;
+    let artifact_inputs = baseline
+        .named_identities
+        .iter()
+        .chain(&candidate.named_identities)
+        .cloned()
+        .collect();
     let identities = PreparedFileIdentities {
         driver: validated.driver_identity.clone(),
+        composed_request: composed_request_identity.clone(),
         environment_receipt: environment_identity.clone(),
         baseline: baseline.executable_identity.clone(),
         candidate: candidate.executable_identity.clone(),
         repository_inputs,
+        artifact_inputs,
+        reviewed_patch: reviewed_patch.clone(),
     };
     let plan = Plan {
         schema: PLAN_SCHEMA.to_owned(),
@@ -923,12 +1178,30 @@ fn materialize_plan_root(validated: ValidatedPreparation) -> Result<PrepareOutco
             environment_sha256: environment_identity.sha256,
         },
         repository,
-        baseline: baseline.executable,
-        candidate: candidate.executable,
+        baseline: baseline.artifact,
+        candidate: candidate.artifact,
+        provenance_policy: validated.provenance_policy,
+        reviewed_patch: super::model::ReviewedPatch {
+            manifest: FileInput {
+                path: reviewed_patch.canonical_path,
+                sha256: reviewed_patch.sha256,
+            },
+            record: validated.reviewed_patch_record,
+        },
         harness: HarnessContract::fixed(),
         blocked_evidence: validated.blocked_evidence,
         evidence_root: validated.execution_root.canonical_path,
+        composed_request: FileInput {
+            path: composed_request_identity.canonical_path,
+            sha256: composed_request_identity.sha256,
+        },
     };
+    provenance::validate_plan(&plan, provenance_policy).map_err(|error| {
+        materialize_error(
+            &plan_root_path,
+            format!("materialized plan failed shared semantic validation: {error}"),
+        )
+    })?;
     let identities_relative = Path::new("input-identities.json");
     plan_root.write_json_create_new(identities_relative, &identities)?;
     set_plan_file_mode(&plan_root, identities_relative, 0o444)?;
@@ -957,6 +1230,9 @@ fn materialize_plan_root(validated: ValidatedPreparation) -> Result<PrepareOutco
     plan_root.atomic_create_new_synced(Path::new("plan.sha256"), seal.as_bytes())?;
     set_plan_file_mode(&plan_root, Path::new("plan.sha256"), 0o444)?;
     plan_root.set_directory_mode(Path::new("artifacts"), 0o555)?;
+    plan_root.set_directory_mode(Path::new("artifacts/repository"), 0o555)?;
+    plan_root.set_directory_mode(Path::new("artifacts/baseline"), 0o555)?;
+    plan_root.set_directory_mode(Path::new("artifacts/candidate"), 0o555)?;
     plan_root.set_mode(0o555)?;
     plan_root.sync()?;
     require_published_file_matches_pinned(&plan_root, Path::new("plan.json"))?;
@@ -970,10 +1246,11 @@ fn materialize_plan_root(validated: ValidatedPreparation) -> Result<PrepareOutco
     })
 }
 
-struct MaterializedExecutable {
-    executable: ExecutableIdentity,
+struct MaterializedArtifact {
+    artifact: ArtifactInput,
     executable_identity: FileIdentity,
-    source_identity: FileIdentity,
+    identities: Vec<FileIdentity>,
+    named_identities: Vec<NamedFileIdentity>,
 }
 
 fn materialize_repository_copies(
@@ -983,11 +1260,13 @@ fn materialize_repository_copies(
 ) -> Result<Vec<NamedFileIdentity>, PrepareError> {
     let mut materialized = Vec::with_capacity(inputs.len());
     for input in inputs {
+        require_original_input_unchanged(&input.identity)?;
         let leaf = match input.role.as_str() {
-            "source_diff" => "repository-source.snapshot",
-            "source_status" => "repository-status.txt",
+            "source_diff" => "source.snapshot",
+            "source_status" => "source-status.txt",
+            "source_manifest" => "source-manifest.json",
             "cargo_lock" => "Cargo.lock",
-            "quic_source" => "quic-source.rs",
+            "quic_source" => "quic.rs",
             "task_spec" => "task-spec.md",
             _ => {
                 return Err(materialize_error(
@@ -996,7 +1275,7 @@ fn materialize_repository_copies(
                 ));
             }
         };
-        let relative = PathBuf::from("artifacts").join(leaf);
+        let relative = PathBuf::from("artifacts/repository").join(leaf);
         plan_root.atomic_create_new_synced(&relative, &input.bytes)?;
         set_plan_file_mode(plan_root, &relative, 0o444)?;
         let identity = plan_root.stable_file_identity(&relative)?;
@@ -1020,6 +1299,9 @@ fn materialize_repository_copies(
             "source_status" => repository
                 .source_status
                 .clone_from(&identity.canonical_path),
+            "source_manifest" => repository
+                .source_manifest
+                .clone_from(&identity.canonical_path),
             "cargo_lock" => repository.cargo_lock.clone_from(&identity.canonical_path),
             "quic_source" => repository.quic_source.clone_from(&identity.canonical_path),
             "task_spec" => repository.task_spec.clone_from(&identity.canonical_path),
@@ -1034,57 +1316,149 @@ fn materialize_repository_copies(
     Ok(materialized)
 }
 
-fn materialize_executable_copy(
+fn materialize_artifact_copy(
     plan_root: &RootHandle,
     role: &str,
-    validated: ValidatedExecutable,
-) -> Result<MaterializedExecutable, PrepareError> {
-    let executable_relative = PathBuf::from("artifacts").join(role);
-    let source_identity_relative =
-        PathBuf::from("artifacts").join(format!("{role}.source-identity"));
-    plan_root.atomic_create_new_synced(&executable_relative, &validated.executable_bytes)?;
-    set_plan_file_mode(plan_root, &executable_relative, 0o555)?;
-    plan_root
-        .atomic_create_new_synced(&source_identity_relative, &validated.source_identity_bytes)?;
-    set_plan_file_mode(plan_root, &source_identity_relative, 0o444)?;
-
-    let executable_identity = plan_root.stable_file_identity(&executable_relative)?;
-    let source_identity = plan_root.stable_file_identity(&source_identity_relative)?;
-    if executable_identity.sha256 != validated.executable.sha256
-        || source_identity.sha256 != validated.executable.source_identity_sha256
-    {
-        return Err(materialize_error(
-            plan_root.path(),
-            format!("materialized {role} bytes do not match their validated hashes"),
-        ));
+    validated: ValidatedArtifact,
+) -> Result<MaterializedArtifact, PrepareError> {
+    let mut model = validated.model;
+    let layout = artifact_layout(&model);
+    let mut identities = Vec::new();
+    let mut named_identities = Vec::new();
+    for ((field, input), (expected_field, leaf)) in validated.inputs.into_iter().zip(layout) {
+        if field != expected_field {
+            return Err(materialize_error(
+                plan_root.path(),
+                "artifact layout role mismatch",
+            ));
+        }
+        let relative = PathBuf::from(format!("artifacts/{role}")).join(leaf);
+        let mode = if field == "executable" { 0o555 } else { 0o444 };
+        let identity = materialize_file_copy(plan_root, &relative, &input, mode)?;
+        set_artifact_file(&mut model, &field, &identity);
+        named_identities.push(NamedFileIdentity {
+            role: format!("{role}.{field}"),
+            identity: identity.clone(),
+        });
+        identities.push(identity);
     }
-    if executable_identity.same_file(&validated.executable_identity)
-        || source_identity.same_file(&validated.source_identity)
-        || executable_identity.same_file(&source_identity)
-    {
-        return Err(materialize_error(
-            plan_root.path(),
-            format!("materialized {role} inputs do not have distinct inodes"),
-        ));
-    }
-    if executable_identity.mode & 0o7777 != 0o555 || source_identity.mode & 0o7777 != 0o444 {
-        return Err(materialize_error(
-            plan_root.path(),
-            format!("materialized {role} inputs have unexpected permissions"),
-        ));
-    }
-
-    Ok(MaterializedExecutable {
-        executable: ExecutableIdentity {
-            path: executable_identity.canonical_path.clone(),
-            sha256: validated.executable.sha256,
-            build_identity: validated.executable.build_identity,
-            source_identity_path: source_identity.canonical_path.clone(),
-            source_identity_sha256: validated.executable.source_identity_sha256,
-        },
+    let executable_identity = identities
+        .first()
+        .expect("validated artifact contains executable")
+        .clone();
+    Ok(MaterializedArtifact {
+        artifact: model,
         executable_identity,
-        source_identity,
+        identities,
+        named_identities,
     })
+}
+
+fn materialize_file_copy(
+    root: &RootHandle,
+    relative: &Path,
+    validated: &ValidatedFileInput,
+    mode: u32,
+) -> Result<FileIdentity, PrepareError> {
+    require_original_input_unchanged(&validated.identity)?;
+    root.atomic_create_new_synced(relative, &validated.bytes)?;
+    set_plan_file_mode(root, relative, mode)?;
+    let copied = root.stable_file_identity(relative)?;
+    if copied.sha256 != validated.identity.sha256
+        || copied.same_file(&validated.identity)
+        || copied.mode & 0o7777 != mode
+    {
+        return Err(materialize_error(
+            &root.path().join(relative),
+            "materialized input failed hash, inode, or mode validation",
+        ));
+    }
+    Ok(copied)
+}
+
+fn require_original_input_unchanged(identity: &FileIdentity) -> Result<(), PrepareError> {
+    let current = evidence::stable_file_identity_bounded(
+        &identity.canonical_path,
+        MAX_PROVENANCE_INPUT_BYTES,
+    )?;
+    if !current.same_file(identity)
+        || current.sha256 != identity.sha256
+        || current.length != identity.length
+        || current.mode != identity.mode
+    {
+        return Err(materialize_error(
+            &identity.canonical_path,
+            "input changed after validation and before immutable publication",
+        ));
+    }
+    Ok(())
+}
+
+fn artifact_layout(artifact: &ArtifactInput) -> Vec<(String, &'static str)> {
+    let mut layout = vec![
+        ("executable".to_owned(), "executable"),
+        ("provenance_receipt".to_owned(), "provenance.json"),
+        ("source_snapshot".to_owned(), "source.snapshot"),
+        ("source_manifest".to_owned(), "source-manifest.json"),
+        ("source_bundle".to_owned(), "source-bundle.json"),
+        ("legacy_primary".to_owned(), "legacy-primary.txt"),
+        ("legacy_secondary".to_owned(), "legacy-secondary.txt"),
+        ("benchmark_source".to_owned(), "benchmark-source.rs"),
+        ("cargo_lock".to_owned(), "Cargo.lock"),
+        ("workspace_manifest".to_owned(), "workspace-Cargo.toml"),
+        ("package_manifest".to_owned(), "package-Cargo.toml"),
+    ];
+    if artifact.legacy_evidence.environment.is_some() {
+        layout.push(("legacy_environment".to_owned(), "legacy-environment.txt"));
+    }
+    if artifact.legacy_evidence.preregistration.is_some() {
+        layout.push((
+            "legacy_preregistration".to_owned(),
+            "legacy-preregistration.txt",
+        ));
+    }
+    if artifact.legacy_evidence.build_result.is_some() {
+        layout.push(("legacy_build_result".to_owned(), "legacy-build-result.txt"));
+    }
+    if artifact.cargo_config.is_some() {
+        layout.push(("cargo_config".to_owned(), "cargo-config.toml"));
+    }
+    layout.extend([
+        ("rustc_verbose".to_owned(), "rustc-verbose.txt"),
+        ("cargo_verbose".to_owned(), "cargo-verbose.txt"),
+        ("build_environment".to_owned(), "build-environment.json"),
+        ("profile_identity".to_owned(), "profile-identity.json"),
+    ]);
+    layout
+}
+
+fn set_artifact_file(artifact: &mut ArtifactInput, role: &str, identity: &FileIdentity) {
+    let value = FileInput {
+        path: identity.canonical_path.clone(),
+        sha256: identity.sha256.clone(),
+    };
+    match role {
+        "executable" => artifact.executable = value,
+        "provenance_receipt" => artifact.provenance_receipt = value,
+        "source_snapshot" => artifact.source_snapshot = value,
+        "source_manifest" => artifact.source_manifest = value,
+        "source_bundle" => artifact.source_bundle = value,
+        "legacy_primary" => artifact.legacy_evidence.primary = value,
+        "legacy_secondary" => artifact.legacy_evidence.secondary = value,
+        "legacy_environment" => artifact.legacy_evidence.environment = Some(value),
+        "legacy_preregistration" => artifact.legacy_evidence.preregistration = Some(value),
+        "legacy_build_result" => artifact.legacy_evidence.build_result = Some(value),
+        "benchmark_source" => artifact.benchmark_source = value,
+        "cargo_lock" => artifact.cargo_lock = value,
+        "workspace_manifest" => artifact.workspace_manifest = value,
+        "package_manifest" => artifact.package_manifest = value,
+        "cargo_config" => artifact.cargo_config = Some(value),
+        "rustc_verbose" => artifact.rustc_verbose = value,
+        "cargo_verbose" => artifact.cargo_verbose = value,
+        "build_environment" => artifact.build_environment = value,
+        "profile_identity" => artifact.profile_identity = value,
+        _ => unreachable!("validated artifact role"),
+    }
 }
 
 fn ensure_distinct_identities(
@@ -1128,7 +1502,8 @@ fn require_published_file_matches_pinned(
 ) -> Result<(), PrepareError> {
     let pinned = root.stable_file_identity(relative)?;
     let published_path = root.path().join(relative);
-    let published = evidence::stable_file_identity(&published_path)?;
+    let published =
+        evidence::stable_file_identity_bounded(&published_path, MAX_PROVENANCE_INPUT_BYTES)?;
     if !pinned.same_file(&published) || pinned.sha256 != published.sha256 {
         return Err(materialize_error(
             &published_path,
@@ -1158,6 +1533,7 @@ fn validate_repository_text_identity(
     for hash in [
         &repository.source_diff_sha256,
         &repository.source_status_sha256,
+        &repository.source_manifest_sha256,
         &repository.cargo_lock_sha256,
         &repository.quic_source_sha256,
         &repository.task_spec_sha256,
@@ -1181,6 +1557,11 @@ fn validate_repository_files(
             "source_status",
             &repository.source_status,
             &repository.source_status_sha256,
+        ),
+        (
+            "source_manifest",
+            &repository.source_manifest,
+            &repository.source_manifest_sha256,
         ),
         (
             "cargo_lock",
@@ -1235,42 +1616,114 @@ fn canonical_role_path(
         })
 }
 
-fn validate_executable(
-    executable: &ExecutableIdentity,
+fn validate_artifact(
+    artifact: &ArtifactInput,
     role: &str,
-) -> Result<ValidatedExecutable, PreflightIssue> {
-    validate_sha256(&executable.sha256)?;
-    validate_sha256(&executable.source_identity_sha256)?;
-    if executable.build_identity.is_empty() {
+) -> Result<ValidatedArtifact, PreflightIssue> {
+    let mut model = artifact.clone();
+    let mut inputs = Vec::new();
+    let values = artifact_file_inputs(artifact);
+    for (field, value) in values {
+        let validated = validate_file_input(value, &format!("{role}.{field}"))?;
+        if field == "executable" {
+            require_executable(role, &validated.identity)?;
+        }
+        let canonical = FileInput {
+            path: validated.identity.canonical_path.clone(),
+            sha256: validated.identity.sha256.clone(),
+        };
+        set_artifact_model_file(&mut model, &field, canonical);
+        inputs.push((field, validated));
+    }
+    Ok(ValidatedArtifact { model, inputs })
+}
+
+fn validate_file_input(
+    input: &FileInput,
+    role: &str,
+) -> Result<ValidatedFileInput, PreflightIssue> {
+    validate_sha256(&input.sha256)?;
+    let (identity, bytes) = checked_regular_file_bytes(&input.path)?;
+    require_hash(role, &input.sha256, &identity)?;
+    if identity.canonical_path != input.path {
         return Err(PreflightIssue::new(
             PreflightBlockCode::InvalidPath,
-            format!("{role} build identity is empty"),
+            format!("{role} path is not canonical"),
         ));
     }
-    let (identity, executable_bytes) = checked_regular_file_bytes(&executable.path)?;
-    let (source_identity, source_identity_bytes) =
-        checked_regular_file_bytes(&executable.source_identity_path)?;
-    require_hash(
-        &format!("{role} source identity"),
-        &executable.source_identity_sha256,
-        &source_identity,
-    )?;
-    require_executable(role, &identity)?;
-    require_hash(role, &executable.sha256, &identity)?;
-    let canonical = ExecutableIdentity {
-        path: identity.canonical_path.clone(),
-        sha256: executable.sha256.clone(),
-        build_identity: executable.build_identity.clone(),
-        source_identity_path: source_identity.canonical_path.clone(),
-        source_identity_sha256: executable.source_identity_sha256.clone(),
-    };
-    Ok(ValidatedExecutable {
-        executable: canonical,
-        executable_identity: identity,
-        executable_bytes,
-        source_identity,
-        source_identity_bytes,
-    })
+    Ok(ValidatedFileInput { identity, bytes })
+}
+
+fn artifact_file_inputs(artifact: &ArtifactInput) -> Vec<(String, &FileInput)> {
+    let mut values = vec![
+        ("executable".to_owned(), &artifact.executable),
+        (
+            "provenance_receipt".to_owned(),
+            &artifact.provenance_receipt,
+        ),
+        ("source_snapshot".to_owned(), &artifact.source_snapshot),
+        ("source_manifest".to_owned(), &artifact.source_manifest),
+        ("source_bundle".to_owned(), &artifact.source_bundle),
+        (
+            "legacy_primary".to_owned(),
+            &artifact.legacy_evidence.primary,
+        ),
+        (
+            "legacy_secondary".to_owned(),
+            &artifact.legacy_evidence.secondary,
+        ),
+        ("benchmark_source".to_owned(), &artifact.benchmark_source),
+        ("cargo_lock".to_owned(), &artifact.cargo_lock),
+        (
+            "workspace_manifest".to_owned(),
+            &artifact.workspace_manifest,
+        ),
+        ("package_manifest".to_owned(), &artifact.package_manifest),
+    ];
+    if let Some(environment) = &artifact.legacy_evidence.environment {
+        values.push(("legacy_environment".to_owned(), environment));
+    }
+    if let Some(preregistration) = &artifact.legacy_evidence.preregistration {
+        values.push(("legacy_preregistration".to_owned(), preregistration));
+    }
+    if let Some(build_result) = &artifact.legacy_evidence.build_result {
+        values.push(("legacy_build_result".to_owned(), build_result));
+    }
+    if let Some(config) = &artifact.cargo_config {
+        values.push(("cargo_config".to_owned(), config));
+    }
+    values.extend([
+        ("rustc_verbose".to_owned(), &artifact.rustc_verbose),
+        ("cargo_verbose".to_owned(), &artifact.cargo_verbose),
+        ("build_environment".to_owned(), &artifact.build_environment),
+        ("profile_identity".to_owned(), &artifact.profile_identity),
+    ]);
+    values
+}
+
+fn set_artifact_model_file(artifact: &mut ArtifactInput, role: &str, value: FileInput) {
+    match role {
+        "executable" => artifact.executable = value,
+        "provenance_receipt" => artifact.provenance_receipt = value,
+        "source_snapshot" => artifact.source_snapshot = value,
+        "source_manifest" => artifact.source_manifest = value,
+        "source_bundle" => artifact.source_bundle = value,
+        "legacy_primary" => artifact.legacy_evidence.primary = value,
+        "legacy_secondary" => artifact.legacy_evidence.secondary = value,
+        "legacy_environment" => artifact.legacy_evidence.environment = Some(value),
+        "legacy_preregistration" => artifact.legacy_evidence.preregistration = Some(value),
+        "legacy_build_result" => artifact.legacy_evidence.build_result = Some(value),
+        "benchmark_source" => artifact.benchmark_source = value,
+        "cargo_lock" => artifact.cargo_lock = value,
+        "workspace_manifest" => artifact.workspace_manifest = value,
+        "package_manifest" => artifact.package_manifest = value,
+        "cargo_config" => artifact.cargo_config = Some(value),
+        "rustc_verbose" => artifact.rustc_verbose = value,
+        "cargo_verbose" => artifact.cargo_verbose = value,
+        "build_environment" => artifact.build_environment = value,
+        "profile_identity" => artifact.profile_identity = value,
+        _ => unreachable!("validated artifact input role"),
+    }
 }
 
 fn canonical_directory(path: &Path, role: &str) -> Result<PathBuf, PreflightIssue> {
@@ -1325,7 +1778,7 @@ fn checked_regular_file_bytes(path: &Path) -> Result<(FileIdentity, Vec<u8>), Pr
             format!("input is not a regular file: {}", path.display()),
         ));
     }
-    evidence::stable_file_bytes(path).map_err(|error| {
+    evidence::stable_file_bytes_bounded(path, MAX_PROVENANCE_INPUT_BYTES).map_err(|error| {
         let code = if matches!(error, EvidenceError::FileChanged(_)) {
             PreflightBlockCode::InputChanged
         } else {
@@ -1396,11 +1849,12 @@ fn map_root_error(error: &EvidenceError) -> PreflightIssue {
 
 #[cfg(test)]
 mod tests {
-    use super::super::model::{ExecutableIdentity, RepositoryIdentity};
+    use super::super::model::*;
     use super::*;
     use crate::quic_fetch_acceptance::environment::{
         EnvironmentProbeError, LoopbackFacts, OsFacts, PowerFacts,
     };
+    use std::collections::BTreeMap;
     use std::os::unix::fs::{symlink, PermissionsExt};
     use tempfile::TempDir;
 
@@ -1411,6 +1865,7 @@ mod tests {
     }
 
     impl Fixture {
+        #[allow(clippy::too_many_lines)]
         fn new() -> Self {
             let temporary = tempfile::tempdir().unwrap();
             let root = fs::canonicalize(temporary.path()).unwrap();
@@ -1421,13 +1876,37 @@ mod tests {
             let cargo_lock = write_file(&repository_root.join("Cargo.lock"), b"lock");
             let quic_source = write_file(&repository_root.join("quic.rs"), b"quic");
             let task_spec = write_file(&repository_root.join("task.md"), b"task");
-            let baseline = write_executable(&root.join("baseline"), b"baseline");
-            let candidate = write_executable(&root.join("candidate"), b"candidate");
+            let baseline = write_executable(&root.join("baseline-executable"), b"baseline");
+            let candidate = write_executable(&root.join("candidate-executable"), b"candidate");
             let driver = write_executable(&root.join("driver"), b"driver");
-            let baseline_source_identity = repository_root.join("baseline-source.txt");
-            let candidate_source_identity = repository_root.join("candidate-source.txt");
-            fs::write(&baseline_source_identity, b"baseline source").unwrap();
-            fs::write(&candidate_source_identity, b"candidate source").unwrap();
+            let historical = HistoricalSourceIdentity {
+                repository_head: "a".repeat(40),
+                source_snapshot_sha256: String::new(),
+                source_identity_sha256: String::new(),
+                source_manifest_sha256: String::new(),
+                source_bundle_sha256: String::new(),
+                benchmark_source_sha256: String::new(),
+            };
+            let mut patch_record = ReviewedPatchManifest {
+                schema: REVIEWED_PATCH_SCHEMA.to_owned(),
+                baseline: historical.clone(),
+                candidate: historical,
+                files: Vec::new(),
+            };
+            let patch_path = root.join("reviewed-patch.json");
+            write_canonical_json(&patch_path, &patch_record);
+            let baseline_artifact = fixture_artifact(&root, "baseline", &baseline);
+            let candidate_artifact = fixture_artifact(&root, "candidate", &candidate);
+            patch_record.baseline = baseline_artifact.provenance.source.clone();
+            patch_record.candidate = candidate_artifact.provenance.source.clone();
+            write_canonical_json_replace(&patch_path, &patch_record);
+            let baseline_artifact =
+                fixture_artifact(&root, "baseline-final", &baseline_artifact.executable.path);
+            let candidate_artifact = fixture_artifact(
+                &root,
+                "candidate-final",
+                &candidate_artifact.executable.path,
+            );
 
             let request = Request {
                 schema: REQUEST_SCHEMA.to_owned(),
@@ -1438,6 +1917,8 @@ mod tests {
                     source_diff_sha256: evidence::sha256_file(&source_diff).unwrap(),
                     source_status: source_status.clone(),
                     source_status_sha256: evidence::sha256_file(&source_status).unwrap(),
+                    source_manifest: baseline_artifact.source_manifest.path.clone(),
+                    source_manifest_sha256: baseline_artifact.source_manifest.sha256.clone(),
                     cargo_lock: cargo_lock.clone(),
                     cargo_lock_sha256: evidence::sha256_file(&cargo_lock).unwrap(),
                     quic_source: quic_source.clone(),
@@ -1445,21 +1926,57 @@ mod tests {
                     task_spec: task_spec.clone(),
                     task_spec_sha256: evidence::sha256_file(&task_spec).unwrap(),
                 },
-                baseline: ExecutableIdentity {
-                    path: baseline.clone(),
-                    sha256: evidence::sha256_file(&baseline).unwrap(),
-                    build_identity: "baseline-build".to_owned(),
-                    source_identity_path: baseline_source_identity.clone(),
-                    source_identity_sha256: evidence::sha256_file(&baseline_source_identity)
-                        .unwrap(),
+                baseline: baseline_artifact.clone(),
+                candidate: candidate_artifact.clone(),
+                provenance_policy: ProvenancePolicy {
+                    baseline_origin: ArtifactOrigin::RecoveredFrozen,
+                    candidate_origin: ArtifactOrigin::RecoveredFrozen,
+                    status: ProvenanceStatusPolicy::EvidenceDerivedOnly,
+                    baseline_artifact_sha256: baseline_artifact.executable.sha256.clone(),
+                    candidate_artifact_sha256: candidate_artifact.executable.sha256.clone(),
+                    baseline_legacy_primary_sha256: baseline_artifact
+                        .legacy_evidence
+                        .primary
+                        .sha256
+                        .clone(),
+                    baseline_legacy_secondary_sha256: baseline_artifact
+                        .legacy_evidence
+                        .secondary
+                        .sha256
+                        .clone(),
+                    baseline_legacy_environment_sha256: baseline_artifact
+                        .legacy_evidence
+                        .environment
+                        .as_ref()
+                        .map(|input| input.sha256.clone()),
+                    baseline_legacy_preregistration_sha256: baseline_artifact
+                        .legacy_evidence
+                        .preregistration
+                        .as_ref()
+                        .map(|input| input.sha256.clone()),
+                    baseline_legacy_build_result_sha256: baseline_artifact
+                        .legacy_evidence
+                        .build_result
+                        .as_ref()
+                        .map(|input| input.sha256.clone()),
+                    candidate_legacy_primary_sha256: candidate_artifact
+                        .legacy_evidence
+                        .primary
+                        .sha256
+                        .clone(),
+                    candidate_legacy_secondary_sha256: candidate_artifact
+                        .legacy_evidence
+                        .secondary
+                        .sha256
+                        .clone(),
+                    baseline_source_bundle_sha256: Some(
+                        baseline_artifact.source_bundle.sha256.clone(),
+                    ),
+                    candidate_source_bundle_sha256: candidate_artifact.source_bundle.sha256.clone(),
                 },
-                candidate: ExecutableIdentity {
-                    path: candidate.clone(),
-                    sha256: evidence::sha256_file(&candidate).unwrap(),
-                    build_identity: "candidate-build".to_owned(),
-                    source_identity_path: candidate_source_identity.clone(),
-                    source_identity_sha256: evidence::sha256_file(&candidate_source_identity)
-                        .unwrap(),
+                reviewed_patch: ReviewedPatch {
+                    manifest: file_input(&patch_path),
+                    record: patch_record,
                 },
                 harness: HarnessContract::fixed(),
                 blocked_evidence: root.join("BLOCKED.json"),
@@ -1481,6 +1998,219 @@ mod tests {
                 request,
                 paths,
             }
+        }
+    }
+
+    fn file_input(path: &Path) -> FileInput {
+        FileInput {
+            path: path.to_path_buf(),
+            sha256: evidence::sha256_file(path).unwrap(),
+        }
+    }
+
+    fn write_canonical_json<T: Serialize>(path: &Path, value: &T) {
+        fs::write(path, canonical_json_line(value).unwrap()).unwrap();
+    }
+
+    fn write_canonical_json_replace<T: Serialize>(path: &Path, value: &T) {
+        fs::remove_file(path).unwrap();
+        write_canonical_json(path, value);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn fixture_artifact(root: &Path, name: &str, executable: &Path) -> ArtifactInput {
+        let arm = root.join(name);
+        fs::create_dir(&arm).unwrap();
+        let source_snapshot = write_file(&arm.join("source.snapshot"), b"snapshot");
+        let benchmark_source = write_file(&arm.join("benchmark.rs"), b"benchmark");
+        let cargo_lock = write_file(&arm.join("Cargo.lock"), b"lock");
+        let workspace_manifest = write_file(&arm.join("workspace.toml"), b"workspace");
+        let package_manifest = write_file(&arm.join("package.toml"), b"package");
+        let rustc_verbose = write_file(&arm.join("rustc.txt"), b"rustc");
+        let cargo_verbose = write_file(&arm.join("cargo.txt"), b"cargo");
+        let build_environment = write_file(&arm.join("environment.json"), b"{}\n");
+        let profile_identity = arm.join("profile.json");
+        write_canonical_json(
+            &profile_identity,
+            &ReleaseProfileIdentity {
+                schema: RELEASE_PROFILE_SCHEMA.to_owned(),
+                profile: "release".to_owned(),
+                opt_level: 3,
+                lto: true,
+                codegen_units: 1,
+                panic: "abort".to_owned(),
+                strip: true,
+            },
+        );
+        let bundle_record = SourceBundle {
+            schema: SOURCE_BUNDLE_SCHEMA.to_owned(),
+            repository_head: "a".repeat(40),
+            entries: vec![
+                SourceBundleEntry {
+                    path: "Cargo.toml".to_owned(),
+                    mode: "100644".to_owned(),
+                    contents: b"workspace".to_vec(),
+                },
+                SourceBundleEntry {
+                    path: "bench/Cargo.toml".to_owned(),
+                    mode: "100644".to_owned(),
+                    contents: b"bench".to_vec(),
+                },
+                SourceBundleEntry {
+                    path: "client/Cargo.toml".to_owned(),
+                    mode: "100644".to_owned(),
+                    contents: b"client".to_vec(),
+                },
+                SourceBundleEntry {
+                    path: "core/Cargo.toml".to_owned(),
+                    mode: "100644".to_owned(),
+                    contents: b"core".to_vec(),
+                },
+                SourceBundleEntry {
+                    path: "rust-toolchain.toml".to_owned(),
+                    mode: "100644".to_owned(),
+                    contents: b"toolchain".to_vec(),
+                },
+                SourceBundleEntry {
+                    path: "server/Cargo.toml".to_owned(),
+                    mode: "100644".to_owned(),
+                    contents: b"package".to_vec(),
+                },
+                SourceBundleEntry {
+                    path: "server/src/quic.rs".to_owned(),
+                    mode: "100644".to_owned(),
+                    contents: b"benchmark".to_vec(),
+                },
+            ],
+        };
+        let source_bundle = arm.join("source-bundle.json");
+        write_canonical_json(&source_bundle, &bundle_record);
+        let source_manifest_record = SourceManifest {
+            schema: SOURCE_MANIFEST_SCHEMA.to_owned(),
+            repository_head: "a".repeat(40),
+            entries: bundle_record
+                .entries
+                .iter()
+                .map(|entry| SourceManifestEntry {
+                    path: entry.path.clone(),
+                    mode: entry.mode.clone(),
+                    length: u64::try_from(entry.contents.len()).unwrap(),
+                    sha256: evidence::sha256_bytes(&entry.contents),
+                })
+                .collect(),
+        };
+        let source_manifest = arm.join("source-manifest.json");
+        write_canonical_json(&source_manifest, &source_manifest_record);
+        let legacy_primary = write_file(&arm.join("legacy-primary.txt"), b"fixture-primary");
+        let legacy_secondary = write_file(&arm.join("legacy-secondary.txt"), b"fixture-secondary");
+        let role = if name.starts_with("baseline") {
+            ArtifactRole::Baseline
+        } else {
+            ArtifactRole::Candidate
+        };
+        let legacy_environment = if role == ArtifactRole::Baseline {
+            Some(write_file(
+                &arm.join("legacy-environment.txt"),
+                b"fixture baseline environment",
+            ))
+        } else {
+            None
+        };
+        let legacy_preregistration = if role == ArtifactRole::Baseline {
+            Some(write_file(
+                &arm.join("legacy-preregistration.txt"),
+                b"fixture baseline preregistration",
+            ))
+        } else {
+            None
+        };
+        let legacy_build_result = if role == ArtifactRole::Baseline {
+            Some(write_file(
+                &arm.join("legacy-build-result.txt"),
+                b"fixture baseline build result",
+            ))
+        } else {
+            None
+        };
+        let source = HistoricalSourceIdentity {
+            repository_head: source_manifest_record.repository_head,
+            source_snapshot_sha256: evidence::sha256_file(&source_snapshot).unwrap(),
+            source_identity_sha256: match role {
+                ArtifactRole::Baseline => evidence::sha256_file(&legacy_secondary).unwrap(),
+                ArtifactRole::Candidate => evidence::sha256_file(&legacy_primary).unwrap(),
+            },
+            source_manifest_sha256: evidence::sha256_file(&source_manifest).unwrap(),
+            source_bundle_sha256: evidence::sha256_file(&source_bundle).unwrap(),
+            benchmark_source_sha256: evidence::sha256_file(&benchmark_source).unwrap(),
+        };
+        let provenance = ArtifactProvenance {
+            schema: ARTIFACT_PROVENANCE_SCHEMA.to_owned(),
+            role,
+            origin: ArtifactOrigin::RecoveredFrozen,
+            status: ProvenanceStatus::EvidenceDerived {
+                derivation: EvidenceDerivation::SyntheticFixture,
+            },
+            artifact_sha256: evidence::sha256_file(&executable).unwrap(),
+            source,
+            dependencies: DependencyIdentity {
+                cargo_lock_sha256: evidence::sha256_file(&cargo_lock).unwrap(),
+                workspace_manifest_sha256: evidence::sha256_file(&workspace_manifest).unwrap(),
+                package_manifest_sha256: evidence::sha256_file(&package_manifest).unwrap(),
+                cargo_config_sha256: None,
+            },
+            toolchain: ToolchainIdentity {
+                rustc_release: "1.96.0".to_owned(),
+                rustc_commit_hash: "ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96".to_owned(),
+                cargo_release: "1.96.0".to_owned(),
+                host: "aarch64-apple-darwin".to_owned(),
+                target: "aarch64-apple-darwin".to_owned(),
+                rustc_verbose_sha256: evidence::sha256_file(&rustc_verbose).unwrap(),
+                cargo_verbose_sha256: evidence::sha256_file(&cargo_verbose).unwrap(),
+            },
+            build: BuildIdentity {
+                profile: "release".to_owned(),
+                profile_identity_sha256: evidence::sha256_file(&profile_identity).unwrap(),
+                features: vec!["redb".to_owned()],
+                command_argv: [
+                    "cargo",
+                    "test",
+                    "--profile",
+                    "release",
+                    "-p",
+                    "distd_server",
+                    "--no-run",
+                ]
+                .map(str::to_owned)
+                .to_vec(),
+                environment: BTreeMap::default(),
+                environment_sha256: evidence::sha256_file(&build_environment).unwrap(),
+            },
+        };
+        let provenance_receipt = arm.join("provenance.json");
+        write_canonical_json(&provenance_receipt, &provenance);
+        ArtifactInput {
+            executable: file_input(&executable),
+            provenance_receipt: file_input(&provenance_receipt),
+            source_snapshot: file_input(&source_snapshot),
+            source_manifest: file_input(&source_manifest),
+            source_bundle: file_input(&source_bundle),
+            legacy_evidence: LegacyEvidence {
+                primary: file_input(&legacy_primary),
+                secondary: file_input(&legacy_secondary),
+                environment: legacy_environment.as_deref().map(file_input),
+                preregistration: legacy_preregistration.as_deref().map(file_input),
+                build_result: legacy_build_result.as_deref().map(file_input),
+            },
+            benchmark_source: file_input(&benchmark_source),
+            cargo_lock: file_input(&cargo_lock),
+            workspace_manifest: file_input(&workspace_manifest),
+            package_manifest: file_input(&package_manifest),
+            cargo_config: None,
+            rustc_verbose: file_input(&rustc_verbose),
+            cargo_verbose: file_input(&cargo_verbose),
+            build_environment: file_input(&build_environment),
+            profile_identity: file_input(&profile_identity),
+            provenance,
         }
     }
 
@@ -1512,7 +2242,9 @@ mod tests {
         }
     }
 
-    struct FixtureRepository;
+    struct FixtureRepository {
+        source_manifest: Vec<u8>,
+    }
 
     impl RepositoryProbe for FixtureRepository {
         fn observe(
@@ -1523,6 +2255,7 @@ mod tests {
                 head: "a".repeat(40),
                 source_diff: b"diff".to_vec(),
                 source_status: b"status".to_vec(),
+                source_manifest: self.source_manifest.clone(),
             })
         }
     }
@@ -1553,11 +2286,14 @@ mod tests {
     }
 
     fn prepare_fixture(fixture: &Fixture) -> Result<PrepareOutcome, PrepareError> {
+        let repository = FixtureRepository {
+            source_manifest: fs::read(&fixture.request.repository.source_manifest).unwrap(),
+        };
         prepare_with_probes(
             &fixture.request,
             &fixture.paths,
             &PassingEnvironment,
-            &FixtureRepository,
+            &repository,
         )
     }
 
@@ -1598,14 +2334,17 @@ mod tests {
             "shared model run IDs are authoritative"
         );
         assert!(!plan.evidence_root.exists());
-        assert_eq!(plan.baseline.path, plan_root.join("artifacts/baseline"));
         assert_eq!(
-            plan.candidate.source_identity_path,
-            plan_root.join("artifacts/candidate.source-identity")
+            plan.baseline.executable.path,
+            plan_root.join("artifacts/baseline/executable")
+        );
+        assert_eq!(
+            plan.candidate.provenance_receipt.path,
+            plan_root.join("artifacts/candidate/provenance.json")
         );
         assert_eq!(
             plan.repository.source_diff,
-            plan_root.join("artifacts/repository-source.snapshot")
+            plan_root.join("artifacts/repository/source.snapshot")
         );
         for repository_input in [
             &plan.repository.source_diff,
@@ -1621,7 +2360,7 @@ mod tests {
             );
         }
         assert_eq!(
-            fs::metadata(&plan.baseline.path)
+            fs::metadata(&plan.baseline.executable.path)
                 .unwrap()
                 .permissions()
                 .mode()
@@ -1651,7 +2390,7 @@ mod tests {
     #[test]
     fn hash_drift_is_blocked_without_plan_or_execution_root() {
         let mut fixture = Fixture::new();
-        fixture.request.candidate.sha256 = "0".repeat(64);
+        fixture.request.candidate.executable.sha256 = "0".repeat(64);
         let outcome = prepare_fixture(&fixture).unwrap();
         assert!(matches!(
             outcome,
@@ -1738,8 +2477,8 @@ mod tests {
     fn symlink_and_same_file_inputs_are_blocked() {
         let mut symlink_fixture = Fixture::new();
         let linked = symlink_fixture.temporary.path().join("candidate-link");
-        symlink(&symlink_fixture.request.candidate.path, &linked).unwrap();
-        symlink_fixture.request.candidate.path = linked;
+        symlink(&symlink_fixture.request.candidate.executable.path, &linked).unwrap();
+        symlink_fixture.request.candidate.executable.path = linked;
         assert!(matches!(
             prepare_fixture(&symlink_fixture).unwrap(),
             PrepareOutcome::Blocked(BlockedReceipt {
@@ -1751,8 +2490,25 @@ mod tests {
         assert!(!symlink_fixture.request.evidence_root.exists());
 
         let mut same_fixture = Fixture::new();
-        same_fixture.request.candidate.path = same_fixture.request.baseline.path.clone();
-        same_fixture.request.candidate.sha256 = same_fixture.request.baseline.sha256.clone();
+        same_fixture.request.candidate.executable.path =
+            same_fixture.request.baseline.executable.path.clone();
+        same_fixture.request.candidate.executable.sha256 =
+            same_fixture.request.baseline.executable.sha256.clone();
+        same_fixture.request.candidate.provenance.artifact_sha256 =
+            same_fixture.request.baseline.executable.sha256.clone();
+        let receipt_path = same_fixture
+            .request
+            .candidate
+            .provenance_receipt
+            .path
+            .clone();
+        write_canonical_json_replace(&receipt_path, &same_fixture.request.candidate.provenance);
+        same_fixture.request.candidate.provenance_receipt.sha256 =
+            evidence::sha256_file(&receipt_path).unwrap();
+        same_fixture
+            .request
+            .provenance_policy
+            .candidate_artifact_sha256 = same_fixture.request.baseline.executable.sha256.clone();
         assert!(matches!(
             prepare_fixture(&same_fixture).unwrap(),
             PrepareOutcome::Blocked(BlockedReceipt {

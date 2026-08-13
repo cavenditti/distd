@@ -1,9 +1,15 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-pub const REQUEST_SCHEMA: &str = "distd.quic.fetch.driver.request.v1";
-pub const PLAN_SCHEMA: &str = "distd.quic.fetch.driver.plan.v1";
+pub const REQUEST_SCHEMA: &str = "distd.quic.fetch.driver.request.v3";
+pub const PLAN_SCHEMA: &str = "distd.quic.fetch.driver.plan.v3";
+pub const ARTIFACT_PROVENANCE_SCHEMA: &str = "distd.quic.fetch.artifact-provenance.v1";
+pub const REVIEWED_PATCH_SCHEMA: &str = "distd.quic.fetch.reviewed-patch.v1";
+pub const SOURCE_MANIFEST_SCHEMA: &str = "distd.quic.fetch.source-manifest.v1";
+pub const SOURCE_BUNDLE_SCHEMA: &str = "distd.quic.fetch.source-bundle.v1";
+pub const RELEASE_PROFILE_SCHEMA: &str = "distd.quic.fetch.release-profile.v1";
 pub const CHILD_RECEIPT_SCHEMA: &str = "distd.quic.fetch.driver.child.v1";
 pub const RUN_RECORD_SCHEMA: &str = "distd.quic.fetch.driver.run.v1";
 pub const AUDIT_SCHEMA: &str = "distd.quic.fetch.driver.audit.v1";
@@ -23,32 +29,60 @@ pub const MAX_CHILD_STDOUT_BYTES: u64 = 4 * 1024 * 1024;
 pub const MAX_CHILD_STDERR_BYTES: u64 = 1024 * 1024;
 pub const RUN_COUNT: usize = 12;
 pub const MEASURED_RUNS_PER_ARM: usize = 5;
+pub const BASELINE_ARTIFACT_SHA256: &str =
+    "d60c56edf574a9980b3ba9e7572f9da95ca80260e530781495bdff4604979478";
+pub const CANDIDATE_ARTIFACT_SHA256: &str =
+    "6cb669536efea5b3055c6f4487624b96abc136cc5d036cbfaae672a651fcb327";
+pub const BASELINE_LEGACY_PRIMARY_SHA256: &str =
+    "098a8af95d9dfae1b07a73939928f2d57c8f951fa8066d32c5776813b0cf8bf9";
+pub const BASELINE_LEGACY_SECONDARY_SHA256: &str =
+    "fcecacdd6f0f71a3b515616ecb144efd91ade2d09f10428b2c24bac4ba309941";
+pub const BASELINE_LEGACY_ENVIRONMENT_SHA256: &str =
+    "53e526b066818d82355edd6f7dac54f43a80b0e13c43fdead520cf38b014f3ac";
+pub const BASELINE_LEGACY_PREREGISTRATION_SHA256: &str =
+    "9fc81d187c3c9c3a0931106ae58a35c90a90efa7331bc444b02b71fb31f8725a";
+pub const BASELINE_LEGACY_BUILD_RESULT_SHA256: &str =
+    "7f518a88b4b47c79d12b9090d285665aa53a6327ebde8efb34dfcd2bf5b96c99";
+pub const CANDIDATE_LEGACY_PRIMARY_SHA256: &str =
+    "90ae2c529fb6cd0bb959d485eefa958728a0cd81b3d888b3d2b334a2008c2330";
+pub const CANDIDATE_LEGACY_SECONDARY_SHA256: &str =
+    "98a55d72755da6e78cca11163f09b20812d0297c185830573de8474fa6f60eaa";
+pub const CANDIDATE_SOURCE_BUNDLE_SHA256: &str =
+    "fbbb585bfb4404c9abfb01e807451045becf669361f9275c7450b21e88e87c13";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Request {
     pub schema: String,
     pub repository: RepositoryIdentity,
-    pub baseline: ExecutableIdentity,
-    pub candidate: ExecutableIdentity,
+    pub baseline: ArtifactInput,
+    pub candidate: ArtifactInput,
+    pub provenance_policy: ProvenancePolicy,
+    pub reviewed_patch: ReviewedPatch,
     pub harness: HarnessContract,
     pub blocked_evidence: PathBuf,
     pub evidence_root: PathBuf,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Plan {
     pub schema: String,
     pub driver: DriverIdentity,
     pub preflight: PreflightIdentity,
     pub repository: RepositoryIdentity,
-    pub baseline: ExecutableIdentity,
-    pub candidate: ExecutableIdentity,
+    pub baseline: ArtifactInput,
+    pub candidate: ArtifactInput,
+    pub provenance_policy: ProvenancePolicy,
+    pub reviewed_patch: ReviewedPatch,
     pub harness: HarnessContract,
     pub blocked_evidence: PathBuf,
     pub evidence_root: PathBuf,
+    pub composed_request: FileInput,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DriverIdentity {
     pub path: PathBuf,
     pub sha256: String,
@@ -57,12 +91,14 @@ pub struct DriverIdentity {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PreflightIdentity {
     pub environment_path: PathBuf,
     pub environment_sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RepositoryIdentity {
     pub root: PathBuf,
     pub head: String,
@@ -70,6 +106,8 @@ pub struct RepositoryIdentity {
     pub source_diff_sha256: String,
     pub source_status: PathBuf,
     pub source_status_sha256: String,
+    pub source_manifest: PathBuf,
+    pub source_manifest_sha256: String,
     pub cargo_lock: PathBuf,
     pub cargo_lock_sha256: String,
     pub quic_source: PathBuf,
@@ -79,15 +117,281 @@ pub struct RepositoryIdentity {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct ExecutableIdentity {
+#[serde(deny_unknown_fields)]
+pub struct FileInput {
     pub path: PathBuf,
     pub sha256: String,
-    pub build_identity: String,
-    pub source_identity_path: PathBuf,
-    pub source_identity_sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactInput {
+    pub executable: FileInput,
+    pub provenance_receipt: FileInput,
+    pub source_snapshot: FileInput,
+    pub source_manifest: FileInput,
+    pub source_bundle: FileInput,
+    pub legacy_evidence: LegacyEvidence,
+    pub benchmark_source: FileInput,
+    pub cargo_lock: FileInput,
+    pub workspace_manifest: FileInput,
+    pub package_manifest: FileInput,
+    pub cargo_config: Option<FileInput>,
+    pub rustc_verbose: FileInput,
+    pub cargo_verbose: FileInput,
+    pub build_environment: FileInput,
+    pub profile_identity: FileInput,
+    pub provenance: ArtifactProvenance,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyEvidence {
+    pub primary: FileInput,
+    pub secondary: FileInput,
+    pub environment: Option<FileInput>,
+    pub preregistration: Option<FileInput>,
+    pub build_result: Option<FileInput>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactProvenance {
+    pub schema: String,
+    pub role: ArtifactRole,
+    pub origin: ArtifactOrigin,
+    pub status: ProvenanceStatus,
+    pub artifact_sha256: String,
+    pub source: HistoricalSourceIdentity,
+    pub dependencies: DependencyIdentity,
+    pub toolchain: ToolchainIdentity,
+    pub build: BuildIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactRole {
+    Baseline,
+    Candidate,
+}
+
+/// How the executable bytes were obtained, independently of how their provenance was recorded.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ArtifactOrigin {
+    RecoveredFrozen,
+    ReproducedExact { expected_historical_sha256: String },
+}
+
+/// Whether the provenance receipt is the original record or a later reconstruction.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProvenanceStatus {
+    EvidenceDerived {
+        derivation: EvidenceDerivation,
+    },
+    Reconstructed {
+        authority: String,
+        evidence: Vec<FileInput>,
+        limitations: Vec<String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceDerivation {
+    ByteExactPayloadsFromDurableSessionLogOriginalPathsAndInodesUnavailable,
+    SyntheticFixture,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoricalSourceIdentity {
+    pub repository_head: String,
+    pub source_snapshot_sha256: String,
+    /// Role-specific recovered source identity receipt (baseline status; candidate identity).
+    pub source_identity_sha256: String,
+    pub source_manifest_sha256: String,
+    pub source_bundle_sha256: String,
+    pub benchmark_source_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DependencyIdentity {
+    pub cargo_lock_sha256: String,
+    pub workspace_manifest_sha256: String,
+    pub package_manifest_sha256: String,
+    pub cargo_config_sha256: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolchainIdentity {
+    pub rustc_release: String,
+    pub rustc_commit_hash: String,
+    pub cargo_release: String,
+    pub host: String,
+    pub target: String,
+    pub rustc_verbose_sha256: String,
+    pub cargo_verbose_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuildIdentity {
+    pub profile: String,
+    pub profile_identity_sha256: String,
+    pub features: Vec<String>,
+    pub command_argv: Vec<String>,
+    pub environment: BTreeMap<String, String>,
+    pub environment_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseProfileIdentity {
+    pub schema: String,
+    pub profile: String,
+    pub opt_level: u8,
+    pub lto: bool,
+    pub codegen_units: u32,
+    pub panic: String,
+    pub strip: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceManifest {
+    pub schema: String,
+    pub repository_head: String,
+    pub entries: Vec<SourceManifestEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceManifestEntry {
+    /// Canonical UTF-8 repository-relative path using `/` separators.
+    pub path: String,
+    /// Exact Git-compatible mode such as `100644` or `100755`.
+    pub mode: String,
+    pub length: u64,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceBundle {
+    pub schema: String,
+    pub repository_head: String,
+    pub entries: Vec<SourceBundleEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceBundleEntry {
+    pub path: String,
+    pub mode: String,
+    pub contents: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewedPatch {
+    pub manifest: FileInput,
+    pub record: ReviewedPatchManifest,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewedPatchManifest {
+    pub schema: String,
+    pub baseline: HistoricalSourceIdentity,
+    pub candidate: HistoricalSourceIdentity,
+    pub files: Vec<ReviewedPatchFile>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewedPatchFile {
+    pub path: String,
+    pub operation: ReviewedPatchOperation,
+    pub baseline: Option<ReviewedPatchFileIdentity>,
+    pub candidate: Option<ReviewedPatchFileIdentity>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewedPatchFileIdentity {
+    pub mode: String,
+    pub length: u64,
+    pub sha256: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewedPatchOperation {
+    Added,
+    Modified,
+    Deleted,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProvenancePolicy {
+    pub baseline_origin: ArtifactOrigin,
+    pub candidate_origin: ArtifactOrigin,
+    pub status: ProvenanceStatusPolicy,
+    pub baseline_artifact_sha256: String,
+    pub candidate_artifact_sha256: String,
+    pub baseline_legacy_primary_sha256: String,
+    pub baseline_legacy_secondary_sha256: String,
+    pub baseline_legacy_environment_sha256: Option<String>,
+    pub baseline_legacy_preregistration_sha256: Option<String>,
+    pub baseline_legacy_build_result_sha256: Option<String>,
+    pub candidate_legacy_primary_sha256: String,
+    pub candidate_legacy_secondary_sha256: String,
+    /// Absent until the exact baseline build-source bundle is independently recovered.
+    pub baseline_source_bundle_sha256: Option<String>,
+    pub candidate_source_bundle_sha256: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProvenanceStatusPolicy {
+    OriginalOnly,
+    EvidenceDerivedOnly,
+    FutureReconstructedWithAuthority,
+}
+
+impl ProvenancePolicy {
+    #[must_use]
+    pub fn recovered_frozen_evidence_derived() -> Self {
+        Self {
+            baseline_origin: ArtifactOrigin::RecoveredFrozen,
+            candidate_origin: ArtifactOrigin::RecoveredFrozen,
+            status: ProvenanceStatusPolicy::EvidenceDerivedOnly,
+            baseline_artifact_sha256: BASELINE_ARTIFACT_SHA256.to_owned(),
+            candidate_artifact_sha256: CANDIDATE_ARTIFACT_SHA256.to_owned(),
+            baseline_legacy_primary_sha256: BASELINE_LEGACY_PRIMARY_SHA256.to_owned(),
+            baseline_legacy_secondary_sha256: BASELINE_LEGACY_SECONDARY_SHA256.to_owned(),
+            baseline_legacy_environment_sha256: Some(BASELINE_LEGACY_ENVIRONMENT_SHA256.to_owned()),
+            baseline_legacy_preregistration_sha256: Some(
+                BASELINE_LEGACY_PREREGISTRATION_SHA256.to_owned(),
+            ),
+            baseline_legacy_build_result_sha256: Some(
+                BASELINE_LEGACY_BUILD_RESULT_SHA256.to_owned(),
+            ),
+            candidate_legacy_primary_sha256: CANDIDATE_LEGACY_PRIMARY_SHA256.to_owned(),
+            candidate_legacy_secondary_sha256: CANDIDATE_LEGACY_SECONDARY_SHA256.to_owned(),
+            baseline_source_bundle_sha256: None,
+            candidate_source_bundle_sha256: CANDIDATE_SOURCE_BUNDLE_SHA256.to_owned(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct HarnessContract {
     pub schema: String,
     pub test_name: String,
@@ -141,6 +445,7 @@ pub enum ChildEnvironmentPolicy {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RunAssignment {
     pub sequence: u8,
     pub run_id: String,
@@ -204,6 +509,7 @@ pub fn fixed_run_assignments() -> [RunAssignment; RUN_COUNT] {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct HarnessRecord {
     pub schema: String,
     pub run_id: String,
@@ -217,6 +523,7 @@ pub struct HarnessRecord {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChildReceipt {
     pub schema: String,
     pub status_available: bool,
@@ -231,7 +538,7 @@ pub struct ChildReceipt {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ChildTerminationReceipt {
     Exited,
     ManagedSignal {
@@ -253,7 +560,7 @@ pub enum ChildTerminationReceipt {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ChildCleanupIssueReceipt {
     Setup {
         stage: String,
@@ -276,6 +583,7 @@ pub enum ChildCleanupIssueReceipt {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RunRecord {
     pub schema: String,
     pub assignment: RunAssignment,
@@ -285,6 +593,7 @@ pub struct RunRecord {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Event {
     pub schema: String,
     pub sequence: u64,
@@ -302,6 +611,7 @@ pub enum EventPhase {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuditRecord {
     pub schema: String,
     pub status: TerminalStatus,
@@ -317,6 +627,7 @@ pub struct AuditRecord {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct TerminalReceipt {
     pub schema: String,
     pub status: TerminalStatus,
@@ -329,6 +640,7 @@ pub struct TerminalReceipt {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PairedDelta {
     pub pair: u8,
     pub baseline_ns_per_op: u64,
@@ -349,9 +661,12 @@ pub enum TerminalStatus {
 #[cfg(test)]
 mod tests {
     use super::{
-        fixed_run_assignments, Arm, ChildEnvironmentPolicy, Event, EventPhase, HarnessContract,
-        RunKind, BENCHMARK_TEST_NAME, EVENT_SCHEMA, HARNESS_SCHEMA, MAX_CHILD_DURATION_SECONDS,
-        MAX_CHILD_STDERR_BYTES, MAX_CHILD_STDOUT_BYTES, RUN_COUNT, RUN_ID_ENVIRONMENT_VARIABLE,
+        fixed_run_assignments, Arm, ArtifactOrigin, ChildEnvironmentPolicy, Event, EventPhase,
+        HarnessContract, ProvenancePolicy, ProvenanceStatusPolicy, RunKind, TerminalReceipt,
+        TerminalStatus, BASELINE_ARTIFACT_SHA256, BASELINE_LEGACY_PRIMARY_SHA256,
+        BENCHMARK_TEST_NAME, CANDIDATE_ARTIFACT_SHA256, CANDIDATE_LEGACY_SECONDARY_SHA256,
+        EVENT_SCHEMA, HARNESS_SCHEMA, MAX_CHILD_DURATION_SECONDS, MAX_CHILD_STDERR_BYTES,
+        MAX_CHILD_STDOUT_BYTES, RUN_COUNT, RUN_ID_ENVIRONMENT_VARIABLE,
     };
 
     #[test]
@@ -426,5 +741,51 @@ mod tests {
             assert_eq!(value["schema"], EVENT_SCHEMA);
             assert_eq!(value["phase"], expected);
         }
+    }
+
+    #[test]
+    fn acceptance_records_reject_unknown_fields() {
+        let event = Event {
+            schema: EVENT_SCHEMA.to_owned(),
+            sequence: 7,
+            phase: EventPhase::Started,
+            run_id: Some("pair1-B".to_owned()),
+            pid: Some(42),
+        };
+        let mut event = serde_json::to_value(event).unwrap();
+        event["unreviewed"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<Event>(event).is_err());
+
+        let terminal = TerminalReceipt {
+            schema: "distd.quic.fetch.driver.terminal.v1".to_owned(),
+            status: TerminalStatus::Blocked,
+            stage: "preflight".to_owned(),
+            detail: "fixture".to_owned(),
+            manifest_sha256: "a".repeat(64),
+            completed_runs: 0,
+            audit: None,
+        };
+        let mut terminal = serde_json::to_value(terminal).unwrap();
+        terminal["unreviewed"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<TerminalReceipt>(terminal).is_err());
+    }
+
+    #[test]
+    fn recovery_policy_pins_evidence_derived_frozen_artifacts() {
+        let policy = ProvenancePolicy::recovered_frozen_evidence_derived();
+
+        assert_eq!(policy.baseline_origin, ArtifactOrigin::RecoveredFrozen);
+        assert_eq!(policy.candidate_origin, ArtifactOrigin::RecoveredFrozen);
+        assert_eq!(policy.status, ProvenanceStatusPolicy::EvidenceDerivedOnly);
+        assert_eq!(policy.baseline_artifact_sha256, BASELINE_ARTIFACT_SHA256);
+        assert_eq!(policy.candidate_artifact_sha256, CANDIDATE_ARTIFACT_SHA256);
+        assert_eq!(
+            policy.baseline_legacy_primary_sha256,
+            BASELINE_LEGACY_PRIMARY_SHA256
+        );
+        assert_eq!(
+            policy.candidate_legacy_secondary_sha256,
+            CANDIDATE_LEGACY_SECONDARY_SHA256
+        );
     }
 }

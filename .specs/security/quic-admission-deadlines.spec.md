@@ -17,7 +17,7 @@ refines:
 aspects: [preauth, admission, accounting, deadlines, release, configuration]
 assignee: carlo
 eta:
-blocked_by: [TASK:performance/quic-fetch-benchmark-driver]
+blocked_by: [TASK:performance/run-final-source-quic-fetch-acceptance]
 ---
 
 # Quic admission deadlines
@@ -123,7 +123,13 @@ a lower-level raw QUIC frame harness rather than Quinn's public stream API.
 - Build each arm once in release mode and reuse that immutable artifact for all
   of its runs. Record exact host hardware, OS/power state, Rust toolchain,
   dependency lock, release flags, source revision/dirty digest, and both build
-  identities; baseline and candidate identities MUST differ only by the
+  identities. The acceptance driver MUST independently anchor recovered legacy
+  evidence, derive each source manifest from complete rehashable source bytes,
+  and mechanically derive the baseline-to-candidate patch; a caller-authored
+  identity or patch is insufficient. Build command argv and explicit command
+  environment overrides MUST likewise derive from independently anchored
+  command evidence; they do not claim inherited process environment state.
+  Baseline and candidate product source identities MUST differ only by the
   reviewed task patch. Under that frozen environment, run exactly one
   unmeasured 5,000-stream warm-up for each arm in preregistered B-then-C order,
   then exactly five measured chronological pairs in the fixed order

@@ -41,6 +41,8 @@ pub enum EvidenceError {
     NotRegularFile(PathBuf),
     #[error("file changed while its identity was captured: {0}")]
     FileChanged(PathBuf),
+    #[error("file exceeds the {limit_bytes}-byte input limit: {path}")]
+    FileTooLarge { path: PathBuf, limit_bytes: u64 },
     #[error("manifest path is outside its evidence root: {0}")]
     ManifestOutsideRoot(PathBuf),
     #[error("manifest has unsupported schema: {0}")]
@@ -68,6 +70,7 @@ fn io_error(path: &Path, source: io::Error) -> EvidenceError {
 
 /// An absent absolute path resolved through its already-existing canonical parent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AbsentRoot {
     pub canonical_parent: PathBuf,
     pub leaf: PathBuf,
@@ -159,6 +162,22 @@ impl PinnedAbsentRoot {
             self.absent.leaf.as_os_str(),
             &self.absent.canonical_path,
             bytes,
+            0o600,
+        )
+    }
+
+    /// Create a final file at the requested mode before it becomes reachable by name.
+    pub fn atomic_create_new_synced_mode(
+        self,
+        bytes: &[u8],
+        mode: u32,
+    ) -> Result<(), EvidenceError> {
+        atomic_create_new_synced_at(
+            &self.parent.directory,
+            self.absent.leaf.as_os_str(),
+            &self.absent.canonical_path,
+            bytes,
+            mode,
         )
     }
 
@@ -459,7 +478,7 @@ impl RootHandle {
         bytes: &[u8],
     ) -> Result<(), EvidenceError> {
         let (parent, leaf, display_path) = self.open_relative_parent(relative)?;
-        atomic_create_new_synced_at(&parent, &leaf, &display_path, bytes)
+        atomic_create_new_synced_at(&parent, &leaf, &display_path, bytes, 0o600)
     }
 
     pub fn write_json_create_new<T: Serialize>(
@@ -519,15 +538,37 @@ impl RootHandle {
         stable_file_bytes_at(&parent, &leaf, &display_path)
     }
 
+    /// Read and hash a pinned root-relative regular file with an allocation ceiling.
+    pub fn stable_file_bytes_bounded(
+        &self,
+        relative: &Path,
+        max_bytes: u64,
+    ) -> Result<(FileIdentity, Vec<u8>), EvidenceError> {
+        let (parent, leaf, display_path) = self.open_relative_parent(relative)?;
+        let (identity, bytes, _) =
+            stable_file_capture_at(&parent, &leaf, &display_path, Some(max_bytes))?;
+        Ok((identity, bytes))
+    }
+
     pub fn stable_file_identity(&self, relative: &Path) -> Result<FileIdentity, EvidenceError> {
         self.stable_file_bytes(relative)
+            .map(|(identity, _)| identity)
+    }
+
+    /// Hash one pinned root-relative regular file with an allocation ceiling.
+    pub fn stable_file_identity_bounded(
+        &self,
+        relative: &Path,
+        max_bytes: u64,
+    ) -> Result<FileIdentity, EvidenceError> {
+        self.stable_file_bytes_bounded(relative, max_bytes)
             .map(|(identity, _)| identity)
     }
 
     /// Hash, verify, retain, and rewind one root-relative regular file descriptor.
     pub fn open_stable_file(&self, relative: &Path) -> Result<(FileIdentity, File), EvidenceError> {
         let (parent, leaf, display_path) = self.open_relative_parent(relative)?;
-        let (identity, _, file) = stable_file_capture_at(&parent, &leaf, &display_path)?;
+        let (identity, _, file) = stable_file_capture_at(&parent, &leaf, &display_path, None)?;
         Ok((identity, file))
     }
 
@@ -798,6 +839,7 @@ fn atomic_create_new_synced_at(
     leaf: &OsStr,
     display_path: &Path,
     bytes: &[u8],
+    mode: u32,
 ) -> Result<(), EvidenceError> {
     let mut temporary_name = None;
     let mut temporary_file = None;
@@ -853,6 +895,9 @@ fn atomic_create_new_synced_at(
             .write_all(bytes)
             .map_err(|error| io_error(&temporary_display, error))?;
         temporary_file
+            .set_permissions(fs::Permissions::from_mode(mode))
+            .map_err(|error| io_error(&temporary_display, error))?;
+        temporary_file
             .sync_all()
             .map_err(|error| io_error(&temporary_display, error))?;
         let staged = temporary_file
@@ -903,7 +948,7 @@ fn stable_file_bytes_at(
     leaf: &OsStr,
     display_path: &Path,
 ) -> Result<(FileIdentity, Vec<u8>), EvidenceError> {
-    let (identity, bytes, _) = stable_file_capture_at(parent, leaf, display_path)?;
+    let (identity, bytes, _) = stable_file_capture_at(parent, leaf, display_path, None)?;
     Ok((identity, bytes))
 }
 
@@ -911,6 +956,7 @@ fn stable_file_capture_at(
     parent: &File,
     leaf: &OsStr,
     display_path: &Path,
+    max_bytes: Option<u64>,
 ) -> Result<(FileIdentity, Vec<u8>, File), EvidenceError> {
     let link_metadata = metadata_at(parent, leaf, display_path, libc::AT_SYMLINK_NOFOLLOW)?;
     if (link_metadata.st_mode & libc::S_IFMT) != libc::S_IFREG {
@@ -930,11 +976,31 @@ fn stable_file_capture_at(
     if !before.is_file() {
         return Err(EvidenceError::NotRegularFile(display_path.to_path_buf()));
     }
+    if max_bytes.is_some_and(|limit| before.len() > limit) {
+        return Err(EvidenceError::FileTooLarge {
+            path: display_path.to_path_buf(),
+            limit_bytes: max_bytes.expect("checked as present"),
+        });
+    }
     let before_identity = MetadataIdentity::from(&before);
-    let capacity = usize::try_from(before.len()).unwrap_or(0);
+    let capacity = usize::try_from(max_bytes.map_or(before.len(), |limit| before.len().min(limit)))
+        .unwrap_or(0);
     let mut bytes = Vec::with_capacity(capacity);
-    file.read_to_end(&mut bytes)
-        .map_err(|error| io_error(display_path, error))?;
+    if let Some(limit) = max_bytes {
+        Read::by_ref(&mut file)
+            .take(limit.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|error| io_error(display_path, error))?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > limit {
+            return Err(EvidenceError::FileTooLarge {
+                path: display_path.to_path_buf(),
+                limit_bytes: limit,
+            });
+        }
+    } else {
+        file.read_to_end(&mut bytes)
+            .map_err(|error| io_error(display_path, error))?;
+    }
     let sha256 = sha256_bytes(&bytes);
     let after = file
         .metadata()
@@ -1145,7 +1211,7 @@ fn canonicalize_json(value: Value) -> Value {
 /// the requested name atomically with create-new semantics.
 pub fn atomic_create_new_synced(path: &Path, bytes: &[u8]) -> Result<(), EvidenceError> {
     let (parent, leaf) = pin_parent_for_path(path)?;
-    atomic_create_new_synced_at(&parent.directory, &leaf, path, bytes)
+    atomic_create_new_synced_at(&parent.directory, &leaf, path, bytes, 0o600)
 }
 
 pub fn write_json_create_new<T: Serialize>(path: &Path, value: &T) -> Result<(), EvidenceError> {
@@ -1201,6 +1267,7 @@ fn lowercase_hex(bytes: &[u8]) -> String {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FileIdentity {
     pub canonical_path: PathBuf,
     pub sha256: String,
@@ -1261,8 +1328,21 @@ pub fn stable_file_identity(path: &Path) -> Result<FileIdentity, EvidenceError> 
 pub fn open_stable_file(path: &Path) -> Result<(FileIdentity, File), EvidenceError> {
     let (parent, leaf) = pin_parent_for_path(path)?;
     let display_path = parent.path().join(&leaf);
-    let (identity, _, file) = stable_file_capture_at(&parent.directory, &leaf, &display_path)
+    let (identity, _, file) = stable_file_capture_at(&parent.directory, &leaf, &display_path, None)
         .map_err(|error| remap_file_error_path(error, path))?;
+    Ok((identity, file))
+}
+
+/// Hash and retain a stable regular-file descriptor while enforcing a byte ceiling.
+pub fn open_stable_file_bounded(
+    path: &Path,
+    max_bytes: u64,
+) -> Result<(FileIdentity, File), EvidenceError> {
+    let (parent, leaf) = pin_parent_for_path(path)?;
+    let display_path = parent.path().join(&leaf);
+    let (identity, _, file) =
+        stable_file_capture_at(&parent.directory, &leaf, &display_path, Some(max_bytes))
+            .map_err(|error| remap_file_error_path(error, path))?;
     Ok((identity, file))
 }
 
@@ -1275,15 +1355,41 @@ pub fn stable_file_bytes(path: &Path) -> Result<(FileIdentity, Vec<u8>), Evidenc
         .map_err(|error| remap_file_error_path(error, path))
 }
 
+/// Read and hash one stable regular file while refusing an oversized allocation.
+pub fn stable_file_bytes_bounded(
+    path: &Path,
+    max_bytes: u64,
+) -> Result<(FileIdentity, Vec<u8>), EvidenceError> {
+    let (parent, leaf) = pin_parent_for_path(path)?;
+    let display_path = parent.path().join(&leaf);
+    let (identity, bytes, _) =
+        stable_file_capture_at(&parent.directory, &leaf, &display_path, Some(max_bytes))
+            .map_err(|error| remap_file_error_path(error, path))?;
+    Ok((identity, bytes))
+}
+
+/// Hash one stable regular file while enforcing the same input-size ceiling.
+pub fn stable_file_identity_bounded(
+    path: &Path,
+    max_bytes: u64,
+) -> Result<FileIdentity, EvidenceError> {
+    stable_file_bytes_bounded(path, max_bytes).map(|(identity, _)| identity)
+}
+
 fn remap_file_error_path(error: EvidenceError, requested: &Path) -> EvidenceError {
     match error {
         EvidenceError::NotRegularFile(_) => EvidenceError::NotRegularFile(requested.to_path_buf()),
         EvidenceError::FileChanged(_) => EvidenceError::FileChanged(requested.to_path_buf()),
+        EvidenceError::FileTooLarge { limit_bytes, .. } => EvidenceError::FileTooLarge {
+            path: requested.to_path_buf(),
+            limit_bytes,
+        },
         other => other,
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ManifestEntry {
     pub relative_path: String,
     pub sha256: String,
@@ -1295,6 +1401,7 @@ pub struct ManifestEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvidenceManifest {
     pub schema: String,
     /// Safe root-relative files intentionally published after this manifest.
@@ -1524,6 +1631,24 @@ mod tests {
     }
 
     #[test]
+    fn bounded_stable_read_rejects_oversized_file_before_allocation() {
+        let temporary = tempdir().unwrap();
+        let oversized = temporary.path().join("oversized");
+        let file = File::create(&oversized).unwrap();
+        file.set_len(4_097).unwrap();
+
+        let error = stable_file_bytes_bounded(&oversized, 4_096).unwrap_err();
+
+        assert!(matches!(
+            error,
+            EvidenceError::FileTooLarge {
+                path: _,
+                limit_bytes: 4_096
+            }
+        ));
+    }
+
+    #[test]
     fn open_stable_file_retains_hashed_inode_after_path_replacement() {
         let temporary = tempdir().unwrap();
         let executable = temporary.path().join("executable");
@@ -1615,7 +1740,7 @@ mod tests {
         assert!(matches!(
             root.create_manifest_with_exclusions(Path::new("../escaped-manifest.json"), &[]),
             Err(EvidenceError::UnsafeRelativePath(path))
-                if path == PathBuf::from("../escaped-manifest.json")
+                if path.as_path() == Path::new("../escaped-manifest.json")
         ));
         assert!(!temporary.path().join("escaped-manifest.json").exists());
     }

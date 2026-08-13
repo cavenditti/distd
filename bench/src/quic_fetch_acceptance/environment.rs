@@ -11,6 +11,7 @@ const data = $(text).dataUsingEncoding($.NSUTF8StringEncoding);
 $.NSFileHandle.fileHandleWithStandardOutput.writeData(data);";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OsFacts {
     pub product_version: String,
     pub kernel_identity: String,
@@ -18,6 +19,7 @@ pub struct OsFacts {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PowerFacts {
     pub ac_power_active: bool,
     pub low_power_mode: bool,
@@ -26,6 +28,7 @@ pub struct PowerFacts {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoopbackFacts {
     pub address: String,
     pub port: u16,
@@ -33,6 +36,7 @@ pub struct LoopbackFacts {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EnvironmentExpectations {
     pub product_version: Option<String>,
     pub kernel_identity: Option<String>,
@@ -40,6 +44,7 @@ pub struct EnvironmentExpectations {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EnvironmentPass {
     pub schema: String,
     pub status: String,
@@ -61,6 +66,7 @@ pub enum EnvironmentBlockCode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EnvironmentBlocked {
     pub schema: String,
     pub status: String,
@@ -489,5 +495,23 @@ mod tests {
         );
         assert!(parse_u8_assignment("thermal_state=0\nthermal_state=1", "thermal_state").is_err());
         assert!(parse_u8_assignment("thermal_state=nominal", "thermal_state").is_err());
+    }
+
+    #[test]
+    fn acceptance_receipts_reject_unknown_fields() {
+        let mut value = serde_json::to_value(EnvironmentPass {
+            schema: "distd.quic.fetch.environment-pass.v1".to_owned(),
+            status: "PASS".to_owned(),
+            os: MockProbe::passing().os.unwrap(),
+            power: MockProbe::passing().power.unwrap(),
+            loopback: MockProbe::passing().loopback.unwrap(),
+        })
+        .unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("unauthenticated".to_owned(), serde_json::json!(true));
+
+        assert!(serde_json::from_value::<EnvironmentPass>(value).is_err());
     }
 }

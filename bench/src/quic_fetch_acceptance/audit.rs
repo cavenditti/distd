@@ -238,8 +238,8 @@ fn validate_plan(plan: &Plan) -> Result<(), AuditError> {
         return Err(AuditError::HarnessContractMismatch);
     }
     for (arm, sha256) in [
-        (Arm::Baseline, plan.baseline.sha256.as_str()),
-        (Arm::Candidate, plan.candidate.sha256.as_str()),
+        (Arm::Baseline, plan.baseline.executable.sha256.as_str()),
+        (Arm::Candidate, plan.candidate.executable.sha256.as_str()),
     ] {
         if !is_lowercase_sha256(sha256) {
             return Err(AuditError::PlanExecutableHash { arm });
@@ -259,8 +259,8 @@ fn validate_run(plan: &Plan, index: usize, run: &RunRecord) -> Result<(), AuditE
         return Err(AuditError::ExecutableHash { index });
     }
     let expected_executable_hash = match run.assignment.arm {
-        Arm::Baseline => &plan.baseline.sha256,
-        Arm::Candidate => &plan.candidate.sha256,
+        Arm::Baseline => &plan.baseline.executable.sha256,
+        Arm::Candidate => &plan.candidate.executable.sha256,
     };
     if run.executable_sha256 != *expected_executable_hash {
         return Err(AuditError::ExecutableHashMismatch {
@@ -387,16 +387,95 @@ fn is_lowercase_sha256(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{collections::BTreeMap, path::PathBuf};
 
     use super::{audit_run_metrics as audit_runs_with_plan, AuditError};
     use crate::quic_fetch_acceptance::model::{
-        fixed_run_assignments, Arm, AuditRecord, ChildReceipt, ChildTerminationReceipt,
-        DriverIdentity, ExecutableIdentity, HarnessContract, HarnessRecord, Plan,
-        PreflightIdentity, RepositoryIdentity, RunKind, RunRecord, TerminalStatus,
-        CHILD_RECEIPT_SCHEMA, HARNESS_SCHEMA, OPERATIONS_PER_RUN, PLAN_SCHEMA, RESPONSE_BLAKE3,
-        RESPONSE_FRAME_BYTES, RUN_RECORD_SCHEMA,
+        fixed_run_assignments, Arm, ArtifactInput, ArtifactOrigin, ArtifactProvenance,
+        ArtifactRole, AuditRecord, BuildIdentity, ChildReceipt, ChildTerminationReceipt,
+        DependencyIdentity, DriverIdentity, EvidenceDerivation, FileInput, HarnessContract,
+        HarnessRecord, HistoricalSourceIdentity, LegacyEvidence, Plan, PreflightIdentity,
+        ProvenancePolicy, ProvenanceStatus, ProvenanceStatusPolicy, RepositoryIdentity,
+        ReviewedPatch, ReviewedPatchManifest, RunKind, RunRecord, TerminalStatus,
+        ToolchainIdentity, ARTIFACT_PROVENANCE_SCHEMA, CHILD_RECEIPT_SCHEMA, HARNESS_SCHEMA,
+        OPERATIONS_PER_RUN, PLAN_SCHEMA, RESPONSE_BLAKE3, RESPONSE_FRAME_BYTES,
+        REVIEWED_PATCH_SCHEMA, RUN_RECORD_SCHEMA,
     };
+
+    fn input(path: &str, hash: char) -> FileInput {
+        FileInput {
+            path: PathBuf::from(path),
+            sha256: hash.to_string().repeat(64),
+        }
+    }
+
+    fn artifact(role: ArtifactRole, root: &str, hash: char) -> ArtifactInput {
+        let source = HistoricalSourceIdentity {
+            repository_head: "1".repeat(40),
+            source_snapshot_sha256: "3".repeat(64),
+            source_identity_sha256: "4".repeat(64),
+            source_manifest_sha256: "5".repeat(64),
+            source_bundle_sha256: "0".repeat(64),
+            benchmark_source_sha256: "6".repeat(64),
+        };
+        let provenance = ArtifactProvenance {
+            schema: ARTIFACT_PROVENANCE_SCHEMA.to_string(),
+            role,
+            origin: ArtifactOrigin::RecoveredFrozen,
+            status: ProvenanceStatus::EvidenceDerived {
+                derivation: EvidenceDerivation::SyntheticFixture,
+            },
+            artifact_sha256: hash.to_string().repeat(64),
+            source,
+            dependencies: DependencyIdentity {
+                cargo_lock_sha256: "7".repeat(64),
+                workspace_manifest_sha256: "8".repeat(64),
+                package_manifest_sha256: "9".repeat(64),
+                cargo_config_sha256: None,
+            },
+            toolchain: ToolchainIdentity {
+                rustc_release: "1.96.0".to_string(),
+                rustc_commit_hash: "a".repeat(40),
+                cargo_release: "1.96.0".to_string(),
+                host: "fixture-host".to_string(),
+                target: "fixture-target".to_string(),
+                rustc_verbose_sha256: "a".repeat(64),
+                cargo_verbose_sha256: "b".repeat(64),
+            },
+            build: BuildIdentity {
+                profile: "release".to_string(),
+                profile_identity_sha256: "c".repeat(64),
+                features: vec!["redb".to_owned()],
+                command_argv: vec!["cargo".to_string(), "test".to_string()],
+                environment: BTreeMap::new(),
+                environment_sha256: "d".repeat(64),
+            },
+        };
+        ArtifactInput {
+            executable: input(&format!("{root}/executable"), hash),
+            provenance_receipt: input(&format!("{root}/provenance.json"), 'f'),
+            source_snapshot: input(&format!("{root}/source.snapshot"), '3'),
+            source_manifest: input(&format!("{root}/source-manifest.json"), '5'),
+            source_bundle: input(&format!("{root}/source-bundle.json"), '0'),
+            legacy_evidence: LegacyEvidence {
+                primary: input(&format!("{root}/legacy-primary.txt"), '1'),
+                secondary: input(&format!("{root}/legacy-secondary.txt"), '2'),
+                environment: None,
+                preregistration: None,
+                build_result: None,
+            },
+            benchmark_source: input(&format!("{root}/benchmark-source.rs"), '6'),
+            cargo_lock: input(&format!("{root}/Cargo.lock"), '7'),
+            workspace_manifest: input(&format!("{root}/workspace-Cargo.toml"), '8'),
+            package_manifest: input(&format!("{root}/package-Cargo.toml"), '9'),
+            cargo_config: None,
+            rustc_verbose: input(&format!("{root}/rustc-verbose.txt"), 'a'),
+            cargo_verbose: input(&format!("{root}/cargo-verbose.txt"), 'b'),
+            build_environment: input(&format!("{root}/build-environment.json"), 'd'),
+            profile_identity: input(&format!("{root}/profile-identity.json"), 'c'),
+            provenance,
+        }
+    }
 
     fn valid_plan() -> Plan {
         Plan {
@@ -418,6 +497,8 @@ mod tests {
                 source_diff_sha256: "f".repeat(64),
                 source_status: PathBuf::from("/frozen/source-status.txt"),
                 source_status_sha256: "f".repeat(64),
+                source_manifest: PathBuf::from("/frozen/source-manifest.json"),
+                source_manifest_sha256: "f".repeat(64),
                 cargo_lock: PathBuf::from("/frozen/Cargo.lock"),
                 cargo_lock_sha256: "f".repeat(64),
                 quic_source: PathBuf::from("/frozen/quic.rs"),
@@ -425,23 +506,41 @@ mod tests {
                 task_spec: PathBuf::from("/frozen/task.spec.md"),
                 task_spec_sha256: "f".repeat(64),
             },
-            baseline: ExecutableIdentity {
-                path: PathBuf::from("/bin/baseline"),
-                sha256: "a".repeat(64),
-                build_identity: "baseline-build".to_string(),
-                source_identity_path: PathBuf::from("/frozen/baseline-source.txt"),
-                source_identity_sha256: "1".repeat(64),
+            baseline: artifact(ArtifactRole::Baseline, "/frozen/baseline", 'a'),
+            candidate: artifact(ArtifactRole::Candidate, "/frozen/candidate", 'b'),
+            provenance_policy: ProvenancePolicy {
+                baseline_origin: ArtifactOrigin::RecoveredFrozen,
+                candidate_origin: ArtifactOrigin::RecoveredFrozen,
+                status: ProvenanceStatusPolicy::EvidenceDerivedOnly,
+                baseline_artifact_sha256: "a".repeat(64),
+                candidate_artifact_sha256: "b".repeat(64),
+                baseline_legacy_primary_sha256: "1".repeat(64),
+                baseline_legacy_secondary_sha256: "2".repeat(64),
+                baseline_legacy_environment_sha256: None,
+                baseline_legacy_preregistration_sha256: None,
+                baseline_legacy_build_result_sha256: None,
+                candidate_legacy_primary_sha256: "1".repeat(64),
+                candidate_legacy_secondary_sha256: "2".repeat(64),
+                baseline_source_bundle_sha256: Some("0".repeat(64)),
+                candidate_source_bundle_sha256: "0".repeat(64),
             },
-            candidate: ExecutableIdentity {
-                path: PathBuf::from("/bin/candidate"),
-                sha256: "b".repeat(64),
-                build_identity: "candidate-build".to_string(),
-                source_identity_path: PathBuf::from("/frozen/candidate-source.txt"),
-                source_identity_sha256: "2".repeat(64),
+            reviewed_patch: ReviewedPatch {
+                manifest: input("/frozen/reviewed-patch.json", 'e'),
+                record: ReviewedPatchManifest {
+                    schema: REVIEWED_PATCH_SCHEMA.to_string(),
+                    baseline: artifact(ArtifactRole::Baseline, "/unused", 'a')
+                        .provenance
+                        .source,
+                    candidate: artifact(ArtifactRole::Candidate, "/unused", 'b')
+                        .provenance
+                        .source,
+                    files: Vec::new(),
+                },
             },
             harness: HarnessContract::fixed(),
             blocked_evidence: PathBuf::from("/blocked.json"),
             evidence_root: PathBuf::from("/evidence"),
+            composed_request: input("/frozen/request.json", '0'),
         }
     }
 

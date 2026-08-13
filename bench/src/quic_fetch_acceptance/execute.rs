@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -18,23 +18,24 @@ use super::environment::{
     EnvironmentExpectations, EnvironmentPass, SystemEnvironmentProbe,
 };
 use super::evidence::{
-    canonical_json_line, open_stable_file, pin_absent_root, sha256_bytes, stable_file_identity,
-    EvidenceError, ManifestEntry, RootHandle,
+    canonical_json_line, open_stable_file_bounded, pin_absent_root, sha256_bytes,
+    stable_file_identity_bounded, EvidenceError, ManifestEntry, RootHandle,
 };
 use super::model::{
-    Arm, AuditRecord, ChildCleanupIssueReceipt, ChildReceipt, ChildTerminationReceipt, Event,
-    EventPhase, HarnessContract, HarnessRecord, Plan, RunAssignment, RunRecord, TerminalReceipt,
-    TerminalStatus, CHILD_RECEIPT_SCHEMA, EVENT_SCHEMA, PLAN_SCHEMA, RUN_COUNT, RUN_RECORD_SCHEMA,
+    Arm, ArtifactInput, AuditRecord, ChildCleanupIssueReceipt, ChildReceipt,
+    ChildTerminationReceipt, Event, EventPhase, HarnessContract, HarnessRecord, Plan,
+    RunAssignment, RunRecord, TerminalReceipt, TerminalStatus, CHILD_RECEIPT_SCHEMA, EVENT_SCHEMA,
+    PLAN_SCHEMA, RUN_COUNT, RUN_RECORD_SCHEMA,
 };
 use super::prepare::verify_live_repository;
 use super::process::{
     run_child_with_output_files, ChildCleanupIssue, ChildTermination, ExecutionSignalGuard,
     ProcessError, ProcessLimits,
 };
+use super::provenance::{self, ProvenanceValidationPolicy, MAX_PROVENANCE_INPUT_BYTES};
 
 const HARNESS_PREFIX: &str = "DISTD_QUIC_FETCH_BENCH ";
 const TERMINAL_SCHEMA: &str = "distd.quic.fetch.driver.terminal.v1";
-
 #[derive(Debug, Error)]
 pub enum ExecuteError {
     #[error(transparent)]
@@ -70,6 +71,7 @@ pub enum ExecuteError {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ExecutionPreflight {
     pub(crate) schema: String,
     pub(crate) prepared_environment_sha256: String,
@@ -77,12 +79,14 @@ pub(crate) struct ExecutionPreflight {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 struct OnceEvidence {
     schema: String,
     plan_sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 struct StartingEvidence {
     schema: String,
     assignment: RunAssignment,
@@ -91,6 +95,7 @@ struct StartingEvidence {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 struct InputBlockedReceipt {
     schema: String,
     status: TerminalStatus,
@@ -124,14 +129,20 @@ impl ExecutionDependencies for SystemExecutionDependencies {
 }
 
 pub fn execute(plan_path: &Path) -> Result<TerminalStatus, ExecuteError> {
-    execute_with_dependencies(plan_path, &SystemExecutionDependencies)
+    execute_with_dependencies_and_policy(
+        plan_path,
+        &SystemExecutionDependencies,
+        ProvenanceValidationPolicy::production(),
+    )
 }
 
-pub(crate) fn execute_with_dependencies(
+pub(crate) fn execute_with_dependencies_and_policy(
     plan_path: &Path,
     dependencies: &dyn ExecutionDependencies,
+    validation_policy: ProvenanceValidationPolicy<'_>,
 ) -> Result<TerminalStatus, ExecuteError> {
-    let (_plan_root, plan, plan_bytes, plan_sha256) = load_sealed_plan(plan_path)?;
+    let (_plan_root, plan, plan_bytes, plan_sha256) =
+        load_sealed_plan(plan_path, validation_policy)?;
     let blocked_target = pin_absent_root(&plan.blocked_evidence)?;
     if blocked_target.absent().canonical_path != plan.blocked_evidence {
         return Err(ExecuteError::Plan(
@@ -185,7 +196,6 @@ pub(crate) fn execute_with_dependencies(
             &plan_bytes,
             &plan_sha256,
             &execution_preflight,
-            dependencies,
         );
 
         if let Err(error) = &execution {
@@ -214,7 +224,6 @@ fn execute_in_root(
     plan_bytes: &[u8],
     plan_sha256: &str,
     execution_preflight: &ExecutionPreflight,
-    dependencies: &dyn ExecutionDependencies,
 ) -> Result<TerminalStatus, ExecuteError> {
     root.write_json_create_new(
         Path::new("execution-once.json"),
@@ -234,8 +243,6 @@ fn execute_in_root(
 
     let mut records = Vec::with_capacity(RUN_COUNT);
     for assignment in &plan.harness.assignments {
-        guard.require_no_signal()?;
-        dependencies.verify_plan_inputs(plan)?;
         guard.require_no_signal()?;
         records.push(execute_one(guard, root, plan, assignment)?);
     }
@@ -336,22 +343,23 @@ fn execute_one(
         &StartingEvidence {
             schema: "distd.quic.fetch.driver.starting.v1".to_string(),
             assignment: assignment.clone(),
-            executable_sha256: executable.sha256.clone(),
-            executable_path: executable.path.clone(),
+            executable_sha256: executable.executable.sha256.clone(),
+            executable_path: executable.executable.path.clone(),
         },
     )?;
     write_event(root, assignment, EventPhase::Starting, None)?;
 
     let stdout_path = run_root.join("stdout.log");
     let stderr_path = run_root.join("stderr.log");
-    let (executable_identity, executable_file) = open_stable_file(&executable.path)?;
-    if executable_identity.sha256 != executable.sha256 {
+    let (executable_identity, executable_file) =
+        open_stable_file_bounded(&executable.executable.path, MAX_PROVENANCE_INPUT_BYTES)?;
+    if executable_identity.sha256 != executable.executable.sha256 {
         return Err(ExecuteError::Plan(format!(
             "executable drifted immediately before spawn: {}",
-            executable.path.display()
+            executable.executable.path.display()
         )));
     }
-    let mut command = Command::new(&executable.path);
+    let mut command = Command::new(&executable.executable.path);
     command
         .args(&plan.harness.child_argv_suffix)
         .current_dir(&plan.repository.root)
@@ -380,8 +388,14 @@ fn execute_one(
         |pid| {
             write_event(root, assignment, EventPhase::Started, Some(pid))
                 .map_err(io::Error::other)?;
-            let current = stable_file_identity(&executable.path).map_err(io::Error::other)?;
-            if !current.same_file(&executable_identity) || current.sha256 != executable.sha256 {
+            let current = stable_file_identity_bounded(
+                &executable.executable.path,
+                MAX_PROVENANCE_INPUT_BYTES,
+            )
+            .map_err(io::Error::other)?;
+            if !current.same_file(&executable_identity)
+                || current.sha256 != executable.executable.sha256
+            {
                 return Err(io::Error::other(
                     "executable pathname changed between verification and spawn",
                 ));
@@ -432,7 +446,7 @@ fn execute_one(
     let record = RunRecord {
         schema: RUN_RECORD_SCHEMA.to_string(),
         assignment: assignment.clone(),
-        executable_sha256: executable.sha256.clone(),
+        executable_sha256: executable.executable.sha256.clone(),
         child,
         harness_records,
     };
@@ -588,7 +602,10 @@ fn rerun_environment_preflight(plan: &Plan) -> Result<ExecutionPreflight, Enviro
     })
 }
 
-fn load_sealed_plan(plan_path: &Path) -> Result<(RootHandle, Plan, Vec<u8>, String), ExecuteError> {
+fn load_sealed_plan(
+    plan_path: &Path,
+    validation_policy: ProvenanceValidationPolicy<'_>,
+) -> Result<(RootHandle, Plan, Vec<u8>, String), ExecuteError> {
     if fs::symlink_metadata(plan_path)
         .map_err(|source| ExecuteError::Io {
             path: plan_path.to_path_buf(),
@@ -615,7 +632,8 @@ fn load_sealed_plan(plan_path: &Path) -> Result<(RootHandle, Plan, Vec<u8>, Stri
         .ok_or_else(|| ExecuteError::Plan("plan has no parent".to_string()))?;
     let plan_root = RootHandle::open(plan_root_path)?;
     validate_plan_tree(&plan_root)?;
-    let (identity, bytes) = plan_root.stable_file_bytes(Path::new("plan.json"))?;
+    let (identity, bytes) =
+        plan_root.stable_file_bytes_bounded(Path::new("plan.json"), MAX_PROVENANCE_INPUT_BYTES)?;
     let plan: Plan = serde_json::from_slice(&bytes)
         .map_err(|error| ExecuteError::Plan(format!("plan JSON is malformed: {error}")))?;
     if plan.schema != PLAN_SCHEMA || plan.harness != HarnessContract::fixed() {
@@ -624,6 +642,7 @@ fn load_sealed_plan(plan_path: &Path) -> Result<(RootHandle, Plan, Vec<u8>, Stri
         ));
     }
     validate_plan_bindings(&plan, plan_root.path())?;
+    validate_sealed_provenance(&plan, validation_policy)?;
     let canonical = canonical_json_line(&plan)?;
     if canonical != bytes {
         return Err(ExecuteError::Plan(
@@ -631,7 +650,8 @@ fn load_sealed_plan(plan_path: &Path) -> Result<(RootHandle, Plan, Vec<u8>, Stri
         ));
     }
     let hash = sha256_bytes(&bytes);
-    let (_, seal_bytes) = plan_root.stable_file_bytes(Path::new("plan.sha256"))?;
+    let (_, seal_bytes) = plan_root
+        .stable_file_bytes_bounded(Path::new("plan.sha256"), MAX_PROVENANCE_INPUT_BYTES)?;
     let seal = String::from_utf8(seal_bytes)
         .map_err(|_| ExecuteError::Plan("plan seal is not UTF-8".to_string()))?;
     if seal != format!("{hash}  plan.json\n") {
@@ -647,28 +667,33 @@ fn load_sealed_plan(plan_path: &Path) -> Result<(RootHandle, Plan, Vec<u8>, Stri
 
 fn validate_plan_bindings(plan: &Plan, plan_root: &Path) -> Result<(), ExecuteError> {
     let expected = [
+        (&plan.composed_request.path, "request.json"),
         (&plan.preflight.environment_path, "environment.json"),
-        (&plan.baseline.path, "artifacts/baseline"),
-        (
-            &plan.baseline.source_identity_path,
-            "artifacts/baseline.source-identity",
-        ),
-        (&plan.candidate.path, "artifacts/candidate"),
-        (
-            &plan.candidate.source_identity_path,
-            "artifacts/candidate.source-identity",
-        ),
         (
             &plan.repository.source_diff,
-            "artifacts/repository-source.snapshot",
+            "artifacts/repository/source.snapshot",
         ),
         (
             &plan.repository.source_status,
-            "artifacts/repository-status.txt",
+            "artifacts/repository/source-status.txt",
         ),
-        (&plan.repository.cargo_lock, "artifacts/Cargo.lock"),
-        (&plan.repository.quic_source, "artifacts/quic-source.rs"),
-        (&plan.repository.task_spec, "artifacts/task-spec.md"),
+        (
+            &plan.repository.source_manifest,
+            "artifacts/repository/source-manifest.json",
+        ),
+        (
+            &plan.repository.cargo_lock,
+            "artifacts/repository/Cargo.lock",
+        ),
+        (&plan.repository.quic_source, "artifacts/repository/quic.rs"),
+        (
+            &plan.repository.task_spec,
+            "artifacts/repository/task-spec.md",
+        ),
+        (
+            &plan.reviewed_patch.manifest.path,
+            "artifacts/reviewed-patch.json",
+        ),
     ];
     for (actual, relative) in expected {
         if actual != &plan_root.join(relative) {
@@ -678,28 +703,182 @@ fn validate_plan_bindings(plan: &Plan, plan_root: &Path) -> Result<(), ExecuteEr
             )));
         }
     }
+    validate_artifact_bindings(&plan.baseline, plan_root, "baseline")?;
+    validate_artifact_bindings(&plan.candidate, plan_root, "candidate")?;
     Ok(())
 }
 
+fn validate_artifact_bindings(
+    artifact: &ArtifactInput,
+    plan_root: &Path,
+    role: &str,
+) -> Result<(), ExecuteError> {
+    let prefix = format!("artifacts/{role}");
+    let expected = [
+        (&artifact.executable.path, "executable"),
+        (&artifact.provenance_receipt.path, "provenance.json"),
+        (&artifact.source_snapshot.path, "source.snapshot"),
+        (&artifact.source_manifest.path, "source-manifest.json"),
+        (&artifact.source_bundle.path, "source-bundle.json"),
+        (&artifact.legacy_evidence.primary.path, "legacy-primary.txt"),
+        (
+            &artifact.legacy_evidence.secondary.path,
+            "legacy-secondary.txt",
+        ),
+        (&artifact.benchmark_source.path, "benchmark-source.rs"),
+        (&artifact.cargo_lock.path, "Cargo.lock"),
+        (&artifact.workspace_manifest.path, "workspace-Cargo.toml"),
+        (&artifact.package_manifest.path, "package-Cargo.toml"),
+        (&artifact.rustc_verbose.path, "rustc-verbose.txt"),
+        (&artifact.cargo_verbose.path, "cargo-verbose.txt"),
+        (&artifact.build_environment.path, "build-environment.json"),
+        (&artifact.profile_identity.path, "profile-identity.json"),
+    ];
+    for (actual, leaf) in expected {
+        let wanted = plan_root.join(&prefix).join(leaf);
+        if actual != &wanted {
+            return Err(ExecuteError::Plan(format!(
+                "sealed {role} input {} does not use the prepare-owned layout",
+                actual.display()
+            )));
+        }
+    }
+    if let Some(cargo_config) = &artifact.cargo_config {
+        let wanted = plan_root.join(&prefix).join("cargo-config.toml");
+        if cargo_config.path != wanted {
+            return Err(ExecuteError::Plan(format!(
+                "sealed {role} Cargo configuration does not use the prepare-owned layout"
+            )));
+        }
+    } else {
+        let undeclared = plan_root.join(&prefix).join("cargo-config.toml");
+        if undeclared.try_exists().map_err(|source| ExecuteError::Io {
+            path: undeclared.clone(),
+            source,
+        })? {
+            return Err(ExecuteError::Plan(format!(
+                "sealed {role} tree contains an undeclared Cargo configuration"
+            )));
+        }
+    }
+    if let Some(environment) = &artifact.legacy_evidence.environment {
+        let wanted = plan_root.join(&prefix).join("legacy-environment.txt");
+        if environment.path != wanted {
+            return Err(ExecuteError::Plan(format!(
+                "sealed {role} legacy environment does not use the prepare-owned layout"
+            )));
+        }
+    } else {
+        let undeclared = plan_root.join(&prefix).join("legacy-environment.txt");
+        if undeclared.try_exists().map_err(|source| ExecuteError::Io {
+            path: undeclared.clone(),
+            source,
+        })? {
+            return Err(ExecuteError::Plan(format!(
+                "sealed {role} tree contains an undeclared legacy environment"
+            )));
+        }
+    }
+    for (input, leaf, label) in [
+        (
+            artifact.legacy_evidence.preregistration.as_ref(),
+            "legacy-preregistration.txt",
+            "preregistration",
+        ),
+        (
+            artifact.legacy_evidence.build_result.as_ref(),
+            "legacy-build-result.txt",
+            "build result",
+        ),
+    ] {
+        let wanted = plan_root.join(&prefix).join(leaf);
+        if let Some(input) = input {
+            if input.path != wanted {
+                return Err(ExecuteError::Plan(format!(
+                    "sealed {role} legacy {label} does not use the prepare-owned layout"
+                )));
+            }
+        } else if wanted.try_exists().map_err(|source| ExecuteError::Io {
+            path: wanted.clone(),
+            source,
+        })? {
+            return Err(ExecuteError::Plan(format!(
+                "sealed {role} tree contains an undeclared legacy {label}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_sealed_provenance(
+    plan: &Plan,
+    policy: ProvenanceValidationPolicy<'_>,
+) -> Result<(), ExecuteError> {
+    provenance::validate_plan(plan, policy)
+        .map(|_| ())
+        .map_err(|error| ExecuteError::Plan(format!("sealed provenance is invalid: {error}")))
+}
+
 fn validate_plan_tree(root: &RootHandle) -> Result<(), ExecuteError> {
-    let expected_files = BTreeSet::from([
-        "artifacts/Cargo.lock".to_string(),
-        "artifacts/baseline".to_string(),
-        "artifacts/baseline.source-identity".to_string(),
-        "artifacts/candidate".to_string(),
-        "artifacts/candidate.source-identity".to_string(),
-        "artifacts/quic-source.rs".to_string(),
-        "artifacts/repository-source.snapshot".to_string(),
-        "artifacts/repository-status.txt".to_string(),
-        "artifacts/task-spec.md".to_string(),
+    let mut expected_files = BTreeSet::from([
+        "artifacts/repository/Cargo.lock".to_string(),
+        "artifacts/repository/quic.rs".to_string(),
+        "artifacts/repository/source.snapshot".to_string(),
+        "artifacts/repository/source-status.txt".to_string(),
+        "artifacts/repository/source-manifest.json".to_string(),
+        "artifacts/repository/task-spec.md".to_string(),
+        "artifacts/reviewed-patch.json".to_string(),
         "environment.json".to_string(),
         "input-identities.json".to_string(),
         "plan.json".to_string(),
         "plan.sha256".to_string(),
         "prepare-receipt.json".to_string(),
+        "request.json".to_string(),
     ]);
-    let expected_directories = BTreeSet::from(["artifacts".to_string()]);
+    for role in ["baseline", "candidate"] {
+        for leaf in [
+            "executable",
+            "provenance.json",
+            "source.snapshot",
+            "source-manifest.json",
+            "source-bundle.json",
+            "legacy-primary.txt",
+            "legacy-secondary.txt",
+            "benchmark-source.rs",
+            "Cargo.lock",
+            "workspace-Cargo.toml",
+            "package-Cargo.toml",
+            "rustc-verbose.txt",
+            "cargo-verbose.txt",
+            "build-environment.json",
+            "profile-identity.json",
+        ] {
+            expected_files.insert(format!("artifacts/{role}/{leaf}"));
+        }
+    }
     let (files, directories) = root.collect_tree_paths()?;
+    for role in ["baseline", "candidate"] {
+        let optional_environment = format!("artifacts/{role}/legacy-environment.txt");
+        if files.contains(&optional_environment) {
+            expected_files.insert(optional_environment);
+        }
+        for leaf in ["legacy-preregistration.txt", "legacy-build-result.txt"] {
+            let optional = format!("artifacts/{role}/{leaf}");
+            if files.contains(&optional) {
+                expected_files.insert(optional);
+            }
+        }
+        let optional = format!("artifacts/{role}/cargo-config.toml");
+        if files.contains(&optional) {
+            expected_files.insert(optional);
+        }
+    }
+    let expected_directories = BTreeSet::from([
+        "artifacts".to_string(),
+        "artifacts/repository".to_string(),
+        "artifacts/baseline".to_string(),
+        "artifacts/candidate".to_string(),
+    ]);
     if files != expected_files || directories != expected_directories {
         return Err(ExecuteError::Plan(format!(
             "plan tree layout differs from prepare output: files={files:?}, directories={directories:?}"
@@ -713,9 +892,9 @@ fn validate_plan_tree(root: &RootHandle) -> Result<(), ExecuteError> {
     }
     validate_safe_plan_ancestry(root.path())?;
     for path in &expected_files {
-        let identity = root.stable_file_identity(Path::new(path))?;
-        let expected_mode = if matches!(path.as_str(), "artifacts/baseline" | "artifacts/candidate")
-        {
+        let identity =
+            root.stable_file_identity_bounded(Path::new(path), MAX_PROVENANCE_INPUT_BYTES)?;
+        let expected_mode = if path.ends_with("/executable") {
             0o555
         } else {
             0o444
@@ -726,12 +905,13 @@ fn validate_plan_tree(root: &RootHandle) -> Result<(), ExecuteError> {
             )));
         }
     }
-    let (artifacts_mode, artifacts_uid) = root.directory_mode_owner(Path::new("artifacts"))?;
-    if artifacts_mode != 0o555 || artifacts_uid != current_uid {
-        return Err(ExecuteError::Plan(
-            "plan artifacts directory must be owned by the executing user with mode 555"
-                .to_string(),
-        ));
+    for directory in &expected_directories {
+        let (mode, uid) = root.directory_mode_owner(Path::new(directory))?;
+        if mode != 0o555 || uid != current_uid {
+            return Err(ExecuteError::Plan(format!(
+                "plan directory {directory} must be owned by the executing user with mode 555"
+            )));
+        }
     }
     Ok(())
 }
@@ -759,54 +939,63 @@ fn validate_safe_plan_ancestry(plan_root: &Path) -> Result<(), ExecuteError> {
     Ok(())
 }
 
+fn append_artifact_file_inputs<'a>(
+    paths: &mut Vec<(&'a PathBuf, &'a String)>,
+    artifact: &'a ArtifactInput,
+) {
+    for input in [
+        &artifact.executable,
+        &artifact.provenance_receipt,
+        &artifact.source_snapshot,
+        &artifact.source_manifest,
+        &artifact.source_bundle,
+        &artifact.legacy_evidence.primary,
+        &artifact.legacy_evidence.secondary,
+        &artifact.benchmark_source,
+        &artifact.cargo_lock,
+        &artifact.workspace_manifest,
+        &artifact.package_manifest,
+        &artifact.rustc_verbose,
+        &artifact.cargo_verbose,
+        &artifact.build_environment,
+        &artifact.profile_identity,
+    ] {
+        paths.push((&input.path, &input.sha256));
+    }
+    if let Some(input) = &artifact.cargo_config {
+        paths.push((&input.path, &input.sha256));
+    }
+    if let Some(input) = &artifact.legacy_evidence.environment {
+        paths.push((&input.path, &input.sha256));
+    }
+    if let Some(input) = &artifact.legacy_evidence.preregistration {
+        paths.push((&input.path, &input.sha256));
+    }
+    if let Some(input) = &artifact.legacy_evidence.build_result {
+        paths.push((&input.path, &input.sha256));
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn verify_plan_inputs(plan: &Plan) -> Result<(), ExecuteError> {
     verify_live_repository(&plan.repository)
         .map_err(|error| ExecuteError::Plan(error.to_string()))?;
-    let baseline_parent = plan.baseline.path.parent().ok_or_else(|| {
+    let baseline_parent = plan.baseline.executable.path.parent().ok_or_else(|| {
         ExecuteError::Plan("materialized baseline has no artifact directory".to_string())
     })?;
-    if plan.candidate.path.parent() != Some(baseline_parent)
-        || plan.baseline.source_identity_path.parent() != Some(baseline_parent)
-        || plan.candidate.source_identity_path.parent() != Some(baseline_parent)
-        || plan.repository.source_diff.parent() != Some(baseline_parent)
-        || plan.repository.source_status.parent() != Some(baseline_parent)
-        || plan.repository.cargo_lock.parent() != Some(baseline_parent)
-        || plan.repository.quic_source.parent() != Some(baseline_parent)
-        || plan.repository.task_spec.parent() != Some(baseline_parent)
-    {
+    let candidate_parent = plan.candidate.executable.path.parent().ok_or_else(|| {
+        ExecuteError::Plan("materialized candidate has no artifact directory".to_string())
+    })?;
+    if baseline_parent.parent() != candidate_parent.parent() {
         return Err(ExecuteError::Plan(
-            "sealed materialized inputs do not share one artifact directory".to_string(),
+            "sealed arm inputs do not share one artifact root".to_string(),
         ));
-    }
-    let artifact_mode = fs::metadata(baseline_parent)
-        .map_err(|source| ExecuteError::Io {
-            path: baseline_parent.to_path_buf(),
-            source,
-        })?
-        .permissions()
-        .mode()
-        & 0o7777;
-    if artifact_mode != 0o555 {
-        return Err(ExecuteError::Plan(format!(
-            "artifact directory mode is {artifact_mode:o}, expected 555"
-        )));
     }
     let mut paths = vec![
         (&plan.driver.path, &plan.driver.sha256),
         (
             &plan.preflight.environment_path,
             &plan.preflight.environment_sha256,
-        ),
-        (&plan.baseline.path, &plan.baseline.sha256),
-        (&plan.candidate.path, &plan.candidate.sha256),
-        (
-            &plan.baseline.source_identity_path,
-            &plan.baseline.source_identity_sha256,
-        ),
-        (
-            &plan.candidate.source_identity_path,
-            &plan.candidate.source_identity_sha256,
         ),
         (
             &plan.repository.source_diff,
@@ -815,6 +1004,10 @@ fn verify_plan_inputs(plan: &Plan) -> Result<(), ExecuteError> {
         (
             &plan.repository.source_status,
             &plan.repository.source_status_sha256,
+        ),
+        (
+            &plan.repository.source_manifest,
+            &plan.repository.source_manifest_sha256,
         ),
         (
             &plan.repository.cargo_lock,
@@ -828,10 +1021,17 @@ fn verify_plan_inputs(plan: &Plan) -> Result<(), ExecuteError> {
             &plan.repository.task_spec,
             &plan.repository.task_spec_sha256,
         ),
+        (
+            &plan.reviewed_patch.manifest.path,
+            &plan.reviewed_patch.manifest.sha256,
+        ),
+        (&plan.composed_request.path, &plan.composed_request.sha256),
     ];
+    append_artifact_file_inputs(&mut paths, &plan.baseline);
+    append_artifact_file_inputs(&mut paths, &plan.candidate);
     let mut seen = BTreeSet::new();
     for (path, expected) in paths.drain(..) {
-        let identity = stable_file_identity(path)?;
+        let identity = stable_file_identity_bounded(path, MAX_PROVENANCE_INPUT_BYTES)?;
         if identity.sha256 != *expected {
             return Err(ExecuteError::Plan(format!(
                 "input drifted: {}",
@@ -845,13 +1045,15 @@ fn verify_plan_inputs(plan: &Plan) -> Result<(), ExecuteError> {
             )));
         }
     }
-    for executable in [&plan.baseline, &plan.candidate] {
-        let executable_mode = stable_file_identity(&executable.path)?.mode & 0o7777;
-        let source_mode = stable_file_identity(&executable.source_identity_path)?.mode & 0o7777;
-        if executable_mode != 0o555 || source_mode != 0o444 {
+    for artifact in [&plan.baseline, &plan.candidate] {
+        let executable_mode =
+            stable_file_identity_bounded(&artifact.executable.path, MAX_PROVENANCE_INPUT_BYTES)?
+                .mode
+                & 0o7777;
+        if executable_mode != 0o555 {
             return Err(ExecuteError::Plan(format!(
-                "materialized executable or source receipt has unsafe modes: {}",
-                executable.path.display()
+                "materialized executable has unsafe mode: {}",
+                artifact.executable.path.display()
             )));
         }
     }
@@ -864,8 +1066,9 @@ fn verify_plan_inputs(plan: &Plan) -> Result<(), ExecuteError> {
             path: PathBuf::from("current_exe"),
             source,
         })?;
-    let current = stable_file_identity(&current_path)?;
-    let sealed_driver = stable_file_identity(&plan.driver.path)?;
+    let current = stable_file_identity_bounded(&current_path, MAX_PROVENANCE_INPUT_BYTES)?;
+    let sealed_driver =
+        stable_file_identity_bounded(&plan.driver.path, MAX_PROVENANCE_INPUT_BYTES)?;
     if current_path != plan.driver.path
         || current.sha256 != plan.driver.sha256
         || current.device != plan.driver.device
@@ -881,7 +1084,21 @@ fn verify_plan_inputs(plan: &Plan) -> Result<(), ExecuteError> {
 
 #[allow(clippy::too_many_lines)]
 pub fn verify(plan_path: &Path, evidence_root: &Path) -> Result<TerminalStatus, ExecuteError> {
-    let (_plan_root, plan, plan_bytes, plan_sha256) = load_sealed_plan(plan_path)?;
+    verify_with_policy(
+        plan_path,
+        evidence_root,
+        ProvenanceValidationPolicy::production(),
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+pub(crate) fn verify_with_policy(
+    plan_path: &Path,
+    evidence_root: &Path,
+    validation_policy: ProvenanceValidationPolicy<'_>,
+) -> Result<TerminalStatus, ExecuteError> {
+    let (_plan_root, plan, plan_bytes, plan_sha256) =
+        load_sealed_plan(plan_path, validation_policy)?;
     let canonical_evidence_root =
         fs::canonicalize(evidence_root).map_err(|source| ExecuteError::Io {
             path: evidence_root.to_path_buf(),
@@ -1006,8 +1223,8 @@ pub fn verify(plan_path: &Path, evidence_root: &Path) -> Result<TerminalStatus, 
         let starting: StartingEvidence =
             read_json_manifested(&root, &run_root.join("starting.json"), &manifested)?;
         if starting.assignment != *assignment
-            || starting.executable_path != expected_executable.path
-            || starting.executable_sha256 != expected_executable.sha256
+            || starting.executable_path != expected_executable.executable.path
+            || starting.executable_sha256 != expected_executable.executable.sha256
         {
             return Err(ExecuteError::Verification(format!(
                 "starting evidence mismatch for {}",
@@ -1315,8 +1532,8 @@ fn verify_partial_run_prefix(
         Arm::Candidate => &plan.candidate,
     };
     if starting.assignment != *assignment
-        || starting.executable_path != expected_executable.path
-        || starting.executable_sha256 != expected_executable.sha256
+        || starting.executable_path != expected_executable.executable.path
+        || starting.executable_sha256 != expected_executable.executable.sha256
     {
         return Err(ExecuteError::Verification(
             "partial starting identity differs from plan".to_string(),

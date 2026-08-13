@@ -115,6 +115,135 @@ presented as controlled network comparisons.
 “Resume” remains a planned workload. A complete transfer is not labeled as a
 resume measurement.
 
+### Frozen QUIC Fetch acceptance workflow
+
+`quic-fetch-acceptance` is a fail-closed acceptance driver for one preregistered
+comparison: the frozen baseline and candidate executables running
+`quic::tests::manual_quic_authenticated_fetch_handler_5000`. It is not a general
+benchmark launcher.
+
+The authority boundary is deliberately split into four steps:
+
+1. `capture-source` records the current repository identity without running a
+   product executable.
+2. `compose-request` consumes that capture, the two complete source bundles,
+   their supporting build inputs, the reviewed patch, and the recovered legacy
+   receipt bytes. It publishes one canonical, read-only request without running
+   a product executable.
+3. `prepare` accepts only the exact canonical request bytes. It repeats the
+   shared provenance checks, rehashes every input, validates the current product
+   source projection, and copies the request, source bundles, legacy anchors,
+   executables, and supporting inputs into an immutable plan tree. Only a
+   `PREPARED` plan may cross the execution boundary.
+4. `execute` and `verify` both authenticate the sealed plan with the same
+   production provenance policy. Execution repeats live input, repository, and
+   environment checks once before the fixed series, then verifies only the
+   selected executable's descriptor, inode, and hash immediately around each
+   spawn. This avoids full source-tree I/O between timed children. Verification
+   never reruns a product process.
+
+The normal order is therefore:
+
+```text
+capture-source -> compose-request -> prepare -> execute -> verify
+```
+
+For example, with every destination absent before the command starts:
+
+```sh
+./target/release/quic-fetch-acceptance capture-source \
+  --repository /absolute/path/to/distd \
+  --output /absolute/secure/capture \
+  --task-spec /absolute/path/to/distd/.specs/performance/run-final-source-quic-fetch-acceptance.spec.md
+
+./target/release/quic-fetch-acceptance compose-request \
+  --input /absolute/secure/compose-input.v3.json \
+  --output /absolute/secure/request.json
+
+./target/release/quic-fetch-acceptance prepare \
+  --request /absolute/secure/request.json \
+  --plan /absolute/secure/plan \
+  --blocked-evidence /absolute/secure/BLOCKED.json
+
+# Authority stop: continue only when prepare printed PREPARED for this plan.
+./target/release/quic-fetch-acceptance execute \
+  --plan /absolute/secure/plan/plan.json
+
+./target/release/quic-fetch-acceptance verify \
+  --plan /absolute/secure/plan/plan.json \
+  --evidence /absolute/secure/execution-evidence
+```
+
+`capture-source --output` is an absent directory outside the repository.
+`compose-request --output`, `prepare --plan`, `--blocked-evidence`, and the
+descriptor's `evidence_root` must also be absent; output roots may not overlap
+one another or any input parent. The v3 compose descriptor is canonical
+one-line JSON with this expanded shape (each `FileInput` is an absolute `path`
+plus its lowercase `sha256`):
+
+```text
+schema: distd.quic.fetch.compose-input.v3
+repository_capture: FileInput for capture/repository.json
+baseline, candidate:
+  executable, provenance_receipt, source_snapshot, source_manifest,
+  source_bundle, benchmark_source, cargo_lock, workspace_manifest,
+  package_manifest, cargo_config?, rustc_verbose, cargo_verbose,
+  build_environment, profile_identity: FileInput
+  legacy_evidence:
+    primary, secondary: FileInput
+    environment?, preregistration?, build_result?: FileInput
+reviewed_patch_manifest: FileInput
+blocked_evidence, evidence_root, output: absolute absent paths
+```
+
+Nullable legacy fields are role-specific: production requires the exact
+recovered baseline environment, preregistration, and build-result payloads and
+requires all three to be absent for the candidate. The descriptor is not an
+acceptance request. Only `compose-request` may publish `request.json`; there is
+no supported hand-authored-request path into `prepare`.
+
+The driver rejects an individual provenance input above 64 MiB. A source
+bundle is additionally limited to 4,096 entries, 8 MiB per decoded entry, and
+32 MiB of aggregate decoded contents.
+
+The CLI terminal vocabulary is `PREPARED`, `BLOCKED`, `PASS`, `FAIL`, and
+`INVALID`. Each terminal line names its evidence path. Exit status `0` means a
+successful non-executing preparation step or `PASS`; `2` means an authenticated
+`FAIL`; `3` means `BLOCKED` before product execution; and `1` means `INVALID`
+input, plan, or execution evidence. Managed signals are re-raised after cleanup
+so shells retain the corresponding signal exit status.
+
+The recovered provenance directory contains byte-exact payloads recovered from
+the durable session log: the baseline executable identity, source-status,
+environment, preregistration, and build-result receipts, and the candidate
+identity and build-command receipts. Their original files and inode identities
+are gone. The newer structured wrapper is therefore evidence-derived, not an
+original historical receipt. Its fixed policy anchors the exact recovered
+payload hashes; it does not treat caller-authored metadata as historical
+authority. The recovered environment receipt supports only the facts present in
+those bytes; the original build-process environment itself remains unavailable.
+
+The candidate source state is a separate question from the executable: its
+historical tracked tree can be materialized deterministically from commit
+`a17d501` and the reviewed `4dbe52c..a17d501` transition, then checked against
+the frozen lockfile and QUIC-source identities. The canonical 45-entry
+build-source bundle is independently anchored by SHA-256
+`fbbb585bfb4404c9abfb01e807451045becf669361f9275c7450b21e88e87c13`.
+Recoverable source bytes do not authorize rebuilding or stand in for the
+missing executable bytes.
+
+No acceptance result may be produced by rebuilding an arm, substituting a
+different executable, or accepting a merely self-consistent provenance bundle.
+The exact candidate executable with SHA-256
+`6cb669536efea5b3055c6f4487624b96abc136cc5d036cbfaae672a651fcb327`
+is currently absent. Independently, the exact baseline source bundle has not
+been recovered and sealed as a production code anchor. Production composition
+therefore fails closed before publication, and the final comparison remains
+`BLOCKED` even if only one of those gaps is closed. Execution requires both the
+exact candidate bytes and the independently anchored baseline source bundle;
+reconstruction, rebuilding, substitution, or a hash-policy exception is not a
+path around either requirement.
+
 ## Remaining v0.2 limitations
 
 - Multipart publication is authenticated and capped at 512 MiB, but fields are
