@@ -4,7 +4,12 @@ use std::{
     fs::{self, create_dir_all, remove_file, File, OpenOptions},
     io::{BufWriter, Read, Seek, Write},
     path::{Path, PathBuf},
-    sync::{atomic::AtomicBool, Arc, Mutex, RwLock},
+    sync::{
+        atomic::AtomicBool,
+        mpsc::{sync_channel, SyncSender, TrySendError},
+        Arc, Mutex, RwLock,
+    },
+    thread::JoinHandle,
 };
 
 use serde::{Deserialize, Serialize};
@@ -16,7 +21,8 @@ use crate::{
     chunk_storage::StorageError,
     chunks::{ChunkAlgorithm, ChunkInfo, CHUNK_SIZE},
     durable_state::{
-        read_bounded_file, read_enveloped_state, replace_enveloped_state, DurableStateKind,
+        read_bounded_file, read_enveloped_state, replace_enveloped_state,
+        replace_enveloped_state_with_hook, DurableReplaceStage, DurableStateKind,
         MAX_DURABLE_STATE_PAYLOAD,
     },
     error::{Error, InvalidParameter},
@@ -29,6 +35,7 @@ use super::{ChunkStorage, Node, ReceivedChunk};
 
 const DEFAULT_CHUNK_CACHE_BYTES: usize = 512 * 1024 * 1024;
 const DEFAULT_TREE_CACHE_ENTRIES: usize = 65_536;
+const DEFAULT_IMMUTABLE_READER_ENTRIES: usize = 32;
 const FS_STORAGE_PAYLOAD_SCHEMA: u16 = 1;
 const FS_STORAGE_ROOT_DOMAIN: &[u8] = b"distd fs storage root identity v1\0";
 const FS_STORAGE_REVISION_NAMESPACE: &str = ".distd-revisions-v1";
@@ -36,6 +43,201 @@ const FS_STORAGE_REVISION_MARKER_DOMAIN: &[u8] = b"distd fs server revision mark
 const FS_STORAGE_REVISION_MARKER_EXTENSION: &str = "item";
 const FS_STORAGE_MAX_LINK_RECORDS: usize = 65_536;
 const FS_STORAGE_MAX_LINK_DEPTH: usize = 256;
+const FS_ACTIVATION_NAMESPACE: &str = ".distd-activation-v1";
+const FS_ACTIVATION_ACTIVE_SCHEMA: u16 = 1;
+const FS_ACTIVATION_TRANSACTION_SCHEMA: u16 = 2;
+const FS_ACTIVATION_DESTINATION_DOMAIN: &[u8] = b"distd activation destination v1\0";
+const FS_ACTIVATION_REVISION_DOMAIN: &[u8] = b"distd activation revision v1\0";
+const FS_ACTIVATION_MAX_RECORDS: usize = 65_536;
+const FS_ACTIVATION_COPY_BUFFER_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ActiveRevisionKind {
+    File,
+    Directory,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ActivationRecordKind {
+    Active,
+    Transaction(ActivationTransactionPhase),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ActivationTransactionPhase {
+    Intent,
+    Ready,
+    Switched,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ActivationOperation {
+    NamespaceCreate,
+    NamespaceParentSync,
+    StagingCreate,
+    StagingParentSync,
+    RevisionDigestCreate,
+    RevisionDigestParentSync,
+    MaterializeDirectoryCreate,
+    MaterializeFileCreate,
+    MaterializeFileWrite,
+    MaterializeFileSync,
+    MaterializeDirectorySync,
+    RevisionRename,
+    RevisionParentSync,
+    MirrorDirectoryCreate,
+    MirrorEntryCreate,
+    MirrorEntryWrite,
+    MirrorEntrySync,
+    MirrorEntryRename,
+    MirrorEntryRemove,
+    MirrorDirectorySync,
+    RecoveryMirrorCleanup,
+    RecoveryMirrorCleanupParentSync,
+    RecoveryStagingCleanup,
+    RecoveryStagingCleanupParentSync,
+    RecoveryTransactionCleanup,
+    RecoveryTransactionCleanupParentSync,
+    RecoveryRecordTempCleanup,
+    RecoveryRecordTempCleanupParentSync,
+    RecoveryRecordQuarantine,
+    RecoveryRecordSourceParentSync,
+    RecoveryRecordQuarantineParentSync,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ActivationFaultStage {
+    BeforeIntent,
+    DurableRecord {
+        record: ActivationRecordKind,
+        stage: DurableReplaceStage,
+    },
+    Operation(ActivationOperation),
+    AfterIntent,
+    AfterMaterialize,
+    AfterRevisionPublish,
+    AfterReady,
+    AfterSelector,
+    AfterSwitched,
+    AfterStatePersist,
+    AfterMirror,
+}
+
+#[derive(Clone)]
+struct ActivationFaultHook {
+    hook: Arc<dyn Fn(ActivationFaultStage) -> std::io::Result<()> + Send + Sync + 'static>,
+    #[cfg(test)]
+    simulates_crash: bool,
+}
+
+impl std::fmt::Debug for ActivationFaultHook {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ActivationFaultHook(..)")
+    }
+}
+
+/// A snapshot of one immutable activated revision.
+///
+/// Handles never consult the mutable destination mirror after opening, so all
+/// entry reads remain pinned to the same revision across later activations.
+#[derive(Clone, Debug)]
+pub struct ActiveRevisionHandle {
+    active: Arc<FsActivationActiveV1>,
+    revision_root: PathBuf,
+    kind: ActiveRevisionKind,
+}
+
+impl ActiveRevisionHandle {
+    #[must_use]
+    pub fn item(&self) -> &Item {
+        &self.active.item
+    }
+
+    #[must_use]
+    pub fn destination(&self) -> &Path {
+        &self.active.destination
+    }
+
+    #[must_use]
+    pub fn kind(&self) -> ActiveRevisionKind {
+        self.kind
+    }
+
+    pub fn open_file(&self) -> Result<File, Error> {
+        if self.kind != ActiveRevisionKind::File {
+            return Err(invalid_state("active revision is a directory"));
+        }
+        File::open(&self.revision_root).map_err(Into::into)
+    }
+
+    pub fn open_entry(&self, relative_path: &Path) -> Result<File, Error> {
+        if self.kind != ActiveRevisionKind::Directory {
+            return Err(invalid_state("active revision is a file"));
+        }
+        let relative_path = crate::utils::path::validate_relative(relative_path)?;
+        let path = self.revision_root.join(relative_path);
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(invalid_state("active revision entry is not a regular file"));
+        }
+        File::open(path).map_err(Into::into)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct FsActivationActiveV1 {
+    root_identity: [u8; 32],
+    destination: PathBuf,
+    destination_identity: [u8; 32],
+    revision_identity: [u8; 32],
+    item: Item,
+    kind: u8,
+    seals: Vec<FsActivationFileSealV1>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct FsActivationFileSealV1 {
+    relative_path: Option<PathBuf>,
+    size: u64,
+    device: u64,
+    inode: u64,
+    mode: u32,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+enum FsActivationPhaseV2 {
+    Intent,
+    Ready,
+    Switched,
+}
+
+impl From<FsActivationPhaseV2> for ActivationTransactionPhase {
+    fn from(phase: FsActivationPhaseV2) -> Self {
+        match phase {
+            FsActivationPhaseV2::Intent => Self::Intent,
+            FsActivationPhaseV2::Ready => Self::Ready,
+            FsActivationPhaseV2::Switched => Self::Switched,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct FsActivationTransactionV2 {
+    root_identity: [u8; 32],
+    transaction_id: [u8; 16],
+    destination: PathBuf,
+    destination_identity: [u8; 32],
+    candidate_revision_identity: [u8; 32],
+    previous: Option<FsActivationActiveV1>,
+    item: Item,
+    kind: u8,
+    phase: FsActivationPhaseV2,
+    candidate_seals: Vec<FsActivationFileSealV1>,
+    mirror_staging_path: PathBuf,
+    mirror_backup_path: PathBuf,
+}
 
 #[derive(Clone, Debug)]
 enum ChunkData {
@@ -48,6 +250,13 @@ impl ChunkData {
         match self {
             Self::Owned(data) => data,
             Self::Shared(data) => Arc::new(data.into_vec()),
+        }
+    }
+
+    fn into_vec(self) -> Vec<u8> {
+        match self {
+            Self::Owned(data) => Arc::try_unwrap(data).unwrap_or_else(|data| data.as_ref().clone()),
+            Self::Shared(data) => data.into_vec(),
         }
     }
 }
@@ -96,6 +305,51 @@ struct HotNodeCache {
     max_entries: usize,
     order: VecDeque<Hash>,
     entries: HashMap<Hash, Arc<Node>>,
+}
+
+#[derive(Debug)]
+struct ImmutableReaderCache {
+    max_entries: usize,
+    order: VecDeque<PathBuf>,
+    entries: HashMap<PathBuf, Arc<File>>,
+}
+
+impl ImmutableReaderCache {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            max_entries,
+            order: VecDeque::new(),
+            entries: HashMap::default(),
+        }
+    }
+
+    fn get_or_open(&mut self, path: &Path) -> Result<Arc<File>, Error> {
+        if let Some(file) = self.entries.get(path).cloned() {
+            self.order.push_back(path.to_path_buf());
+            return Ok(file);
+        }
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(invalid_state(
+                "immutable read backing is not a regular file",
+            ));
+        }
+        let file = Arc::new(File::open(path)?);
+        if self.max_entries == 0 {
+            return Ok(file);
+        }
+        self.entries.insert(path.to_path_buf(), file.clone());
+        self.order.push_back(path.to_path_buf());
+        while self.entries.len() > self.max_entries {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if self.entries.remove(&oldest).is_some() {
+                self.order.retain(|queued| queued != &oldest);
+            }
+        }
+        Ok(file)
+    }
 }
 
 impl HotNodeCache {
@@ -482,6 +736,12 @@ fn invalid_state(message: impl Into<String>) -> Error {
     ))
 }
 
+fn activation_indeterminate(error: impl std::fmt::Display) -> Error {
+    Error::Other(format!(
+        "activation commit indeterminate; restart required: {error}"
+    ))
+}
+
 fn bitcode_identity<T: Serialize>(value: &T) -> Result<Vec<u8>, Error> {
     bitcode::serialize(value).map_err(|error| InvalidParameter::from(error).into())
 }
@@ -672,10 +932,14 @@ fn hash_file_range(path: &Path, offset: u64, size: u64) -> Result<Hash, Error> {
     Ok(do_hash(&bytes))
 }
 
-fn verify_populated_chunk_hashes(data: &HashMap<Hash, Vec<Arc<InFileChunk>>>) -> Result<(), Error> {
+fn verify_populated_chunk_hashes(
+    data: &HashMap<Hash, Vec<Arc<InFileChunk>>>,
+    activation_root: Option<&Path>,
+) -> Result<(), Error> {
     for (hash, entries) in data {
         for entry in entries {
             if entry.populated.load(std::sync::atomic::Ordering::Relaxed)
+                && !activation_root.is_some_and(|root| entry.path.starts_with(root))
                 && hash_file_range(&entry.path, entry.offset, entry.info.size)? != *hash
             {
                 return Err(invalid_state(format!(
@@ -763,13 +1027,12 @@ fn validate_retained_items(
                     "item entry path is not in canonical relative form",
                 ));
             }
-            if normalized
-                .components()
-                .next()
-                .is_some_and(|component| component.as_os_str() == FS_STORAGE_REVISION_NAMESPACE)
-            {
+            if normalized.components().next().is_some_and(|component| {
+                component.as_os_str() == FS_STORAGE_REVISION_NAMESPACE
+                    || component.as_os_str() == FS_ACTIVATION_NAMESPACE
+            }) {
                 return Err(invalid_state(
-                    "item entry path uses the reserved revision namespace",
+                    "item entry path uses a reserved storage namespace",
                 ));
             }
             if !normalized_paths.insert(normalized.clone()) {
@@ -777,13 +1040,17 @@ fn validate_retained_items(
                     "item entry paths alias after canonical normalization",
                 ));
             }
-            if previous_path
-                .as_ref()
-                .is_some_and(|previous| previous >= &normalized)
-            {
-                return Err(invalid_state(
-                    "item entry paths are duplicated or not strictly ordered",
-                ));
+            if let Some(previous) = previous_path.as_ref() {
+                if previous >= &normalized {
+                    return Err(invalid_state(
+                        "item entry paths are duplicated or not strictly ordered",
+                    ));
+                }
+                if normalized.starts_with(previous) {
+                    return Err(invalid_state(
+                        "item entry path conflicts with an ancestor file",
+                    ));
+                }
             }
             previous_path = Some(normalized);
             let start = usize::try_from(entry.chunk_range.0).map_err(InvalidParameter::from)?;
@@ -1219,6 +1486,7 @@ impl FsStorageStateV1 {
         mut self,
         root: PathBuf,
         persistance_path: PathBuf,
+        selected: &[Arc<FsActivationActiveV1>],
     ) -> Result<FsStorageState, Error> {
         if self.root_identity != fs_storage_root_identity(&root)? {
             return Err(invalid_state(
@@ -1229,9 +1497,18 @@ impl FsStorageStateV1 {
         require_canonical_order(&self.data)?;
         require_canonical_order(&self.links)?;
 
+        let claimed_destinations = selected
+            .iter()
+            .map(|active| active.destination.clone())
+            .collect::<HashSet<_>>();
+        let mut claimed_roots = Vec::new();
         let mut items = HashSet::default();
         for mut item in self.items.drain(..) {
             validate_item_paths(&root, &mut item)?;
+            if claimed_destinations.contains(&item.metadata.path) {
+                claimed_roots.push(item.metadata.root.hash);
+                continue;
+            }
             if !items.insert(item) {
                 return Err(invalid_state("duplicate item"));
             }
@@ -1248,9 +1525,18 @@ impl FsStorageStateV1 {
                 if chunk.info.hash != entry.hash {
                     return Err(invalid_state("chunk map key does not match chunk hash"));
                 }
+                let relative_path = crate::utils::path::validate_relative(&chunk.relative_path)?;
+                if chunk.populated
+                    && selected.iter().any(|active| {
+                        relative_path == active.destination
+                            || (active.kind == 1 && relative_path.starts_with(&active.destination))
+                    })
+                {
+                    continue;
+                }
                 let path = validate_existing_chunk_path(
                     &root,
-                    &chunk.relative_path,
+                    &relative_path,
                     chunk.populated,
                     chunk.offset,
                     chunk.info.size,
@@ -1262,11 +1548,62 @@ impl FsStorageStateV1 {
                     populated: Arc::new(AtomicBool::new(chunk.populated)),
                 }));
             }
+            if chunks.is_empty() {
+                continue;
+            }
             if data.insert(entry.hash, chunks).is_some() {
                 return Err(invalid_state("duplicate chunk-map hash"));
             }
         }
-        verify_populated_chunk_hashes(&data)?;
+        for active in selected {
+            let revision_root = root
+                .join(FS_ACTIVATION_NAMESPACE)
+                .join("revisions")
+                .join(FsStorage::hex_identity(&active.revision_identity))
+                .join("root");
+            if active.kind == 0 {
+                let mut offset = 0u64;
+                for chunk in &active.item.chunks {
+                    data.entry(chunk.hash)
+                        .or_default()
+                        .push(Arc::new(InFileChunk {
+                            info: *chunk,
+                            path: revision_root.clone(),
+                            offset,
+                            populated: Arc::new(AtomicBool::new(true)),
+                        }));
+                    offset = offset
+                        .checked_add(chunk.size)
+                        .ok_or_else(|| invalid_state("active checkpoint offset overflows"))?;
+                }
+            } else {
+                for entry in &active.item.manifest.entries {
+                    let path = revision_root.join(crate::utils::path::validate_relative(
+                        Path::new(&entry.relative_path),
+                    )?);
+                    let mut offset = 0u64;
+                    for chunk in &active.item.chunks
+                        [entry.chunk_range.0 as usize..entry.chunk_range.1 as usize]
+                    {
+                        data.entry(chunk.hash)
+                            .or_default()
+                            .push(Arc::new(InFileChunk {
+                                info: *chunk,
+                                path: path.clone(),
+                                offset,
+                                populated: Arc::new(AtomicBool::new(true)),
+                            }));
+                        offset = offset.checked_add(chunk.size).ok_or_else(|| {
+                            invalid_state("active checkpoint entry offset overflows")
+                        })?;
+                    }
+                }
+            }
+        }
+        verify_populated_chunk_hashes(
+            &data,
+            Some(&root.join(FS_ACTIVATION_NAMESPACE).join("revisions")),
+        )?;
         validate_retained_items(&items, &data)?;
 
         let mut links = HashMap::default();
@@ -1279,6 +1616,14 @@ impl FsStorageStateV1 {
                 return Err(invalid_state("duplicate link-map hash"));
             }
         }
+        // A selected activation supersedes the checkpoint's mutable-path item. Drop
+        // only the link subgraph reachable exclusively from those claimed items;
+        // unrelated (including orphaned) link records remain subject to strict
+        // validation below and therefore cannot be hidden by a valid selector.
+        let retained_roots = items.iter().map(|item| item.metadata.root.hash);
+        let retained_links = FsStorageState::reachable_link_hashes(retained_roots, &links);
+        let claimed_links = FsStorageState::reachable_link_hashes(claimed_roots, &links);
+        links.retain(|hash, _| !claimed_links.contains(hash) || retained_links.contains(hash));
         for node in links.values() {
             validate_link_node(node, &data, &links)?;
         }
@@ -1347,7 +1692,7 @@ impl LegacyFsStorageState {
             dirty: false,
             generation: 0,
         };
-        verify_populated_chunk_hashes(&runtime.data)?;
+        verify_populated_chunk_hashes(&runtime.data, None)?;
         validate_retained_items(&runtime.items, &runtime.data)?;
         FsStorageStateV1::from_runtime(&runtime)
     }
@@ -1397,6 +1742,17 @@ impl FsStorageState {
     }
 
     fn retain_links_reachable_from_items(&mut self) {
+        let retained = Self::reachable_link_hashes(
+            self.items.iter().map(|item| item.metadata.root.hash),
+            &self.links,
+        );
+        self.links.retain(|hash, _| retained.contains(hash));
+    }
+
+    fn reachable_link_hashes(
+        roots: impl IntoIterator<Item = Hash>,
+        links: &HashMap<Hash, Arc<Node>>,
+    ) -> HashSet<Hash> {
         fn visit(
             node: &Node,
             links: &HashMap<Hash, Arc<Node>>,
@@ -1431,12 +1787,89 @@ impl FsStorageState {
         }
 
         let mut retained = HashSet::default();
-        for item in &self.items {
-            if let Some(root) = self.links.get(&item.metadata.root.hash) {
-                visit(root, &self.links, &mut retained, 0);
+        for root_hash in roots {
+            if let Some(root) = links.get(&root_hash) {
+                visit(root, links, &mut retained, 0);
             }
         }
-        self.links.retain(|hash, _| retained.contains(hash));
+        retained
+    }
+
+    fn reconstruct_item_links(
+        &mut self,
+        item: &Item,
+        expected_root: ChunkInfo,
+    ) -> Result<(), Error> {
+        let mut partials = item
+            .chunks
+            .iter()
+            .map(|chunk| {
+                Arc::new(Node::Skipped {
+                    hash: chunk.hash,
+                    size: chunk.size,
+                })
+            })
+            .collect::<Vec<_>>();
+        if partials.is_empty() {
+            return Err(invalid_state("active revision has no chunks"));
+        }
+        while partials.len() > 1 {
+            let count = partials.len();
+            for (to, index) in (0..count - 1).step_by(2).enumerate() {
+                let left = partials[index].clone();
+                let right = partials[index + 1].clone();
+                let hash = merge_hashes(left.hash(), right.hash());
+                let size = left
+                    .size()
+                    .checked_add(right.size())
+                    .ok_or_else(|| invalid_state("active revision link size overflows"))?;
+                let node = if let Some(existing) = self.links.get(&hash) {
+                    match existing.as_ref() {
+                        Node::Parent {
+                            size: existing_size,
+                            left: existing_left,
+                            right: existing_right,
+                            ..
+                        } if *existing_size == size
+                            && existing_left.hash() == left.hash()
+                            && existing_left.size() == left.size()
+                            && existing_right.hash() == right.hash()
+                            && existing_right.size() == right.size() =>
+                        {
+                            existing.clone()
+                        }
+                        _ => {
+                            return Err(Error::Storage(StorageError::ImmutableConflict));
+                        }
+                    }
+                } else {
+                    let node = Arc::new(Node::Parent {
+                        hash,
+                        size,
+                        left,
+                        right,
+                    });
+                    self.links.insert(hash, node.clone());
+                    self.mark_dirty();
+                    node
+                };
+                partials[to] = node;
+            }
+            let half = count / 2;
+            if count % 2 != 0 {
+                partials.swap(half, count - 1);
+                partials.truncate(half + 1);
+            } else {
+                partials.truncate(half);
+            }
+        }
+        let root = partials.swap_remove(0);
+        if *root.hash() != expected_root.hash || root.size() != expected_root.size {
+            return Err(invalid_state(
+                "active revision chunks do not reconstruct the declared root",
+            ));
+        }
+        Ok(())
     }
 
     /// Returns the stored path of any path relative to root
@@ -1607,6 +2040,140 @@ impl FsStorageState {
 
 // ─── Public handle ────────────────────────────────────────────────────────────
 
+const ACTIVATION_CLEANUP_QUEUE_CAPACITY: usize = 4_096;
+
+struct ActivationCleanupCoordinator {
+    sender: Option<SyncSender<(PathBuf, Option<ActivationFaultHook>)>>,
+    worker: Option<JoinHandle<()>>,
+    fault_hook: Arc<RwLock<Option<ActivationFaultHook>>>,
+    poisoned: Arc<AtomicBool>,
+}
+
+impl std::fmt::Debug for ActivationCleanupCoordinator {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ActivationCleanupCoordinator")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ActivationCleanupCoordinator {
+    fn new(
+        fault_hook: Arc<RwLock<Option<ActivationFaultHook>>>,
+        poisoned: Arc<AtomicBool>,
+    ) -> Self {
+        let (sender, receiver) = sync_channel::<(PathBuf, Option<ActivationFaultHook>)>(
+            ACTIVATION_CLEANUP_QUEUE_CAPACITY,
+        );
+        let worker_poisoned = poisoned.clone();
+        let worker = std::thread::Builder::new()
+            .name("distd-activation-cleanup".to_string())
+            .spawn(move || {
+                while let Ok((path, hook)) = receiver.recv() {
+                    if hook.as_ref().is_some_and(|hook| {
+                        (hook.hook)(ActivationFaultStage::Operation(
+                            ActivationOperation::RecoveryTransactionCleanup,
+                        ))
+                        .is_err()
+                    }) {
+                        worker_poisoned.store(true, std::sync::atomic::Ordering::Release);
+                        tracing::warn!(
+                            "deferred activation transaction cleanup faulted for {}",
+                            path.display()
+                        );
+                        continue;
+                    }
+                    match fs::symlink_metadata(&path) {
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Ok(metadata)
+                            if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+                        Ok(_) => {
+                            worker_poisoned.store(true, std::sync::atomic::Ordering::Release);
+                            tracing::error!(
+                                "deferred activation transaction cleanup found unsafe path {}",
+                                path.display()
+                            );
+                            continue;
+                        }
+                        Err(error) => {
+                            worker_poisoned.store(true, std::sync::atomic::Ordering::Release);
+                            tracing::error!(
+                                "deferred activation transaction cleanup could not inspect {}: {error}",
+                                path.display()
+                            );
+                            continue;
+                        }
+                    }
+                    if let Err(error) = fs::remove_file(&path) {
+                        worker_poisoned.store(true, std::sync::atomic::Ordering::Release);
+                        tracing::error!(
+                            "deferred activation transaction cleanup could not remove {}: {error}",
+                            path.display()
+                        );
+                        continue;
+                    }
+                    let Some(parent) = path.parent() else {
+                        worker_poisoned.store(true, std::sync::atomic::Ordering::Release);
+                        tracing::error!("activation transaction path has no parent");
+                        continue;
+                    };
+                    if let Err(error) = File::open(parent).and_then(|directory| directory.sync_all())
+                    {
+                        worker_poisoned.store(true, std::sync::atomic::Ordering::Release);
+                        tracing::error!(
+                            "deferred activation transaction cleanup could not sync {}: {error}",
+                            parent.display()
+                        );
+                    }
+                }
+            })
+            .expect("activation cleanup worker creation must succeed");
+        Self {
+            sender: Some(sender),
+            worker: Some(worker),
+            fault_hook,
+            poisoned,
+        }
+    }
+
+    fn schedule(&self, path: PathBuf) {
+        let Some(sender) = self.sender.as_ref() else {
+            return;
+        };
+        let hook = self.fault_hook.read().unwrap().clone();
+        match sender.try_send((path, hook)) {
+            Ok(()) => {}
+            Err(TrySendError::Full((path, _))) => {
+                self.poisoned
+                    .store(true, std::sync::atomic::Ordering::Release);
+                tracing::warn!(
+                    "activation cleanup queue is full; recovery will clean {}",
+                    path.display()
+                );
+            }
+            Err(TrySendError::Disconnected((path, _))) => {
+                self.poisoned
+                    .store(true, std::sync::atomic::Ordering::Release);
+                tracing::error!(
+                    "activation cleanup worker stopped; recovery will clean {}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+impl Drop for ActivationCleanupCoordinator {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(worker) = self.worker.take() {
+            if worker.join().is_err() {
+                tracing::error!("activation cleanup worker panicked");
+            }
+        }
+    }
+}
+
 /// Storage keeping files in the filesystem instead of stored chunks independently.
 ///
 /// It is useful to actually install files in the filesystem if the root is set to `/`.
@@ -1617,17 +2184,44 @@ impl FsStorageState {
 pub struct FsStorage {
     inner: RwLock<FsStorageState>,
     persistence_lock: Mutex<()>,
+    activation_locks: Mutex<HashMap<[u8; 32], Arc<Mutex<()>>>>,
+    activation_poisoned: Arc<AtomicBool>,
+    active_refs: RwLock<HashMap<[u8; 32], Arc<FsActivationActiveV1>>>,
+    activation_fault_hook: Arc<RwLock<Option<ActivationFaultHook>>>,
+    activation_cleanup: ActivationCleanupCoordinator,
+    #[cfg(test)]
+    next_activation_transaction_id: Mutex<Option<[u8; 16]>>,
+    #[cfg(test)]
+    simulated_crash: AtomicBool,
     handles: RwLock<HashMap<PathBuf, Arc<Mutex<Handle>>>>,
+    immutable_readers: Mutex<ImmutableReaderCache>,
     chunk_cache: Mutex<HotChunkCache>,
     tree_cache: Mutex<HotNodeCache>,
 }
 
 impl Default for FsStorage {
     fn default() -> Self {
+        let activation_fault_hook = Arc::new(RwLock::new(None));
+        let activation_poisoned = Arc::new(AtomicBool::new(false));
         Self {
             inner: RwLock::new(FsStorageState::default()),
             persistence_lock: Mutex::new(()),
+            activation_locks: Mutex::new(HashMap::default()),
+            activation_poisoned: activation_poisoned.clone(),
+            active_refs: RwLock::new(HashMap::default()),
+            activation_fault_hook: activation_fault_hook.clone(),
+            activation_cleanup: ActivationCleanupCoordinator::new(
+                activation_fault_hook,
+                activation_poisoned,
+            ),
+            #[cfg(test)]
+            next_activation_transaction_id: Mutex::new(None),
+            #[cfg(test)]
+            simulated_crash: AtomicBool::new(false),
             handles: RwLock::new(HashMap::default()),
+            immutable_readers: Mutex::new(ImmutableReaderCache::new(
+                DEFAULT_IMMUTABLE_READER_ENTRIES,
+            )),
             chunk_cache: Mutex::new(HotChunkCache::new(DEFAULT_CHUNK_CACHE_BYTES)),
             tree_cache: Mutex::new(HotNodeCache::new(DEFAULT_TREE_CACHE_ENTRIES)),
         }
@@ -1635,6 +2229,935 @@ impl Default for FsStorage {
 }
 
 impl FsStorage {
+    fn activation_root(&self) -> PathBuf {
+        self.inner
+            .read()
+            .unwrap()
+            .root
+            .join(FS_ACTIVATION_NAMESPACE)
+    }
+
+    fn activation_destination_identity(&self, destination: &Path) -> Result<[u8; 32], Error> {
+        let destination = self.canonical_activation_destination(destination)?;
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(FS_ACTIVATION_DESTINATION_DOMAIN);
+        hasher.update(&canonical_root_bytes(&destination));
+        Ok(*hasher.finalize().as_bytes())
+    }
+
+    fn canonical_activation_destination(&self, destination: &Path) -> Result<PathBuf, Error> {
+        if destination.is_absolute() {
+            let root = self.inner.read().unwrap().root.clone();
+            let relative =
+                destination
+                    .strip_prefix(&root)
+                    .map_err(|_| InvalidParameter::Generic {
+                        expected: "an activation destination beneath the configured root"
+                            .to_string(),
+                        got: destination.display().to_string(),
+                    })?;
+            crate::utils::path::validate_relative(relative)
+        } else {
+            crate::utils::path::validate_relative(destination)
+        }
+    }
+
+    fn activation_revision_identity(item: &Item) -> Result<[u8; 32], Error> {
+        super::validate_revision_metadata(item)?;
+        let payload = bitcode::serialize(item).map_err(InvalidParameter::from)?;
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(FS_ACTIVATION_REVISION_DOMAIN);
+        hasher.update(&payload);
+        Ok(*hasher.finalize().as_bytes())
+    }
+
+    fn hex_identity(identity: &[u8; 32]) -> String {
+        let mut encoded = String::with_capacity(64);
+        for byte in identity {
+            use std::fmt::Write as _;
+            write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+        }
+        encoded
+    }
+
+    fn active_ref_path(&self, identity: &[u8; 32]) -> PathBuf {
+        self.activation_root()
+            .join("active")
+            .join(format!("{}.state", Self::hex_identity(identity)))
+    }
+
+    fn activation_revision_root(&self, identity: &[u8; 32]) -> PathBuf {
+        self.activation_root()
+            .join("revisions")
+            .join(Self::hex_identity(identity))
+            .join("root")
+    }
+
+    fn activation_transaction_path(&self, id: &[u8; 16]) -> PathBuf {
+        let mut name = Self::activation_transaction_identity(id);
+        name.push_str(".state");
+        self.activation_root().join("transactions").join(name)
+    }
+
+    fn activation_transaction_identity(id: &[u8; 16]) -> String {
+        let mut name = String::with_capacity(32);
+        for byte in id {
+            use std::fmt::Write as _;
+            write!(&mut name, "{byte:02x}").expect("writing to String cannot fail");
+        }
+        name
+    }
+
+    fn activation_staging_root(&self, id: &[u8; 16]) -> PathBuf {
+        let name = Self::activation_transaction_identity(id);
+        self.activation_root()
+            .join("staging")
+            .join(name)
+            .join("root")
+    }
+
+    fn activation_mirror_paths(
+        &self,
+        destination: &Path,
+        id: &[u8; 16],
+    ) -> Result<(PathBuf, PathBuf), Error> {
+        let destination = self.canonical_activation_destination(destination)?;
+        let parent = destination.parent().unwrap_or_else(|| Path::new(""));
+        let name = destination
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .ok_or(Error::MissingData)?;
+        let id = Self::activation_transaction_identity(id);
+        Ok((
+            parent.join(format!(".{name}.distd-activation-mirror-{id}")),
+            parent.join(format!(".{name}.distd-activation-backup-{id}")),
+        ))
+    }
+
+    fn ensure_activation_namespace(&self, components: &[&str]) -> Result<PathBuf, Error> {
+        let mut parent = self.inner.read().unwrap().root.clone();
+        for component in std::iter::once(FS_ACTIVATION_NAMESPACE).chain(components.iter().copied())
+        {
+            let path = parent.join(component);
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+                Ok(_) => return Err(invalid_state("activation namespace is not a directory")),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    match fs::create_dir(&path) {
+                        Ok(()) => {
+                            self.activation_fault(ActivationFaultStage::Operation(
+                                ActivationOperation::NamespaceCreate,
+                            ))?;
+                            #[cfg(unix)]
+                            File::open(&parent)?.sync_all()?;
+                            self.activation_fault(ActivationFaultStage::Operation(
+                                ActivationOperation::NamespaceParentSync,
+                            ))?;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                    let metadata = fs::symlink_metadata(&path)?;
+                    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                        return Err(invalid_state("activation namespace creation conflicted"));
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+            parent = path;
+        }
+        Ok(parent)
+    }
+
+    fn is_hex_state_name(name: &str, digits: usize) -> bool {
+        name.len() == digits + ".state".len()
+            && name.ends_with(".state")
+            && name[..digits]
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+
+    fn is_shared_durable_temp(name: &str, digits: usize) -> bool {
+        let Some(rest) = name.strip_prefix('.') else {
+            return false;
+        };
+        let Some((canonical, suffix)) = rest.split_once(".distd-tmp-") else {
+            return false;
+        };
+        Self::is_hex_state_name(canonical, digits)
+            && !suffix.is_empty()
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte == b'-')
+    }
+
+    fn sync_parent(path: &Path) -> Result<(), Error> {
+        #[cfg(unix)]
+        File::open(path)?.sync_all()?;
+        Ok(())
+    }
+
+    fn remove_activation_path_checked(path: &Path) -> Result<(), Error> {
+        let parent = path.parent().ok_or(Error::MissingData)?;
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                fs::remove_file(path)?;
+            }
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                fs::remove_dir_all(path)?;
+            }
+            Ok(_) => {
+                return Err(invalid_state(
+                    "activation cleanup target has an unsafe type",
+                ))
+            }
+        }
+        Self::sync_parent(parent)
+    }
+
+    fn remove_recovery_path_checked(
+        &self,
+        path: &Path,
+        after_remove: ActivationOperation,
+        after_parent_sync: ActivationOperation,
+    ) -> Result<(), Error> {
+        let parent = path.parent().ok_or(Error::MissingData)?;
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                fs::remove_file(path)?;
+            }
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                fs::remove_dir_all(path)?;
+            }
+            Ok(_) => return Err(invalid_state("recovery cleanup target has an unsafe type")),
+        }
+        self.activation_fault(ActivationFaultStage::Operation(after_remove))?;
+        Self::sync_parent(parent)?;
+        self.activation_fault(ActivationFaultStage::Operation(after_parent_sync))
+    }
+
+    fn quarantine_activation_record(&self, path: &Path, family: &str) -> Result<(), Error> {
+        let quarantine = self.ensure_activation_namespace(&["quarantine"])?;
+        let name = path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .ok_or_else(|| invalid_state("activation record name is not UTF-8"))?;
+        let target = quarantine.join(format!("{family}-{name}-{}", uuid::Uuid::new_v4()));
+        fs::rename(path, &target)?;
+        self.activation_fault(ActivationFaultStage::Operation(
+            ActivationOperation::RecoveryRecordQuarantine,
+        ))?;
+        Self::sync_parent(path.parent().ok_or(Error::MissingData)?)?;
+        self.activation_fault(ActivationFaultStage::Operation(
+            ActivationOperation::RecoveryRecordSourceParentSync,
+        ))?;
+        Self::sync_parent(&quarantine)?;
+        self.activation_fault(ActivationFaultStage::Operation(
+            ActivationOperation::RecoveryRecordQuarantineParentSync,
+        ))
+    }
+
+    fn canonical_activation_records(
+        &self,
+        directory: &Path,
+        family: &str,
+        digits: usize,
+    ) -> Result<Vec<PathBuf>, Error> {
+        let mut canonical = Vec::new();
+        let mut total = 0usize;
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            total += 1;
+            Self::validate_activation_directory_entry_count(total)?;
+            let path = entry.path();
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| invalid_state("activation record name is not UTF-8"))?;
+            let metadata = fs::symlink_metadata(&path)?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(invalid_state("activation record is not a regular file"));
+            }
+            if Self::is_shared_durable_temp(&name, digits) {
+                self.remove_recovery_path_checked(
+                    &path,
+                    ActivationOperation::RecoveryRecordTempCleanup,
+                    ActivationOperation::RecoveryRecordTempCleanupParentSync,
+                )?;
+            } else if Self::is_hex_state_name(&name, digits) {
+                canonical.push(path);
+                if canonical.len() > FS_ACTIVATION_MAX_RECORDS {
+                    return Err(invalid_state("too many activation records"));
+                }
+            } else {
+                self.quarantine_activation_record(&path, family)?;
+            }
+        }
+        canonical.sort();
+        Ok(canonical)
+    }
+
+    fn validate_activation_directory_entry_count(count: usize) -> Result<(), Error> {
+        if count > FS_ACTIVATION_MAX_RECORDS {
+            return Err(invalid_state("too many activation directory entries"));
+        }
+        Ok(())
+    }
+
+    fn write_activation_record<T: Serialize>(
+        &self,
+        path: &Path,
+        schema: u16,
+        record: ActivationRecordKind,
+        value: &T,
+    ) -> Result<(), Error> {
+        let payload = bitcode::serialize(value).map_err(InvalidParameter::from)?;
+        match (schema, record) {
+            (FS_ACTIVATION_ACTIVE_SCHEMA, ActivationRecordKind::Active)
+            | (FS_ACTIVATION_TRANSACTION_SCHEMA, ActivationRecordKind::Transaction(_)) => {}
+            _ => return Err(invalid_state("activation record kind/schema mismatch")),
+        }
+        let hook = self.activation_fault_hook.read().unwrap().clone();
+        replace_enveloped_state_with_hook(
+            path,
+            DurableStateKind::FsActivation,
+            schema,
+            &payload,
+            MAX_DURABLE_STATE_PAYLOAD,
+            |stage| {
+                self.invoke_activation_hook_with(
+                    hook.as_ref(),
+                    ActivationFaultStage::DurableRecord { record, stage },
+                )
+            },
+        )?;
+        Ok(())
+    }
+
+    fn activation_fault(&self, stage: ActivationFaultStage) -> Result<(), Error> {
+        let hook = self.activation_fault_hook.read().unwrap().clone();
+        self.invoke_activation_hook_with(hook.as_ref(), stage)
+            .map_err(Into::into)
+    }
+
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
+    fn invoke_activation_hook_with(
+        &self,
+        hook: Option<&ActivationFaultHook>,
+        stage: ActivationFaultStage,
+    ) -> std::io::Result<()> {
+        let result = hook.map_or(Ok(()), |hook| (hook.hook)(stage));
+        #[cfg(test)]
+        if result.is_err() && hook.is_some_and(|hook| hook.simulates_crash) {
+            self.simulated_crash
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        result
+    }
+
+    #[cfg(test)]
+    fn set_activation_fault_hook<F>(&self, hook: F)
+    where
+        F: Fn(ActivationFaultStage) -> std::io::Result<()> + Send + Sync + 'static,
+    {
+        self.simulated_crash
+            .store(false, std::sync::atomic::Ordering::Release);
+        *self.activation_fault_hook.write().unwrap() = Some(ActivationFaultHook {
+            hook: Arc::new(hook),
+            simulates_crash: true,
+        });
+    }
+
+    #[cfg(test)]
+    fn set_activation_error_hook<F>(&self, hook: F)
+    where
+        F: Fn(ActivationFaultStage) -> std::io::Result<()> + Send + Sync + 'static,
+    {
+        self.simulated_crash
+            .store(false, std::sync::atomic::Ordering::Release);
+        *self.activation_fault_hook.write().unwrap() = Some(ActivationFaultHook {
+            hook: Arc::new(hook),
+            simulates_crash: false,
+        });
+    }
+
+    #[cfg(test)]
+    fn clear_activation_fault_hook(&self) {
+        *self.activation_fault_hook.write().unwrap() = None;
+        self.simulated_crash
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
+    fn simulated_crash(&self) -> bool {
+        #[cfg(test)]
+        {
+            return self
+                .simulated_crash
+                .load(std::sync::atomic::Ordering::Acquire);
+        }
+        #[cfg(not(test))]
+        false
+    }
+
+    fn new_activation_transaction_id(&self) -> [u8; 16] {
+        #[cfg(test)]
+        if let Some(id) = self.next_activation_transaction_id.lock().unwrap().take() {
+            return id;
+        }
+        #[cfg(not(test))]
+        let _ = self;
+        *uuid::Uuid::new_v4().as_bytes()
+    }
+
+    #[cfg(test)]
+    fn set_next_activation_transaction_id(&self, id: [u8; 16]) {
+        *self.next_activation_transaction_id.lock().unwrap() = Some(id);
+    }
+
+    fn decode_active_ref(&self, path: &Path) -> Result<FsActivationActiveV1, Error> {
+        let payload = read_enveloped_state(
+            path,
+            DurableStateKind::FsActivation,
+            FS_ACTIVATION_ACTIVE_SCHEMA,
+            MAX_DURABLE_STATE_PAYLOAD,
+        )?;
+        let active: FsActivationActiveV1 =
+            bitcode::deserialize(&payload).map_err(InvalidParameter::from)?;
+        self.validate_active_ref(path, &active)?;
+        Ok(active)
+    }
+
+    fn validate_active_ref(&self, path: &Path, active: &FsActivationActiveV1) -> Result<(), Error> {
+        if active.root_identity != fs_storage_root_identity(&self.inner.read().unwrap().root)? {
+            return Err(invalid_state("activation root identity mismatch"));
+        }
+        let kind = Self::decode_activation_kind(active.kind)?;
+        let expected_kind = if active.item.manifest.entries.is_empty() {
+            ActiveRevisionKind::File
+        } else {
+            ActiveRevisionKind::Directory
+        };
+        if active.destination != crate::utils::path::validate_relative(&active.destination)?
+            || active.item.metadata.path != active.destination
+            || kind != expected_kind
+            || active.destination_identity
+                != self.activation_destination_identity(&active.destination)?
+            || active.revision_identity != Self::activation_revision_identity(&active.item)?
+            || self.active_ref_path(&active.destination_identity) != path
+        {
+            return Err(invalid_state("active reference identity mismatch"));
+        }
+        let root = self.activation_revision_root(&active.revision_identity);
+        Self::validate_immutable_activation_shape(&root, &active.item, kind)?;
+        Self::validate_activation_seals(&root, &active.item, kind, &active.seals)
+    }
+
+    fn decode_activation_kind(encoded: u8) -> Result<ActiveRevisionKind, Error> {
+        match encoded {
+            0 => Ok(ActiveRevisionKind::File),
+            1 => Ok(ActiveRevisionKind::Directory),
+            _ => Err(invalid_state("unknown active revision kind")),
+        }
+    }
+
+    fn validate_immutable_activation_shape(
+        root: &Path,
+        item: &Item,
+        kind: ActiveRevisionKind,
+    ) -> Result<(), Error> {
+        let metadata = fs::symlink_metadata(root)?;
+        match kind {
+            ActiveRevisionKind::File
+                if !metadata.is_file() || metadata.file_type().is_symlink() =>
+            {
+                Err(invalid_state("immutable activation root is not a file"))
+            }
+            ActiveRevisionKind::Directory
+                if !metadata.is_dir() || metadata.file_type().is_symlink() =>
+            {
+                Err(invalid_state(
+                    "immutable activation root is not a directory",
+                ))
+            }
+            ActiveRevisionKind::File => {
+                if metadata.len() != item.size() {
+                    return Err(invalid_state("immutable activation file size mismatch"));
+                }
+                Ok(())
+            }
+            ActiveRevisionKind::Directory => {
+                let mut expected_files = HashMap::default();
+                let mut expected_directories = HashSet::default();
+                expected_directories.insert(PathBuf::new());
+                for entry in &item.manifest.entries {
+                    let relative =
+                        crate::utils::path::validate_relative(Path::new(&entry.relative_path))?;
+                    if expected_files
+                        .insert(relative.clone(), entry.size)
+                        .is_some()
+                    {
+                        return Err(invalid_state("duplicate immutable activation entry"));
+                    }
+                    let mut parent = relative.parent();
+                    while let Some(path) = parent {
+                        expected_directories.insert(path.to_path_buf());
+                        parent = path.parent();
+                    }
+                }
+                let mut directories = vec![root.to_path_buf()];
+                let mut found_files = 0usize;
+                let mut index = 0usize;
+                while index < directories.len() {
+                    for entry in fs::read_dir(&directories[index])? {
+                        let entry = entry?;
+                        let path = entry.path();
+                        let relative = path
+                            .strip_prefix(root)
+                            .map_err(|_| invalid_state("immutable activation escaped root"))?;
+                        let metadata = fs::symlink_metadata(&path)?;
+                        if metadata.file_type().is_symlink() {
+                            return Err(invalid_state("immutable activation contains a symlink"));
+                        }
+                        if metadata.is_dir() {
+                            if !expected_directories.contains(relative) {
+                                return Err(invalid_state(
+                                    "immutable activation contains an unexpected directory",
+                                ));
+                            }
+                            directories.push(path);
+                        } else if metadata.is_file() {
+                            let expected = expected_files.get(relative).ok_or_else(|| {
+                                invalid_state("immutable activation contains an unexpected file")
+                            })?;
+                            if metadata.len() != *expected {
+                                return Err(invalid_state(
+                                    "immutable activation entry size mismatch",
+                                ));
+                            }
+                            found_files += 1;
+                        } else {
+                            return Err(invalid_state(
+                                "immutable activation contains a special file",
+                            ));
+                        }
+                    }
+                    index += 1;
+                }
+                if found_files != expected_files.len() {
+                    return Err(invalid_state("immutable activation entry is missing"));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn activation_file_seal(
+        path: &Path,
+        relative_path: Option<PathBuf>,
+    ) -> Result<FsActivationFileSealV1, Error> {
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(invalid_state(
+                "activation seal target is not a regular file",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Ok(FsActivationFileSealV1 {
+                relative_path,
+                size: metadata.len(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                mode: metadata.mode(),
+                modified_seconds: metadata.mtime(),
+                modified_nanoseconds: metadata.mtime_nsec(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let modified = metadata
+                .modified()?
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map_err(|_| invalid_state("activation seal mtime predates Unix epoch"))?;
+            Ok(FsActivationFileSealV1 {
+                relative_path,
+                size: metadata.len(),
+                device: 0,
+                inode: 0,
+                mode: u32::from(metadata.permissions().readonly()),
+                modified_seconds: i64::try_from(modified.as_secs())
+                    .map_err(InvalidParameter::from)?,
+                modified_nanoseconds: i64::from(modified.subsec_nanos()),
+            })
+        }
+    }
+
+    fn collect_activation_seals(
+        root: &Path,
+        item: &Item,
+        kind: ActiveRevisionKind,
+    ) -> Result<Vec<FsActivationFileSealV1>, Error> {
+        match kind {
+            ActiveRevisionKind::File => Ok(vec![Self::activation_file_seal(root, None)?]),
+            ActiveRevisionKind::Directory => item
+                .manifest
+                .entries
+                .iter()
+                .map(|entry| {
+                    let relative =
+                        crate::utils::path::validate_relative(Path::new(&entry.relative_path))?;
+                    Self::activation_file_seal(&root.join(&relative), Some(relative))
+                })
+                .collect(),
+        }
+    }
+
+    fn validate_activation_seals(
+        root: &Path,
+        item: &Item,
+        kind: ActiveRevisionKind,
+        seals: &[FsActivationFileSealV1],
+    ) -> Result<(), Error> {
+        let current = Self::collect_activation_seals(root, item, kind)?;
+        if current != seals {
+            Self::verify_immutable_activation_tree(root, item, kind)?;
+            return Err(invalid_state(
+                "activation verification seal changed; durable reactivation is required",
+            ));
+        }
+        Ok(())
+    }
+
+    fn encode_activation_kind(kind: ActiveRevisionKind) -> u8 {
+        match kind {
+            ActiveRevisionKind::File => 0,
+            ActiveRevisionKind::Directory => 1,
+        }
+    }
+
+    fn handle_from_active(
+        &self,
+        active: Arc<FsActivationActiveV1>,
+    ) -> Result<ActiveRevisionHandle, Error> {
+        let kind = Self::decode_activation_kind(active.kind)?;
+        Ok(ActiveRevisionHandle {
+            revision_root: self.activation_revision_root(&active.revision_identity),
+            active,
+            kind,
+        })
+    }
+
+    fn load_active_refs(&self) -> Result<(), Error> {
+        let active_directory = self.activation_root().join("active");
+        match fs::symlink_metadata(&active_directory) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.active_refs.write().unwrap().clear();
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => return Err(invalid_state("activation active path is not a directory")),
+        }
+        let paths = self.canonical_activation_records(&active_directory, "active", 64)?;
+        let mut loaded = HashMap::default();
+        for path in paths {
+            let active = Arc::new(self.decode_active_ref(&path)?);
+            if loaded.insert(active.destination_identity, active).is_some() {
+                return Err(invalid_state("duplicate activation destination record"));
+            }
+        }
+        *self.active_refs.write().unwrap() = loaded;
+        Ok(())
+    }
+
+    fn validate_activation_transaction(
+        &self,
+        path: &Path,
+        transaction: &FsActivationTransactionV2,
+    ) -> Result<ActiveRevisionKind, Error> {
+        let destination = crate::utils::path::validate_relative(&transaction.destination)?;
+        let kind = Self::decode_activation_kind(transaction.kind)?;
+        let expected_kind = if transaction.item.manifest.entries.is_empty() {
+            ActiveRevisionKind::File
+        } else {
+            ActiveRevisionKind::Directory
+        };
+        let (expected_staging, expected_backup) =
+            self.activation_mirror_paths(&transaction.destination, &transaction.transaction_id)?;
+        if transaction.root_identity != fs_storage_root_identity(&self.inner.read().unwrap().root)?
+            || destination != transaction.destination
+            || transaction.item.metadata.path != transaction.destination
+            || transaction.destination_identity
+                != self.activation_destination_identity(&transaction.destination)?
+            || transaction.candidate_revision_identity
+                != Self::activation_revision_identity(&transaction.item)?
+            || self.activation_transaction_path(&transaction.transaction_id) != path
+            || kind != expected_kind
+            || transaction.mirror_staging_path != expected_staging
+            || transaction.mirror_backup_path != expected_backup
+        {
+            return Err(invalid_state("activation transaction identity mismatch"));
+        }
+        self.validate_owned_mirror_path(&transaction.mirror_staging_path)?;
+        self.validate_owned_mirror_path(&transaction.mirror_backup_path)?;
+        if let Some(previous) = transaction.previous.as_ref() {
+            self.validate_active_ref(
+                &self.active_ref_path(&transaction.destination_identity),
+                previous,
+            )?;
+            if previous.destination_identity != transaction.destination_identity
+                || previous.destination != transaction.destination
+                || previous.item.metadata.artifact_id != transaction.item.metadata.artifact_id
+                || previous.item.metadata.revision >= transaction.item.metadata.revision
+            {
+                return Err(invalid_state(
+                    "activation transaction prior revision is inconsistent",
+                ));
+            }
+        }
+        match transaction.phase {
+            FsActivationPhaseV2::Intent if !transaction.candidate_seals.is_empty() => {
+                return Err(invalid_state(
+                    "intent activation transaction unexpectedly contains verification seals",
+                ));
+            }
+            FsActivationPhaseV2::Ready | FsActivationPhaseV2::Switched => {
+                Self::validate_activation_seals(
+                    &self.activation_revision_root(&transaction.candidate_revision_identity),
+                    &transaction.item,
+                    kind,
+                    &transaction.candidate_seals,
+                )?;
+            }
+            FsActivationPhaseV2::Intent => {}
+        }
+        Ok(kind)
+    }
+
+    fn validate_owned_mirror_path(&self, relative: &Path) -> Result<(), Error> {
+        let relative = crate::utils::path::validate_relative(relative)?;
+        let path = self.path(&relative)?;
+        match fs::symlink_metadata(path) {
+            Ok(metadata)
+                if !metadata.file_type().is_symlink()
+                    && (metadata.is_file() || metadata.is_dir()) =>
+            {
+                Ok(())
+            }
+            Ok(_) => Err(invalid_state(
+                "activation-owned mirror path has an unsafe type",
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn preflight_owned_mirror_paths(
+        &self,
+        transaction: &FsActivationTransactionV2,
+    ) -> Result<(), Error> {
+        for relative in [
+            &transaction.mirror_staging_path,
+            &transaction.mirror_backup_path,
+        ] {
+            let path = self.path(relative)?;
+            match fs::symlink_metadata(path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+                Ok(_) => {
+                    return Err(invalid_state(
+                        "activation-owned mirror path already exists before selector switch",
+                    ))
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_activation_backing_coverage(&self) -> Result<(), Error> {
+        let revisions = self.activation_root().join("revisions");
+        let selected_roots = self
+            .active_refs
+            .read()
+            .unwrap()
+            .values()
+            .map(|active| self.activation_revision_root(&active.revision_identity))
+            .collect::<Vec<_>>();
+        for entries in self.inner.read().unwrap().data.values() {
+            for entry in entries {
+                if entry.path.starts_with(&revisions)
+                    && !selected_roots
+                        .iter()
+                        .any(|selected| entry.path.starts_with(selected))
+                {
+                    return Err(invalid_state(
+                        "filesystem state references an unselected activation revision",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn recover_activations(&self) -> Result<(), Error> {
+        let root = self.activation_root();
+        match fs::symlink_metadata(&root) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => return Err(invalid_state("activation namespace is not a directory")),
+        }
+        self.load_active_refs()?;
+        let selected = self
+            .active_refs
+            .read()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for active in &selected {
+            self.reconcile_active_item(active.as_ref(), None, false)?;
+        }
+        self.prune_unselected_activation_backings()?;
+        let transactions = root.join("transactions");
+        match fs::symlink_metadata(&transactions) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.persist_derived_activation_checkpoint()?;
+                return self.validate_activation_backing_coverage();
+            }
+            Err(error) => return Err(error.into()),
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => return Err(invalid_state("activation transactions path is invalid")),
+        }
+        let paths = self.canonical_activation_records(&transactions, "transaction", 32)?;
+        for path in paths {
+            let payload = read_enveloped_state(
+                &path,
+                DurableStateKind::FsActivation,
+                FS_ACTIVATION_TRANSACTION_SCHEMA,
+                MAX_DURABLE_STATE_PAYLOAD,
+            )?;
+            let transaction: FsActivationTransactionV2 =
+                bitcode::deserialize(&payload).map_err(InvalidParameter::from)?;
+            self.validate_activation_transaction(&path, &transaction)?;
+            let selected = self
+                .active_refs
+                .read()
+                .unwrap()
+                .get(&transaction.destination_identity)
+                .cloned();
+            let candidate_selected = selected.as_ref().is_some_and(|active| {
+                active.revision_identity == transaction.candidate_revision_identity
+            });
+            if transaction.phase == FsActivationPhaseV2::Switched && !candidate_selected {
+                return Err(invalid_state(
+                    "activation transaction phase disagrees with selector",
+                ));
+            }
+            if candidate_selected {
+                let active = selected.expect("checked Some");
+                if active.item != transaction.item
+                    || active.kind != transaction.kind
+                    || (transaction.phase != FsActivationPhaseV2::Intent
+                        && active.seals != transaction.candidate_seals)
+                {
+                    return Err(invalid_state(
+                        "selected activation differs from its transaction",
+                    ));
+                }
+                self.reconcile_active_item(active.as_ref(), transaction.previous.as_ref(), false)?;
+                let handle = self.handle_from_active(active)?;
+                let destination = self.path(&transaction.destination)?;
+                self.replace_compatibility_mirror(
+                    &handle.revision_root,
+                    &destination,
+                    handle.kind,
+                    &transaction,
+                    true,
+                )?;
+            }
+            for relative in [
+                &transaction.mirror_staging_path,
+                &transaction.mirror_backup_path,
+            ] {
+                self.remove_recovery_path_checked(
+                    &self.path(relative)?,
+                    ActivationOperation::RecoveryMirrorCleanup,
+                    ActivationOperation::RecoveryMirrorCleanupParentSync,
+                )?;
+            }
+            let staging_parent = self
+                .activation_staging_root(&transaction.transaction_id)
+                .parent()
+                .ok_or(Error::MissingData)?
+                .to_path_buf();
+            self.remove_recovery_path_checked(
+                &staging_parent,
+                ActivationOperation::RecoveryStagingCleanup,
+                ActivationOperation::RecoveryStagingCleanupParentSync,
+            )?;
+            self.remove_recovery_path_checked(
+                &path,
+                ActivationOperation::RecoveryTransactionCleanup,
+                ActivationOperation::RecoveryTransactionCleanupParentSync,
+            )?;
+        }
+        self.persist_derived_activation_checkpoint()?;
+        self.validate_activation_backing_coverage()
+    }
+
+    fn prune_unselected_activation_backings(&self) -> Result<(), Error> {
+        let revisions = self.activation_root().join("revisions");
+        let selected_roots = self
+            .active_refs
+            .read()
+            .unwrap()
+            .values()
+            .map(|active| self.activation_revision_root(&active.revision_identity))
+            .collect::<Vec<_>>();
+        let mut inner = self.inner.write().unwrap();
+        let mut changed = false;
+        for entries in inner.data.values_mut() {
+            let before = entries.len();
+            entries.retain(|entry| {
+                !entry.path.starts_with(&revisions)
+                    || selected_roots
+                        .iter()
+                        .any(|selected| entry.path.starts_with(selected))
+            });
+            changed |= entries.len() != before;
+        }
+        let before = inner.data.len();
+        inner.data.retain(|_, entries| !entries.is_empty());
+        changed |= inner.data.len() != before;
+        if changed {
+            inner.mark_dirty();
+        }
+        Ok(())
+    }
+
+    fn persist_derived_activation_checkpoint(&self) -> Result<(), Error> {
+        if self.inner.read().unwrap().dirty {
+            self.persist()?;
+        }
+        Ok(())
+    }
+
+    fn destination_lock(&self, identity: [u8; 32]) -> Arc<Mutex<()>> {
+        self.activation_locks
+            .lock()
+            .unwrap()
+            .entry(identity)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
     fn artifact_entry_path(root: &Path, relative_path: &Path) -> Result<PathBuf, Error> {
         crate::utils::path::resolve_beneath(root, relative_path)
     }
@@ -1802,6 +3325,27 @@ impl FsStorage {
         #[cfg(unix)]
         File::open(path.parent().ok_or(Error::MissingData)?)?.sync_all()?;
         Ok(())
+    }
+
+    fn cleanup_preselector_activation(
+        &self,
+        staging_parent: &Path,
+        transaction_path: &Path,
+    ) -> Result<(), Error> {
+        let staging_result = Self::remove_activation_path_checked(staging_parent);
+        let transaction_result = Self::remove_revision_marker(transaction_path);
+        match (staging_result, transaction_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(staging), Ok(())) => Err(invalid_state(format!(
+                "pre-selector staging cleanup failed: {staging}"
+            ))),
+            (Ok(()), Err(transaction)) => Err(invalid_state(format!(
+                "pre-selector transaction cleanup failed: {transaction}"
+            ))),
+            (Err(staging), Err(transaction)) => Err(invalid_state(format!(
+                "pre-selector staging cleanup failed ({staging}); transaction cleanup also failed ({transaction})"
+            ))),
+        }
     }
 
     fn read_revision_markers(&self) -> Result<Vec<(PathBuf, Item)>, Error> {
@@ -2009,12 +3553,20 @@ impl FsStorage {
     }
 
     fn migrate_referenced_chunks_to_cas(&self) -> Result<bool, Error> {
+        let selected_active_items = self
+            .active_refs
+            .read()
+            .unwrap()
+            .values()
+            .map(|active| active.item.clone())
+            .collect::<HashSet<_>>();
         let referenced = self
             .inner
             .read()
             .unwrap()
             .items
             .iter()
+            .filter(|item| !selected_active_items.contains(*item))
             .flat_map(|item| item.chunks.iter().copied())
             .collect::<HashSet<_>>();
         if referenced.is_empty() {
@@ -2154,6 +3706,33 @@ impl FsStorage {
         node
     }
 
+    fn is_immutable_backing(&self, path: &Path) -> bool {
+        let root = self.inner.read().unwrap().root.clone();
+        path.starts_with(root.join(FS_ACTIVATION_NAMESPACE).join("revisions"))
+            || path.starts_with(root.join(FS_STORAGE_REVISION_NAMESPACE).join("chunks"))
+    }
+
+    fn read_immutable_backing(
+        &self,
+        path: &Path,
+        offset: u64,
+        bytes: &mut [u8],
+    ) -> Result<(), Error> {
+        let file = self.immutable_readers.lock().unwrap().get_or_open(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            file.read_exact_at(bytes, offset)?;
+        }
+        #[cfg(not(unix))]
+        {
+            let mut file = file.try_clone()?;
+            file.seek(std::io::SeekFrom::Start(offset))?;
+            file.read_exact(bytes)?;
+        }
+        Ok(())
+    }
+
     fn read_chunk_data(&self, hash: &Hash) -> Option<ChunkData> {
         if let Some(cached) = self.cached_chunk_data(hash) {
             return Some(cached);
@@ -2174,6 +3753,16 @@ impl FsStorage {
 
         let size = usize::try_from(entry.info.size).ok()?;
         let mut buf = vec![0u8; size];
+
+        if self.is_immutable_backing(&entry.path)
+            && self
+                .read_immutable_backing(&entry.path, entry.offset, &mut buf)
+                .is_ok()
+        {
+            return Some(ChunkData::Owned(
+                self.cache_chunk_data(*hash, Arc::new(buf)),
+            ));
+        }
 
         // Try to read via the existing handle (avoids File::open per chunk)
         if let Some(handle) = self.handle_for_path(&entry.path) {
@@ -2315,10 +3904,15 @@ impl FsStorage {
                 chunks.push(chunk_info);
 
                 if available_hashes.contains(&chunk_info.hash) {
-                    let data = self
-                        .read_chunk_data(&chunk_info.hash)
-                        .ok_or(Error::Storage(StorageError::TreeReconstruct))?;
-                    staged_data.insert(chunk_info.hash, data);
+                    if !self
+                        .inner
+                        .read()
+                        .unwrap()
+                        .data
+                        .contains_key(&chunk_info.hash)
+                    {
+                        return Err(Error::Storage(StorageError::TreeReconstruct));
+                    }
                 } else {
                     let data = received_chunks
                         .pop_front()
@@ -2341,162 +3935,1254 @@ impl FsStorage {
         Ok((chunks, root))
     }
 
-    fn activate_staged_chunks(
+    fn materialize_activation_tree(
         &self,
-        item_root: &Path,
+        staging_root: &Path,
+        kind: ActiveRevisionKind,
         manifest: &Manifest,
         chunks: &[ChunkInfo],
         staged_data: &HashMap<Hash, ChunkData>,
+        previous: Option<&FsActivationActiveV1>,
     ) -> Result<(), Error> {
-        let parent = item_root.parent().ok_or(Error::MissingData)?;
-        create_dir_all(parent)?;
-        let item_name = item_root.file_name().ok_or(Error::MissingData)?;
-        let staging_root = parent.join(format!(
-            ".{}.distd-stage-{}",
-            item_name.to_string_lossy(),
-            uuid::Uuid::new_v4()
-        ));
-
-        let mut staged_files = Vec::new();
-        let mut final_files = Vec::new();
-        let mut ranges = Vec::new();
-
-        if manifest.entries.is_empty() {
-            staged_files.push(staging_root.clone());
-            final_files.push(item_root.to_path_buf());
-            ranges.push((0usize, chunks.len()));
+        if kind == ActiveRevisionKind::File
+            && self.materialize_incremental_activation_file(
+                staging_root,
+                chunks,
+                staged_data,
+                previous,
+            )?
+        {
+            return Ok(());
+        }
+        if kind == ActiveRevisionKind::Directory {
+            fs::create_dir(staging_root)?;
+            self.activation_fault(ActivationFaultStage::Operation(
+                ActivationOperation::MaterializeDirectoryCreate,
+            ))?;
+        }
+        let entries = if manifest.entries.is_empty() {
+            vec![(staging_root.to_path_buf(), 0usize, chunks.len(), None)]
         } else {
-            create_dir_all(&staging_root)?;
-            let mut expected_start = 0usize;
-            let mut seen_paths = HashSet::default();
-            for entry in &manifest.entries {
-                let relative_path =
-                    crate::utils::path::validate_relative(Path::new(&entry.relative_path))?;
-                if !seen_paths.insert(relative_path.clone()) {
-                    return Err(Error::Storage(StorageError::TreeReconstruct));
-                }
-
-                let start = entry.chunk_range.0 as usize;
-                let end = entry.chunk_range.1 as usize;
-                if start != expected_start || end < start || end > chunks.len() {
-                    return Err(Error::Storage(StorageError::TreeReconstruct));
-                }
-                let actual_size = chunks[start..end]
-                    .iter()
-                    .map(|chunk| chunk.size)
-                    .sum::<u64>();
-                if actual_size != entry.size {
-                    return Err(Error::Storage(StorageError::TreeReconstruct));
-                }
-                expected_start = end;
-
-                staged_files.push(Self::artifact_entry_path(&staging_root, &relative_path)?);
-                final_files.push(Self::artifact_entry_path(item_root, &relative_path)?);
-                ranges.push((start, end));
-            }
-            if expected_start != chunks.len() {
+            manifest
+                .entries
+                .iter()
+                .map(|entry| {
+                    let relative =
+                        crate::utils::path::validate_relative(Path::new(&entry.relative_path))?;
+                    Ok((
+                        staging_root.join(relative),
+                        entry.chunk_range.0 as usize,
+                        entry.chunk_range.1 as usize,
+                        Some(entry),
+                    ))
+                })
+                .collect::<Result<Vec<_>, Error>>()?
+        };
+        for (path, start, end, entry) in entries {
+            if start > end || end > chunks.len() {
                 return Err(Error::Storage(StorageError::TreeReconstruct));
             }
-        }
-
-        let materialize_result = staged_files
-            .iter()
-            .zip(ranges.iter().copied())
-            .try_for_each(|(path, (start, end))| {
-                if let Some(parent) = path.parent() {
-                    create_dir_all(parent)?;
+            if let Some(parent) = path.parent() {
+                let parent_existed = parent.exists();
+                create_dir_all(parent)?;
+                if !parent_existed {
+                    self.activation_fault(ActivationFaultStage::Operation(
+                        ActivationOperation::MaterializeDirectoryCreate,
+                    ))?;
                 }
-                let mut file = File::create(path)?;
-                for chunk in &chunks[start..end] {
-                    let data = staged_data
-                        .get(&chunk.hash)
-                        .ok_or(Error::Storage(StorageError::TreeReconstruct))?;
+            }
+            if let (Some(previous), Some(entry)) = (previous, entry) {
+                if let Some(previous_entry) =
+                    previous.item.manifest.entries.iter().find(|candidate| {
+                        candidate.relative_path == entry.relative_path
+                            && candidate.size == entry.size
+                            && previous.item.chunks
+                                [candidate.chunk_range.0 as usize..candidate.chunk_range.1 as usize]
+                                == chunks[start..end]
+                    })
+                {
+                    fs::hard_link(
+                        self.activation_revision_root(&previous.revision_identity)
+                            .join(&previous_entry.relative_path),
+                        &path,
+                    )?;
+                    self.activation_fault(ActivationFaultStage::Operation(
+                        ActivationOperation::MaterializeFileCreate,
+                    ))?;
+                    continue;
+                }
+            }
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
+            self.activation_fault(ActivationFaultStage::Operation(
+                ActivationOperation::MaterializeFileCreate,
+            ))?;
+            for chunk in &chunks[start..end] {
+                if let Some(data) = staged_data.get(&chunk.hash) {
                     if data.as_ref().len() as u64 != chunk.size
                         || do_hash(data.as_ref()) != chunk.hash
                     {
                         return Err(Error::Storage(StorageError::TreeReconstruct));
                     }
                     file.write_all(data.as_ref())?;
+                } else {
+                    self.copy_existing_chunk_bounded(chunk, &mut file)?;
                 }
-                file.set_len(chunks[start..end].iter().map(|chunk| chunk.size).sum())?;
-                file.sync_all()?;
-                Ok::<(), Error>(())
-            });
-
-        if let Err(error) = materialize_result {
-            Self::remove_staging_path(&staging_root);
-            return Err(error);
-        }
-
-        if let Err(error) = Self::atomic_replace(&staging_root, item_root) {
-            Self::remove_staging_path(&staging_root);
-            return Err(error);
-        }
-
-        let mut inner = self.inner.write().unwrap();
-        for entries in inner.data.values_mut() {
-            entries.retain(|entry| !entry.path.starts_with(item_root));
-        }
-        inner.data.retain(|_, entries| !entries.is_empty());
-        for (path, (start, end)) in final_files.iter().zip(ranges.iter().copied()) {
-            let mut offset = 0u64;
-            for chunk in &chunks[start..end] {
-                inner
-                    .data
-                    .entry(chunk.hash)
-                    .or_default()
-                    .push(Arc::new(InFileChunk {
-                        info: *chunk,
-                        path: path.clone(),
-                        offset,
-                        populated: Arc::new(AtomicBool::new(true)),
-                    }));
-                offset += chunk.size;
+                self.activation_fault(ActivationFaultStage::Operation(
+                    ActivationOperation::MaterializeFileWrite,
+                ))?;
             }
+            file.sync_all()?;
+            self.activation_fault(ActivationFaultStage::Operation(
+                ActivationOperation::MaterializeFileSync,
+            ))?;
         }
-        inner.mark_dirty();
-        drop(inner);
-
-        let mut handles = self.handles.write().unwrap();
-        handles.retain(|path, _| !path.starts_with(item_root));
-        for path in final_files {
-            handles.insert(path.clone(), Arc::new(Mutex::new(Handle::new(&path)?)));
+        if kind == ActiveRevisionKind::Directory {
+            self.sync_activation_directory_tree(
+                staging_root,
+                ActivationOperation::MaterializeDirectorySync,
+            )?;
         }
         Ok(())
     }
 
-    fn remove_staging_path(path: &Path) {
-        if path.is_dir() {
-            let _ = fs::remove_dir_all(path);
+    fn materialize_incremental_activation_file(
+        &self,
+        staging_root: &Path,
+        chunks: &[ChunkInfo],
+        staged_data: &HashMap<Hash, ChunkData>,
+        previous: Option<&FsActivationActiveV1>,
+    ) -> Result<bool, Error> {
+        let Some(previous) = previous.filter(|previous| {
+            previous.kind == Self::encode_activation_kind(ActiveRevisionKind::File)
+                && previous.item.manifest.entries.is_empty()
+                && previous.seals.len() == 1
+                && previous.seals[0].relative_path.is_none()
+        }) else {
+            return Ok(false);
+        };
+        let previous_root = self.activation_revision_root(&previous.revision_identity);
+        if !Self::try_clone_file(&previous_root, staging_root)? {
+            match fs::symlink_metadata(staging_root) {
+                Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                    Self::remove_activation_path_checked(staging_root)?;
+                }
+                Ok(_) => {
+                    return Err(invalid_state(
+                        "failed activation clone left an unsafe staging path",
+                    ))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            return Ok(false);
+        }
+        self.activation_fault(ActivationFaultStage::Operation(
+            ActivationOperation::MaterializeFileCreate,
+        ))?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(staging_root)?;
+        let mut candidate_offset = 0u64;
+        let mut previous_offset = 0u64;
+        for (index, chunk) in chunks.iter().enumerate() {
+            let previous_chunk = previous.item.chunks.get(index);
+            let unchanged = previous_chunk == Some(chunk) && previous_offset == candidate_offset;
+            if !unchanged {
+                file.seek(std::io::SeekFrom::Start(candidate_offset))?;
+                if let Some(data) = staged_data.get(&chunk.hash) {
+                    if data.as_ref().len() as u64 != chunk.size
+                        || do_hash(data.as_ref()) != chunk.hash
+                    {
+                        return Err(Error::Storage(StorageError::TreeReconstruct));
+                    }
+                    file.write_all(data.as_ref())?;
+                } else {
+                    self.copy_existing_chunk_bounded(chunk, &mut file)?;
+                }
+                self.activation_fault(ActivationFaultStage::Operation(
+                    ActivationOperation::MaterializeFileWrite,
+                ))?;
+            }
+            candidate_offset = candidate_offset
+                .checked_add(chunk.size)
+                .ok_or_else(|| invalid_state("activation candidate file size overflows"))?;
+            if let Some(previous_chunk) = previous_chunk {
+                previous_offset = previous_offset
+                    .checked_add(previous_chunk.size)
+                    .ok_or_else(|| invalid_state("prior activation file size overflows"))?;
+            }
+        }
+        file.set_len(candidate_offset)?;
+        file.sync_all()?;
+        self.activation_fault(ActivationFaultStage::Operation(
+            ActivationOperation::MaterializeFileSync,
+        ))?;
+        Ok(true)
+    }
+
+    fn copy_existing_chunk_bounded(
+        &self,
+        chunk: &ChunkInfo,
+        output: &mut File,
+    ) -> Result<(), Error> {
+        let backing = self
+            .inner
+            .read()
+            .unwrap()
+            .data
+            .get(&chunk.hash)
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|entry| {
+                        entry.info == *chunk
+                            && entry.populated.load(std::sync::atomic::Ordering::Relaxed)
+                    })
+                    .cloned()
+            })
+            .ok_or(Error::Storage(StorageError::TreeReconstruct))?;
+        let mut input = File::open(&backing.path)?;
+        input.seek(std::io::SeekFrom::Start(backing.offset))?;
+        let mut remaining = chunk.size;
+        let mut hasher = blake3::Hasher::new();
+        let mut buffer = vec![0u8; FS_ACTIVATION_COPY_BUFFER_BYTES];
+        while remaining > 0 {
+            let length = usize::try_from(remaining.min(buffer.len() as u64))
+                .map_err(InvalidParameter::from)?;
+            input.read_exact(&mut buffer[..length])?;
+            hasher.update(&buffer[..length]);
+            output.write_all(&buffer[..length])?;
+            remaining -= length as u64;
+        }
+        if Hash::from(hasher.finalize()) != chunk.hash {
+            return Err(Error::Storage(StorageError::TreeReconstruct));
+        }
+        Ok(())
+    }
+
+    fn sync_directory_tree_with<F>(root: &Path, mut after_sync: F) -> Result<(), Error>
+    where
+        F: FnMut() -> Result<(), Error>,
+    {
+        let mut directories = vec![root.to_path_buf()];
+        let mut index = 0usize;
+        while index < directories.len() {
+            for entry in fs::read_dir(&directories[index])? {
+                let entry = entry?;
+                let metadata = fs::symlink_metadata(entry.path())?;
+                if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                    directories.push(entry.path());
+                }
+            }
+            index += 1;
+        }
+        for directory in directories.into_iter().rev() {
+            File::open(directory)?.sync_all()?;
+            after_sync()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn sync_directory_tree(root: &Path) -> Result<(), Error> {
+        Self::sync_directory_tree_with(root, || Ok(()))
+    }
+
+    fn sync_activation_directory_tree(
+        &self,
+        root: &Path,
+        operation: ActivationOperation,
+    ) -> Result<(), Error> {
+        Self::sync_directory_tree_with(root, || {
+            self.activation_fault(ActivationFaultStage::Operation(operation))
+        })
+    }
+
+    fn preflight_compatibility_mirror(
+        &self,
+        destination: &Path,
+        item: &Item,
+        kind: ActiveRevisionKind,
+    ) -> Result<(), Error> {
+        let storage_root = self.inner.read().unwrap().root.clone();
+        let relative = destination
+            .strip_prefix(&storage_root)
+            .map_err(|_| invalid_state("activation destination escaped storage root"))?;
+        let mut parent = storage_root.clone();
+        let components = relative.components().collect::<Vec<_>>();
+        for component in components.iter().take(components.len().saturating_sub(1)) {
+            let std::path::Component::Normal(component) = component else {
+                return Err(invalid_state("activation destination is not canonical"));
+            };
+            let path = parent.join(component);
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+                Ok(_) => {
+                    return Err(invalid_state(
+                        "activation destination parent is not a regular directory",
+                    ))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    fs::create_dir(&path)?;
+                    Self::sync_parent(&parent)?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+            parent = path;
+        }
+        let mut destination_is_directory = false;
+        match fs::symlink_metadata(destination) {
+            Ok(metadata)
+                if !metadata.file_type().is_symlink()
+                    && (metadata.is_file() || metadata.is_dir()) =>
+            {
+                if metadata.is_dir() {
+                    destination_is_directory = true;
+                    let mut directories = vec![destination.to_path_buf()];
+                    let mut index = 0usize;
+                    while index < directories.len() {
+                        for entry in fs::read_dir(&directories[index])? {
+                            let entry = entry?;
+                            let metadata = fs::symlink_metadata(entry.path())?;
+                            if metadata.file_type().is_symlink()
+                                || (!metadata.is_file() && !metadata.is_dir())
+                            {
+                                return Err(invalid_state(
+                                    "activation destination contains an unsafe entry",
+                                ));
+                            }
+                            if metadata.is_dir() {
+                                directories.push(entry.path());
+                            }
+                        }
+                        index += 1;
+                    }
+                }
+            }
+            Ok(_) => return Err(invalid_state("activation destination has an unsafe type")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        if kind == ActiveRevisionKind::Directory && destination_is_directory {
+            for entry in &item.manifest.entries {
+                let relative =
+                    crate::utils::path::validate_relative(Path::new(&entry.relative_path))?;
+                let mut current = destination.to_path_buf();
+                for component in relative.components() {
+                    current.push(component.as_os_str());
+                    match fs::symlink_metadata(&current) {
+                        Ok(metadata)
+                            if !metadata.file_type().is_symlink()
+                                && (metadata.is_file() || metadata.is_dir()) => {}
+                        Ok(_) => {
+                            return Err(invalid_state(
+                                "activation destination entry has an unsafe type",
+                            ))
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_activation_digest_directory(&self, revision_root: &Path) -> Result<(), Error> {
+        let directory = revision_root.parent().ok_or(Error::MissingData)?;
+        let parent = directory.parent().ok_or(Error::MissingData)?;
+        match fs::symlink_metadata(directory) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => return Err(invalid_state("activation revision digest path is unsafe")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match fs::create_dir(directory) {
+                    Ok(()) => {
+                        self.activation_fault(ActivationFaultStage::Operation(
+                            ActivationOperation::RevisionDigestCreate,
+                        ))?;
+                        Self::sync_parent(parent)?;
+                        self.activation_fault(ActivationFaultStage::Operation(
+                            ActivationOperation::RevisionDigestParentSync,
+                        ))?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        let metadata = fs::symlink_metadata(directory)?;
+                        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                            return Err(invalid_state(
+                                "activation revision digest creation conflicted",
+                            ));
+                        }
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let staging_parent = self.activation_root().join("staging");
+            if fs::metadata(directory)?.dev() != fs::metadata(staging_parent)?.dev() {
+                return Err(invalid_state(
+                    "activation staging and revision namespaces are on different devices",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_immutable_activation_tree(
+        root: &Path,
+        item: &Item,
+        kind: ActiveRevisionKind,
+    ) -> Result<(), Error> {
+        let metadata = fs::symlink_metadata(root)?;
+        match kind {
+            ActiveRevisionKind::File
+                if !metadata.is_file() || metadata.file_type().is_symlink() =>
+            {
+                return Err(invalid_state("immutable activation root is not a file"));
+            }
+            ActiveRevisionKind::Directory
+                if !metadata.is_dir() || metadata.file_type().is_symlink() =>
+            {
+                return Err(invalid_state(
+                    "immutable activation root is not a directory",
+                ));
+            }
+            _ => {}
+        }
+        let entries = if item.manifest.entries.is_empty() {
+            vec![(root.to_path_buf(), 0usize, item.chunks.len())]
         } else {
-            let _ = fs::remove_file(path);
+            item.manifest
+                .entries
+                .iter()
+                .map(|entry| {
+                    Ok((
+                        root.join(crate::utils::path::validate_relative(Path::new(
+                            &entry.relative_path,
+                        ))?),
+                        entry.chunk_range.0 as usize,
+                        entry.chunk_range.1 as usize,
+                    ))
+                })
+                .collect::<Result<Vec<_>, Error>>()?
+        };
+        for (path, start, end) in entries {
+            let metadata = fs::symlink_metadata(&path)?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(invalid_state("immutable activation entry is not a file"));
+            }
+            let mut file = File::open(&path)?;
+            for chunk in item.chunks.get(start..end).ok_or_else(|| {
+                invalid_state("immutable activation entry has invalid chunk range")
+            })? {
+                let mut bytes =
+                    vec![0u8; usize::try_from(chunk.size).map_err(InvalidParameter::from)?];
+                file.read_exact(&mut bytes)?;
+                if do_hash(&bytes) != chunk.hash {
+                    return Err(invalid_state("immutable activation chunk hash mismatch"));
+                }
+            }
+            let expected = item.chunks[start..end]
+                .iter()
+                .map(|chunk| chunk.size)
+                .sum::<u64>();
+            if metadata.len() != expected {
+                return Err(invalid_state("immutable activation entry size mismatch"));
+            }
+        }
+        Ok(())
+    }
+
+    fn replace_compatibility_mirror(
+        &self,
+        revision_root: &Path,
+        destination: &Path,
+        kind: ActiveRevisionKind,
+        transaction: &FsActivationTransactionV2,
+        recovery: bool,
+    ) -> Result<(), Error> {
+        let parent = destination.parent().ok_or(Error::MissingData)?;
+        create_dir_all(parent)?;
+        let staging = self.path(&transaction.mirror_staging_path)?;
+        let backup = self.path(&transaction.mirror_backup_path)?;
+        self.validate_owned_mirror_path(&transaction.mirror_staging_path)?;
+        self.validate_owned_mirror_path(&transaction.mirror_backup_path)?;
+        let result = match kind {
+            ActiveRevisionKind::File => {
+                self.remove_mirror_owned_path(&staging, recovery)?;
+                self.activation_fault(ActivationFaultStage::Operation(
+                    ActivationOperation::MirrorEntryRemove,
+                ))?;
+                Self::clone_or_copy_file(revision_root, &staging)?;
+                self.activation_fault(ActivationFaultStage::Operation(
+                    ActivationOperation::MirrorEntryCreate,
+                ))?;
+                self.activation_fault(ActivationFaultStage::Operation(
+                    ActivationOperation::MirrorEntryWrite,
+                ))?;
+                File::open(&staging)?.sync_all()?;
+                self.activation_fault(ActivationFaultStage::Operation(
+                    ActivationOperation::MirrorEntrySync,
+                ))?;
+                self.atomic_replace_owned(&staging, destination, &backup, None)
+            }
+            ActiveRevisionKind::Directory => {
+                self.update_directory_mirror_incrementally(revision_root, destination, transaction)
+            }
+        };
+        result?;
+        self.remove_mirror_owned_path(&staging, recovery)?;
+        self.activation_fault(ActivationFaultStage::Operation(
+            ActivationOperation::MirrorEntryRemove,
+        ))?;
+        self.remove_mirror_owned_path(&backup, recovery)?;
+        self.activation_fault(ActivationFaultStage::Operation(
+            ActivationOperation::MirrorEntryRemove,
+        ))
+    }
+
+    fn remove_mirror_owned_path(&self, path: &Path, recovery: bool) -> Result<(), Error> {
+        if recovery {
+            self.remove_recovery_path_checked(
+                path,
+                ActivationOperation::RecoveryMirrorCleanup,
+                ActivationOperation::RecoveryMirrorCleanupParentSync,
+            )
+        } else {
+            Self::remove_activation_path_checked(path)
         }
     }
 
-    fn atomic_replace(staging: &Path, destination: &Path) -> Result<(), Error> {
+    fn try_clone_file(source: &Path, destination: &Path) -> Result<bool, Error> {
+        #[cfg(target_os = "macos")]
+        {
+            use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+            unsafe extern "C" {
+                fn clonefile(
+                    source: *const std::ffi::c_char,
+                    destination: *const std::ffi::c_char,
+                    flags: u32,
+                ) -> std::ffi::c_int;
+            }
+
+            let source = CString::new(source.as_os_str().as_bytes())
+                .map_err(|_| invalid_state("activation clone source contains NUL"))?;
+            let destination_c = CString::new(destination.as_os_str().as_bytes())
+                .map_err(|_| invalid_state("activation clone destination contains NUL"))?;
+            // SAFETY: both pointers are valid NUL-terminated path strings for the duration of
+            // the call, and destination is an activation-owned unique staging path.
+            if unsafe { clonefile(source.as_ptr(), destination_c.as_ptr(), 0) } == 0 {
+                return Ok(true);
+            }
+            match fs::symlink_metadata(destination) {
+                Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                    fs::remove_file(destination)?;
+                }
+                Ok(_) => {
+                    return Err(invalid_state(
+                        "failed activation clone left an unsafe staging path",
+                    ))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(false)
+    }
+
+    fn clone_or_copy_file(source: &Path, destination: &Path) -> Result<(), Error> {
+        if Self::try_clone_file(source, destination)? {
+            return Ok(());
+        }
+        fs::copy(source, destination)?;
+        Ok(())
+    }
+
+    fn update_directory_mirror_incrementally(
+        &self,
+        revision_root: &Path,
+        destination: &Path,
+        transaction: &FsActivationTransactionV2,
+    ) -> Result<(), Error> {
+        let previous = transaction.previous.as_ref();
+        let item = &transaction.item;
+        let staging_root = self.path(&transaction.mirror_staging_path)?;
+        let backup_root = self.path(&transaction.mirror_backup_path)?;
+        let mut changed_directories = HashSet::default();
+        match fs::symlink_metadata(destination) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                match fs::symlink_metadata(&backup_root) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        fs::rename(destination, &backup_root)?;
+                        changed_directories.insert(
+                            destination
+                                .parent()
+                                .ok_or(Error::MissingData)?
+                                .to_path_buf(),
+                        );
+                    }
+                    Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+                    Ok(_) => {
+                        return Err(invalid_state("activation mirror backup has the wrong type"))
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+                fs::create_dir(destination)?;
+                changed_directories.insert(
+                    destination
+                        .parent()
+                        .ok_or(Error::MissingData)?
+                        .to_path_buf(),
+                );
+                self.activation_fault(ActivationFaultStage::Operation(
+                    ActivationOperation::MirrorDirectoryCreate,
+                ))?;
+            }
+            Ok(_) => return Err(invalid_state("compatibility mirror has an unsafe type")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(destination)?;
+                changed_directories.insert(
+                    destination
+                        .parent()
+                        .ok_or(Error::MissingData)?
+                        .to_path_buf(),
+                );
+                self.activation_fault(ActivationFaultStage::Operation(
+                    ActivationOperation::MirrorDirectoryCreate,
+                ))?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        match fs::symlink_metadata(&staging_root) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(invalid_state(
+                    "activation mirror staging has the wrong type",
+                ))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&staging_root)?;
+                Self::sync_parent(staging_root.parent().ok_or(Error::MissingData)?)?;
+                self.activation_fault(ActivationFaultStage::Operation(
+                    ActivationOperation::MirrorDirectoryCreate,
+                ))?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+
+        let mut expected_files = HashMap::default();
+        let mut expected_directories = HashSet::default();
+        expected_directories.insert(PathBuf::new());
+        for entry in &item.manifest.entries {
+            let relative = crate::utils::path::validate_relative(Path::new(&entry.relative_path))?;
+            expected_files.insert(relative.clone(), entry);
+            let mut parent = relative.parent();
+            while let Some(path) = parent {
+                expected_directories.insert(path.to_path_buf());
+                parent = path.parent();
+            }
+        }
+
+        let mut directories = vec![destination.to_path_buf()];
+        let mut index = 0usize;
+        while index < directories.len() {
+            for entry in fs::read_dir(&directories[index])? {
+                let entry = entry?;
+                let path = entry.path();
+                let relative = path
+                    .strip_prefix(destination)
+                    .map_err(|_| invalid_state("compatibility mirror escaped destination"))?;
+                let metadata = fs::symlink_metadata(&path)?;
+                if metadata.file_type().is_symlink() || (!metadata.is_file() && !metadata.is_dir())
+                {
+                    return Err(invalid_state(
+                        "compatibility mirror contains an unsafe entry",
+                    ));
+                }
+                if metadata.is_dir() {
+                    directories.push(path);
+                } else if !expected_files.contains_key(relative) {
+                    let backup = backup_root.join(relative);
+                    if let Some(parent) = backup.parent() {
+                        create_dir_all(parent)?;
+                    }
+                    match fs::symlink_metadata(&backup) {
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            fs::rename(&path, &backup)?;
+                            changed_directories
+                                .insert(path.parent().ok_or(Error::MissingData)?.to_path_buf());
+                            self.activation_fault(ActivationFaultStage::Operation(
+                                ActivationOperation::MirrorEntryRemove,
+                            ))?;
+                        }
+                        Ok(metadata)
+                            if metadata.is_file() && !metadata.file_type().is_symlink() =>
+                        {
+                            Self::remove_activation_path_checked(&path)?;
+                            changed_directories
+                                .insert(path.parent().ok_or(Error::MissingData)?.to_path_buf());
+                            self.activation_fault(ActivationFaultStage::Operation(
+                                ActivationOperation::MirrorEntryRemove,
+                            ))?;
+                        }
+                        Ok(_) => {
+                            return Err(invalid_state(
+                                "activation mirror removed-entry backup has an unsafe type",
+                            ))
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
+            index += 1;
+        }
+        for directory in directories.into_iter().skip(1).rev() {
+            let relative = directory
+                .strip_prefix(destination)
+                .map_err(|_| invalid_state("compatibility mirror escaped destination"))?;
+            if !expected_directories.contains(relative) {
+                Self::remove_activation_path_checked(&directory)?;
+                changed_directories
+                    .insert(directory.parent().ok_or(Error::MissingData)?.to_path_buf());
+                self.activation_fault(ActivationFaultStage::Operation(
+                    ActivationOperation::MirrorEntryRemove,
+                ))?;
+            }
+        }
+
+        for entry in &item.manifest.entries {
+            let relative = crate::utils::path::validate_relative(Path::new(&entry.relative_path))?;
+            let target = destination.join(&relative);
+            Self::ensure_mirror_parent_directories(
+                destination,
+                relative.parent(),
+                &mut changed_directories,
+            )?;
+            let unchanged = previous.is_some_and(|previous| {
+                Self::decode_activation_kind(previous.kind).ok()
+                    == Some(ActiveRevisionKind::Directory)
+                    && previous.item.manifest.entries.iter().any(|candidate| {
+                        candidate.relative_path == entry.relative_path
+                            && candidate.size == entry.size
+                            && previous.item.chunks
+                                [candidate.chunk_range.0 as usize..candidate.chunk_range.1 as usize]
+                                == item.chunks
+                                    [entry.chunk_range.0 as usize..entry.chunk_range.1 as usize]
+                    })
+            });
+            if unchanged
+                && fs::symlink_metadata(&target).is_ok_and(|metadata| {
+                    metadata.is_file()
+                        && !metadata.file_type().is_symlink()
+                        && metadata.len() == entry.size
+                })
+            {
+                continue;
+            }
+            let source = revision_root.join(&relative);
+            let staging = staging_root.join(&relative);
+            Self::ensure_mirror_parent_directories(
+                &staging_root,
+                relative.parent(),
+                &mut changed_directories,
+            )?;
+            Self::remove_activation_path_checked(&staging)?;
+            Self::clone_or_copy_file(&source, &staging)?;
+            self.activation_fault(ActivationFaultStage::Operation(
+                ActivationOperation::MirrorEntryCreate,
+            ))?;
+            self.activation_fault(ActivationFaultStage::Operation(
+                ActivationOperation::MirrorEntryWrite,
+            ))?;
+            File::open(&staging)?.sync_all()?;
+            self.activation_fault(ActivationFaultStage::Operation(
+                ActivationOperation::MirrorEntrySync,
+            ))?;
+            let backup = backup_root.join(&relative);
+            self.atomic_replace_owned(&staging, &target, &backup, Some(&mut changed_directories))?;
+        }
+        let mut changed_directories = changed_directories.into_iter().collect::<Vec<_>>();
+        changed_directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+        for directory in changed_directories {
+            File::open(directory)?.sync_all()?;
+            self.activation_fault(ActivationFaultStage::Operation(
+                ActivationOperation::MirrorDirectorySync,
+            ))?;
+        }
+        Ok(())
+    }
+
+    fn ensure_mirror_parent_directories(
+        root: &Path,
+        relative: Option<&Path>,
+        changed_directories: &mut HashSet<PathBuf>,
+    ) -> Result<(), Error> {
+        let Some(relative) = relative else {
+            return Ok(());
+        };
+        let mut parent = root.to_path_buf();
+        for component in relative.components() {
+            let std::path::Component::Normal(component) = component else {
+                return Err(invalid_state("invalid compatibility mirror directory"));
+            };
+            let path = parent.join(component);
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+                Ok(_) => {
+                    return Err(invalid_state(
+                        "compatibility mirror parent is not a directory",
+                    ))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    fs::create_dir(&path)?;
+                    changed_directories.insert(parent.clone());
+                }
+                Err(error) => return Err(error.into()),
+            }
+            parent = path;
+        }
+        Ok(())
+    }
+
+    fn activate_verified_item(
+        &self,
+        item: Item,
+        destination: &Path,
+        staged_data: &HashMap<Hash, ChunkData>,
+    ) -> Result<ActiveRevisionHandle, Error> {
+        if self
+            .activation_poisoned
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(invalid_state(
+                "activation state is indeterminate and requires restart",
+            ));
+        }
+        let destination = self.canonical_activation_destination(destination)?;
+        let destination_identity = self.activation_destination_identity(&destination)?;
+        let destination_lock = self.destination_lock(destination_identity);
+        let _destination_guard = destination_lock.lock().unwrap();
+        if self
+            .activation_poisoned
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(invalid_state(
+                "activation state is indeterminate and requires restart",
+            ));
+        }
+        let revision_identity = Self::activation_revision_identity(&item)?;
+        let kind = if item.manifest.entries.is_empty() {
+            ActiveRevisionKind::File
+        } else {
+            ActiveRevisionKind::Directory
+        };
+        let root_identity = fs_storage_root_identity(&self.inner.read().unwrap().root)?;
+        let active_path = self.active_ref_path(&destination_identity);
+        let previous = match fs::symlink_metadata(&active_path) {
+            Ok(_) => Some(self.decode_active_ref(&active_path)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        if item.metadata.path != destination {
+            return Err(invalid_state(
+                "activation item path does not match its destination",
+            ));
+        }
+        if let Some(previous) = previous.as_ref() {
+            if previous.item == item {
+                return self.handle_from_active(Arc::new(previous.clone()));
+            }
+            if previous.item.metadata.artifact_id != item.metadata.artifact_id {
+                return Err(invalid_state(
+                    "activation destination is owned by a different artifact",
+                ));
+            }
+            if item.metadata.revision <= previous.item.metadata.revision {
+                return Err(invalid_state(
+                    "activation revision must increase strictly for an existing artifact",
+                ));
+            }
+        }
+
+        self.ensure_activation_namespace(&["transactions"])?;
+        self.ensure_activation_namespace(&["staging"])?;
+        self.ensure_activation_namespace(&["revisions"])?;
+        self.ensure_activation_namespace(&["active"])?;
+        self.ensure_activation_namespace(&["quarantine"])?;
+
+        let transaction_id = self.new_activation_transaction_id();
+        let transaction_path = self.activation_transaction_path(&transaction_id);
+        let (mirror_staging_path, mirror_backup_path) =
+            self.activation_mirror_paths(&destination, &transaction_id)?;
+        let transaction = FsActivationTransactionV2 {
+            root_identity,
+            transaction_id,
+            destination: destination.clone(),
+            destination_identity,
+            candidate_revision_identity: revision_identity,
+            previous,
+            item: item.clone(),
+            kind: Self::encode_activation_kind(kind),
+            phase: FsActivationPhaseV2::Intent,
+            candidate_seals: Vec::new(),
+            mirror_staging_path,
+            mirror_backup_path,
+        };
+        // A durable Intent establishes ownership of these deterministic paths. Existing
+        // entries must therefore be rejected before the Intent can make recovery treat
+        // them as activation-owned cleanup targets.
+        self.preflight_owned_mirror_paths(&transaction)?;
+        self.activation_fault(ActivationFaultStage::BeforeIntent)?;
+        self.write_activation_record(
+            &transaction_path,
+            FS_ACTIVATION_TRANSACTION_SCHEMA,
+            ActivationRecordKind::Transaction(ActivationTransactionPhase::Intent),
+            &transaction,
+        )?;
+        let staging_root = self.activation_staging_root(&transaction_id);
+        let staging_parent = staging_root
+            .parent()
+            .ok_or(Error::MissingData)?
+            .to_path_buf();
+        let prepared = (|| {
+            self.activation_fault(ActivationFaultStage::AfterIntent)?;
+            fs::create_dir(&staging_parent)?;
+            self.activation_fault(ActivationFaultStage::Operation(
+                ActivationOperation::StagingCreate,
+            ))?;
+            #[cfg(unix)]
+            File::open(staging_parent.parent().ok_or(Error::MissingData)?)?.sync_all()?;
+            self.activation_fault(ActivationFaultStage::Operation(
+                ActivationOperation::StagingParentSync,
+            ))?;
+            self.materialize_activation_tree(
+                &staging_root,
+                kind,
+                &item.manifest,
+                &item.chunks,
+                staged_data,
+                transaction.previous.as_ref(),
+            )?;
+            self.activation_fault(ActivationFaultStage::AfterMaterialize)?;
+            let revision_root = self.activation_revision_root(&revision_identity);
+            let revision_directory = revision_root.parent().ok_or(Error::MissingData)?;
+            self.ensure_activation_digest_directory(&revision_root)?;
+            let mut newly_published = false;
+            match fs::symlink_metadata(&revision_root) {
+                Ok(_) => {
+                    Self::remove_activation_path_checked(&staging_parent)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if fs::read_dir(revision_directory)?.next().is_some() {
+                        return Err(invalid_state(
+                            "activation revision digest directory contains an unexpected entry",
+                        ));
+                    }
+                    fs::rename(&staging_root, &revision_root)?;
+                    self.activation_fault(ActivationFaultStage::Operation(
+                        ActivationOperation::RevisionRename,
+                    ))?;
+                    Self::sync_parent(revision_directory)?;
+                    self.activation_fault(ActivationFaultStage::Operation(
+                        ActivationOperation::RevisionParentSync,
+                    ))?;
+                    Self::remove_activation_path_checked(&staging_parent)?;
+                    newly_published = true;
+                }
+                Err(error) => return Err(error.into()),
+            }
+            if !newly_published {
+                Self::verify_immutable_activation_tree(&revision_root, &item, kind)?;
+            }
+            self.activation_fault(ActivationFaultStage::AfterRevisionPublish)?;
+            let candidate_seals = Self::collect_activation_seals(&revision_root, &item, kind)?;
+            let destination_path = self.path(&destination)?;
+            self.preflight_compatibility_mirror(&destination_path, &item, kind)?;
+            self.activation_fault(ActivationFaultStage::AfterReady)?;
+            let active = FsActivationActiveV1 {
+                root_identity,
+                destination: destination.clone(),
+                destination_identity,
+                revision_identity,
+                item: item.clone(),
+                kind: Self::encode_activation_kind(kind),
+                seals: candidate_seals,
+            };
+            Ok::<_, Error>((revision_root, destination_path, active))
+        })();
+        let (revision_root, destination_path, active) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) if self.simulated_crash() => return Err(error),
+            Err(error) => {
+                if let Err(cleanup) =
+                    self.cleanup_preselector_activation(&staging_parent, &transaction_path)
+                {
+                    self.activation_poisoned
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    return Err(activation_indeterminate(invalid_state(format!(
+                        "activation failed before selector ({error}); checked cleanup failed ({cleanup})"
+                    ))));
+                }
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.write_activation_record(
+            &active_path,
+            FS_ACTIVATION_ACTIVE_SCHEMA,
+            ActivationRecordKind::Active,
+            &active,
+        ) {
+            if matches!(
+                error,
+                Error::DurableState(
+                    crate::durable_state::DurableStateError::CommitIndeterminate { .. }
+                )
+            ) {
+                self.activation_poisoned
+                    .store(true, std::sync::atomic::Ordering::Release);
+                return Err(activation_indeterminate(error));
+            }
+            if self.simulated_crash() {
+                return Err(error);
+            }
+            if let Err(cleanup) =
+                self.cleanup_preselector_activation(&staging_parent, &transaction_path)
+            {
+                self.activation_poisoned
+                    .store(true, std::sync::atomic::Ordering::Release);
+                return Err(activation_indeterminate(invalid_state(format!(
+                    "active selector write failed ({error}); checked pre-selector cleanup failed ({cleanup})"
+                ))));
+            }
+            return Err(error);
+        }
+        let active = Arc::new(active);
+        self.active_refs
+            .write()
+            .unwrap()
+            .insert(destination_identity, active.clone());
+
+        let post_switch = (|| {
+            self.activation_fault(ActivationFaultStage::AfterSelector)?;
+            self.activation_fault(ActivationFaultStage::AfterSwitched)?;
+            self.reconcile_active_item(active.as_ref(), transaction.previous.as_ref(), false)?;
+            self.activation_fault(ActivationFaultStage::AfterStatePersist)?;
+            self.replace_compatibility_mirror(
+                &revision_root,
+                &destination_path,
+                kind,
+                &transaction,
+                false,
+            )?;
+            self.activation_fault(ActivationFaultStage::AfterMirror)?;
+            Ok::<(), Error>(())
+        })();
+        if let Err(error) = post_switch {
+            self.activation_poisoned
+                .store(true, std::sync::atomic::Ordering::Release);
+            return Err(activation_indeterminate(error));
+        }
+        self.activation_cleanup.schedule(transaction_path);
+        self.handle_from_active(active)
+    }
+
+    fn reconcile_active_item(
+        &self,
+        active: &FsActivationActiveV1,
+        previous: Option<&FsActivationActiveV1>,
+        persist_checkpoint: bool,
+    ) -> Result<(), Error> {
+        let kind = Self::decode_activation_kind(active.kind)?;
+        let revision_root = self.activation_revision_root(&active.revision_identity);
+        let destination_path = self.path(&active.destination)?;
+        let previous_revision_root =
+            previous.map(|previous| self.activation_revision_root(&previous.revision_identity));
+        let item = &active.item;
+        let expected_root = super::validate_revision_metadata(item)?;
+        let mut inner = self.inner.write().unwrap();
+        inner
+            .items
+            .retain(|existing| existing.metadata.path != item.metadata.path);
+        for entries in inner.data.values_mut() {
+            entries.retain(|entry| {
+                !entry.path.starts_with(&destination_path)
+                    && !entry.path.starts_with(&revision_root)
+                    && !previous_revision_root
+                        .as_ref()
+                        .is_some_and(|previous| entry.path.starts_with(previous))
+            });
+        }
+        inner.data.retain(|_, entries| !entries.is_empty());
+        match kind {
+            ActiveRevisionKind::File => {
+                let mut offset = 0u64;
+                for chunk in &item.chunks {
+                    inner
+                        .data
+                        .entry(chunk.hash)
+                        .or_default()
+                        .push(Arc::new(InFileChunk {
+                            info: *chunk,
+                            path: revision_root.clone(),
+                            offset,
+                            populated: Arc::new(AtomicBool::new(true)),
+                        }));
+                    offset = offset
+                        .checked_add(chunk.size)
+                        .ok_or_else(|| invalid_state("active revision backing offset overflows"))?;
+                }
+            }
+            ActiveRevisionKind::Directory => {
+                for entry in &item.manifest.entries {
+                    let path = revision_root.join(crate::utils::path::validate_relative(
+                        Path::new(&entry.relative_path),
+                    )?);
+                    let mut offset = 0u64;
+                    for chunk in
+                        &item.chunks[entry.chunk_range.0 as usize..entry.chunk_range.1 as usize]
+                    {
+                        inner
+                            .data
+                            .entry(chunk.hash)
+                            .or_default()
+                            .push(Arc::new(InFileChunk {
+                                info: *chunk,
+                                path: path.clone(),
+                                offset,
+                                populated: Arc::new(AtomicBool::new(true)),
+                            }));
+                        offset = offset.checked_add(chunk.size).ok_or_else(|| {
+                            invalid_state("active directory backing offset overflows")
+                        })?;
+                    }
+                }
+            }
+        }
+        inner.reconstruct_item_links(item, expected_root)?;
+        inner.insert_item(item.clone());
+        inner.retain_links_reachable_from_items();
+        drop(inner);
+        if persist_checkpoint {
+            self.persist()?;
+        }
+        self.handles.write().unwrap().retain(|path, _| {
+            !path.starts_with(&destination_path)
+                && !path.starts_with(&revision_root)
+                && !previous_revision_root
+                    .as_ref()
+                    .is_some_and(|previous| path.starts_with(previous))
+        });
+        Ok(())
+    }
+
+    fn atomic_replace_owned(
+        &self,
+        staging: &Path,
+        destination: &Path,
+        backup: &Path,
+        mut changed_directories: Option<&mut HashSet<PathBuf>>,
+    ) -> Result<(), Error> {
         let parent = destination.parent().ok_or(Error::MissingData)?;
-        let name = destination.file_name().ok_or(Error::MissingData)?;
-        let backup = parent.join(format!(
-            ".{}.distd-backup-{}",
-            name.to_string_lossy(),
-            uuid::Uuid::new_v4()
-        ));
-        let had_destination = destination.exists();
-        if had_destination {
-            fs::rename(destination, &backup)?;
+        let destination_metadata = match fs::symlink_metadata(destination) {
+            Ok(metadata)
+                if !metadata.file_type().is_symlink()
+                    && (metadata.is_file() || metadata.is_dir()) =>
+            {
+                Some(metadata)
+            }
+            Ok(_) => return Err(invalid_state("replacement destination has an unsafe type")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let staging_metadata = fs::symlink_metadata(staging)?;
+        if staging_metadata.file_type().is_symlink()
+            || (!staging_metadata.is_file() && !staging_metadata.is_dir())
+        {
+            return Err(invalid_state("replacement staging path has an unsafe type"));
+        }
+        if destination_metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.is_file())
+            && staging_metadata.is_file()
+            && !staging_metadata.file_type().is_symlink()
+        {
+            fs::rename(staging, destination)?;
+            self.activation_fault(ActivationFaultStage::Operation(
+                ActivationOperation::MirrorEntryRename,
+            ))?;
+            if let Some(directories) = changed_directories.as_deref_mut() {
+                directories.insert(parent.to_path_buf());
+            } else {
+                File::open(parent)?.sync_all()?;
+                self.activation_fault(ActivationFaultStage::Operation(
+                    ActivationOperation::MirrorDirectorySync,
+                ))?;
+            }
+            return Ok(());
+        }
+        let mut moved_destination = false;
+        if destination_metadata.is_some() {
+            let backup_exists = match fs::symlink_metadata(backup) {
+                Ok(metadata)
+                    if !metadata.file_type().is_symlink()
+                        && (metadata.is_file() || metadata.is_dir()) =>
+                {
+                    true
+                }
+                Ok(_) => return Err(invalid_state("replacement backup path has an unsafe type")),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error.into()),
+            };
+            if backup_exists {
+                return Err(invalid_state(
+                    "replacement destination and deterministic backup both exist",
+                ));
+            }
+            if let Some(backup_parent) = backup.parent() {
+                create_dir_all(backup_parent)?;
+            }
+            fs::rename(destination, backup)?;
+            self.activation_fault(ActivationFaultStage::Operation(
+                ActivationOperation::MirrorEntryRename,
+            ))?;
+            if let Some(directories) = changed_directories.as_deref_mut() {
+                directories.insert(parent.to_path_buf());
+            } else {
+                Self::sync_parent(parent)?;
+                self.activation_fault(ActivationFaultStage::Operation(
+                    ActivationOperation::MirrorDirectorySync,
+                ))?;
+            }
+            moved_destination = true;
         }
 
         if let Err(error) = fs::rename(staging, destination) {
-            if had_destination {
-                let _ = fs::rename(&backup, destination);
+            if moved_destination {
+                let _ = fs::rename(backup, destination);
+                let _ = Self::sync_parent(parent);
             }
             return Err(error.into());
         }
-
-        if had_destination {
-            Self::remove_staging_path(&backup);
+        self.activation_fault(ActivationFaultStage::Operation(
+            ActivationOperation::MirrorEntryRename,
+        ))?;
+        if let Some(directories) = changed_directories.as_deref_mut() {
+            directories.insert(parent.to_path_buf());
+        } else {
+            Self::sync_parent(parent)?;
+            self.activation_fault(ActivationFaultStage::Operation(
+                ActivationOperation::MirrorDirectorySync,
+            ))?;
         }
-        File::open(parent)?.sync_all()?;
         Ok(())
     }
 
@@ -2665,11 +5351,11 @@ impl FsStorage {
         local_hashes: &[Hash],
         received_chunks: Vec<ReceivedChunk>,
     ) -> Result<Item, Error> {
+        let path = self.canonical_activation_destination(&path)?;
         if chunk_infos.len() != manifest.chunk_count as usize {
             return Err(Error::Storage(StorageError::TreeReconstruct));
         }
 
-        let stored_path = self.path(&path)?;
         let available_hashes: HashSet<Hash> = local_hashes.iter().copied().collect();
         let mut received_chunks: VecDeque<ReceivedChunk> = received_chunks.into();
         let mut staged_data = HashMap::default();
@@ -2682,10 +5368,15 @@ impl FsStorage {
                 chunks.push(chunk_info);
 
                 let node = if available_hashes.contains(&chunk_info.hash) {
-                    let data = self
-                        .read_chunk_data(&chunk_info.hash)
-                        .ok_or(Error::Storage(StorageError::TreeReconstruct))?;
-                    staged_data.insert(chunk_info.hash, data);
+                    if !self
+                        .inner
+                        .read()
+                        .unwrap()
+                        .data
+                        .contains_key(&chunk_info.hash)
+                    {
+                        return Err(Error::Storage(StorageError::TreeReconstruct));
+                    }
                     Arc::new(Node::Skipped {
                         hash: chunk_info.hash,
                         size: chunk_info.size,
@@ -2729,29 +5420,21 @@ impl FsStorage {
             return Err(Error::Storage(StorageError::TreeReconstruct));
         }
 
-        self.activate_staged_chunks(&stored_path, manifest, &chunks, &staged_data)?;
-
-        self.cache_verified_received_chunks(received_in_order);
-
         let item = Item::make_with_entries(
             name,
-            path,
+            path.clone(),
             revision,
             description,
             root.chunk_info(),
             chunks,
             manifest.entries.clone(),
             manifest.chunk_algorithm,
-        )?;
+        )?
+        .with_artifact_id(manifest.artifact_id.clone());
 
-        let mut inner = self.inner.write().unwrap();
-        inner
-            .items
-            .retain(|existing| existing.metadata.artifact_id != item.metadata.artifact_id);
-        inner.insert_item(item.clone());
-        inner.retain_links_reachable_from_items();
-        drop(inner);
-        self.persist()?;
+        let _handle = self.activate_verified_item(item.clone(), &path, &staged_data)?;
+
+        self.cache_verified_received_chunks(received_in_order);
         Ok(item)
     }
 
@@ -2814,6 +5497,46 @@ impl FsStorage {
         let root_identity = fs_storage_root_identity(&root)?;
         let persistance_path = persistance_dir.join(identity_filename(&root_identity));
 
+        let activation_fault_hook = Arc::new(RwLock::new(None));
+        let activation_poisoned = Arc::new(AtomicBool::new(false));
+        let storage = Self {
+            inner: RwLock::new(FsStorageState {
+                root: root.clone(),
+                persistance_path: persistance_path.clone(),
+                ..Default::default()
+            }),
+            persistence_lock: Mutex::new(()),
+            activation_locks: Mutex::new(HashMap::default()),
+            activation_poisoned: activation_poisoned.clone(),
+            active_refs: RwLock::new(HashMap::default()),
+            activation_fault_hook: activation_fault_hook.clone(),
+            activation_cleanup: ActivationCleanupCoordinator::new(
+                activation_fault_hook,
+                activation_poisoned,
+            ),
+            #[cfg(test)]
+            next_activation_transaction_id: Mutex::new(None),
+            #[cfg(test)]
+            simulated_crash: AtomicBool::new(false),
+            handles: RwLock::new(HashMap::default()),
+            immutable_readers: Mutex::new(ImmutableReaderCache::new(
+                DEFAULT_IMMUTABLE_READER_ENTRIES,
+            )),
+            chunk_cache: Mutex::new(HotChunkCache::new(cache_config.max_chunk_bytes)),
+            tree_cache: Mutex::new(HotNodeCache::new(cache_config.max_tree_entries)),
+        };
+        // Selectors are authoritative and independently enveloped. Authenticate them before
+        // decoding the derived Fs checkpoint so stale direct-path backings claimed by an exact
+        // selector cannot prevent recovery, while corrupt selectors still fail closed.
+        storage.load_active_refs()?;
+        let selected = storage
+            .active_refs
+            .read()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+
         let state = match fs::symlink_metadata(&persistance_path) {
             Ok(_) => {
                 tracing::debug!("FsStorage envelope found, loading…");
@@ -2825,7 +5548,7 @@ impl FsStorage {
                 )?;
                 let canonical: FsStorageStateV1 =
                     bitcode::deserialize(&payload).map_err(InvalidParameter::from)?;
-                canonical.into_runtime(root.clone(), persistance_path.clone())?
+                canonical.into_runtime(root.clone(), persistance_path.clone(), &selected)?
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 match fs::symlink_metadata(&legacy_path) {
@@ -2858,7 +5581,7 @@ impl FsStorage {
                                 "migrated state did not reread with semantic equivalence",
                             ));
                         }
-                        actual.into_runtime(root.clone(), persistance_path.clone())?
+                        actual.into_runtime(root.clone(), persistance_path.clone(), &[])?
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                         tracing::debug!("No previous FsStorage state found, creating a new one");
@@ -2874,12 +5597,16 @@ impl FsStorage {
             Err(error) => return Err(error.into()),
         };
 
-        // Opening writable handles is deliberately last: bounded decode and all
-        // constructor-root/path semantics are validated before this point.
+        *storage.inner.write().unwrap() = state;
+        storage.recover_activations()?;
+        if storage.migrate_referenced_chunks_to_cas()? {
+            storage.persist()?;
+        }
         let mut handles = HashMap::default();
-        for entries in state.data.values() {
+        let activation_root = storage.activation_root();
+        for entries in storage.inner.read().unwrap().data.values() {
             for entry in entries {
-                if !handles.contains_key(&entry.path) {
+                if !entry.path.starts_with(&activation_root) && !handles.contains_key(&entry.path) {
                     handles.insert(
                         entry.path.clone(),
                         Arc::new(Mutex::new(Handle::existing(&entry.path)?)),
@@ -2887,17 +5614,7 @@ impl FsStorage {
                 }
             }
         }
-
-        let storage = Self {
-            inner: RwLock::new(state),
-            persistence_lock: Mutex::new(()),
-            handles: RwLock::new(handles),
-            chunk_cache: Mutex::new(HotChunkCache::new(cache_config.max_chunk_bytes)),
-            tree_cache: Mutex::new(HotNodeCache::new(cache_config.max_tree_entries)),
-        };
-        if storage.migrate_referenced_chunks_to_cas()? {
-            storage.persist()?;
-        }
+        *storage.handles.write().unwrap() = handles;
         Ok(storage)
     }
 
@@ -2927,6 +5644,53 @@ impl FsStorage {
             })
             .cloned()
             .max_by_key(|item| (item.metadata.revision, item.chunks.len(), item.size()))
+    }
+
+    /// Open the immutable revision currently selected for a destination.
+    pub fn open_active_revision(
+        &self,
+        destination: &Path,
+    ) -> Result<Option<ActiveRevisionHandle>, Error> {
+        if self
+            .activation_poisoned
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(invalid_state(
+                "activation state is indeterminate and requires restart",
+            ));
+        }
+        let destination = self.canonical_activation_destination(destination)?;
+        let identity = self.activation_destination_identity(&destination)?;
+        if let Some(active) = self.active_refs.read().unwrap().get(&identity).cloned() {
+            return self.handle_from_active(active).map(Some);
+        }
+        let destination_lock = self.destination_lock(identity);
+        let destination_guard = destination_lock.lock().unwrap();
+        if self
+            .activation_poisoned
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(invalid_state(
+                "activation state is indeterminate and requires restart",
+            ));
+        }
+        if let Some(active) = self.active_refs.read().unwrap().get(&identity).cloned() {
+            return self.handle_from_active(active).map(Some);
+        }
+
+        let Some(item) = self.item_for_path(&destination) else {
+            return Ok(None);
+        };
+        let kind = if item.manifest.entries.is_empty() {
+            ActiveRevisionKind::File
+        } else {
+            ActiveRevisionKind::Directory
+        };
+        let direct_path = self.path(&destination)?;
+        Self::verify_immutable_activation_tree(&direct_path, &item, kind)?;
+        drop(destination_guard);
+        self.activate_verified_item(item, &destination, &HashMap::default())
+            .map(Some)
     }
 
     /// Pre-allocate a single `ChunkInfo` slot on disk
@@ -3040,9 +5804,7 @@ impl ChunkStorage for FsStorage {
     fn get_chunk_by_index(&self, root: &Hash, index: u32) -> Option<Vec<u8>> {
         if let Some(item) = self.item_for_root_hash(root) {
             let chunk = item.chunks.get(index as usize)?;
-            return self
-                .read_chunk_data(&chunk.hash)
-                .map(|data| data.as_ref().to_vec());
+            return self.read_chunk_data(&chunk.hash).map(ChunkData::into_vec);
         }
 
         let node = self.get(root)?;
@@ -3598,6 +6360,205 @@ mod tests {
             inner.data.iter().collect::<Vec<_>>(),
             inner.items,
         );
+    }
+
+    fn activation_test_item(bytes: &[u8], revision: u32) -> Item {
+        use crate::chunk_storage::hashmap_storage::HashMapStorage;
+
+        let source = HashMapStorage::default();
+        let (root, chunks) = source
+            .chunk_tree(bytes, ChunkAlgorithm::fixed_aligned(4, 1))
+            .unwrap();
+        let mut item = Item::make(
+            "artifact".to_string(),
+            PathBuf::from("artifact.bin"),
+            revision,
+            Some("activation fixture".to_string()),
+            root.chunk_info(),
+            chunks,
+            ChunkAlgorithm::fixed_aligned(4, 1),
+        )
+        .unwrap();
+        item.metadata.created = std::time::SystemTime::UNIX_EPOCH;
+        item.metadata.updated = std::time::SystemTime::UNIX_EPOCH;
+        item
+    }
+
+    fn activation_staged_data(bytes: &[u8], item: &Item) -> HashMap<Hash, ChunkData> {
+        let mut offset = 0usize;
+        item.chunks
+            .iter()
+            .map(|chunk| {
+                let end = offset + chunk.size as usize;
+                let data = bytes[offset..end].to_vec();
+                offset = end;
+                (chunk.hash, ChunkData::Owned(Arc::new(data)))
+            })
+            .collect()
+    }
+
+    fn activation_directory_item(first: &[u8], second: &[u8], revision: u32) -> Item {
+        use crate::chunk_storage::hashmap_storage::HashMapStorage;
+
+        let mut bytes = first.to_vec();
+        bytes.extend_from_slice(second);
+        let source = HashMapStorage::default();
+        let (root, chunks) = source
+            .chunk_tree(&bytes, ChunkAlgorithm::fixed_aligned(4, 1))
+            .unwrap();
+        let mut item = Item::make_with_entries(
+            "directory-artifact".to_string(),
+            PathBuf::from("artifact-dir"),
+            revision,
+            None,
+            root.chunk_info(),
+            chunks,
+            vec![
+                FileEntry {
+                    relative_path: "a.bin".to_string(),
+                    size: first.len() as u64,
+                    chunk_range: (0, 1),
+                },
+                FileEntry {
+                    relative_path: "b.bin".to_string(),
+                    size: second.len() as u64,
+                    chunk_range: (1, 2),
+                },
+            ],
+            ChunkAlgorithm::fixed_aligned(4, 1),
+        )
+        .unwrap();
+        item.metadata.created = std::time::SystemTime::UNIX_EPOCH;
+        item.metadata.updated = std::time::SystemTime::UNIX_EPOCH;
+        item
+    }
+
+    fn activation_directory_fixture(entries: &[(&str, &[u8])], revision: u32) -> (Item, Vec<u8>) {
+        use crate::chunk_storage::hashmap_storage::HashMapStorage;
+
+        let bytes = entries
+            .iter()
+            .flat_map(|(_, bytes)| bytes.iter().copied())
+            .collect::<Vec<_>>();
+        let source = HashMapStorage::default();
+        let (root, chunks) = source
+            .chunk_tree(&bytes, ChunkAlgorithm::fixed_aligned(4, 1))
+            .unwrap();
+        let file_entries = entries
+            .iter()
+            .enumerate()
+            .map(|(index, (path, bytes))| FileEntry {
+                relative_path: (*path).to_string(),
+                size: bytes.len() as u64,
+                chunk_range: (index as u32, index as u32 + 1),
+            })
+            .collect();
+        let mut item = Item::make_with_entries(
+            "directory-artifact".to_string(),
+            PathBuf::from("artifact-dir"),
+            revision,
+            None,
+            root.chunk_info(),
+            chunks,
+            file_entries,
+            ChunkAlgorithm::fixed_aligned(4, 1),
+        )
+        .unwrap();
+        item.metadata.created = std::time::SystemTime::UNIX_EPOCH;
+        item.metadata.updated = std::time::SystemTime::UNIX_EPOCH;
+        (item, bytes)
+    }
+
+    fn assert_directory_fixture(root: &Path, entries: &[(&str, &[u8])]) {
+        let directory = root.join("artifact-dir");
+        for (relative, expected) in entries {
+            assert_eq!(fs::read(directory.join(relative)).unwrap(), *expected);
+        }
+        let mut actual = Vec::new();
+        let mut pending = vec![directory.clone()];
+        while let Some(parent) = pending.pop() {
+            for entry in fs::read_dir(parent).unwrap() {
+                let entry = entry.unwrap();
+                let metadata = fs::symlink_metadata(entry.path()).unwrap();
+                if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                    pending.push(entry.path());
+                } else {
+                    assert!(metadata.is_file() && !metadata.file_type().is_symlink());
+                    actual.push(
+                        entry
+                            .path()
+                            .strip_prefix(&directory)
+                            .unwrap()
+                            .to_str()
+                            .unwrap()
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        actual.sort();
+        let mut expected = entries
+            .iter()
+            .map(|(path, _)| (*path).to_string())
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(actual, expected);
+    }
+
+    fn transition_file_item(bytes: &[u8], revision: u32) -> Item {
+        let mut item = activation_test_item(bytes, revision).with_artifact_id("transition".into());
+        item.metadata.path = PathBuf::from("target");
+        item
+    }
+
+    fn transition_directory_item(first: &[u8], second: &[u8], revision: u32) -> Item {
+        let mut item = activation_directory_item(first, second, revision)
+            .with_artifact_id("transition".into());
+        item.metadata.path = PathBuf::from("target");
+        item
+    }
+
+    fn install_switched_transaction(
+        storage: &FsStorage,
+        previous: FsActivationActiveV1,
+        active: &FsActivationActiveV1,
+        transaction_id: [u8; 16],
+    ) -> FsActivationTransactionV2 {
+        let (mirror_staging_path, mirror_backup_path) = storage
+            .activation_mirror_paths(&active.destination, &transaction_id)
+            .unwrap();
+        let transaction = FsActivationTransactionV2 {
+            root_identity: active.root_identity,
+            transaction_id,
+            destination: active.destination.clone(),
+            destination_identity: active.destination_identity,
+            candidate_revision_identity: active.revision_identity,
+            previous: Some(previous),
+            item: active.item.clone(),
+            kind: active.kind,
+            phase: FsActivationPhaseV2::Switched,
+            candidate_seals: active.seals.clone(),
+            mirror_staging_path,
+            mirror_backup_path,
+        };
+        storage
+            .write_activation_record(
+                &storage.activation_transaction_path(&transaction_id),
+                FS_ACTIVATION_TRANSACTION_SCHEMA,
+                ActivationRecordKind::Transaction(ActivationTransactionPhase::Switched),
+                &transaction,
+            )
+            .unwrap();
+        transaction
+    }
+
+    fn hex_bytes(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+        let mut result = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            write!(&mut result, "{byte:02x}").unwrap();
+        }
+        result
     }
 
     fn make_infile_chunk<const SIZE: usize>() -> ([u8; SIZE], Hash, InFileChunk) {
@@ -5613,7 +8574,7 @@ mod tests {
         .unwrap();
         let decoded: FsStorageStateV1 = bitcode::deserialize(decoded).unwrap();
         let _runtime = decoded
-            .into_runtime(root.clone(), root.join("decoded-state"))
+            .into_runtime(root.clone(), root.join("decoded-state"), &[])
             .unwrap();
         let decode = started.elapsed();
 
@@ -5861,6 +8822,2932 @@ mod tests {
                 .to_string_lossy()
                 .contains(".distd-stage-")
         }));
+    }
+
+    #[test]
+    fn active_revision_handle_survives_replacement_and_restart() {
+        let root = temp_path();
+        let storage = FsStorage::new(root.clone()).unwrap();
+        let first_bytes = b"abcdefgh".to_vec();
+        let first = activation_test_item(&first_bytes, 1);
+        storage
+            .receive_sync_item(
+                first.metadata.name.clone(),
+                first.metadata.path.clone(),
+                first.metadata.revision,
+                first.metadata.description.clone(),
+                &first.manifest,
+                &first.chunks,
+                &[],
+                vec![b"abcd".to_vec(), b"efgh".to_vec()],
+            )
+            .unwrap();
+        let old_handle = storage
+            .open_active_revision(Path::new("artifact.bin"))
+            .unwrap()
+            .unwrap();
+
+        let second_bytes = b"ijklmnop".to_vec();
+        let second = activation_test_item(&second_bytes, 2);
+        storage
+            .receive_sync_item(
+                second.metadata.name.clone(),
+                second.metadata.path.clone(),
+                second.metadata.revision,
+                second.metadata.description.clone(),
+                &second.manifest,
+                &second.chunks,
+                &[],
+                vec![b"ijkl".to_vec(), b"mnop".to_vec()],
+            )
+            .unwrap();
+        let current_handle = storage
+            .open_active_revision(Path::new("artifact.bin"))
+            .unwrap()
+            .unwrap();
+        let mut old = Vec::new();
+        old_handle
+            .open_file()
+            .unwrap()
+            .read_to_end(&mut old)
+            .unwrap();
+        let mut current = Vec::new();
+        current_handle
+            .open_file()
+            .unwrap()
+            .read_to_end(&mut current)
+            .unwrap();
+        assert_eq!(old, first_bytes);
+        assert_eq!(current, second_bytes);
+        assert_eq!(fs::read(root.join("artifact.bin")).unwrap(), second_bytes);
+        drop(storage);
+
+        let restarted = FsStorage::new(root).unwrap();
+        let restarted_handle = restarted
+            .open_active_revision(Path::new("artifact.bin"))
+            .unwrap()
+            .unwrap();
+        let mut restarted_bytes = Vec::new();
+        restarted_handle
+            .open_file()
+            .unwrap()
+            .read_to_end(&mut restarted_bytes)
+            .unwrap();
+        assert_eq!(restarted_bytes, b"ijklmnop");
+    }
+
+    #[test]
+    fn open_active_revision_lazily_adopts_direct_path() {
+        let root = temp_path();
+        let storage = FsStorage::new(root.clone()).unwrap();
+        storage
+            .create_item(
+                "legacy".to_string(),
+                PathBuf::from("legacy.bin"),
+                0,
+                None,
+                bytes::Bytes::from_static(b"legacy direct bytes"),
+                ChunkAlgorithm::default(),
+            )
+            .unwrap();
+        assert!(storage.active_refs.read().unwrap().is_empty());
+
+        let handle = storage
+            .open_active_revision(Path::new("legacy.bin"))
+            .unwrap()
+            .unwrap();
+        let mut bytes = Vec::new();
+        handle.open_file().unwrap().read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"legacy direct bytes");
+        assert_eq!(fs::read(root.join("legacy.bin")).unwrap(), bytes);
+        assert_eq!(storage.active_refs.read().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn selector_repairs_stale_direct_path_checkpoint_before_backing_validation() {
+        let root = temp_path();
+        let storage = FsStorage::new(root.clone()).unwrap();
+        storage
+            .create_item(
+                "artifact".to_string(),
+                PathBuf::from("artifact.bin"),
+                1,
+                Some("activation fixture".to_string()),
+                bytes::Bytes::from_static(b"version1"),
+                ChunkAlgorithm::fixed_aligned(4, 1),
+            )
+            .unwrap();
+        storage
+            .open_active_revision(Path::new("artifact.bin"))
+            .unwrap()
+            .unwrap();
+
+        let replacement = activation_test_item(b"version2", 2);
+        storage
+            .activate_verified_item(
+                replacement.clone(),
+                Path::new("artifact.bin"),
+                &activation_staged_data(b"version2", &replacement),
+            )
+            .unwrap();
+
+        // Model abrupt process loss: the direct-path checkpoint still describes
+        // version 1 while the independently durable selector names version 2.
+        std::mem::forget(storage);
+        let restarted = FsStorage::new(root.clone()).unwrap();
+        assert_eq!(
+            restarted
+                .get(&replacement.metadata.root.hash)
+                .unwrap()
+                .clone_data()
+                .unwrap()
+                .as_slice(),
+            b"version2"
+        );
+        drop(restarted);
+
+        assert_eq!(
+            FsStorage::new(root)
+                .unwrap()
+                .open_active_revision(Path::new("artifact.bin"))
+                .unwrap()
+                .unwrap()
+                .item(),
+            &replacement
+        );
+    }
+
+    #[test]
+    fn activation_envelope_goldens_are_stable_and_nonempty() {
+        let item = activation_test_item(b"abcdefgh", 7);
+        let active = FsActivationActiveV1 {
+            root_identity: [1; 32],
+            destination: PathBuf::from("artifact.bin"),
+            destination_identity: [2; 32],
+            revision_identity: [3; 32],
+            item: item.clone(),
+            kind: 0,
+            seals: vec![FsActivationFileSealV1 {
+                relative_path: None,
+                size: 8,
+                device: 9,
+                inode: 10,
+                mode: 0o100644,
+                modified_seconds: 11,
+                modified_nanoseconds: 12,
+            }],
+        };
+        let transaction = FsActivationTransactionV2 {
+            root_identity: [1; 32],
+            transaction_id: [4; 16],
+            destination: PathBuf::from("artifact.bin"),
+            destination_identity: [2; 32],
+            candidate_revision_identity: [3; 32],
+            previous: Some(active.clone()),
+            item,
+            kind: 0,
+            phase: FsActivationPhaseV2::Ready,
+            candidate_seals: active.seals.clone(),
+            mirror_staging_path: PathBuf::from(format!(
+                ".artifact.bin.distd-activation-mirror-{}",
+                "04".repeat(16)
+            )),
+            mirror_backup_path: PathBuf::from(format!(
+                ".artifact.bin.distd-activation-backup-{}",
+                "04".repeat(16)
+            )),
+        };
+        let active_payload = bitcode::serialize(&active).unwrap();
+        let active_envelope = crate::durable_state::encode_envelope(
+            DurableStateKind::FsActivation,
+            FS_ACTIVATION_ACTIVE_SCHEMA,
+            &active_payload,
+            MAX_DURABLE_STATE_PAYLOAD,
+        )
+        .unwrap();
+        let transaction_payload = bitcode::serialize(&transaction).unwrap();
+        let transaction_envelope = crate::durable_state::encode_envelope(
+            DurableStateKind::FsActivation,
+            FS_ACTIVATION_TRANSACTION_SCHEMA,
+            &transaction_payload,
+            MAX_DURABLE_STATE_PAYLOAD,
+        )
+        .unwrap();
+
+        assert_eq!(
+            hex_bytes(&active_envelope),
+            "444953544453544104000100010000006201000000000000b9a42e852a8da4b66814bbaab51048222567025ef644c199a70503b669d4096001010101010101010101010101010101010101010101010101010101010101010c61727469666163742e62696e02020202020202020202020202020202020202020202020202020202020202020303030303030303030303030303030303030303030303030303030303030303086172746966616374086172746966616374011261637469766174696f6e206669787475726504070c61727469666163742e62696e06084f9bad48a95198b85d824e751dcda4b959dd4829e404ea24a722d990d9a3b692060004000600040005302e322e300008617274696661637406074f9bad48a95198b85d824e751dcda4b959dd4829e404ea24a722d990d9a3b69206080402040401040404010400040100020604048c239ccb986e812c80ef5d671a3a84e0716e02a5d73ba4e52e34581ab9719000d06288d1ddee8853a8824fde7308141ad77a1cf283fd81ae071157d61f972b1500010006080609060a02a481060b060c"
+        );
+        assert_eq!(
+            hex_bytes(&transaction_envelope),
+            "444953544453544104000100020000006403000000000000bc0ad25c048cb023353821ed764918ab97b5e929d84d65cbe10c1ed8fb54507b0101010101010101010101010101010101010101010101010101010101010101040404040404040404040404040404040c61727469666163742e62696e020202020202020202020202020202020202020202020202020202020202020203030303030303030303030303030303030303030303030303030303030303030101010101010101010101010101010101010101010101010101010101010101010c61727469666163742e62696e02020202020202020202020202020202020202020202020202020202020202020303030303030303030303030303030303030303030303030303030303030303086172746966616374086172746966616374011261637469766174696f6e206669787475726504070c61727469666163742e62696e06084f9bad48a95198b85d824e751dcda4b959dd4829e404ea24a722d990d9a3b692060004000600040005302e322e300008617274696661637406074f9bad48a95198b85d824e751dcda4b959dd4829e404ea24a722d990d9a3b69206080402040401040404010400040100020604048c239ccb986e812c80ef5d671a3a84e0716e02a5d73ba4e52e34581ab9719000d06288d1ddee8853a8824fde7308141ad77a1cf283fd81ae071157d61f972b1500010006080609060a02a481060b060c086172746966616374086172746966616374011261637469766174696f6e206669787475726504070c61727469666163742e62696e06084f9bad48a95198b85d824e751dcda4b959dd4829e404ea24a722d990d9a3b692060004000600040005302e322e300008617274696661637406074f9bad48a95198b85d824e751dcda4b959dd4829e404ea24a722d990d9a3b69206080402040401040404010400040100020604048c239ccb986e812c80ef5d671a3a84e0716e02a5d73ba4e52e34581ab9719000d06288d1ddee8853a8824fde7308141ad77a1cf283fd81ae071157d61f972b150001010006080609060a02a481060b060c462e61727469666163742e62696e2e64697374642d61637469766174696f6e2d6d6972726f722d3034303430343034303430343034303430343034303430343034303430343034462e61727469666163742e62696e2e64697374642d61637469766174696f6e2d6261636b75702d3034303430343034303430343034303430343034303430343034303430343034"
+        );
+    }
+
+    #[test]
+    fn recovery_removes_shared_temp_records_before_decoding_canonical_records() {
+        let root = temp_path();
+        let storage = FsStorage::new(root.clone()).unwrap();
+        let bytes = b"abcdefgh";
+        let item = activation_test_item(bytes, 1);
+        storage
+            .activate_verified_item(
+                item,
+                Path::new("artifact.bin"),
+                &activation_staged_data(bytes, &activation_test_item(bytes, 1)),
+            )
+            .unwrap();
+        let active_directory = storage.activation_root().join("active");
+        let active_path = fs::read_dir(&active_directory)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let active_name = active_path.file_name().unwrap().to_str().unwrap();
+        let active_temp = active_directory.join(format!(".{active_name}.distd-tmp-123-1"));
+        fs::copy(&active_path, &active_temp).unwrap();
+        let transactions = storage.activation_root().join("transactions");
+        let transaction_temp =
+            transactions.join(format!(".{}.state.distd-tmp-123-2", "0".repeat(32)));
+        fs::write(&transaction_temp, b"partial").unwrap();
+        drop(storage);
+
+        let restarted = FsStorage::new(root).unwrap();
+        assert!(!active_temp.exists());
+        assert!(!transaction_temp.exists());
+        assert!(restarted
+            .open_active_revision(Path::new("artifact.bin"))
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn activation_directory_entry_cap_counts_mixed_names_before_classification() {
+        let canonical = format!("{}.state", "a".repeat(64));
+        let temporary = format!(".{canonical}.distd-tmp-123-1");
+        let names = (0..=FS_ACTIVATION_MAX_RECORDS)
+            .map(|index| match index % 3 {
+                0 => canonical.as_str(),
+                1 => temporary.as_str(),
+                _ => "noncanonical-record",
+            })
+            .collect::<Vec<_>>();
+        for (index, name) in names.iter().take(FS_ACTIVATION_MAX_RECORDS).enumerate() {
+            FsStorage::validate_activation_directory_entry_count(index + 1).unwrap();
+            let _classified = FsStorage::is_hex_state_name(name, 64)
+                || FsStorage::is_shared_durable_temp(name, 64);
+        }
+        assert!(FsStorage::validate_activation_directory_entry_count(names.len()).is_err());
+    }
+
+    #[test]
+    fn activation_is_idempotent_but_rejects_non_monotonic_and_cross_artifact_writes() {
+        let root = temp_path();
+        let storage = FsStorage::new(root).unwrap();
+        let bytes = b"abcdefgh";
+        let item = activation_test_item(bytes, 1);
+        let staged = activation_staged_data(bytes, &item);
+        let first = storage
+            .activate_verified_item(item.clone(), Path::new("artifact.bin"), &staged)
+            .unwrap();
+        let exact = storage
+            .activate_verified_item(item.clone(), Path::new("artifact.bin"), &staged)
+            .unwrap();
+        assert_eq!(first.item(), exact.item());
+
+        let mut same_revision = item.clone();
+        same_revision.metadata.description = Some("forged same revision".to_string());
+        assert!(storage
+            .activate_verified_item(same_revision, Path::new("artifact.bin"), &staged)
+            .is_err());
+
+        let other =
+            activation_test_item(b"ijklmnop", 2).with_artifact_id("other-artifact".to_string());
+        assert!(storage
+            .activate_verified_item(
+                other.clone(),
+                Path::new("artifact.bin"),
+                &activation_staged_data(b"ijklmnop", &other),
+            )
+            .is_err());
+        assert_eq!(
+            storage
+                .open_active_revision(Path::new("artifact.bin"))
+                .unwrap()
+                .unwrap()
+                .item(),
+            &item
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_nested_mirror_component_is_rejected_before_selector_switch() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_path();
+        let outside = temp_path();
+        let storage = FsStorage::new(root.clone()).unwrap();
+        fs::create_dir(root.join("artifact")).unwrap();
+        symlink(&outside, root.join("artifact/nested")).unwrap();
+        let bytes = b"data";
+        let info = ChunkInfo {
+            hash: do_hash(bytes),
+            size: bytes.len() as u64,
+        };
+        let mut item = Item::make_with_entries(
+            "artifact".to_string(),
+            PathBuf::from("artifact"),
+            1,
+            None,
+            info,
+            vec![info],
+            vec![FileEntry {
+                relative_path: "nested/file".to_string(),
+                size: info.size,
+                chunk_range: (0, 1),
+            }],
+            ChunkAlgorithm::default(),
+        )
+        .unwrap();
+        item.metadata.created = std::time::SystemTime::UNIX_EPOCH;
+        item.metadata.updated = std::time::SystemTime::UNIX_EPOCH;
+        let staged = activation_staged_data(bytes, &item);
+
+        assert!(storage
+            .activate_verified_item(item, Path::new("artifact"), &staged)
+            .is_err());
+        assert!(storage.active_refs.read().unwrap().is_empty());
+        assert!(fs::symlink_metadata(root.join("artifact/nested"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn unchanged_hardlink_preserves_prior_seal_across_ready_transaction_restart() {
+        let root = temp_path();
+        let storage = FsStorage::new(root.clone()).unwrap();
+        let first = activation_directory_item(b"aaaa", b"bbbb", 1);
+        let first_bytes = b"aaaabbbb";
+        storage
+            .activate_verified_item(
+                first.clone(),
+                Path::new("artifact-dir"),
+                &activation_staged_data(first_bytes, &first),
+            )
+            .unwrap();
+        let destination_identity = storage
+            .activation_destination_identity(Path::new("artifact-dir"))
+            .unwrap();
+        let previous = storage
+            .active_refs
+            .read()
+            .unwrap()
+            .get(&destination_identity)
+            .unwrap()
+            .as_ref()
+            .clone();
+
+        let second = activation_directory_item(b"aaaa", b"cccc", 2);
+        let second_bytes = b"aaaacccc";
+        let revision_identity = FsStorage::activation_revision_identity(&second).unwrap();
+        let transaction_id = [42; 16];
+        let transaction_path = storage.activation_transaction_path(&transaction_id);
+        let staging_root = storage.activation_staging_root(&transaction_id);
+        fs::create_dir(staging_root.parent().unwrap()).unwrap();
+        storage
+            .materialize_activation_tree(
+                &staging_root,
+                ActiveRevisionKind::Directory,
+                &second.manifest,
+                &second.chunks,
+                &activation_staged_data(second_bytes, &second),
+                Some(&previous),
+            )
+            .unwrap();
+        let revision_root = storage.activation_revision_root(&revision_identity);
+        storage
+            .ensure_activation_digest_directory(&revision_root)
+            .unwrap();
+        fs::rename(&staging_root, &revision_root).unwrap();
+        FsStorage::sync_parent(revision_root.parent().unwrap()).unwrap();
+        let seals = FsStorage::collect_activation_seals(
+            &revision_root,
+            &second,
+            ActiveRevisionKind::Directory,
+        )
+        .unwrap();
+        let transaction = FsActivationTransactionV2 {
+            root_identity: fs_storage_root_identity(&root).unwrap(),
+            transaction_id,
+            destination: PathBuf::from("artifact-dir"),
+            destination_identity,
+            candidate_revision_identity: revision_identity,
+            previous: Some(previous.clone()),
+            item: second,
+            kind: FsStorage::encode_activation_kind(ActiveRevisionKind::Directory),
+            phase: FsActivationPhaseV2::Ready,
+            candidate_seals: seals,
+            mirror_staging_path: storage
+                .activation_mirror_paths(Path::new("artifact-dir"), &transaction_id)
+                .unwrap()
+                .0,
+            mirror_backup_path: storage
+                .activation_mirror_paths(Path::new("artifact-dir"), &transaction_id)
+                .unwrap()
+                .1,
+        };
+        storage
+            .write_activation_record(
+                &transaction_path,
+                FS_ACTIVATION_TRANSACTION_SCHEMA,
+                ActivationRecordKind::Transaction(ActivationTransactionPhase::Ready),
+                &transaction,
+            )
+            .unwrap();
+        storage
+            .validate_active_ref(&storage.active_ref_path(&destination_identity), &previous)
+            .unwrap();
+        drop(storage);
+
+        let restarted = FsStorage::new(root).unwrap();
+        assert_eq!(
+            restarted
+                .open_active_revision(Path::new("artifact-dir"))
+                .unwrap()
+                .unwrap()
+                .item(),
+            &first
+        );
+        assert!(!transaction_path.exists());
+    }
+
+    #[test]
+    fn recovery_completes_file_to_directory_mirror_after_old_destination_rename() {
+        let root = temp_path();
+        let storage = FsStorage::new(root.clone()).unwrap();
+        let old = transition_file_item(b"old!", 1);
+        storage
+            .activate_verified_item(
+                old.clone(),
+                Path::new("target"),
+                &activation_staged_data(b"old!", &old),
+            )
+            .unwrap();
+        let identity = storage
+            .activation_destination_identity(Path::new("target"))
+            .unwrap();
+        let previous = storage.active_refs.read().unwrap()[&identity]
+            .as_ref()
+            .clone();
+        let new = transition_directory_item(b"aaaa", b"bbbb", 2);
+        storage
+            .activate_verified_item(
+                new.clone(),
+                Path::new("target"),
+                &activation_staged_data(b"aaaabbbb", &new),
+            )
+            .unwrap();
+        let active = storage.active_refs.read().unwrap()[&identity]
+            .as_ref()
+            .clone();
+        let transaction = install_switched_transaction(&storage, previous, &active, [51; 16]);
+        let destination = root.join("target");
+        FsStorage::remove_activation_path_checked(&destination).unwrap();
+        let backup = storage.path(&transaction.mirror_backup_path).unwrap();
+        fs::write(&backup, b"old!").unwrap();
+        File::open(backup.parent().unwrap())
+            .unwrap()
+            .sync_all()
+            .unwrap();
+        drop(storage);
+
+        for _ in 0..2 {
+            let restarted = FsStorage::new(root.clone()).unwrap();
+            assert_eq!(fs::read(root.join("target/a.bin")).unwrap(), b"aaaa");
+            assert_eq!(fs::read(root.join("target/b.bin")).unwrap(), b"bbbb");
+            assert!(!restarted
+                .path(&transaction.mirror_staging_path)
+                .unwrap()
+                .exists());
+            assert!(!restarted
+                .path(&transaction.mirror_backup_path)
+                .unwrap()
+                .exists());
+            drop(restarted);
+        }
+    }
+
+    #[test]
+    fn recovery_completes_directory_to_file_mirror_after_old_destination_rename() {
+        let root = temp_path();
+        let storage = FsStorage::new(root.clone()).unwrap();
+        let old = transition_directory_item(b"aaaa", b"bbbb", 1);
+        storage
+            .activate_verified_item(
+                old.clone(),
+                Path::new("target"),
+                &activation_staged_data(b"aaaabbbb", &old),
+            )
+            .unwrap();
+        let identity = storage
+            .activation_destination_identity(Path::new("target"))
+            .unwrap();
+        let previous = storage.active_refs.read().unwrap()[&identity]
+            .as_ref()
+            .clone();
+        let new = transition_file_item(b"new!", 2);
+        storage
+            .activate_verified_item(
+                new.clone(),
+                Path::new("target"),
+                &activation_staged_data(b"new!", &new),
+            )
+            .unwrap();
+        let active = storage.active_refs.read().unwrap()[&identity]
+            .as_ref()
+            .clone();
+        let transaction = install_switched_transaction(&storage, previous, &active, [52; 16]);
+        let destination = root.join("target");
+        FsStorage::remove_activation_path_checked(&destination).unwrap();
+        let backup = storage.path(&transaction.mirror_backup_path).unwrap();
+        fs::create_dir(&backup).unwrap();
+        fs::write(backup.join("a.bin"), b"aaaa").unwrap();
+        fs::write(backup.join("b.bin"), b"bbbb").unwrap();
+        FsStorage::sync_directory_tree(&backup).unwrap();
+        drop(storage);
+
+        for _ in 0..2 {
+            let restarted = FsStorage::new(root.clone()).unwrap();
+            assert_eq!(fs::read(root.join("target")).unwrap(), b"new!");
+            assert!(!restarted
+                .path(&transaction.mirror_staging_path)
+                .unwrap()
+                .exists());
+            assert!(!restarted
+                .path(&transaction.mirror_backup_path)
+                .unwrap()
+                .exists());
+            drop(restarted);
+        }
+    }
+
+    #[test]
+    fn ordinary_item_sharing_selected_chunk_still_migrates_to_cas() {
+        let root = temp_path();
+        let storage = FsStorage::new(root).unwrap();
+        let bytes = b"shared immutable bytes";
+        let active = activation_test_item(bytes, 1);
+        storage
+            .activate_verified_item(
+                active.clone(),
+                Path::new("artifact.bin"),
+                &activation_staged_data(bytes, &active),
+            )
+            .unwrap();
+        storage
+            .create_item(
+                "ordinary".to_string(),
+                PathBuf::from("ordinary.bin"),
+                1,
+                None,
+                bytes::Bytes::copy_from_slice(bytes),
+                active.manifest.chunk_algorithm,
+            )
+            .unwrap();
+
+        assert!(storage.migrate_referenced_chunks_to_cas().unwrap());
+        for chunk in &active.chunks {
+            let path = storage.revision_chunk_path(&chunk.hash).unwrap();
+            assert!(path.is_file());
+            FsStorage::verify_cas_chunk(&path, chunk).unwrap();
+        }
+    }
+
+    #[test]
+    fn immutable_reader_cache_is_globally_bounded() {
+        let root = temp_path();
+        let storage = FsStorage::new(root).unwrap();
+        for index in 0..(DEFAULT_IMMUTABLE_READER_ENTRIES + 17) {
+            let path = storage
+                .activation_root()
+                .join("reader-fixtures")
+                .join(format!("{index}.bin"));
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, [index as u8]).unwrap();
+            let mut byte = [0];
+            storage.read_immutable_backing(&path, 0, &mut byte).unwrap();
+            assert_eq!(byte, [index as u8]);
+        }
+        assert!(
+            storage.immutable_readers.lock().unwrap().entries.len()
+                <= DEFAULT_IMMUTABLE_READER_ENTRIES
+        );
+    }
+
+    #[test]
+    fn preexisting_mirror_transaction_paths_fail_before_intent_and_survive_restarts() {
+        for use_backup in [false, true] {
+            for collision_is_directory in [false, true] {
+                let root = temp_path();
+                let storage = FsStorage::new(root.clone()).unwrap();
+                let old = activation_test_item(b"old-old!", 1);
+                storage
+                    .activate_verified_item(
+                        old.clone(),
+                        Path::new("artifact.bin"),
+                        &activation_staged_data(b"old-old!", &old),
+                    )
+                    .unwrap();
+
+                let transaction_id = [91 + u8::from(use_backup); 16];
+                storage.set_next_activation_transaction_id(transaction_id);
+                let (staging, backup) = storage
+                    .activation_mirror_paths(Path::new("artifact.bin"), &transaction_id)
+                    .unwrap();
+                let collision = storage
+                    .path(if use_backup { &backup } else { &staging })
+                    .unwrap();
+                if collision_is_directory {
+                    fs::create_dir(&collision).unwrap();
+                    fs::write(collision.join("owned.txt"), b"preserve-directory").unwrap();
+                } else {
+                    fs::write(&collision, b"preserve-file").unwrap();
+                }
+
+                let new = activation_test_item(b"new-new!", 2);
+                assert!(
+                    storage
+                        .activate_verified_item(
+                            new,
+                            Path::new("artifact.bin"),
+                            &activation_staged_data(
+                                b"new-new!",
+                                &activation_test_item(b"new-new!", 2),
+                            ),
+                        )
+                        .is_err()
+                );
+                assert!(!storage
+                    .activation_transaction_path(&transaction_id)
+                    .exists());
+                drop(storage);
+
+                for _ in 0..2 {
+                    let restarted = FsStorage::new(root.clone()).unwrap();
+                    assert_eq!(
+                        restarted
+                            .open_active_revision(Path::new("artifact.bin"))
+                            .unwrap()
+                            .unwrap()
+                            .item(),
+                        &old
+                    );
+                    assert_eq!(fs::read(root.join("artifact.bin")).unwrap(), b"old-old!");
+                    if collision_is_directory {
+                        assert_eq!(
+                            fs::read(collision.join("owned.txt")).unwrap(),
+                            b"preserve-directory"
+                        );
+                    } else {
+                        assert_eq!(fs::read(&collision).unwrap(), b"preserve-file");
+                    }
+                    drop(restarted);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn injected_crash_preserves_snapshot_while_ordinary_materialize_error_rolls_back() {
+        let ordinary_root = temp_path();
+        let ordinary = FsStorage::new(ordinary_root).unwrap();
+        let ordinary_id = [101; 16];
+        ordinary.set_next_activation_transaction_id(ordinary_id);
+        let item = activation_test_item(b"ordinary", 1);
+        assert!(ordinary
+            .activate_verified_item(item, Path::new("artifact.bin"), &HashMap::default(),)
+            .is_err());
+        assert!(!ordinary.simulated_crash());
+        assert!(!ordinary.activation_transaction_path(&ordinary_id).exists());
+        assert!(!ordinary
+            .activation_staging_root(&ordinary_id)
+            .parent()
+            .unwrap()
+            .exists());
+
+        let crash_root = temp_path();
+        let crash = FsStorage::new(crash_root.clone()).unwrap();
+        let crash_id = [102; 16];
+        crash.set_next_activation_transaction_id(crash_id);
+        crash.set_activation_fault_hook(|stage| {
+            if stage == ActivationFaultStage::Operation(ActivationOperation::MaterializeFileCreate)
+            {
+                return Err(std::io::Error::other("simulated process crash"));
+            }
+            Ok(())
+        });
+        let item = activation_test_item(b"snapshot", 1);
+        assert!(crash
+            .activate_verified_item(
+                item.clone(),
+                Path::new("artifact.bin"),
+                &activation_staged_data(b"snapshot", &item),
+            )
+            .is_err());
+        assert!(crash.simulated_crash());
+        assert!(crash.activation_transaction_path(&crash_id).is_file());
+        assert!(crash
+            .activation_staging_root(&crash_id)
+            .parent()
+            .unwrap()
+            .is_dir());
+        drop(crash);
+
+        for _ in 0..2 {
+            let restarted = FsStorage::new(crash_root.clone()).unwrap();
+            assert!(restarted
+                .open_active_revision(Path::new("artifact.bin"))
+                .unwrap()
+                .is_none());
+            assert!(!restarted.activation_transaction_path(&crash_id).exists());
+            assert!(!restarted
+                .activation_staging_root(&crash_id)
+                .parent()
+                .unwrap()
+                .exists());
+            drop(restarted);
+        }
+    }
+
+    #[test]
+    fn ordinary_preselector_errors_cleanup_and_allow_identical_same_process_retry() {
+        for (index, operation) in [
+            ActivationOperation::StagingParentSync,
+            ActivationOperation::RevisionParentSync,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let root = temp_path();
+            let storage = FsStorage::new(root.clone()).unwrap();
+            let failed_transaction_id = [u8::try_from(index + 103).unwrap(); 16];
+            storage.set_next_activation_transaction_id(failed_transaction_id);
+            let fired = Arc::new(AtomicBool::new(false));
+            let hook_fired = fired.clone();
+            storage.set_activation_error_hook(move |stage| {
+                if stage == ActivationFaultStage::Operation(operation)
+                    && !hook_fired.swap(true, std::sync::atomic::Ordering::AcqRel)
+                {
+                    return Err(std::io::Error::other("ordinary pre-selector failure"));
+                }
+                Ok(())
+            });
+            let item = activation_test_item(b"retry-me", 1);
+            let staged = activation_staged_data(b"retry-me", &item);
+            assert!(storage
+                .activate_verified_item(item.clone(), Path::new("artifact.bin"), &staged)
+                .is_err());
+            assert!(fired.load(std::sync::atomic::Ordering::Acquire));
+            assert!(!storage.simulated_crash());
+            assert!(!storage
+                .activation_transaction_path(&failed_transaction_id)
+                .exists());
+            assert!(!storage
+                .activation_staging_root(&failed_transaction_id)
+                .parent()
+                .unwrap()
+                .exists());
+            assert!(!storage
+                .activation_poisoned
+                .load(std::sync::atomic::Ordering::Acquire));
+            assert!(storage
+                .open_active_revision(Path::new("artifact.bin"))
+                .unwrap()
+                .is_none());
+
+            storage.clear_activation_fault_hook();
+            let active = storage
+                .activate_verified_item(item.clone(), Path::new("artifact.bin"), &staged)
+                .unwrap();
+            assert_eq!(active.item(), &item);
+            assert_eq!(fs::read(root.join("artifact.bin")).unwrap(), b"retry-me");
+            drop(storage);
+
+            for _ in 0..2 {
+                let restarted = FsStorage::new(root.clone()).unwrap();
+                assert_eq!(
+                    restarted
+                        .open_active_revision(Path::new("artifact.bin"))
+                        .unwrap()
+                        .unwrap()
+                        .item(),
+                    &item
+                );
+                assert_eq!(fs::read(root.join("artifact.bin")).unwrap(), b"retry-me");
+                drop(restarted);
+            }
+        }
+    }
+
+    #[test]
+    fn namespace_digest_and_staging_crash_boundaries_recover_twice() {
+        let operations = [
+            ActivationOperation::NamespaceCreate,
+            ActivationOperation::NamespaceParentSync,
+            ActivationOperation::StagingCreate,
+            ActivationOperation::StagingParentSync,
+            ActivationOperation::RevisionDigestCreate,
+            ActivationOperation::RevisionDigestParentSync,
+        ];
+        for operation in operations {
+            let root = temp_path();
+            let storage = FsStorage::new(root.clone()).unwrap();
+            let transaction_id = [operation as u8 + 110; 16];
+            storage.set_next_activation_transaction_id(transaction_id);
+            let fired = Arc::new(AtomicBool::new(false));
+            let hook_fired = fired.clone();
+            storage.set_activation_fault_hook(move |stage| {
+                if stage == ActivationFaultStage::Operation(operation)
+                    && !hook_fired.swap(true, std::sync::atomic::Ordering::AcqRel)
+                {
+                    return Err(std::io::Error::other("simulated namespace crash"));
+                }
+                Ok(())
+            });
+            let item = activation_test_item(b"snapshot", 1);
+            assert!(storage
+                .activate_verified_item(
+                    item.clone(),
+                    Path::new("artifact.bin"),
+                    &activation_staged_data(b"snapshot", &item),
+                )
+                .is_err());
+            assert!(fired.load(std::sync::atomic::Ordering::Acquire));
+            assert!(storage.simulated_crash());
+            drop(storage);
+
+            for _ in 0..2 {
+                let restarted = FsStorage::new(root.clone()).unwrap();
+                assert!(restarted
+                    .open_active_revision(Path::new("artifact.bin"))
+                    .unwrap()
+                    .is_none());
+                drop(restarted);
+            }
+        }
+    }
+
+    #[test]
+    fn shared_durable_temp_snapshots_for_every_transaction_phase_recover_twice() {
+        #[derive(Clone, Copy)]
+        enum TempSnapshot {
+            Created,
+            PartialWrite,
+            FullWrite,
+            FileSynced,
+        }
+
+        for (phase_index, phase) in [
+            FsActivationPhaseV2::Intent,
+            FsActivationPhaseV2::Ready,
+            FsActivationPhaseV2::Switched,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for (snapshot_index, snapshot) in [
+                TempSnapshot::Created,
+                TempSnapshot::PartialWrite,
+                TempSnapshot::FullWrite,
+                TempSnapshot::FileSynced,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let root = temp_path();
+                let storage = FsStorage::new(root.clone()).unwrap();
+                let first = activation_test_item(b"version1", 1);
+                storage
+                    .activate_verified_item(
+                        first.clone(),
+                        Path::new("artifact.bin"),
+                        &activation_staged_data(b"version1", &first),
+                    )
+                    .unwrap();
+                let identity = storage
+                    .activation_destination_identity(Path::new("artifact.bin"))
+                    .unwrap();
+                let previous = storage.active_refs.read().unwrap()[&identity]
+                    .as_ref()
+                    .clone();
+                let second = activation_test_item(b"version2", 2);
+                storage
+                    .activate_verified_item(
+                        second.clone(),
+                        Path::new("artifact.bin"),
+                        &activation_staged_data(b"version2", &second),
+                    )
+                    .unwrap();
+                let active = storage.active_refs.read().unwrap()[&identity]
+                    .as_ref()
+                    .clone();
+                let transaction_id =
+                    [u8::try_from(phase_index * 3 + snapshot_index + 120).unwrap(); 16];
+                let (mirror_staging_path, mirror_backup_path) = storage
+                    .activation_mirror_paths(Path::new("artifact.bin"), &transaction_id)
+                    .unwrap();
+                let transaction = FsActivationTransactionV2 {
+                    root_identity: active.root_identity,
+                    transaction_id,
+                    destination: active.destination.clone(),
+                    destination_identity: active.destination_identity,
+                    candidate_revision_identity: active.revision_identity,
+                    previous: Some(previous),
+                    item: active.item.clone(),
+                    kind: active.kind,
+                    phase,
+                    candidate_seals: if phase == FsActivationPhaseV2::Intent {
+                        Vec::new()
+                    } else {
+                        active.seals.clone()
+                    },
+                    mirror_staging_path,
+                    mirror_backup_path,
+                };
+                let payload = bitcode::serialize(&transaction).unwrap();
+                let encoded = crate::durable_state::encode_envelope(
+                    DurableStateKind::FsActivation,
+                    FS_ACTIVATION_TRANSACTION_SCHEMA,
+                    &payload,
+                    MAX_DURABLE_STATE_PAYLOAD,
+                )
+                .unwrap();
+                let canonical = storage.activation_transaction_path(&transaction_id);
+                let canonical_name = canonical.file_name().unwrap().to_str().unwrap();
+                let temporary = canonical
+                    .parent()
+                    .unwrap()
+                    .join(format!(".{canonical_name}.distd-tmp-999-1"));
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&temporary)
+                    .unwrap();
+                let expected = match snapshot {
+                    TempSnapshot::Created => Vec::new(),
+                    TempSnapshot::PartialWrite => {
+                        let partial = encoded[..encoded.len() / 2].to_vec();
+                        file.write_all(&partial).unwrap();
+                        partial
+                    }
+                    TempSnapshot::FullWrite => {
+                        file.write_all(&encoded).unwrap();
+                        encoded
+                    }
+                    TempSnapshot::FileSynced => {
+                        file.write_all(&encoded).unwrap();
+                        file.sync_all().unwrap();
+                        encoded
+                    }
+                };
+                drop(file);
+                assert_eq!(fs::read(&temporary).unwrap(), expected);
+                drop(storage);
+
+                for _ in 0..2 {
+                    let restarted = FsStorage::new(root.clone()).unwrap();
+                    assert!(!temporary.exists());
+                    assert_eq!(
+                        restarted
+                            .open_active_revision(Path::new("artifact.bin"))
+                            .unwrap()
+                            .unwrap()
+                            .item(),
+                        &second
+                    );
+                    assert_eq!(fs::read(root.join("artifact.bin")).unwrap(), b"version2");
+                    drop(restarted);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_active_and_transaction_records_fail_closed_without_losing_old_state() {
+        #[derive(Clone, Copy, Debug)]
+        enum RecordFixture {
+            Active,
+            Transaction,
+        }
+        #[derive(Clone, Copy, Debug)]
+        enum Malformation {
+            WrongKind,
+            FutureSchema,
+            Truncated,
+            Trailing,
+            Oversized,
+            PathMismatch,
+            KindMismatch,
+            PreviousMismatch,
+            PhaseMismatch,
+        }
+
+        let framing_and_semantic = [
+            Malformation::WrongKind,
+            Malformation::FutureSchema,
+            Malformation::Truncated,
+            Malformation::Trailing,
+            Malformation::Oversized,
+            Malformation::PathMismatch,
+            Malformation::KindMismatch,
+            Malformation::PreviousMismatch,
+            Malformation::PhaseMismatch,
+        ];
+        for record_fixture in [RecordFixture::Active, RecordFixture::Transaction] {
+            for malformation in framing_and_semantic {
+                if matches!(record_fixture, RecordFixture::Active)
+                    && matches!(
+                        malformation,
+                        Malformation::PreviousMismatch | Malformation::PhaseMismatch
+                    )
+                {
+                    continue;
+                }
+                let root = temp_path();
+                let storage = FsStorage::new(root.clone()).unwrap();
+                let old = activation_test_item(b"old-state", 1);
+                storage
+                    .activate_verified_item(
+                        old.clone(),
+                        Path::new("artifact.bin"),
+                        &activation_staged_data(b"old-state", &old),
+                    )
+                    .unwrap();
+                let old_identity = storage
+                    .activation_destination_identity(Path::new("artifact.bin"))
+                    .unwrap();
+                let old_active = storage.active_refs.read().unwrap()[&old_identity]
+                    .as_ref()
+                    .clone();
+                let old_selector_path = storage.active_ref_path(&old_identity);
+                let old_selector_bytes = fs::read(&old_selector_path).unwrap();
+
+                let (record_path, schema, mut payload) = match record_fixture {
+                    RecordFixture::Active => {
+                        let mut second = activation_test_item(b"other-one", 1)
+                            .with_artifact_id("other-artifact".to_string());
+                        second.metadata.path = PathBuf::from("other.bin");
+                        storage
+                            .activate_verified_item(
+                                second,
+                                Path::new("other.bin"),
+                                &activation_staged_data(b"other-one", &{
+                                    let mut item = activation_test_item(b"other-one", 1)
+                                        .with_artifact_id("other-artifact".to_string());
+                                    item.metadata.path = PathBuf::from("other.bin");
+                                    item
+                                }),
+                            )
+                            .unwrap();
+                        let identity = storage
+                            .activation_destination_identity(Path::new("other.bin"))
+                            .unwrap();
+                        let mut active = storage.active_refs.read().unwrap()[&identity]
+                            .as_ref()
+                            .clone();
+                        match malformation {
+                            Malformation::PathMismatch => {
+                                active.item.metadata.path = PathBuf::from("wrong.bin");
+                            }
+                            Malformation::KindMismatch => active.kind = 1,
+                            _ => {}
+                        }
+                        (
+                            storage.active_ref_path(&identity),
+                            FS_ACTIVATION_ACTIVE_SCHEMA,
+                            bitcode::serialize(&active).unwrap(),
+                        )
+                    }
+                    RecordFixture::Transaction => {
+                        let transaction_id = [210
+                            + match malformation {
+                                Malformation::WrongKind => 0,
+                                Malformation::FutureSchema => 1,
+                                Malformation::Truncated => 2,
+                                Malformation::Trailing => 3,
+                                Malformation::Oversized => 4,
+                                Malformation::PathMismatch => 5,
+                                Malformation::KindMismatch => 6,
+                                Malformation::PreviousMismatch => 7,
+                                Malformation::PhaseMismatch => 8,
+                            }; 16];
+                        let new = activation_test_item(b"new-state", 2);
+                        let (mirror_staging_path, mirror_backup_path) = storage
+                            .activation_mirror_paths(Path::new("artifact.bin"), &transaction_id)
+                            .unwrap();
+                        let mut transaction =
+                            FsActivationTransactionV2 {
+                                root_identity: old_active.root_identity,
+                                transaction_id,
+                                destination: PathBuf::from("artifact.bin"),
+                                destination_identity: old_identity,
+                                candidate_revision_identity:
+                                    FsStorage::activation_revision_identity(&new).unwrap(),
+                                previous: Some(old_active.clone()),
+                                item: new,
+                                kind: FsStorage::encode_activation_kind(ActiveRevisionKind::File),
+                                phase: FsActivationPhaseV2::Intent,
+                                candidate_seals: Vec::new(),
+                                mirror_staging_path,
+                                mirror_backup_path,
+                            };
+                        match malformation {
+                            Malformation::PathMismatch => {
+                                transaction.item.metadata.path = PathBuf::from("wrong.bin");
+                            }
+                            Malformation::KindMismatch => transaction.kind = 1,
+                            Malformation::PreviousMismatch => {
+                                transaction.previous.as_mut().unwrap().destination =
+                                    PathBuf::from("wrong.bin");
+                            }
+                            Malformation::PhaseMismatch => {
+                                transaction.item = old.clone();
+                                transaction.candidate_revision_identity =
+                                    old_active.revision_identity;
+                                transaction.previous = None;
+                                transaction.phase = FsActivationPhaseV2::Switched;
+                            }
+                            _ => {}
+                        }
+                        (
+                            storage.activation_transaction_path(&transaction_id),
+                            FS_ACTIVATION_TRANSACTION_SCHEMA,
+                            bitcode::serialize(&transaction).unwrap(),
+                        )
+                    }
+                };
+                let kind = if matches!(malformation, Malformation::WrongKind) {
+                    DurableStateKind::FsStorage
+                } else {
+                    DurableStateKind::FsActivation
+                };
+                let encoded_schema = if matches!(malformation, Malformation::FutureSchema) {
+                    schema + 100
+                } else {
+                    schema
+                };
+                let mut encoded = crate::durable_state::encode_envelope(
+                    kind,
+                    encoded_schema,
+                    &payload,
+                    MAX_DURABLE_STATE_PAYLOAD,
+                )
+                .unwrap();
+                match malformation {
+                    Malformation::Truncated => encoded.truncate(encoded.len() / 2),
+                    Malformation::Trailing => encoded.push(0xa5),
+                    Malformation::Oversized => {
+                        encoded[16..24]
+                            .copy_from_slice(&(MAX_DURABLE_STATE_PAYLOAD + 1).to_le_bytes());
+                    }
+                    _ => {}
+                }
+                payload.clear();
+                fs::write(&record_path, &encoded).unwrap();
+                let corrupt_bytes = fs::read(&record_path).unwrap();
+                drop(storage);
+
+                for _ in 0..2 {
+                    assert!(
+                        FsStorage::new(root.clone()).is_err(),
+                        "{record_fixture:?} {malformation:?}"
+                    );
+                    assert_eq!(fs::read(&record_path).unwrap(), corrupt_bytes);
+                    assert_eq!(fs::read(&old_selector_path).unwrap(), old_selector_bytes);
+                    assert_eq!(fs::read(root.join("artifact.bin")).unwrap(), b"old-state");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_mutation_faults_leave_restartable_snapshots_and_converge_twice() {
+        let operations = [
+            ActivationOperation::RecoveryMirrorCleanup,
+            ActivationOperation::RecoveryMirrorCleanupParentSync,
+            ActivationOperation::RecoveryStagingCleanup,
+            ActivationOperation::RecoveryStagingCleanupParentSync,
+            ActivationOperation::RecoveryTransactionCleanup,
+            ActivationOperation::RecoveryTransactionCleanupParentSync,
+        ];
+        for (index, operation) in operations.into_iter().enumerate() {
+            let root = temp_path();
+            let storage = FsStorage::new(root.clone()).unwrap();
+            let old = activation_test_item(b"version1", 1);
+            storage
+                .activate_verified_item(
+                    old,
+                    Path::new("artifact.bin"),
+                    &activation_staged_data(b"version1", &activation_test_item(b"version1", 1)),
+                )
+                .unwrap();
+            let identity = storage
+                .activation_destination_identity(Path::new("artifact.bin"))
+                .unwrap();
+            let previous = storage.active_refs.read().unwrap()[&identity]
+                .as_ref()
+                .clone();
+            let new = activation_test_item(b"version2", 2);
+            storage
+                .activate_verified_item(
+                    new.clone(),
+                    Path::new("artifact.bin"),
+                    &activation_staged_data(b"version2", &new),
+                )
+                .unwrap();
+            let active = storage.active_refs.read().unwrap()[&identity]
+                .as_ref()
+                .clone();
+            let transaction_id = [u8::try_from(index + 230).unwrap(); 16];
+            let transaction =
+                install_switched_transaction(&storage, previous, &active, transaction_id);
+            if matches!(
+                operation,
+                ActivationOperation::RecoveryMirrorCleanup
+                    | ActivationOperation::RecoveryMirrorCleanupParentSync
+            ) {
+                fs::write(
+                    storage.path(&transaction.mirror_staging_path).unwrap(),
+                    b"owned mirror staging",
+                )
+                .unwrap();
+            }
+            if matches!(
+                operation,
+                ActivationOperation::RecoveryStagingCleanup
+                    | ActivationOperation::RecoveryStagingCleanupParentSync
+            ) {
+                let staging_parent = storage
+                    .activation_staging_root(&transaction_id)
+                    .parent()
+                    .unwrap()
+                    .to_path_buf();
+                fs::create_dir(&staging_parent).unwrap();
+                fs::write(staging_parent.join("owned"), b"staging").unwrap();
+            }
+            let fired = Arc::new(AtomicBool::new(false));
+            let hook_fired = fired.clone();
+            storage.set_activation_fault_hook(move |stage| {
+                if stage == ActivationFaultStage::Operation(operation)
+                    && !hook_fired.swap(true, std::sync::atomic::Ordering::AcqRel)
+                {
+                    return Err(std::io::Error::other("simulated recovery crash"));
+                }
+                Ok(())
+            });
+            assert!(storage.recover_activations().is_err());
+            assert!(fired.load(std::sync::atomic::Ordering::Acquire));
+            drop(storage);
+
+            for _ in 0..2 {
+                let restarted = FsStorage::new(root.clone()).unwrap();
+                assert_eq!(
+                    restarted
+                        .open_active_revision(Path::new("artifact.bin"))
+                        .unwrap()
+                        .unwrap()
+                        .item(),
+                    &new
+                );
+                assert_eq!(fs::read(root.join("artifact.bin")).unwrap(), b"version2");
+                assert!(!restarted
+                    .activation_transaction_path(&transaction_id)
+                    .exists());
+                drop(restarted);
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_mirror_operation_faults_converge_twice() {
+        for (index, operation) in [
+            ActivationOperation::MirrorEntryCreate,
+            ActivationOperation::MirrorEntryWrite,
+            ActivationOperation::MirrorEntrySync,
+            ActivationOperation::MirrorEntryRename,
+            ActivationOperation::MirrorEntryRemove,
+            ActivationOperation::MirrorDirectorySync,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let root = temp_path();
+            let storage = FsStorage::new(root.clone()).unwrap();
+            let old = activation_test_item(b"version1", 1);
+            storage
+                .activate_verified_item(
+                    old,
+                    Path::new("artifact.bin"),
+                    &activation_staged_data(b"version1", &activation_test_item(b"version1", 1)),
+                )
+                .unwrap();
+            let identity = storage
+                .activation_destination_identity(Path::new("artifact.bin"))
+                .unwrap();
+            let previous = storage.active_refs.read().unwrap()[&identity]
+                .as_ref()
+                .clone();
+            let new = activation_test_item(b"version2", 2);
+            storage
+                .activate_verified_item(
+                    new.clone(),
+                    Path::new("artifact.bin"),
+                    &activation_staged_data(b"version2", &new),
+                )
+                .unwrap();
+            let active = storage.active_refs.read().unwrap()[&identity]
+                .as_ref()
+                .clone();
+            let transaction_id = [u8::try_from(index + 240).unwrap(); 16];
+            install_switched_transaction(&storage, previous, &active, transaction_id);
+            fs::write(root.join("artifact.bin"), b"version1").unwrap();
+            let fired = Arc::new(AtomicBool::new(false));
+            let hook_fired = fired.clone();
+            storage.set_activation_fault_hook(move |stage| {
+                if stage == ActivationFaultStage::Operation(operation)
+                    && !hook_fired.swap(true, std::sync::atomic::Ordering::AcqRel)
+                {
+                    return Err(std::io::Error::other("simulated recovery mirror crash"));
+                }
+                Ok(())
+            });
+            assert!(storage.recover_activations().is_err());
+            assert!(fired.load(std::sync::atomic::Ordering::Acquire));
+            drop(storage);
+
+            for _ in 0..2 {
+                let restarted = FsStorage::new(root.clone()).unwrap();
+                assert_eq!(
+                    restarted
+                        .open_active_revision(Path::new("artifact.bin"))
+                        .unwrap()
+                        .unwrap()
+                        .item(),
+                    &new
+                );
+                assert_eq!(fs::read(root.join("artifact.bin")).unwrap(), b"version2");
+                assert!(!restarted
+                    .activation_transaction_path(&transaction_id)
+                    .exists());
+                drop(restarted);
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_record_temp_and_quarantine_faults_converge_without_byte_loss() {
+        for operation in [
+            ActivationOperation::RecoveryRecordTempCleanup,
+            ActivationOperation::RecoveryRecordTempCleanupParentSync,
+            ActivationOperation::RecoveryRecordQuarantine,
+            ActivationOperation::RecoveryRecordSourceParentSync,
+            ActivationOperation::RecoveryRecordQuarantineParentSync,
+        ] {
+            let root = temp_path();
+            let storage = FsStorage::new(root.clone()).unwrap();
+            let old = activation_test_item(b"old-state", 1);
+            storage
+                .activate_verified_item(
+                    old.clone(),
+                    Path::new("artifact.bin"),
+                    &activation_staged_data(b"old-state", &old),
+                )
+                .unwrap();
+            let transactions = storage.activation_root().join("transactions");
+            let source = if matches!(
+                operation,
+                ActivationOperation::RecoveryRecordTempCleanup
+                    | ActivationOperation::RecoveryRecordTempCleanupParentSync
+            ) {
+                transactions.join(format!(".{}.state.distd-tmp-999-9", "a".repeat(32)))
+            } else {
+                transactions.join("noncanonical-record")
+            };
+            let original = b"exact recovery record bytes";
+            fs::write(&source, original).unwrap();
+            let fired = Arc::new(AtomicBool::new(false));
+            let hook_fired = fired.clone();
+            storage.set_activation_fault_hook(move |stage| {
+                if stage == ActivationFaultStage::Operation(operation)
+                    && !hook_fired.swap(true, std::sync::atomic::Ordering::AcqRel)
+                {
+                    return Err(std::io::Error::other("simulated record recovery crash"));
+                }
+                Ok(())
+            });
+            assert!(storage.recover_activations().is_err());
+            assert!(fired.load(std::sync::atomic::Ordering::Acquire));
+            if matches!(
+                operation,
+                ActivationOperation::RecoveryRecordTempCleanup
+                    | ActivationOperation::RecoveryRecordTempCleanupParentSync
+            ) {
+                assert!(!source.exists());
+            } else {
+                let quarantine = storage.activation_root().join("quarantine");
+                let quarantined = fs::read_dir(&quarantine)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .find(|path| {
+                        path.file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .starts_with("transaction-noncanonical-record-")
+                    })
+                    .unwrap();
+                assert_eq!(fs::read(quarantined).unwrap(), original);
+            }
+            drop(storage);
+
+            for _ in 0..2 {
+                let restarted = FsStorage::new(root.clone()).unwrap();
+                assert_eq!(
+                    restarted
+                        .open_active_revision(Path::new("artifact.bin"))
+                        .unwrap()
+                        .unwrap()
+                        .item(),
+                    &old
+                );
+                assert_eq!(fs::read(root.join("artifact.bin")).unwrap(), b"old-state");
+                drop(restarted);
+            }
+        }
+    }
+
+    #[test]
+    fn named_activation_faults_recover_idempotently_through_real_file_path() {
+        let durable_stages = [
+            DurableReplaceStage::AfterEncode,
+            DurableReplaceStage::AfterCreate,
+            DurableReplaceStage::AfterWrite,
+            DurableReplaceStage::AfterFileSync,
+            DurableReplaceStage::AfterRename,
+            DurableReplaceStage::AfterDirectorySync,
+        ];
+        let mut stages = vec![
+            ActivationFaultStage::BeforeIntent,
+            ActivationFaultStage::AfterIntent,
+            ActivationFaultStage::AfterMaterialize,
+            ActivationFaultStage::AfterRevisionPublish,
+            ActivationFaultStage::AfterReady,
+            ActivationFaultStage::AfterSelector,
+            ActivationFaultStage::AfterSwitched,
+            ActivationFaultStage::AfterStatePersist,
+            ActivationFaultStage::AfterMirror,
+        ];
+        stages.extend(durable_stages.into_iter().map(|stage| {
+            ActivationFaultStage::DurableRecord {
+                record: ActivationRecordKind::Active,
+                stage,
+            }
+        }));
+        for phase in [ActivationTransactionPhase::Intent] {
+            stages.extend(durable_stages.into_iter().map(|stage| {
+                ActivationFaultStage::DurableRecord {
+                    record: ActivationRecordKind::Transaction(phase),
+                    stage,
+                }
+            }));
+        }
+        stages.extend(
+            [
+                ActivationOperation::MaterializeFileCreate,
+                ActivationOperation::MaterializeFileWrite,
+                ActivationOperation::MaterializeFileSync,
+                ActivationOperation::RevisionRename,
+                ActivationOperation::RevisionParentSync,
+                ActivationOperation::MirrorEntryCreate,
+                ActivationOperation::MirrorEntryWrite,
+                ActivationOperation::MirrorEntrySync,
+                ActivationOperation::MirrorEntryRename,
+                ActivationOperation::MirrorEntryRemove,
+                ActivationOperation::MirrorDirectorySync,
+            ]
+            .into_iter()
+            .map(ActivationFaultStage::Operation),
+        );
+        for fault in stages {
+            let root = temp_path();
+            let storage = FsStorage::new(root.clone()).unwrap();
+            let old = activation_test_item(b"old-old!", 1);
+            storage
+                .activate_verified_item(
+                    old.clone(),
+                    Path::new("artifact.bin"),
+                    &activation_staged_data(b"old-old!", &old),
+                )
+                .unwrap();
+            let fired = Arc::new(AtomicBool::new(false));
+            let fired_by_hook = fired.clone();
+            storage.set_activation_fault_hook(move |stage| {
+                if stage == fault && !fired_by_hook.swap(true, std::sync::atomic::Ordering::AcqRel)
+                {
+                    return Err(std::io::Error::other("injected activation fault"));
+                }
+                Ok(())
+            });
+            let new = activation_test_item(b"new-new!", 2);
+            assert!(storage
+                .activate_verified_item(
+                    new.clone(),
+                    Path::new("artifact.bin"),
+                    &activation_staged_data(b"new-new!", &new),
+                )
+                .is_err());
+            assert!(fired.load(std::sync::atomic::Ordering::Acquire));
+            drop(storage);
+
+            let restarted = FsStorage::new(root.clone()).unwrap();
+            let selected = restarted
+                .open_active_revision(Path::new("artifact.bin"))
+                .unwrap()
+                .unwrap()
+                .item()
+                .clone();
+            let expected = if selected.metadata.revision == 1 {
+                b"old-old!".as_slice()
+            } else {
+                assert_eq!(selected.metadata.revision, 2);
+                b"new-new!".as_slice()
+            };
+            assert_eq!(fs::read(root.join("artifact.bin")).unwrap(), expected);
+            drop(restarted);
+            let restarted_twice = FsStorage::new(root).unwrap();
+            assert_eq!(
+                restarted_twice
+                    .open_active_revision(Path::new("artifact.bin"))
+                    .unwrap()
+                    .unwrap()
+                    .item()
+                    .metadata
+                    .revision,
+                selected.metadata.revision
+            );
+        }
+    }
+
+    #[test]
+    fn directory_operation_faults_cover_add_change_remove_reuse_and_restart_twice() {
+        let old_entries: &[(&str, &[u8])] = &[
+            ("change.bin", b"old!"),
+            ("nested/old.bin", b"nest"),
+            ("remove.bin", b"gone"),
+            ("reuse.bin", b"same"),
+        ];
+        let new_entries: &[(&str, &[u8])] = &[
+            ("add.bin", b"add!"),
+            ("change.bin", b"new!"),
+            ("nested/new.bin", b"next"),
+            ("reuse.bin", b"same"),
+        ];
+        let operations = [
+            ActivationOperation::MaterializeDirectoryCreate,
+            ActivationOperation::MaterializeFileCreate,
+            ActivationOperation::MaterializeFileWrite,
+            ActivationOperation::MaterializeFileSync,
+            ActivationOperation::MaterializeDirectorySync,
+            ActivationOperation::RevisionRename,
+            ActivationOperation::RevisionParentSync,
+            ActivationOperation::MirrorDirectoryCreate,
+            ActivationOperation::MirrorEntryCreate,
+            ActivationOperation::MirrorEntryWrite,
+            ActivationOperation::MirrorEntrySync,
+            ActivationOperation::MirrorEntryRename,
+            ActivationOperation::MirrorEntryRemove,
+            ActivationOperation::MirrorDirectorySync,
+        ];
+        for operation in operations {
+            let root = temp_path();
+            let storage = FsStorage::new(root.clone()).unwrap();
+            let (old, old_bytes) = activation_directory_fixture(old_entries, 1);
+            storage
+                .activate_verified_item(
+                    old.clone(),
+                    Path::new("artifact-dir"),
+                    &activation_staged_data(&old_bytes, &old),
+                )
+                .unwrap();
+            let fired = Arc::new(AtomicBool::new(false));
+            let hook_fired = fired.clone();
+            storage.set_activation_fault_hook(move |stage| {
+                if stage == ActivationFaultStage::Operation(operation)
+                    && !hook_fired.swap(true, std::sync::atomic::Ordering::AcqRel)
+                {
+                    return Err(std::io::Error::other("injected directory operation fault"));
+                }
+                Ok(())
+            });
+            let (new, new_bytes) = activation_directory_fixture(new_entries, 2);
+            assert!(storage
+                .activate_verified_item(
+                    new.clone(),
+                    Path::new("artifact-dir"),
+                    &activation_staged_data(&new_bytes, &new),
+                )
+                .is_err());
+            assert!(fired.load(std::sync::atomic::Ordering::Acquire));
+            drop(storage);
+
+            let restarted = FsStorage::new(root.clone()).unwrap();
+            let selected = restarted
+                .open_active_revision(Path::new("artifact-dir"))
+                .unwrap()
+                .unwrap()
+                .item()
+                .clone();
+            if selected.metadata.revision == 1 {
+                assert_directory_fixture(&root, old_entries);
+            } else {
+                assert_eq!(selected.metadata.revision, 2);
+                assert_directory_fixture(&root, new_entries);
+                assert!(!root.join("artifact-dir/remove.bin").exists());
+                assert!(!root.join("artifact-dir/nested/old.bin").exists());
+            }
+            drop(restarted);
+            let restarted_twice = FsStorage::new(root).unwrap();
+            assert_eq!(
+                restarted_twice
+                    .open_active_revision(Path::new("artifact-dir"))
+                    .unwrap()
+                    .unwrap()
+                    .item()
+                    .metadata
+                    .revision,
+                selected.metadata.revision
+            );
+        }
+    }
+
+    #[test]
+    fn opens_are_nonblocking_after_selector_and_old_handle_stays_pinned() {
+        let root = temp_path();
+        let storage = Arc::new(FsStorage::new(root).unwrap());
+        let old = activation_test_item(b"old-old!", 1);
+        let old_handle = storage
+            .activate_verified_item(
+                old,
+                Path::new("artifact.bin"),
+                &activation_staged_data(b"old-old!", &activation_test_item(b"old-old!", 1)),
+            )
+            .unwrap();
+        let stop_opening = Arc::new(AtomicBool::new(false));
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let opener_storage = storage.clone();
+        let opener_stop = stop_opening.clone();
+        let opener_observed = observed.clone();
+        let opener = std::thread::spawn(move || {
+            while !opener_stop.load(std::sync::atomic::Ordering::Acquire) {
+                let revision = opener_storage
+                    .open_active_revision(Path::new("artifact.bin"))
+                    .unwrap()
+                    .unwrap()
+                    .item()
+                    .metadata
+                    .revision;
+                opener_observed.lock().unwrap().push(revision);
+                std::thread::yield_now();
+            }
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !observed.lock().unwrap().contains(&1) {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let reached = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let hook_reached = reached.clone();
+        let hook_release = release.clone();
+        storage.set_activation_fault_hook(move |stage| {
+            if stage == ActivationFaultStage::AfterSelector {
+                let (lock, cv) = &*hook_reached;
+                *lock.lock().unwrap() = true;
+                cv.notify_all();
+                let (lock, cv) = &*hook_release;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = cv.wait(released).unwrap();
+                }
+            }
+            Ok(())
+        });
+        let activating = storage.clone();
+        let new = activation_test_item(b"new-new!", 2);
+        let thread = std::thread::spawn(move || {
+            activating.activate_verified_item(
+                new.clone(),
+                Path::new("artifact.bin"),
+                &activation_staged_data(b"new-new!", &new),
+            )
+        });
+        let (lock, cv) = &*reached;
+        let mut is_reached = lock.lock().unwrap();
+        while !*is_reached {
+            is_reached = cv.wait(is_reached).unwrap();
+        }
+        drop(is_reached);
+
+        let started = std::time::Instant::now();
+        let new_handle = storage
+            .open_active_revision(Path::new("artifact.bin"))
+            .unwrap()
+            .unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_millis(50));
+        assert_eq!(new_handle.item().metadata.revision, 2);
+        let mut old_bytes = Vec::new();
+        old_handle
+            .open_file()
+            .unwrap()
+            .read_to_end(&mut old_bytes)
+            .unwrap();
+        assert_eq!(old_bytes, b"old-old!");
+        let mut new_bytes = Vec::new();
+        new_handle
+            .open_file()
+            .unwrap()
+            .read_to_end(&mut new_bytes)
+            .unwrap();
+        assert_eq!(new_bytes, b"new-new!");
+
+        let (lock, cv) = &*release;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+        thread.join().unwrap().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !observed.lock().unwrap().contains(&2) {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        stop_opening.store(true, std::sync::atomic::Ordering::Release);
+        opener.join().unwrap();
+        let observed = observed.lock().unwrap();
+        assert!(observed.iter().all(|revision| matches!(revision, 1 | 2)));
+        assert!(observed.contains(&1));
+        assert!(observed.contains(&2));
+    }
+
+    #[test]
+    fn same_destination_reversed_v2_v3_writers_serialize_monotonically() {
+        let root = temp_path();
+        let storage = Arc::new(FsStorage::new(root.clone()).unwrap());
+        let first = activation_test_item(b"version1", 1);
+        storage
+            .activate_verified_item(
+                first,
+                Path::new("artifact.bin"),
+                &activation_staged_data(b"version1", &activation_test_item(b"version1", 1)),
+            )
+            .unwrap();
+        let reached = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let hook_reached = reached.clone();
+        let hook_release = release.clone();
+        storage.set_activation_fault_hook(move |stage| {
+            if stage == ActivationFaultStage::AfterIntent {
+                let (lock, cv) = &*hook_reached;
+                *lock.lock().unwrap() = true;
+                cv.notify_all();
+                let (lock, cv) = &*hook_release;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = cv.wait(released).unwrap();
+                }
+            }
+            Ok(())
+        });
+        let v2_storage = storage.clone();
+        let v2 = std::thread::spawn(move || {
+            let item = activation_test_item(b"version2", 2);
+            v2_storage.activate_verified_item(
+                item.clone(),
+                Path::new("artifact.bin"),
+                &activation_staged_data(b"version2", &item),
+            )
+        });
+        let (lock, cv) = &*reached;
+        let mut is_reached = lock.lock().unwrap();
+        while !*is_reached {
+            is_reached = cv.wait(is_reached).unwrap();
+        }
+        drop(is_reached);
+        let v3_storage = storage.clone();
+        let v3 = std::thread::spawn(move || {
+            let item = activation_test_item(b"version3", 3);
+            v3_storage.activate_verified_item(
+                item.clone(),
+                Path::new("artifact.bin"),
+                &activation_staged_data(b"version3", &item),
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let (lock, cv) = &*release;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+        v2.join().unwrap().unwrap();
+        v3.join().unwrap().unwrap();
+        assert_eq!(
+            storage
+                .open_active_revision(Path::new("artifact.bin"))
+                .unwrap()
+                .unwrap()
+                .item()
+                .metadata
+                .revision,
+            3
+        );
+        drop(storage);
+        assert_eq!(
+            FsStorage::new(root)
+                .unwrap()
+                .open_active_revision(Path::new("artifact.bin"))
+                .unwrap()
+                .unwrap()
+                .item()
+                .metadata
+                .revision,
+            3
+        );
+    }
+
+    #[test]
+    fn different_destinations_activate_concurrently_and_survive_restart() {
+        let root = temp_path();
+        let storage = Arc::new(FsStorage::new(root.clone()).unwrap());
+        let reached = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let first_hook = Arc::new(AtomicBool::new(true));
+        let hook_reached = reached.clone();
+        let hook_release = release.clone();
+        let hook_first = first_hook.clone();
+        storage.set_activation_fault_hook(move |stage| {
+            if stage == ActivationFaultStage::AfterIntent
+                && hook_first.swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                let (lock, cv) = &*hook_reached;
+                *lock.lock().unwrap() = true;
+                cv.notify_all();
+                let (lock, cv) = &*hook_release;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = cv.wait(released).unwrap();
+                }
+            }
+            Ok(())
+        });
+        let first_storage = storage.clone();
+        let first = std::thread::spawn(move || {
+            let mut item =
+                activation_test_item(b"firstone", 1).with_artifact_id("first-artifact".to_string());
+            item.metadata.path = PathBuf::from("first.bin");
+            first_storage.activate_verified_item(
+                item.clone(),
+                Path::new("first.bin"),
+                &activation_staged_data(b"firstone", &item),
+            )
+        });
+        let (lock, cv) = &*reached;
+        let mut is_reached = lock.lock().unwrap();
+        while !*is_reached {
+            is_reached = cv.wait(is_reached).unwrap();
+        }
+        drop(is_reached);
+
+        let second_storage = storage.clone();
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            let mut item = activation_test_item(b"second!!", 1)
+                .with_artifact_id("second-artifact".to_string());
+            item.metadata.path = PathBuf::from("second.bin");
+            let result = second_storage.activate_verified_item(
+                item.clone(),
+                Path::new("second.bin"),
+                &activation_staged_data(b"second!!", &item),
+            );
+            completed_tx.send(result.is_ok()).unwrap();
+            result
+        });
+        assert!(completed_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap());
+        let (lock, cv) = &*release;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+        first.join().unwrap().unwrap();
+        second.join().unwrap().unwrap();
+        drop(storage);
+
+        let restarted = FsStorage::new(root).unwrap();
+        assert_eq!(
+            restarted
+                .open_active_revision(Path::new("first.bin"))
+                .unwrap()
+                .unwrap()
+                .item()
+                .metadata
+                .artifact_id,
+            "first-artifact"
+        );
+        assert_eq!(
+            restarted
+                .open_active_revision(Path::new("second.bin"))
+                .unwrap()
+                .unwrap()
+                .item()
+                .metadata
+                .artifact_id,
+            "second-artifact"
+        );
+    }
+
+    #[test]
+    fn same_destination_v3_arriving_first_makes_waiting_v2_reject() {
+        let root = temp_path();
+        let storage = Arc::new(FsStorage::new(root.clone()).unwrap());
+        let first = activation_test_item(b"version1", 1);
+        storage
+            .activate_verified_item(
+                first,
+                Path::new("artifact.bin"),
+                &activation_staged_data(b"version1", &activation_test_item(b"version1", 1)),
+            )
+            .unwrap();
+        let reached = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let hook_reached = reached.clone();
+        let hook_release = release.clone();
+        storage.set_activation_fault_hook(move |stage| {
+            if stage == ActivationFaultStage::AfterIntent {
+                let (lock, cv) = &*hook_reached;
+                *lock.lock().unwrap() = true;
+                cv.notify_all();
+                let (lock, cv) = &*hook_release;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = cv.wait(released).unwrap();
+                }
+            }
+            Ok(())
+        });
+        let v3_storage = storage.clone();
+        let v3 = std::thread::spawn(move || {
+            let item = activation_test_item(b"version3", 3);
+            v3_storage.activate_verified_item(
+                item.clone(),
+                Path::new("artifact.bin"),
+                &activation_staged_data(b"version3", &item),
+            )
+        });
+        let (lock, cv) = &*reached;
+        let mut is_reached = lock.lock().unwrap();
+        while !*is_reached {
+            is_reached = cv.wait(is_reached).unwrap();
+        }
+        drop(is_reached);
+        let v2_storage = storage.clone();
+        let v2 = std::thread::spawn(move || {
+            let item = activation_test_item(b"version2", 2);
+            v2_storage.activate_verified_item(
+                item.clone(),
+                Path::new("artifact.bin"),
+                &activation_staged_data(b"version2", &item),
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let (lock, cv) = &*release;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+        v3.join().unwrap().unwrap();
+        assert!(v2.join().unwrap().is_err());
+        assert_eq!(
+            storage
+                .open_active_revision(Path::new("artifact.bin"))
+                .unwrap()
+                .unwrap()
+                .item()
+                .metadata
+                .revision,
+            3
+        );
+        drop(storage);
+        assert_eq!(
+            FsStorage::new(root)
+                .unwrap()
+                .open_active_revision(Path::new("artifact.bin"))
+                .unwrap()
+                .unwrap()
+                .item()
+                .metadata
+                .revision,
+            3
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_spawn_blocking_caller_does_not_cancel_activation_coordinator() {
+        for fault_stage in [
+            ActivationFaultStage::AfterIntent,
+            ActivationFaultStage::AfterSelector,
+        ] {
+            let root = temp_path();
+            let storage = Arc::new(FsStorage::new(root.clone()).unwrap());
+            let storage_lifetime = Arc::downgrade(&storage);
+            let first = activation_test_item(b"version1", 1);
+            storage
+                .activate_verified_item(
+                    first,
+                    Path::new("artifact.bin"),
+                    &activation_staged_data(b"version1", &activation_test_item(b"version1", 1)),
+                )
+                .unwrap();
+            let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+            let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+            let hook_release = release.clone();
+            let sent = Arc::new(AtomicBool::new(false));
+            let hook_sent = sent.clone();
+            storage.set_activation_fault_hook(move |stage| {
+                if stage == fault_stage
+                    && !hook_sent.swap(true, std::sync::atomic::Ordering::AcqRel)
+                {
+                    reached_tx.send(()).unwrap();
+                    let (lock, cv) = &*hook_release;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = cv.wait(released).unwrap();
+                    }
+                }
+                Ok(())
+            });
+            let owned_storage = storage.clone();
+            let caller = tokio::task::spawn_blocking(move || {
+                let item = activation_test_item(b"version2", 2);
+                owned_storage.activate_verified_item(
+                    item.clone(),
+                    Path::new("artifact.bin"),
+                    &activation_staged_data(b"version2", &item),
+                )
+            });
+            reached_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            caller.abort();
+            let (lock, cv) = &*release;
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                if storage
+                    .open_active_revision(Path::new("artifact.bin"))
+                    .ok()
+                    .flatten()
+                    .is_some_and(|active| active.item().metadata.revision == 2)
+                    && fs::read(root.join("artifact.bin")).is_ok_and(|bytes| bytes == b"version2")
+                {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            drop(storage);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while storage_lifetime.upgrade().is_some() {
+                assert!(std::time::Instant::now() < deadline);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                FsStorage::new(root)
+                    .unwrap()
+                    .open_active_revision(Path::new("artifact.bin"))
+                    .unwrap()
+                    .unwrap()
+                    .item()
+                    .metadata
+                    .revision,
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn type_transition_rename_and_cleanup_faults_recover_restart_twice() {
+        for (file_to_directory, operation) in [
+            (true, ActivationOperation::MirrorEntryRename),
+            (true, ActivationOperation::MirrorEntryRemove),
+            (false, ActivationOperation::MirrorEntryRename),
+            (false, ActivationOperation::MirrorEntryRemove),
+        ] {
+            let root = temp_path();
+            let storage = FsStorage::new(root.clone()).unwrap();
+            let (old, old_bytes, new, new_bytes) = if file_to_directory {
+                (
+                    transition_file_item(b"old!", 1),
+                    b"old!".to_vec(),
+                    transition_directory_item(b"aaaa", b"bbbb", 2),
+                    b"aaaabbbb".to_vec(),
+                )
+            } else {
+                (
+                    transition_directory_item(b"aaaa", b"bbbb", 1),
+                    b"aaaabbbb".to_vec(),
+                    transition_file_item(b"new!", 2),
+                    b"new!".to_vec(),
+                )
+            };
+            storage
+                .activate_verified_item(
+                    old.clone(),
+                    Path::new("target"),
+                    &activation_staged_data(&old_bytes, &old),
+                )
+                .unwrap();
+            let fired = Arc::new(AtomicBool::new(false));
+            let hook_fired = fired.clone();
+            storage.set_activation_fault_hook(move |stage| {
+                if stage == ActivationFaultStage::Operation(operation)
+                    && !hook_fired.swap(true, std::sync::atomic::Ordering::AcqRel)
+                {
+                    return Err(std::io::Error::other("injected type-transition fault"));
+                }
+                Ok(())
+            });
+            assert!(storage
+                .activate_verified_item(
+                    new.clone(),
+                    Path::new("target"),
+                    &activation_staged_data(&new_bytes, &new),
+                )
+                .is_err());
+            assert!(fired.load(std::sync::atomic::Ordering::Acquire));
+            drop(storage);
+
+            for _ in 0..2 {
+                let restarted = FsStorage::new(root.clone()).unwrap();
+                assert_eq!(
+                    restarted
+                        .open_active_revision(Path::new("target"))
+                        .unwrap()
+                        .unwrap()
+                        .item(),
+                    &new
+                );
+                if file_to_directory {
+                    assert_eq!(fs::read(root.join("target/a.bin")).unwrap(), b"aaaa");
+                    assert_eq!(fs::read(root.join("target/b.bin")).unwrap(), b"bbbb");
+                } else {
+                    assert_eq!(fs::read(root.join("target")).unwrap(), b"new!");
+                }
+                drop(restarted);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn incremental_file_activation_clones_prior_revision_and_writes_only_changed_chunks() {
+        let root = temp_path();
+        let storage = FsStorage::new(root.clone()).unwrap();
+        let old = activation_test_item(b"aaaabbbbcccc", 1);
+        storage
+            .activate_verified_item(
+                old.clone(),
+                Path::new("artifact.bin"),
+                &activation_staged_data(b"aaaabbbbcccc", &old),
+            )
+            .unwrap();
+
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = writes.clone();
+        storage.set_activation_fault_hook(move |stage| {
+            if stage == ActivationFaultStage::Operation(ActivationOperation::MaterializeFileWrite) {
+                observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            Ok(())
+        });
+        let new = activation_test_item(b"aaaaxxxxcccc", 2);
+        storage
+            .activate_verified_item(
+                new.clone(),
+                Path::new("artifact.bin"),
+                &activation_staged_data(b"aaaaxxxxcccc", &new),
+            )
+            .unwrap();
+
+        assert_eq!(writes.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(
+            fs::read(root.join("artifact.bin")).unwrap(),
+            b"aaaaxxxxcccc"
+        );
+    }
+
+    #[test]
+    fn retained_ready_allows_next_activation_and_restart_rebuilds_checkpoint_and_links() {
+        let root = temp_path();
+        {
+            let storage = FsStorage::new(root.clone()).unwrap();
+            storage
+                .create_item(
+                    "artifact".to_string(),
+                    PathBuf::from("artifact.bin"),
+                    1,
+                    Some("activation fixture".to_string()),
+                    bytes::Bytes::from_static(b"aaaabbbbcccc"),
+                    ChunkAlgorithm::fixed_aligned(4, 1),
+                )
+                .unwrap();
+        }
+
+        let storage = FsStorage::new(root.clone()).unwrap();
+        assert_eq!(
+            storage
+                .open_active_revision(Path::new("artifact.bin"))
+                .unwrap()
+                .unwrap()
+                .item()
+                .metadata
+                .revision,
+            1
+        );
+        let checkpoint_path = storage.inner.read().unwrap().persistance_path.clone();
+        let checkpoint_before = fs::read(&checkpoint_path).unwrap();
+        let second = activation_test_item(b"aaaaxxxxcccc", 2);
+        storage
+            .activate_verified_item(
+                second.clone(),
+                Path::new("artifact.bin"),
+                &activation_staged_data(b"aaaaxxxxcccc", &second),
+            )
+            .unwrap();
+        assert_eq!(fs::read(&checkpoint_path).unwrap(), checkpoint_before);
+
+        let transaction_directory = storage.activation_root().join("transactions");
+        let third = activation_test_item(b"yyyyxxxxcccc", 3);
+        storage
+            .activate_verified_item(
+                third.clone(),
+                Path::new("artifact.bin"),
+                &activation_staged_data(b"yyyyxxxxcccc", &third),
+            )
+            .unwrap();
+        assert_eq!(fs::read(&checkpoint_path).unwrap(), checkpoint_before);
+
+        // Model process loss: do not allow Drop to flush the derived checkpoint.
+        std::mem::forget(storage);
+        let restarted = FsStorage::new(root.clone()).unwrap();
+        let handle = restarted
+            .open_active_revision(Path::new("artifact.bin"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(handle.item(), &third);
+        assert_eq!(
+            restarted
+                .get(&third.metadata.root.hash)
+                .unwrap()
+                .clone_data()
+                .unwrap()
+                .as_slice(),
+            b"yyyyxxxxcccc"
+        );
+        assert!(restarted
+            .inner
+            .read()
+            .unwrap()
+            .links
+            .contains_key(&third.metadata.root.hash));
+        assert_ne!(fs::read(&checkpoint_path).unwrap(), checkpoint_before);
+        assert_eq!(
+            fs::read_dir(&transaction_directory)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .path()
+                    .extension()
+                    .is_some_and(|value| value == "state"))
+                .count(),
+            0
+        );
+        drop(restarted);
+
+        let restarted_twice = FsStorage::new(root).unwrap();
+        assert_eq!(
+            restarted_twice
+                .open_active_revision(Path::new("artifact.bin"))
+                .unwrap()
+                .unwrap()
+                .item(),
+            &third
+        );
+    }
+
+    #[test]
+    fn deferred_intent_cleanup_fault_poison_rejects_next_activation_until_restart() {
+        let root = temp_path();
+        let storage = FsStorage::new(root.clone()).unwrap();
+        storage.set_activation_error_hook(|stage| {
+            if stage
+                == ActivationFaultStage::Operation(ActivationOperation::RecoveryTransactionCleanup)
+            {
+                Err(std::io::Error::other("deferred cleanup fault"))
+            } else {
+                Ok(())
+            }
+        });
+        let first = activation_test_item(b"version1", 1);
+        storage
+            .activate_verified_item(
+                first.clone(),
+                Path::new("artifact.bin"),
+                &activation_staged_data(b"version1", &first),
+            )
+            .unwrap();
+        for _ in 0..100 {
+            if storage
+                .activation_poisoned
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(storage
+            .activation_poisoned
+            .load(std::sync::atomic::Ordering::Acquire));
+        storage.clear_activation_fault_hook();
+        let second = activation_test_item(b"version2", 2);
+        assert!(storage
+            .activate_verified_item(
+                second.clone(),
+                Path::new("artifact.bin"),
+                &activation_staged_data(b"version2", &second),
+            )
+            .is_err());
+        drop(storage);
+
+        let restarted = FsStorage::new(root.clone()).unwrap();
+        assert_eq!(
+            restarted
+                .open_active_revision(Path::new("artifact.bin"))
+                .unwrap()
+                .unwrap()
+                .item(),
+            &first
+        );
+        restarted
+            .activate_verified_item(
+                second.clone(),
+                Path::new("artifact.bin"),
+                &activation_staged_data(b"version2", &second),
+            )
+            .unwrap();
+        drop(restarted);
+        assert_eq!(
+            FsStorage::new(root)
+                .unwrap()
+                .open_active_revision(Path::new("artifact.bin"))
+                .unwrap()
+                .unwrap()
+                .item(),
+            &second
+        );
+    }
+
+    #[test]
+    fn valid_selector_does_not_suppress_unrelated_corrupt_checkpoint_backing() {
+        let root = temp_path();
+        {
+            let storage = FsStorage::new(root.clone()).unwrap();
+            storage
+                .create_item(
+                    "ordinary".to_string(),
+                    PathBuf::from("ordinary.bin"),
+                    1,
+                    None,
+                    bytes::Bytes::from_static(b"ordinary"),
+                    ChunkAlgorithm::fixed_aligned(4, 1),
+                )
+                .unwrap();
+            let active = activation_test_item(b"selected", 1);
+            storage
+                .activate_verified_item(
+                    active.clone(),
+                    Path::new("artifact.bin"),
+                    &activation_staged_data(b"selected", &active),
+                )
+                .unwrap();
+        }
+        fs::write(root.join("ordinary.bin"), b"corrupt!").unwrap();
+        assert!(FsStorage::new(root).is_err());
+    }
+
+    #[test]
+    fn many_successful_activations_drain_deferred_intents_on_owned_drop() {
+        let root = temp_path();
+        let storage = FsStorage::new(root.clone()).unwrap();
+        for revision in 1u32..=64 {
+            let bytes = revision.to_le_bytes();
+            let item = activation_test_item(&bytes, revision);
+            storage
+                .activate_verified_item(
+                    item,
+                    Path::new("artifact.bin"),
+                    &activation_staged_data(&bytes, &activation_test_item(&bytes, revision)),
+                )
+                .unwrap();
+        }
+        drop(storage);
+        let transactions = root.join(FS_ACTIVATION_NAMESPACE).join("transactions");
+        assert_eq!(fs::read_dir(transactions).unwrap().count(), 0);
+        assert_eq!(
+            FsStorage::new(root)
+                .unwrap()
+                .open_active_revision(Path::new("artifact.bin"))
+                .unwrap()
+                .unwrap()
+                .item()
+                .metadata
+                .revision,
+            64
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "local APFS activation performance reference; run explicitly in release mode"]
+    fn activation_reference_performance() {
+        use crate::chunk_storage::hashmap_storage::HashMapStorage;
+        use std::{os::unix::fs::MetadataExt, process::Command, time::Instant};
+
+        const ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
+        const ENTRY_BYTES: usize = 256 * 1024;
+        const CHUNK_COUNT: usize = ARTIFACT_BYTES / ENTRY_BYTES;
+
+        fn p95(samples: &[std::time::Duration]) -> std::time::Duration {
+            let mut sorted = samples.to_vec();
+            sorted.sort_unstable();
+            sorted[(sorted.len() * 95).div_ceil(100).saturating_sub(1)]
+        }
+
+        fn milliseconds(samples: &[std::time::Duration]) -> Vec<f64> {
+            samples
+                .iter()
+                .map(|sample| sample.as_secs_f64() * 1_000.0)
+                .collect()
+        }
+
+        fn worst_campaign_p95(campaigns: &[Vec<std::time::Duration>]) -> std::time::Duration {
+            campaigns.iter().map(|samples| p95(samples)).max().unwrap()
+        }
+
+        fn allocated_bytes(root: &Path) -> u64 {
+            fn visit(path: &Path, seen: &mut HashSet<(u64, u64)>) -> u64 {
+                let Ok(metadata) = fs::symlink_metadata(path) else {
+                    return 0;
+                };
+                if metadata.file_type().is_symlink() {
+                    return 0;
+                }
+                if metadata.is_file() {
+                    return seen
+                        .insert((metadata.dev(), metadata.ino()))
+                        .then_some(metadata.blocks().saturating_mul(512))
+                        .unwrap_or(0);
+                }
+                fs::read_dir(path)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Result::ok)
+                    .map(|entry| visit(&entry.path(), seen))
+                    .sum()
+            }
+            visit(root, &mut HashSet::default())
+        }
+
+        fn open_reference_storage(root: PathBuf) -> FsStorage {
+            FsStorage::with_cache_config(
+                root,
+                FsStorageCacheConfig {
+                    max_chunk_bytes: 1,
+                    max_tree_entries: 1,
+                },
+            )
+            .unwrap()
+        }
+
+        fn stage_one_chunk(bytes: &[u8], item: &Item, index: usize) -> HashMap<Hash, ChunkData> {
+            let chunk = item.chunks[index];
+            let offset = item.chunks[..index]
+                .iter()
+                .map(|chunk| chunk.size as usize)
+                .sum::<usize>();
+            let end = offset + chunk.size as usize;
+            let staged = HashMap::from_iter([(
+                chunk.hash,
+                ChunkData::Owned(Arc::new(bytes[offset..end].to_vec())),
+            )]);
+            assert_eq!(
+                staged
+                    .values()
+                    .map(|data| data.as_ref().len())
+                    .sum::<usize>(),
+                ENTRY_BYTES
+            );
+            assert!(FS_ACTIVATION_COPY_BUFFER_BYTES + ENTRY_BYTES <= 8 * 1024 * 1024);
+            staged
+        }
+
+        fn stable_file_item(bytes: &[u8], revision: u32) -> Item {
+            let source = HashMapStorage::default();
+            let mut item = source
+                .prepare_revision(
+                    "activation-reference".to_string(),
+                    "activation-reference".to_string(),
+                    PathBuf::from("artifact.bin"),
+                    revision,
+                    Some("deterministic 16MiB Fixed256K reference".to_string()),
+                    bytes::Bytes::copy_from_slice(bytes),
+                    ChunkAlgorithm::Fixed256K,
+                )
+                .unwrap();
+            item.metadata.created = std::time::SystemTime::UNIX_EPOCH;
+            item.metadata.updated = std::time::SystemTime::UNIX_EPOCH;
+            item
+        }
+
+        fn stable_directory_item(files: &[Vec<u8>], revision: u32) -> Item {
+            let source = HashMapStorage::default();
+            let mut item = source
+                .prepare_revision_from_files(
+                    "activation-directory-reference".to_string(),
+                    "activation-directory-reference".to_string(),
+                    PathBuf::from("artifact-dir"),
+                    revision,
+                    Some("deterministic 64-file Fixed256K reference".to_string()),
+                    files
+                        .iter()
+                        .enumerate()
+                        .map(|(index, bytes)| {
+                            (
+                                PathBuf::from(format!("file-{index:02}.bin")),
+                                bytes::Bytes::copy_from_slice(bytes),
+                            )
+                        })
+                        .collect(),
+                    ChunkAlgorithm::Fixed256K,
+                )
+                .unwrap();
+            item.metadata.created = std::time::SystemTime::UNIX_EPOCH;
+            item.metadata.updated = std::time::SystemTime::UNIX_EPOCH;
+            item
+        }
+
+        fn run_single_campaign(campaign: usize) -> (Vec<std::time::Duration>, Vec<u64>) {
+            let baseline_bytes = (0..CHUNK_COUNT)
+                .flat_map(|chunk| std::iter::repeat_n(chunk as u8, ENTRY_BYTES))
+                .collect::<Vec<_>>();
+            let mut samples = Vec::with_capacity(20);
+            let mut allocated = Vec::with_capacity(20);
+            for sample in 0..20 {
+                let root = temp_path();
+                let storage = open_reference_storage(root.clone());
+                let baseline = stable_file_item(&baseline_bytes, 1);
+                storage
+                    .activate_verified_item(
+                        baseline.clone(),
+                        Path::new("artifact.bin"),
+                        &activation_staged_data(&baseline_bytes, &baseline),
+                    )
+                    .unwrap();
+                let mut bytes = baseline_bytes.clone();
+                bytes[7 * ENTRY_BYTES..8 * ENTRY_BYTES].fill(if (campaign + sample) % 2 == 0 {
+                    0xa5
+                } else {
+                    0x5a
+                });
+                let item = stable_file_item(&bytes, 2);
+                let staged = stage_one_chunk(&bytes, &item, 7);
+                let before = allocated_bytes(&root);
+                let started = Instant::now();
+                storage
+                    .activate_verified_item(item.clone(), Path::new("artifact.bin"), &staged)
+                    .unwrap();
+                samples.push(started.elapsed());
+                allocated.push(allocated_bytes(&root).saturating_sub(before));
+                assert_eq!(fs::read(root.join("artifact.bin")).unwrap(), bytes);
+                let handle = storage
+                    .open_active_revision(Path::new("artifact.bin"))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(handle.item(), &item);
+                let mut active_bytes = Vec::new();
+                handle
+                    .open_file()
+                    .unwrap()
+                    .read_to_end(&mut active_bytes)
+                    .unwrap();
+                assert_eq!(active_bytes, bytes);
+                drop(handle);
+                drop(storage);
+                let restarted = open_reference_storage(root.clone());
+                assert_eq!(
+                    restarted
+                        .open_active_revision(Path::new("artifact.bin"))
+                        .unwrap()
+                        .unwrap()
+                        .item(),
+                    &item
+                );
+                drop(restarted);
+                assert_eq!(
+                    fs::read_dir(root.join(FS_ACTIVATION_NAMESPACE).join("transactions"))
+                        .unwrap()
+                        .count(),
+                    0
+                );
+                assert_eq!(
+                    fs::read_dir(root.join(FS_ACTIVATION_NAMESPACE).join("staging"))
+                        .unwrap()
+                        .count(),
+                    0
+                );
+            }
+            println!(
+                "single_campaign_{campaign}_ms={:?} allocated_delta_bytes={allocated:?}",
+                milliseconds(&samples)
+            );
+            (samples, allocated)
+        }
+
+        fn run_directory_campaign(campaign: usize) -> (Vec<std::time::Duration>, Vec<u64>) {
+            let baseline_files = (0..CHUNK_COUNT)
+                .map(|index| vec![index as u8; ENTRY_BYTES])
+                .collect::<Vec<_>>();
+            let mut samples = Vec::with_capacity(20);
+            let mut allocated = Vec::with_capacity(20);
+            for sample in 0..20 {
+                let root = temp_path();
+                let storage = open_reference_storage(root.clone());
+                let baseline = stable_directory_item(&baseline_files, 1);
+                let baseline_bytes = baseline_files.concat();
+                storage
+                    .activate_verified_item(
+                        baseline.clone(),
+                        Path::new("artifact-dir"),
+                        &activation_staged_data(&baseline_bytes, &baseline),
+                    )
+                    .unwrap();
+                let mut files = baseline_files.clone();
+                files[7].fill(if (campaign + sample) % 2 == 0 {
+                    0xa5
+                } else {
+                    0x5a
+                });
+                let item = stable_directory_item(&files, 2);
+                let bytes = files.concat();
+                let staged = stage_one_chunk(&bytes, &item, 7);
+                let before = allocated_bytes(&root);
+                let started = Instant::now();
+                storage
+                    .activate_verified_item(item.clone(), Path::new("artifact-dir"), &staged)
+                    .unwrap();
+                samples.push(started.elapsed());
+                allocated.push(allocated_bytes(&root).saturating_sub(before));
+                let handle = storage
+                    .open_active_revision(Path::new("artifact-dir"))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(handle.item(), &item);
+                for (index, expected) in files.iter().enumerate() {
+                    let relative = PathBuf::from(format!("file-{index:02}.bin"));
+                    assert_eq!(
+                        fs::read(root.join("artifact-dir").join(&relative)).unwrap(),
+                        *expected
+                    );
+                    let mut active_bytes = Vec::new();
+                    handle
+                        .open_entry(&relative)
+                        .unwrap()
+                        .read_to_end(&mut active_bytes)
+                        .unwrap();
+                    assert_eq!(active_bytes, *expected);
+                }
+                drop(handle);
+                drop(storage);
+                let restarted = open_reference_storage(root.clone());
+                assert_eq!(
+                    restarted
+                        .open_active_revision(Path::new("artifact-dir"))
+                        .unwrap()
+                        .unwrap()
+                        .item(),
+                    &item
+                );
+                drop(restarted);
+                assert_eq!(
+                    fs::read_dir(root.join(FS_ACTIVATION_NAMESPACE).join("transactions"))
+                        .unwrap()
+                        .count(),
+                    0
+                );
+                assert_eq!(
+                    fs::read_dir(root.join(FS_ACTIVATION_NAMESPACE).join("staging"))
+                        .unwrap()
+                        .count(),
+                    0
+                );
+            }
+            println!(
+                "directory_campaign_{campaign}_ms={:?} allocated_delta_bytes={allocated:?}",
+                milliseconds(&samples)
+            );
+            (samples, allocated)
+        }
+
+        assert!(
+            !cfg!(debug_assertions),
+            "activation performance reference must run with --release"
+        );
+        let git_revision = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let os = Command::new("sw_vers")
+            .output()
+            .ok()
+            .map(|output| String::from_utf8_lossy(&output.stdout).replace('\n', "; "))
+            .unwrap_or_else(|| "unknown".to_string());
+        println!(
+            "activation_reference_identity git={git_revision} source_blake3={} package={} arch={} os={os}",
+            blake3::hash(include_bytes!("fs_storage.rs")),
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::ARCH,
+        );
+
+        let single_campaigns = [run_single_campaign(1), run_single_campaign(2)];
+        let directory_campaigns = [run_directory_campaign(1), run_directory_campaign(2)];
+        let single_p95 = single_campaigns
+            .iter()
+            .map(|(samples, _)| p95(samples))
+            .max()
+            .unwrap();
+        let directory_p95 = directory_campaigns
+            .iter()
+            .map(|(samples, _)| p95(samples))
+            .max()
+            .unwrap();
+        let single_amplification_limit = (ARTIFACT_BYTES as u64 * 11).div_ceil(10) + 1024 * 1024;
+        let directory_amplification_limit = (ENTRY_BYTES as u64 * 11).div_ceil(10) + 1024 * 1024;
+        assert!(single_campaigns
+            .iter()
+            .flat_map(|(_, allocated)| allocated)
+            .all(|delta| *delta <= single_amplification_limit));
+        assert!(directory_campaigns
+            .iter()
+            .flat_map(|(_, allocated)| allocated)
+            .all(|delta| *delta <= directory_amplification_limit));
+
+        let mut selector_campaigns = Vec::with_capacity(3);
+        let mut direct_campaigns = Vec::with_capacity(3);
+        let mut indexed_campaigns = Vec::with_capacity(3);
+        let mut handle_campaigns = Vec::with_capacity(3);
+        let mut restart_campaigns = Vec::with_capacity(3);
+        for campaign in 1..=3 {
+            let component_root = temp_path();
+            let storage = open_reference_storage(component_root.clone());
+            let bytes = (0..CHUNK_COUNT)
+                .flat_map(|chunk| std::iter::repeat_n(chunk as u8, ENTRY_BYTES))
+                .collect::<Vec<_>>();
+            let item = stable_file_item(&bytes, 1);
+            storage
+                .activate_verified_item(
+                    item.clone(),
+                    Path::new("artifact.bin"),
+                    &activation_staged_data(&bytes, &item),
+                )
+                .unwrap();
+            let identity = storage
+                .activation_destination_identity(Path::new("artifact.bin"))
+                .unwrap();
+            let active = storage.active_refs.read().unwrap()[&identity].clone();
+            let active_path = storage.active_ref_path(&identity);
+
+            let mut selector_samples = Vec::with_capacity(20);
+            for _ in 0..20 {
+                let started = Instant::now();
+                storage
+                    .write_activation_record(
+                        &active_path,
+                        FS_ACTIVATION_ACTIVE_SCHEMA,
+                        ActivationRecordKind::Active,
+                        active.as_ref(),
+                    )
+                    .unwrap();
+                selector_samples.push(started.elapsed());
+            }
+            let handle = storage
+                .open_active_revision(Path::new("artifact.bin"))
+                .unwrap()
+                .unwrap();
+            let mut direct_samples = Vec::with_capacity(100);
+            let mut indexed_samples = Vec::with_capacity(100);
+            for _ in 0..100 {
+                let started = Instant::now();
+                let mut file = handle.open_file().unwrap();
+                let mut read = Vec::with_capacity(ARTIFACT_BYTES);
+                file.read_to_end(&mut read).unwrap();
+                assert_eq!(read, bytes);
+                direct_samples.push(started.elapsed());
+
+                let started = Instant::now();
+                for index in 0..CHUNK_COUNT {
+                    assert_eq!(
+                        storage
+                            .get_chunk_by_index(&item.metadata.root.hash, index as u32)
+                            .unwrap(),
+                        bytes[index * ENTRY_BYTES..(index + 1) * ENTRY_BYTES]
+                    );
+                }
+                indexed_samples.push(started.elapsed());
+            }
+            let mut handle_samples = Vec::with_capacity(1_000);
+            for _ in 0..1_000 {
+                let started = Instant::now();
+                assert!(storage
+                    .open_active_revision(Path::new("artifact.bin"))
+                    .unwrap()
+                    .is_some());
+                handle_samples.push(started.elapsed());
+            }
+            assert!(storage.handles.read().unwrap().len() * CHUNK_SIZE * 8 <= 8 * 1024 * 1024);
+            assert!(
+                storage.immutable_readers.lock().unwrap().entries.len()
+                    <= DEFAULT_IMMUTABLE_READER_ENTRIES
+            );
+            drop(handle);
+            drop(storage);
+
+            let mut restart_samples = Vec::with_capacity(5);
+            for _ in 0..5 {
+                let started = Instant::now();
+                let restarted = open_reference_storage(component_root.clone());
+                restart_samples.push(started.elapsed());
+                assert!(restarted
+                    .open_active_revision(Path::new("artifact.bin"))
+                    .unwrap()
+                    .is_some());
+                drop(restarted);
+            }
+            println!(
+                "component_campaign_{campaign}_selector_ms={:?} direct_ms={:?} indexed64_ms={:?} handle_open_ms={:?} restart_ms={:?}",
+                milliseconds(&selector_samples),
+                milliseconds(&direct_samples),
+                milliseconds(&indexed_samples),
+                milliseconds(&handle_samples),
+                milliseconds(&restart_samples),
+            );
+            selector_campaigns.push(selector_samples);
+            direct_campaigns.push(direct_samples);
+            indexed_campaigns.push(indexed_samples);
+            handle_campaigns.push(handle_samples);
+            restart_campaigns.push(restart_samples);
+        }
+        let selector_p95 = worst_campaign_p95(&selector_campaigns);
+        let direct_p95 = worst_campaign_p95(&direct_campaigns);
+        let indexed_p95 = worst_campaign_p95(&indexed_campaigns);
+        let handle_p95 = worst_campaign_p95(&handle_campaigns);
+        let restart_p95 = worst_campaign_p95(&restart_campaigns);
+        println!(
+            "activation_reference_p95_ms single={:.3} directory={:.3} selector={:.3} direct={:.3} indexed64={:.3} handle={:.6} restart={:.3} single_amplification_limit_bytes={single_amplification_limit} directory_amplification_limit_bytes={directory_amplification_limit}",
+            single_p95.as_secs_f64() * 1_000.0,
+            directory_p95.as_secs_f64() * 1_000.0,
+            selector_p95.as_secs_f64() * 1_000.0,
+            direct_p95.as_secs_f64() * 1_000.0,
+            indexed_p95.as_secs_f64() * 1_000.0,
+            handle_p95.as_secs_f64() * 1_000.0,
+            restart_p95.as_secs_f64() * 1_000.0,
+        );
+
+        assert!(single_p95.as_millis() < 100);
+        assert!(directory_p95.as_millis() < 200);
+        assert!(selector_p95.as_millis() < 30);
+        assert!(handle_p95.as_millis() < 1);
+        assert!(direct_p95.as_millis() < 10);
+        assert!(indexed_p95.as_millis() < 50);
+        assert!(restart_p95.as_millis() < 120);
     }
 
     #[cfg(feature = "nightly-bench")]

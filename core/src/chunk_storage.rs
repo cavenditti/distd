@@ -133,18 +133,23 @@ pub fn validate_revision_metadata(item: &Item) -> Result<ChunkInfo, Error> {
         }
         if canonical.components().next().is_some_and(|component| {
             component.as_os_str() == std::ffi::OsStr::new(".distd-revisions-v1")
+                || component.as_os_str() == std::ffi::OsStr::new(".distd-activation-v1")
         }) {
             return Err(invalid_committed_revision(
                 "directory entry path uses the reserved storage namespace",
             ));
         }
-        if previous_path
-            .as_ref()
-            .is_some_and(|previous| previous >= &canonical)
-        {
-            return Err(invalid_committed_revision(
-                "directory entry paths are not strictly ordered and unique",
-            ));
+        if let Some(previous) = previous_path.as_ref() {
+            if previous >= &canonical {
+                return Err(invalid_committed_revision(
+                    "directory entry paths are not strictly ordered and unique",
+                ));
+            }
+            if canonical.starts_with(previous) {
+                return Err(invalid_committed_revision(
+                    "directory entry path conflicts with an ancestor file",
+                ));
+            }
         }
         previous_path = Some(canonical);
 
@@ -190,11 +195,10 @@ fn validate_revision_authority(artifact_id: &str, path: &PathBuf) -> Result<Path
             "revision logical paths must be valid UTF-8".to_string(),
         ));
     }
-    if path
-        .components()
-        .next()
-        .is_some_and(|component| component.as_os_str() == ".distd-revisions-v1")
-    {
+    if path.components().next().is_some_and(|component| {
+        component.as_os_str() == ".distd-revisions-v1"
+            || component.as_os_str() == ".distd-activation-v1"
+    }) {
         return Err(Error::Other(
             "revision logical path uses the reserved storage namespace".to_string(),
         ));
@@ -577,6 +581,7 @@ pub trait ChunkStorage: HashTreeCapable<Arc<Node>, Error> {
                 }
                 if relative_path.components().next().is_some_and(|component| {
                     component.as_os_str() == std::ffi::OsStr::new(".distd-revisions-v1")
+                        || component.as_os_str() == std::ffi::OsStr::new(".distd-activation-v1")
                 }) {
                     return Err(Error::Other(
                         "directory revision path uses the reserved storage namespace".to_string(),
@@ -933,6 +938,36 @@ mod tests {
         }
         .verify_committed_revision(&forged_root)
         .is_err());
+    }
+
+    #[test]
+    fn revision_metadata_rejects_file_ancestor_path_conflicts() {
+        let storage = HashMapStorage::default();
+        let mut item = storage
+            .prepare_revision(
+                "artifact".to_string(),
+                "artifact".to_string(),
+                PathBuf::from("artifact"),
+                1,
+                None,
+                Bytes::from_static(b"abcdefgh"),
+                ChunkAlgorithm::fixed_aligned(4, 1),
+            )
+            .unwrap();
+        item.manifest.entries = vec![
+            FileEntry {
+                relative_path: "a".to_string(),
+                size: 4,
+                chunk_range: (0, 1),
+            },
+            FileEntry {
+                relative_path: "a/b".to_string(),
+                size: 4,
+                chunk_range: (1, 2),
+            },
+        ];
+
+        assert!(validate_revision_metadata(&item).is_err());
     }
 
     pub fn single_chunk_insertion<S>(s: &S)

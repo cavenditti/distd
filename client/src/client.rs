@@ -33,7 +33,7 @@ where
 {
     name: String,
     pub server: Server,
-    pub storage: T,
+    pub storage: Arc<T>,
     pub settings: Arc<Settings>,
     pub state: Arc<ClientState>,
 }
@@ -109,7 +109,7 @@ where
         Ok(Self {
             name: String::from(&settings.client.name),
             server,
-            storage,
+            storage: Arc::new(storage),
             settings: Arc::new(settings),
             state: Arc::new(state),
         })
@@ -223,31 +223,35 @@ impl Client<FsStorage> {
         let network_elapsed = t0.elapsed();
 
         let received_chunk_count = received_chunks.len();
+        let manifest_chunk_count = chunk_infos.len();
         let payload_bytes = received_chunks
             .iter()
             .map(|chunk| chunk.len() as u64)
             .sum::<u64>();
 
         let t1 = Instant::now();
-        let item = self
-            .storage
-            .receive_sync_item_shared(
+        let storage = Arc::clone(&self.storage);
+        let local_basis_count = from.len();
+        let from = from.to_vec();
+        let item = tokio::task::spawn_blocking(move || {
+            storage.receive_sync_item_shared(
                 target.name,
                 destination,
                 target.revision,
                 target.description,
                 &manifest,
                 &chunk_infos,
-                from,
+                &from,
                 received_chunks,
             )
-            .map_err(ClientError::Core)?;
+        })
+        .await??;
         let store_elapsed = t1.elapsed();
 
         tracing::info!(
             "distd_sync_local_basis_chunks={} distd_sync_manifest_chunks={} distd_sync_wire_bytes={wire_bytes} distd_sync_payload_bytes={payload_bytes} distd_sync_received_chunks={} distd_network_ms={} distd_store_ms={}",
-            from.len(),
-            chunk_infos.len(),
+            local_basis_count,
+            manifest_chunk_count,
             received_chunk_count,
             network_elapsed.as_millis(),
             store_elapsed.as_millis(),
