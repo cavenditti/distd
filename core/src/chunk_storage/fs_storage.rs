@@ -32,6 +32,8 @@ const DEFAULT_TREE_CACHE_ENTRIES: usize = 65_536;
 const FS_STORAGE_PAYLOAD_SCHEMA: u16 = 1;
 const FS_STORAGE_ROOT_DOMAIN: &[u8] = b"distd fs storage root identity v1\0";
 const FS_STORAGE_REVISION_NAMESPACE: &str = ".distd-revisions-v1";
+const FS_STORAGE_REVISION_MARKER_DOMAIN: &[u8] = b"distd fs server revision marker v1\0";
+const FS_STORAGE_REVISION_MARKER_EXTENSION: &str = "item";
 const FS_STORAGE_MAX_LINK_RECORDS: usize = 65_536;
 const FS_STORAGE_MAX_LINK_DEPTH: usize = 256;
 
@@ -1645,6 +1647,226 @@ impl FsStorage {
         )
     }
 
+    fn ensure_revision_namespace(&self, leaf: &str) -> Result<PathBuf, Error> {
+        if leaf != "chunks" && leaf != "items" {
+            return Err(invalid_state("unknown reserved revision namespace"));
+        }
+        let root = self.inner.read().unwrap().root.clone();
+        let root_metadata = fs::symlink_metadata(&root)?;
+        if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
+            return Err(invalid_state(format!(
+                "storage root {} is not a regular directory",
+                root.display()
+            )));
+        }
+        let mut parent = root;
+        for component in [FS_STORAGE_REVISION_NAMESPACE, leaf] {
+            let path = parent.join(component);
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+                Ok(_) => {
+                    return Err(invalid_state(format!(
+                        "reserved namespace {} is not a regular directory",
+                        path.display()
+                    )))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    match fs::create_dir(&path) {
+                        Ok(()) => {
+                            #[cfg(unix)]
+                            File::open(&parent)?.sync_all()?;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                    let metadata = fs::symlink_metadata(&path)?;
+                    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                        return Err(invalid_state(format!(
+                            "created reserved namespace {} is not a regular directory",
+                            path.display()
+                        )));
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+            parent = path;
+        }
+        Ok(parent)
+    }
+
+    fn has_cas_backing(inner: &FsStorageState, item: &Item) -> bool {
+        !item.chunks.is_empty()
+            && item.chunks.iter().all(|chunk| {
+                let expected_path = inner
+                    .root
+                    .join(FS_STORAGE_REVISION_NAMESPACE)
+                    .join("chunks")
+                    .join(format!("{}.chunk", chunk.hash));
+                inner.data.get(&chunk.hash).is_some_and(|backings| {
+                    backings.iter().any(|backing| {
+                        backing.info == *chunk
+                            && backing.path == expected_path
+                            && backing.offset == 0
+                            && backing.populated.load(std::sync::atomic::Ordering::Relaxed)
+                    })
+                })
+            })
+    }
+
+    fn revision_marker(&self, item: &Item) -> Result<(PathBuf, Vec<u8>), Error> {
+        let payload = bitcode::serialize(item).map_err(InvalidParameter::from)?;
+        if payload.len() as u64 > MAX_DURABLE_STATE_PAYLOAD {
+            return Err(invalid_state("server revision marker exceeds size limit"));
+        }
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(FS_STORAGE_REVISION_MARKER_DOMAIN);
+        hasher.update(&payload);
+        let identity = hasher.finalize();
+        let path = self.path(
+            &Path::new(FS_STORAGE_REVISION_NAMESPACE)
+                .join("items")
+                .join(format!("{identity}.{FS_STORAGE_REVISION_MARKER_EXTENSION}")),
+        )?;
+        Ok((path, payload))
+    }
+
+    fn verify_revision_marker(path: &Path, expected: &[u8]) -> Result<(), Error> {
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(invalid_state(format!(
+                "server revision marker {} is not a regular file",
+                path.display()
+            )));
+        }
+        let actual = read_bounded_file(path, MAX_DURABLE_STATE_PAYLOAD)?;
+        if actual != expected {
+            return Err(invalid_state(format!(
+                "server revision marker {} conflicts with its Item identity",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    fn commit_revision_marker(&self, item: &Item) -> Result<PathBuf, Error> {
+        let (path, payload) = self.revision_marker(item)?;
+        let parent = self.ensure_revision_namespace("items")?;
+        if path.parent() != Some(parent.as_path()) {
+            return Err(invalid_state("revision marker escaped its namespace"));
+        }
+        match fs::symlink_metadata(&path) {
+            Ok(_) => Self::verify_revision_marker(&path, &payload)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let staging = parent.join(format!(
+                    ".{}.{}.tmp",
+                    path.file_stem()
+                        .and_then(std::ffi::OsStr::to_str)
+                        .ok_or_else(|| invalid_state("revision marker name is not UTF-8"))?,
+                    uuid::Uuid::new_v4()
+                ));
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&staging)?;
+                if let Err(error) = file.write_all(&payload).and_then(|()| file.sync_all()) {
+                    drop(file);
+                    let _ = remove_file(&staging);
+                    return Err(error.into());
+                }
+                drop(file);
+                match fs::hard_link(&staging, &path) {
+                    Ok(()) => remove_file(&staging)?,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        remove_file(&staging)?;
+                        Self::verify_revision_marker(&path, &payload)?;
+                    }
+                    Err(error) => {
+                        let _ = remove_file(&staging);
+                        return Err(error.into());
+                    }
+                }
+                #[cfg(unix)]
+                File::open(parent)?.sync_all()?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        Ok(path)
+    }
+
+    fn remove_revision_marker(path: &Path) -> Result<(), Error> {
+        match remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+        #[cfg(unix)]
+        File::open(path.parent().ok_or(Error::MissingData)?)?.sync_all()?;
+        Ok(())
+    }
+
+    fn read_revision_markers(&self) -> Result<Vec<(PathBuf, Item)>, Error> {
+        let directory = self.path(&Path::new(FS_STORAGE_REVISION_NAMESPACE).join("items"))?;
+        match fs::symlink_metadata(&directory) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(invalid_state(format!(
+                    "server revision marker namespace {} is not a directory",
+                    directory.display()
+                )))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        }
+        let mut markers = Vec::new();
+        for entry in fs::read_dir(&directory)? {
+            let entry = entry?;
+            let file_name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| invalid_state("server revision marker name is not UTF-8"))?;
+            if file_name.starts_with('.') && file_name.ends_with(".tmp") {
+                continue;
+            }
+            if Path::new(&file_name)
+                .extension()
+                .and_then(std::ffi::OsStr::to_str)
+                != Some(FS_STORAGE_REVISION_MARKER_EXTENSION)
+            {
+                return Err(invalid_state(format!(
+                    "unexpected server revision marker entry {file_name}"
+                )));
+            }
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(invalid_state(format!(
+                    "server revision marker {} is not a regular file",
+                    path.display()
+                )));
+            }
+            let payload = read_bounded_file(&path, MAX_DURABLE_STATE_PAYLOAD)?;
+            let item: Item = bitcode::deserialize(&payload).map_err(InvalidParameter::from)?;
+            super::validate_revision_metadata(&item)?;
+            let (expected_path, expected_payload) = self.revision_marker(&item)?;
+            if path != expected_path || payload != expected_payload {
+                return Err(invalid_state(format!(
+                    "server revision marker {} has the wrong content-addressed identity",
+                    path.display()
+                )));
+            }
+            Self::verify_revision_marker(&path, &payload)?;
+            markers.push((path, item));
+        }
+        Ok(markers)
+    }
+
+    fn restore_items_after_failed_cleanup(&self, items: Vec<Item>) {
+        let mut inner = self.inner.write().unwrap();
+        for item in items {
+            inner.insert_item(item);
+        }
+    }
+
     fn verify_cas_chunk(path: &Path, expected: &ChunkInfo) -> Result<(), Error> {
         let metadata = fs::symlink_metadata(path)?;
         if !metadata.is_file() || metadata.file_type().is_symlink() {
@@ -1672,8 +1894,10 @@ impl FsStorage {
             ));
         }
         let path = self.revision_chunk_path(&expected.hash)?;
-        let parent = path.parent().ok_or(Error::MissingData)?;
-        create_dir_all(parent)?;
+        let parent = self.ensure_revision_namespace("chunks")?;
+        if path.parent() != Some(parent.as_path()) {
+            return Err(invalid_state("immutable chunk escaped its namespace"));
+        }
         match fs::symlink_metadata(&path) {
             Ok(_) => Self::verify_cas_chunk(&path, &expected)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1742,8 +1966,45 @@ impl FsStorage {
                 "prepared revision root does not match its chunk sequence",
             ));
         }
+        let (marker_path, marker_payload) = self.revision_marker(&item)?;
+        let marker_exists = match fs::symlink_metadata(&marker_path) {
+            Ok(_) => {
+                Self::verify_revision_marker(&marker_path, &marker_payload)?;
+                true
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        let item_exists = self.inner.read().unwrap().items.contains(&item);
+        if item_exists && !marker_exists {
+            return Err(invalid_state(
+                "exact existing Item lacks immutable server-revision provenance",
+            ));
+        }
+        let marker_created = !marker_exists;
+        if marker_created {
+            self.commit_revision_marker(&item)?;
+        }
         self.inner.write().unwrap().insert_item(item.clone());
-        self.persist()?;
+        if let Err(error) = self.persist() {
+            if !item_exists {
+                self.inner.write().unwrap().remove_item(&item);
+            }
+            let commit_indeterminate = matches!(
+                &error,
+                Error::DurableState(
+                    crate::durable_state::DurableStateError::CommitIndeterminate { .. }
+                )
+            );
+            if marker_created && !commit_indeterminate {
+                if let Err(cleanup) = Self::remove_revision_marker(&marker_path) {
+                    return Err(invalid_state(format!(
+                        "revision state persist failed ({error}); marker cleanup also failed ({cleanup})"
+                    )));
+                }
+            }
+            return Err(error);
+        }
         Ok(item)
     }
 
@@ -2494,8 +2755,7 @@ impl FsStorage {
         Ok(item)
     }
 
-    fn persist(&self) -> Result<(), Error> {
-        let _single_writer = self.persistence_lock.lock().unwrap();
+    fn persist_locked(&self) -> Result<(), Error> {
         self.flush_handles()?;
         let (canonical, generation, persistence_path) = {
             let inner = self.inner.read().unwrap();
@@ -2520,6 +2780,11 @@ impl FsStorage {
             inner.dirty = false;
         }
         Ok(())
+    }
+
+    fn persist(&self) -> Result<(), Error> {
+        let _single_writer = self.persistence_lock.lock().unwrap();
+        self.persist_locked()
     }
 
     /// Create a new `FsStorage` with a root path.
@@ -2783,6 +3048,65 @@ impl ChunkStorage for FsStorage {
         let node = self.get(root)?;
         let leaves = node.flatten_iter().ok()?;
         leaves.get(index as usize).map(|arc| (**arc).clone())
+    }
+
+    fn discard_unpublished_revision(&self, item: &Item) -> Result<(), Error> {
+        let _single_writer = self.persistence_lock.lock().unwrap();
+        let (marker_path, marker_payload) = self.revision_marker(item)?;
+        match fs::symlink_metadata(&marker_path) {
+            Ok(_) => Self::verify_revision_marker(&marker_path, &marker_payload)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+
+        let removed = self.inner.write().unwrap().remove_item(item);
+        if removed {
+            if let Err(error) = self.persist_locked() {
+                self.restore_items_after_failed_cleanup(vec![item.clone()]);
+                return Err(error);
+            }
+        }
+        Self::remove_revision_marker(&marker_path)?;
+        Ok(())
+    }
+
+    fn reconcile_published_revisions(&self, published: &[Item]) -> Result<(), Error> {
+        let _single_writer = self.persistence_lock.lock().unwrap();
+        let published = published.iter().cloned().collect::<HashSet<_>>();
+        let stored_published = {
+            let inner = self.inner.read().unwrap();
+            inner
+                .items
+                .iter()
+                .filter(|item| published.contains(*item) && Self::has_cas_backing(&inner, item))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for item in stored_published {
+            self.commit_revision_marker(&item)?;
+        }
+
+        let markers = self.read_revision_markers()?;
+        let mut removed = Vec::new();
+        let mut orphan_markers = Vec::new();
+        for (path, item) in markers {
+            if !published.contains(&item) {
+                orphan_markers.push(path);
+                if self.inner.write().unwrap().remove_item(&item) {
+                    removed.push(item);
+                }
+            }
+        }
+        if !removed.is_empty() {
+            if let Err(error) = self.persist_locked() {
+                self.restore_items_after_failed_cleanup(removed);
+                return Err(error);
+            }
+        }
+        for marker in orphan_markers {
+            Self::remove_revision_marker(&marker)?;
+        }
+        Ok(())
     }
 
     fn store_chunk(&self, hash: Hash, chunk: &[u8]) -> Result<Arc<Node>, StorageError> {
@@ -3290,6 +3614,344 @@ mod tests {
             populated: Arc::default(),
         };
         (data, hash, infile_chunk)
+    }
+
+    #[test]
+    fn discard_unpublished_revision_is_durable_retry_safe_and_keeps_cas_bytes() {
+        let root = temp_path();
+        let storage = FsStorage::new(root.clone()).unwrap();
+        let bytes = bytes::Bytes::from_static(b"unpublished immutable revision");
+        let item = storage
+            .prepare_revision(
+                "unpublished".to_string(),
+                "unpublished".to_string(),
+                PathBuf::from("logical/unpublished.bin"),
+                1,
+                None,
+                bytes.clone(),
+                ChunkAlgorithm::default(),
+            )
+            .unwrap();
+        let item = storage.commit_revision(item, bytes).unwrap();
+        storage.verify_committed_revision(&item).unwrap();
+        let cas_path = storage.revision_chunk_path(&item.chunks[0].hash).unwrap();
+        let (marker_path, _) = storage.revision_marker(&item).unwrap();
+        assert!(cas_path.is_file());
+        assert!(marker_path.is_file());
+
+        storage.discard_unpublished_revision(&item).unwrap();
+        storage.discard_unpublished_revision(&item).unwrap();
+        assert!(!storage.inner.read().unwrap().items.contains(&item));
+        assert!(!marker_path.exists());
+        assert!(
+            cas_path.is_file(),
+            "cleanup must retain immutable CAS bytes"
+        );
+        drop(storage);
+
+        let restarted = FsStorage::new(root).unwrap();
+        assert!(!restarted.inner.read().unwrap().items.contains(&item));
+        assert!(cas_path.is_file());
+    }
+
+    #[test]
+    fn discard_unpublished_revision_reports_persistence_failure_and_restores_memory() {
+        let root = temp_path();
+        let storage = FsStorage::new(root.clone()).unwrap();
+        let bytes = bytes::Bytes::from_static(b"cleanup must fail explicitly");
+        let item = storage
+            .prepare_revision(
+                "unpublished".to_string(),
+                "unpublished".to_string(),
+                PathBuf::from("logical/unpublished.bin"),
+                1,
+                None,
+                bytes.clone(),
+                ChunkAlgorithm::default(),
+            )
+            .and_then(|item| storage.commit_revision(item, bytes))
+            .unwrap();
+        let original_state_path = {
+            let mut inner = storage.inner.write().unwrap();
+            let original = inner.persistance_path.clone();
+            inner.persistance_path = root.clone();
+            original
+        };
+
+        assert!(storage.discard_unpublished_revision(&item).is_err());
+        assert!(storage.inner.read().unwrap().items.contains(&item));
+
+        storage.inner.write().unwrap().persistance_path = original_state_path;
+        storage.persist().unwrap();
+    }
+
+    #[test]
+    fn marker_before_state_failure_is_clean_on_restart_and_retry() {
+        let root = temp_path();
+        let storage = FsStorage::new(root.clone()).unwrap();
+        let bytes = bytes::Bytes::from_static(b"state persist must fail");
+        let item = storage
+            .prepare_revision(
+                "failed".to_string(),
+                "failed".to_string(),
+                PathBuf::from("same/path.bin"),
+                1,
+                None,
+                bytes.clone(),
+                ChunkAlgorithm::default(),
+            )
+            .unwrap();
+        let (marker_path, _) = storage.revision_marker(&item).unwrap();
+        let original_state_path = {
+            let mut inner = storage.inner.write().unwrap();
+            let original = inner.persistance_path.clone();
+            inner.persistance_path = root.clone();
+            original
+        };
+
+        assert!(storage.commit_revision(item.clone(), bytes).is_err());
+        assert!(!marker_path.exists());
+        assert!(!storage.inner.read().unwrap().items.contains(&item));
+
+        storage.inner.write().unwrap().persistance_path = original_state_path;
+        storage.persist().unwrap();
+        drop(storage);
+
+        let restarted = FsStorage::new(root).unwrap();
+        restarted.reconcile_published_revisions(&[]).unwrap();
+        assert!(!restarted.inner.read().unwrap().items.contains(&item));
+        let retry_bytes = bytes::Bytes::from_static(b"different bytes after restart");
+        let retry = restarted
+            .prepare_revision(
+                "failed".to_string(),
+                "failed".to_string(),
+                PathBuf::from("same/path.bin"),
+                1,
+                None,
+                retry_bytes.clone(),
+                ChunkAlgorithm::default(),
+            )
+            .and_then(|item| restarted.commit_revision(item, retry_bytes))
+            .unwrap();
+        restarted.verify_committed_revision(&retry).unwrap();
+    }
+
+    #[test]
+    fn first_revision_publication_creates_verified_reserved_namespace() {
+        let root = temp_path();
+        let storage = FsStorage::new(root.clone()).unwrap();
+        let namespace = root.join(FS_STORAGE_REVISION_NAMESPACE);
+        assert!(!namespace.exists());
+        let bytes = bytes::Bytes::from_static(b"first publication");
+        let item = storage
+            .prepare_revision(
+                "first".to_string(),
+                "first".to_string(),
+                PathBuf::from("first.bin"),
+                1,
+                None,
+                bytes.clone(),
+                ChunkAlgorithm::default(),
+            )
+            .and_then(|item| storage.commit_revision(item, bytes))
+            .unwrap();
+
+        for path in [
+            namespace.clone(),
+            namespace.join("chunks"),
+            namespace.join("items"),
+        ] {
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            assert!(metadata.is_dir());
+            assert!(!metadata.file_type().is_symlink());
+        }
+        assert!(storage
+            .revision_chunk_path(&item.chunks[0].hash)
+            .unwrap()
+            .is_file());
+        assert!(storage.revision_marker(&item).unwrap().0.is_file());
+        drop(storage);
+
+        let restarted = FsStorage::new(root).unwrap();
+        restarted.verify_committed_revision(&item).unwrap();
+    }
+
+    #[test]
+    fn reserved_namespace_conflicts_fail_before_first_publication() {
+        let root = temp_path();
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(FS_STORAGE_REVISION_NAMESPACE), b"conflict").unwrap();
+        let storage = FsStorage::new(root.clone()).unwrap();
+        let bytes = bytes::Bytes::from_static(b"must not publish");
+        let item = storage
+            .prepare_revision(
+                "first".to_string(),
+                "first".to_string(),
+                PathBuf::from("first.bin"),
+                1,
+                None,
+                bytes.clone(),
+                ChunkAlgorithm::default(),
+            )
+            .unwrap();
+
+        assert!(storage.commit_revision(item.clone(), bytes).is_err());
+        assert!(!storage.inner.read().unwrap().items.contains(&item));
+        assert_eq!(
+            fs::read(root.join(FS_STORAGE_REVISION_NAMESPACE)).unwrap(),
+            b"conflict"
+        );
+    }
+
+    #[test]
+    fn concurrent_first_publications_share_durable_namespace_creation() {
+        let root = temp_path();
+        let storage = Arc::new(FsStorage::new(root.clone()).unwrap());
+        let workers = (0..8)
+            .map(|index| {
+                let storage = storage.clone();
+                std::thread::spawn(move || {
+                    let bytes = bytes::Bytes::from(format!("concurrent first publication {index}"));
+                    let item = storage
+                        .prepare_revision(
+                            format!("artifact-{index}"),
+                            format!("artifact-{index}"),
+                            PathBuf::from(format!("artifact-{index}.bin")),
+                            1,
+                            None,
+                            bytes.clone(),
+                            ChunkAlgorithm::default(),
+                        )
+                        .unwrap();
+                    storage.commit_revision(item, bytes).unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        let items = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+
+        for item in &items {
+            storage.verify_committed_revision(item).unwrap();
+            assert!(storage.revision_marker(item).unwrap().0.is_file());
+        }
+        drop(storage);
+        let restarted = FsStorage::new(root).unwrap();
+        for item in items {
+            restarted.verify_committed_revision(&item).unwrap();
+        }
+    }
+
+    #[test]
+    fn startup_reconciliation_discards_only_orphan_revision_records() {
+        let root = temp_path();
+        let storage = FsStorage::new(root.clone()).unwrap();
+        let published_bytes = bytes::Bytes::from_static(b"published revision");
+        let published = storage
+            .prepare_revision(
+                "published".to_string(),
+                "published".to_string(),
+                PathBuf::from("logical/published.bin"),
+                1,
+                None,
+                published_bytes.clone(),
+                ChunkAlgorithm::default(),
+            )
+            .and_then(|item| storage.commit_revision(item, published_bytes))
+            .unwrap();
+        let orphan_bytes = bytes::Bytes::from_static(b"crash orphan revision");
+        let orphan = storage
+            .prepare_revision(
+                "orphan".to_string(),
+                "orphan".to_string(),
+                PathBuf::from("logical/orphan.bin"),
+                1,
+                None,
+                orphan_bytes.clone(),
+                ChunkAlgorithm::default(),
+            )
+            .and_then(|item| storage.commit_revision(item, orphan_bytes.clone()))
+            .unwrap();
+        let ordinary = storage
+            .create_item(
+                "ordinary".to_string(),
+                PathBuf::from("logical/orphan.bin"),
+                0,
+                None,
+                orphan_bytes,
+                ChunkAlgorithm::default(),
+            )
+            .unwrap();
+        let orphan_cas = storage.revision_chunk_path(&orphan.chunks[0].hash).unwrap();
+        let (orphan_marker, _) = storage.revision_marker(&orphan).unwrap();
+        let (published_marker, _) = storage.revision_marker(&published).unwrap();
+        remove_file(&published_marker).unwrap();
+        drop(storage);
+
+        let restarted = FsStorage::new(root.clone()).unwrap();
+        restarted
+            .reconcile_published_revisions(std::slice::from_ref(&published))
+            .unwrap();
+        {
+            let inner = restarted.inner.read().unwrap();
+            assert!(inner.items.contains(&published));
+            assert!(!inner.items.contains(&orphan));
+            assert!(inner.items.contains(&ordinary));
+        }
+        assert!(orphan_cas.is_file(), "reconciliation retains CAS chunks");
+        assert!(!orphan_marker.exists(), "orphan provenance is consumed");
+        assert!(
+            published_marker.is_file(),
+            "published legacy records receive provenance markers"
+        );
+        drop(restarted);
+
+        let restarted = FsStorage::new(root).unwrap();
+        {
+            let inner = restarted.inner.read().unwrap();
+            assert!(inner.items.contains(&published));
+            assert!(!inner.items.contains(&orphan));
+            assert!(inner.items.contains(&ordinary));
+        }
+        let retry_bytes = bytes::Bytes::from_static(b"different retry bytes");
+        let retry = restarted
+            .prepare_revision(
+                "orphan".to_string(),
+                "orphan".to_string(),
+                PathBuf::from("logical/orphan.bin"),
+                1,
+                None,
+                retry_bytes.clone(),
+                ChunkAlgorithm::default(),
+            )
+            .and_then(|item| restarted.commit_revision(item, retry_bytes))
+            .unwrap();
+        restarted.verify_committed_revision(&retry).unwrap();
+        assert!(restarted.inner.read().unwrap().items.contains(&ordinary));
+    }
+
+    #[test]
+    fn discard_unpublished_revision_preserves_ordinary_item_records() {
+        let root = temp_path();
+        let storage = FsStorage::new(root.clone()).unwrap();
+        let ordinary = storage
+            .create_item(
+                "ordinary".to_string(),
+                PathBuf::from("mutable/ordinary.bin"),
+                0,
+                None,
+                bytes::Bytes::from_static(b"ordinary"),
+                ChunkAlgorithm::default(),
+            )
+            .unwrap();
+
+        storage.discard_unpublished_revision(&ordinary).unwrap();
+        assert!(storage.inner.read().unwrap().items.contains(&ordinary));
+        drop(storage);
+
+        let restarted = FsStorage::new(root).unwrap();
+        assert!(restarted.inner.read().unwrap().items.contains(&ordinary));
     }
 
     #[test]

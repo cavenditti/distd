@@ -6,6 +6,9 @@ pub enum Server {
     #[error("server I/O error")]
     Io(#[from] std::io::Error),
 
+    #[error("durable server state error: {0}")]
+    DurableState(#[from] distd_core::durable_state::DurableStateError),
+
     #[error("Cannot insert chunk in data store")]
     ChunkInsertError,
 

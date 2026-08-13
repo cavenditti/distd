@@ -34,6 +34,7 @@ static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 pub enum DurableStateKind {
     FsStorage = 1,
     ClientTrust = 2,
+    ServerPublication = 3,
 }
 
 impl DurableStateKind {
@@ -289,8 +290,39 @@ pub fn replace_enveloped_state(
     payload: &[u8],
     maximum_payload: u64,
 ) -> Result<(), DurableStateError> {
+    replace_enveloped_state_with_hook(path, kind, payload_schema, payload, maximum_payload, |_| {
+        Ok(())
+    })
+}
+
+/// Named durability boundaries exposed for deterministic composed fault tests.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DurableReplaceStage {
+    AfterEncode,
+    AfterCreate,
+    AfterWrite,
+    AfterFileSync,
+    AfterRename,
+    AfterDirectorySync,
+}
+
+/// Encode and replace state while invoking `hook` at each named durability boundary.
+///
+/// This is the same production operation as [`replace_enveloped_state`]. It exists so consumers
+/// can prove their own visibility and recovery state machines at every shared boundary.
+pub fn replace_enveloped_state_with_hook<F>(
+    path: &Path,
+    kind: DurableStateKind,
+    payload_schema: u16,
+    payload: &[u8],
+    maximum_payload: u64,
+    mut hook: F,
+) -> Result<(), DurableStateError>
+where
+    F: FnMut(DurableReplaceStage) -> io::Result<()>,
+{
     let encoded = encode_envelope(kind, payload_schema, payload, maximum_payload)?;
-    atomic_replace(path, &encoded, &mut |_| Ok(()))
+    atomic_replace(path, &encoded, &mut hook)
 }
 
 fn envelope_digest(header_prefix: &[u8], payload: &[u8]) -> blake3::Hash {
@@ -317,21 +349,11 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
     )
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AtomicReplaceStage {
-    AfterEncode,
-    AfterCreate,
-    AfterWrite,
-    AfterFileSync,
-    AfterRename,
-    AfterDirectorySync,
-}
-
 fn atomic_replace<F>(path: &Path, encoded: &[u8], hook: &mut F) -> Result<(), DurableStateError>
 where
-    F: FnMut(AtomicReplaceStage) -> io::Result<()>,
+    F: FnMut(DurableReplaceStage) -> io::Result<()>,
 {
-    hook(AtomicReplaceStage::AfterEncode)?;
+    hook(DurableReplaceStage::AfterEncode)?;
 
     let parent = path
         .parent()
@@ -347,16 +369,16 @@ where
     let mut temporary_owned = true;
 
     let result = (|| {
-        hook(AtomicReplaceStage::AfterCreate)?;
+        hook(DurableReplaceStage::AfterCreate)?;
         temporary_file.write_all(encoded)?;
-        hook(AtomicReplaceStage::AfterWrite)?;
+        hook(DurableReplaceStage::AfterWrite)?;
         temporary_file.sync_all()?;
-        hook(AtomicReplaceStage::AfterFileSync)?;
+        hook(DurableReplaceStage::AfterFileSync)?;
         drop(temporary_file);
 
         fs::rename(&temporary_path, path)?;
         temporary_owned = false;
-        hook(AtomicReplaceStage::AfterRename).map_err(|source| {
+        hook(DurableReplaceStage::AfterRename).map_err(|source| {
             DurableStateError::CommitIndeterminate {
                 path: path.to_path_buf(),
                 source,
@@ -374,7 +396,7 @@ where
                 path: path.to_path_buf(),
                 source,
             })?;
-        hook(AtomicReplaceStage::AfterDirectorySync).map_err(|source| {
+        hook(DurableReplaceStage::AfterDirectorySync).map_err(|source| {
             DurableStateError::CommitIndeterminate {
                 path: path.to_path_buf(),
                 source,
@@ -580,12 +602,12 @@ mod tests {
     #[test]
     fn every_fault_boundary_leaves_old_or_complete_new_state() {
         let stages = [
-            AtomicReplaceStage::AfterEncode,
-            AtomicReplaceStage::AfterCreate,
-            AtomicReplaceStage::AfterWrite,
-            AtomicReplaceStage::AfterFileSync,
-            AtomicReplaceStage::AfterRename,
-            AtomicReplaceStage::AfterDirectorySync,
+            DurableReplaceStage::AfterEncode,
+            DurableReplaceStage::AfterCreate,
+            DurableReplaceStage::AfterWrite,
+            DurableReplaceStage::AfterFileSync,
+            DurableReplaceStage::AfterRename,
+            DurableReplaceStage::AfterDirectorySync,
         ];
         for fault_stage in stages {
             let directory = test_directory();
@@ -604,7 +626,7 @@ mod tests {
             let actual = fs::read(&path).unwrap();
             if matches!(
                 fault_stage,
-                AtomicReplaceStage::AfterRename | AtomicReplaceStage::AfterDirectorySync
+                DurableReplaceStage::AfterRename | DurableReplaceStage::AfterDirectorySync
             ) {
                 assert_eq!(actual, encoded, "stage {fault_stage:?}: {error}");
                 assert!(matches!(

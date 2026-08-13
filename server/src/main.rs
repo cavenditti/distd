@@ -5,11 +5,13 @@ use distd_core::feed::Feed;
 use std::net::SocketAddr;
 
 use crate::client::Client;
+use crate::metadata_state::{MetadataPaths, MetadataStateStore};
 use crate::quic::QuicResourceSettings;
 use crate::server::{InternalMetadata, Server};
 
 pub mod client;
 pub mod error;
+pub mod metadata_state;
 pub mod quic;
 pub mod rest_api;
 pub mod server;
@@ -77,11 +79,26 @@ fn required_secret(name: &str) -> String {
         })
 }
 
-fn load_metadata(path: &std::path::Path) -> InternalMetadata {
-    InternalMetadata::load(path).unwrap_or_else(|error| {
-        eprintln!("Cannot load server metadata: {error}");
-        std::process::exit(2);
-    })
+fn load_metadata<T>(
+    paths: MetadataPaths,
+    storage: &T,
+) -> (std::sync::Arc<MetadataStateStore>, InternalMetadata)
+where
+    T: ChunkStorage,
+{
+    let (store, metadata) =
+        MetadataStateStore::open_with_validator(paths, |metadata| metadata.verify_storage(storage))
+            .unwrap_or_else(|error| {
+                eprintln!("Cannot load server metadata: {error}");
+                std::process::exit(2);
+            });
+    storage
+        .reconcile_published_revisions(&metadata.published_revisions())
+        .unwrap_or_else(|error| {
+            eprintln!("Cannot reconcile server revision storage: {error}");
+            std::process::exit(2);
+        });
+    (store, metadata)
 }
 
 /// Run the server with a concrete storage backend.
@@ -142,7 +159,7 @@ async fn main() {
     let state_dir = std::env::var("DISTD_SERVER_STATE_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| distd_core::utils::settings::cache_dir().join("server-state"));
-    let metadata_path = state_dir.join("metadata.bitcode");
+    let metadata_paths = MetadataPaths::in_state_directory(&state_dir);
 
     // Select storage backend via DISTD_STORAGE env var.
     // Supported values: "fs", "memory" (default when redb feature is off), "redb" (default).
@@ -156,7 +173,6 @@ async fn main() {
 
     match storage_kind.as_str() {
         "fs" => {
-            let metadata = load_metadata(&metadata_path);
             let root = std::env::var("DISTD_STORAGE_ROOT")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|_| distd_core::utils::settings::cache_dir().join("server-fs"));
@@ -174,32 +190,49 @@ async fn main() {
                 chunk_cache_mb,
                 tree_cache_entries,
             );
-            let storage = FsStorage::with_cache_config(
-                root,
-                FsStorageCacheConfig {
-                    max_chunk_bytes: chunk_cache_mb.saturating_mul(1024 * 1024),
-                    max_tree_entries: tree_cache_entries,
-                },
-            )
+            let (storage, metadata_store, metadata) = tokio::task::spawn_blocking(move || {
+                let storage = FsStorage::with_cache_config(
+                    root,
+                    FsStorageCacheConfig {
+                        max_chunk_bytes: chunk_cache_mb.saturating_mul(1024 * 1024),
+                        max_tree_entries: tree_cache_entries,
+                    },
+                )
+                .unwrap_or_else(|error| {
+                    eprintln!("Cannot initialize filesystem storage: {error}");
+                    std::process::exit(2);
+                });
+                let (metadata_store, metadata) = load_metadata(metadata_paths, &storage);
+                (storage, metadata_store, metadata)
+            })
+            .await
             .unwrap_or_else(|error| {
-                eprintln!("Cannot initialize filesystem storage: {error}");
+                eprintln!("Server-state startup worker failed: {error}");
                 std::process::exit(2);
             });
             let server = Server::new_ephemeral_with_metadata(storage, metadata.clone())
                 .with_enrollment_token(enrollment_token.clone())
-                .with_metadata_persistence(metadata_path.clone());
+                .with_metadata_store(metadata_store);
             run_server(server, http_addr, quic_settings).await;
         }
         #[cfg(feature = "redb")]
         "redb" => {
-            let metadata = load_metadata(&metadata_path);
             let db_path = distd_core::utils::settings::cache_dir().join("server.redb");
             tracing::info!("Using redb storage at {}", db_path.display());
-            let storage = distd_core::chunk_storage::redb::RedbStorage::new(&db_path)
-                .expect("Failed to open redb database");
+            let (storage, metadata_store, metadata) = tokio::task::spawn_blocking(move || {
+                let storage = distd_core::chunk_storage::redb::RedbStorage::new(&db_path)
+                    .expect("Failed to open redb database");
+                let (metadata_store, metadata) = load_metadata(metadata_paths, &storage);
+                (storage, metadata_store, metadata)
+            })
+            .await
+            .unwrap_or_else(|error| {
+                eprintln!("Server-state startup worker failed: {error}");
+                std::process::exit(2);
+            });
             let server = Server::new_ephemeral_with_metadata(storage, metadata.clone())
                 .with_enrollment_token(enrollment_token.clone())
-                .with_metadata_persistence(metadata_path.clone());
+                .with_metadata_store(metadata_store);
             run_server(server, http_addr, quic_settings).await;
         }
         "memory" => {

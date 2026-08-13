@@ -1092,7 +1092,7 @@ where
                         &mut iter_state.cursor,
                         Some(primary_path.as_path()),
                         iter_state.likely_precompressed,
-                        &mut |idx| self.storage.get_chunk_by_index(&root_hash, idx),
+                        &mut |idx| self.storage().get_chunk_by_index(&root_hash, idx),
                     )
                     .map_err(|_| StreamFailure::internal(QuicPhase::Internal))?;
                     batch_build_ns += t0.elapsed().as_nanos() as u64;
@@ -2929,7 +2929,7 @@ mod tests {
                 .await;
         let (_endpoint, connection) = connect_client(addr).await;
         let uuid = register_client_uuid(&connection).await;
-        let metadata_write = server.metadata.write().await;
+        let metadata_write = server.lock_metadata_for_test().await;
 
         let (mut send, mut recv) =
             open_authed_stream(&connection, TransportOp::Fetch, Some(uuid)).await;

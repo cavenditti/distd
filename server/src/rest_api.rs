@@ -163,7 +163,7 @@ where
 {
     Json(
         server
-            .storage
+            .storage()
             .chunks()
             .into_iter()
             .map(|x| x.to_string())
@@ -176,7 +176,7 @@ async fn get_chunks_size_sum<T>(State(server): State<Server<T>>) -> impl IntoRes
 where
     T: ChunkStorage + Sync + Send,
 {
-    Json(server.storage.size())
+    Json(server.storage().size())
 }
 
 /// Get all feeds
@@ -186,8 +186,7 @@ where
 {
     Json(
         server
-            .metadata
-            .read()
+            .metadata_snapshot()
             .await
             .feeds
             .values()
@@ -203,8 +202,7 @@ where
 {
     Json(
         server
-            .metadata
-            .read()
+            .metadata_snapshot()
             .await
             .items
             .keys()
@@ -228,7 +226,7 @@ async fn get_one_item<T>(
 where
     T: ChunkStorage + Sync + Send,
 {
-    let metadata = server.metadata.read().await;
+    let metadata = server.metadata_snapshot().await;
     let found = if let Some(ref aid) = item.artifact_id {
         metadata.items.get(aid).cloned()
     } else if let Some(ref path) = item.path {
@@ -363,7 +361,7 @@ async fn get_one_feed<T>(
 where
     T: ChunkStorage + Sync + Send,
 {
-    Json(server.metadata.read().await.feeds.get(&name).cloned())
+    Json(server.metadata_snapshot().await.feeds.get(&name).cloned())
 }
 
 /// Download data associated with an hash
@@ -381,7 +379,7 @@ where
 {
     let hash = Hash::from_str(hash.as_str()).map_err(|_| StatusCode::BAD_REQUEST)?;
     server
-        .storage
+        .storage()
         .get(&hash)
         .ok_or(StatusCode::NOT_FOUND)
         .map(Json)
@@ -392,7 +390,7 @@ async fn get_metadata<T>(State(server): State<Server<T>>) -> impl IntoResponse
 where
     T: ChunkStorage + Sync + Send,
 {
-    let metadata = (*server.metadata.read().await).clone();
+    let metadata = server.metadata_snapshot().await;
     Json(ServerMetadata::from(metadata))
 }
 

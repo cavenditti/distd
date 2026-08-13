@@ -1,8 +1,10 @@
 use rustc_hash::FxHashMap;
 use std::sync::{Arc, RwLock};
 
-use crate::chunk_storage::ChunkStorage;
+use crate::chunk_storage::{validate_revision_metadata, ChunkStorage};
+use crate::error::Error;
 use crate::hash::{hash as do_hash, merge_hashes, Hash, HashTreeCapable};
+use crate::item::Item;
 
 use super::{Node, StorageError};
 
@@ -105,6 +107,29 @@ impl ChunkStorage for HashMapStorage {
                 Node::Parent { .. } | Node::Skipped { .. } => 0,
             })
             .sum()
+    }
+
+    fn verify_committed_revision(&self, item: &Item) -> Result<(), Error> {
+        validate_revision_metadata(item)?;
+        for (index, expected) in item.chunks.iter().enumerate() {
+            let Some(node) = self.get(&expected.hash) else {
+                return Err(Error::Other(format!(
+                    "invalid committed revision: chunk {index} is missing"
+                )));
+            };
+            match node.as_ref() {
+                Node::Stored { hash, data }
+                    if *hash == expected.hash
+                        && data.len() as u64 == expected.size
+                        && do_hash(data.as_slice()) == expected.hash => {}
+                Node::Stored { .. } | Node::Parent { .. } | Node::Skipped { .. } => {
+                    return Err(Error::Other(format!(
+                        "invalid committed revision: chunk {index} bytes differ from its immutable identity"
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 }
 

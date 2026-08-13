@@ -77,6 +77,107 @@ fn same_revision(candidate: &Item, actual: &Item) -> bool {
         && candidate.chunks == actual.chunks
 }
 
+fn invalid_committed_revision(reason: impl Into<String>) -> Error {
+    Error::Other(format!("invalid committed revision: {}", reason.into()))
+}
+
+/// Validate the storage-independent identity and tree semantics of a published revision.
+///
+/// This does not prove that the declared chunks are present in a selected backend. Backends use
+/// the same validation before checking their exact retained bytes.
+pub fn validate_revision_metadata(item: &Item) -> Result<ChunkInfo, Error> {
+    validate_revision_authority(&item.metadata.artifact_id, &item.metadata.path)?;
+    if item.metadata.artifact_id != item.manifest.artifact_id {
+        return Err(invalid_committed_revision(
+            "metadata and manifest artifact IDs differ",
+        ));
+    }
+    if u64::from(item.metadata.revision) != item.manifest.version {
+        return Err(invalid_committed_revision(
+            "metadata and manifest revisions differ",
+        ));
+    }
+    if item.chunks.is_empty() {
+        return Err(invalid_committed_revision("chunk list is empty"));
+    }
+    if usize::try_from(item.manifest.chunk_count).ok() != Some(item.chunks.len()) {
+        return Err(invalid_committed_revision(
+            "manifest chunk count differs from chunk list",
+        ));
+    }
+    if item.manifest.chunk_size != item.manifest.chunk_algorithm.nominal_chunk_size() {
+        return Err(invalid_committed_revision(
+            "manifest chunk size differs from its algorithm",
+        ));
+    }
+
+    let root = prepared_tree(&item.chunks)?;
+    if root != item.metadata.root
+        || root.hash != item.manifest.root_hash
+        || root.size != item.manifest.total_size
+    {
+        return Err(invalid_committed_revision(
+            "declared chunks do not reconstruct the declared root",
+        ));
+    }
+
+    let mut next_chunk = 0usize;
+    let mut previous_path: Option<PathBuf> = None;
+    for entry in &item.manifest.entries {
+        let path = PathBuf::from(&entry.relative_path);
+        let canonical = crate::utils::path::validate_relative(&path)?;
+        if canonical != path || canonical.to_str() != Some(entry.relative_path.as_str()) {
+            return Err(invalid_committed_revision(
+                "directory entry path is not canonical UTF-8",
+            ));
+        }
+        if canonical.components().next().is_some_and(|component| {
+            component.as_os_str() == std::ffi::OsStr::new(".distd-revisions-v1")
+        }) {
+            return Err(invalid_committed_revision(
+                "directory entry path uses the reserved storage namespace",
+            ));
+        }
+        if previous_path
+            .as_ref()
+            .is_some_and(|previous| previous >= &canonical)
+        {
+            return Err(invalid_committed_revision(
+                "directory entry paths are not strictly ordered and unique",
+            ));
+        }
+        previous_path = Some(canonical);
+
+        let start = usize::try_from(entry.chunk_range.0)
+            .map_err(|_| invalid_committed_revision("directory range start overflows usize"))?;
+        let end = usize::try_from(entry.chunk_range.1)
+            .map_err(|_| invalid_committed_revision("directory range end overflows usize"))?;
+        if start != next_chunk || end <= start || end > item.chunks.len() {
+            return Err(invalid_committed_revision(
+                "directory chunk ranges are not contiguous and in bounds",
+            ));
+        }
+        let size = item.chunks[start..end]
+            .iter()
+            .try_fold(0u64, |sum, chunk| {
+                sum.checked_add(chunk.size)
+                    .ok_or_else(|| invalid_committed_revision("directory entry size overflows u64"))
+            })?;
+        if size != entry.size {
+            return Err(invalid_committed_revision(
+                "directory entry size differs from its chunks",
+            ));
+        }
+        next_chunk = end;
+    }
+    if !item.manifest.entries.is_empty() && next_chunk != item.chunks.len() {
+        return Err(invalid_committed_revision(
+            "directory entries do not cover every chunk",
+        ));
+    }
+    Ok(root)
+}
+
 fn validate_revision_authority(artifact_id: &str, path: &PathBuf) -> Result<PathBuf, Error> {
     if artifact_id.is_empty() || artifact_id.len() > 256 {
         return Err(Error::Other(
@@ -273,6 +374,38 @@ pub trait ChunkStorage: HashTreeCapable<Arc<Node>, Error> {
         let node = self.get(root)?;
         let leaves = node.flatten_iter().ok()?;
         leaves.get(index as usize).map(|arc| (**arc).clone())
+    }
+
+    /// Verify that an already-committed immutable revision is complete and
+    /// exactly matches its authoritative metadata.
+    fn verify_committed_revision(&self, item: &Item) -> Result<(), Error> {
+        let root = validate_revision_metadata(item)?;
+        for (index, expected) in item.chunks.iter().enumerate() {
+            let index = u32::try_from(index)
+                .map_err(|_| invalid_committed_revision("chunk index overflows u32"))?;
+            let bytes = self
+                .get_chunk_by_index(&root.hash, index)
+                .ok_or_else(|| invalid_committed_revision(format!("chunk {index} is missing")))?;
+            if bytes.len() as u64 != expected.size || hash(&bytes) != expected.hash {
+                return Err(invalid_committed_revision(format!(
+                    "chunk {index} bytes differ from its immutable identity"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Forget an exact revision whose storage commit completed but whose
+    /// publication metadata did not. Content-only backends have no Item index
+    /// to clean up and therefore need no work.
+    fn discard_unpublished_revision(&self, _item: &Item) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Reconcile backend Item indexes with the authoritative published set at
+    /// startup. Immutable content may remain for future deduplication.
+    fn reconcile_published_revisions(&self, _published: &[Item]) -> Result<(), Error> {
+        Ok(())
     }
 
     //fn drop(hash: Hash); // TODO
@@ -676,7 +809,131 @@ mod tests {
     use bytes::{Bytes, BytesMut};
     use rand::{self, RngCore};
 
-    use crate::{chunks::CHUNK_SIZE, hash::hash};
+    use crate::{chunk_storage::hashmap_storage::HashMapStorage, chunks::CHUNK_SIZE, hash::hash};
+
+    struct VerificationStorage {
+        chunks: Vec<Option<Vec<u8>>>,
+    }
+
+    impl ChunkStorage for VerificationStorage {
+        fn get(&self, _hash: &Hash) -> Option<Arc<Node>> {
+            None
+        }
+
+        fn store_chunk(&self, _hash: Hash, _chunk: &[u8]) -> Result<Arc<Node>, StorageError> {
+            Err(StorageError::ChunkInsertError)
+        }
+
+        fn store_link(
+            &self,
+            _hash: Hash,
+            _left: Arc<Node>,
+            _right: Arc<Node>,
+        ) -> Result<Arc<Node>, StorageError> {
+            Err(StorageError::LinkCreation)
+        }
+
+        fn chunks(&self) -> Vec<Hash> {
+            Vec::new()
+        }
+
+        fn size(&self) -> u64 {
+            0
+        }
+
+        fn get_chunk_by_index(&self, _root: &Hash, index: u32) -> Option<Vec<u8>> {
+            self.chunks.get(index as usize).cloned().flatten()
+        }
+    }
+
+    impl HashTreeCapable<Arc<Node>, Error> for VerificationStorage {
+        fn func(&self, _data: &[u8]) -> Result<Arc<Node>, Error> {
+            Err(Error::Storage(StorageError::ChunkInsertError))
+        }
+
+        fn merge(&self, _left: &Arc<Node>, _right: &Arc<Node>) -> Result<Arc<Node>, Error> {
+            Err(Error::Storage(StorageError::LinkCreation))
+        }
+    }
+
+    #[test]
+    fn hashmap_verifies_exact_committed_revision_and_rejects_missing() {
+        let storage = HashMapStorage::default();
+        let data = Bytes::from_static(b"abcdefghijkl");
+        let algorithm = ChunkAlgorithm::fixed_aligned(4, 1);
+        let item = storage
+            .prepare_revision(
+                "artifact".to_string(),
+                "artifact".to_string(),
+                PathBuf::from("artifact.bin"),
+                1,
+                None,
+                data.clone(),
+                algorithm,
+            )
+            .unwrap();
+        assert!(storage.verify_committed_revision(&item).is_err());
+
+        let item = storage.commit_revision(item, data).unwrap();
+        storage.verify_committed_revision(&item).unwrap();
+    }
+
+    #[test]
+    fn committed_revision_verification_rejects_wrong_bytes_order_and_root() {
+        let preparation = HashMapStorage::default();
+        let data = Bytes::from_static(b"abcdefghijkl");
+        let item = preparation
+            .prepare_revision(
+                "artifact".to_string(),
+                "artifact".to_string(),
+                PathBuf::from("artifact.bin"),
+                1,
+                None,
+                data,
+                ChunkAlgorithm::fixed_aligned(4, 1),
+            )
+            .unwrap();
+        let exact = vec![
+            Some(b"abcd".to_vec()),
+            Some(b"efgh".to_vec()),
+            Some(b"ijkl".to_vec()),
+        ];
+        VerificationStorage {
+            chunks: exact.clone(),
+        }
+        .verify_committed_revision(&item)
+        .unwrap();
+
+        let mut missing = exact.clone();
+        missing[1] = None;
+        assert!(VerificationStorage { chunks: missing }
+            .verify_committed_revision(&item)
+            .is_err());
+
+        let mut wrong = exact.clone();
+        wrong[1] = Some(b"xxxx".to_vec());
+        assert!(VerificationStorage { chunks: wrong }
+            .verify_committed_revision(&item)
+            .is_err());
+
+        let mut reordered = exact;
+        reordered.swap(0, 1);
+        assert!(VerificationStorage { chunks: reordered }
+            .verify_committed_revision(&item)
+            .is_err());
+
+        let mut forged_root = item;
+        forged_root.manifest.root_hash = hash(b"forged root");
+        assert!(VerificationStorage {
+            chunks: vec![
+                Some(b"abcd".to_vec()),
+                Some(b"efgh".to_vec()),
+                Some(b"ijkl".to_vec()),
+            ],
+        }
+        .verify_committed_revision(&forged_root)
+        .is_err());
+    }
 
     pub fn single_chunk_insertion<S>(s: &S)
     where
