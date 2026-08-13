@@ -561,6 +561,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "tempfile",
  "test-log",
  "thiserror 1.0.63",
  "tokio",

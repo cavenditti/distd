@@ -4,6 +4,8 @@ use config::ConfigError;
 use distd_core::{error::InvalidParameter, transport::PayloadCompressionError};
 use thiserror::Error;
 
+use crate::{persistence::PersistenceError, server_url::ServerUrlError};
+
 #[derive(Error, Debug)]
 pub enum ServerConnection {
     #[error("Cannot create stream")]
@@ -32,6 +34,9 @@ pub enum ServerRequest {
 
     #[error("Server didn't return a valid Uuid")]
     BadUuid,
+
+    #[error("server returned a different client identity for this authority")]
+    ClientIdentityChanged,
 
     #[error("Cannot decode UTF-8 string from server response")]
     Uuid(#[from] uuid::Error),
@@ -65,6 +70,18 @@ pub enum ServerRequest {
 pub enum Client {
     #[error("server certificate is not pinned; configure server.certificate_fingerprint")]
     UnpinnedServer,
+
+    #[error("configured server certificate conflicts with durable trust state")]
+    TrustConflict,
+
+    #[error("invalid server URL")]
+    ServerUrl(#[from] ServerUrlError),
+
+    #[error("cannot load or store client trust state")]
+    Persistence(#[from] PersistenceError),
+
+    #[error("client trust persistence worker failed")]
+    PersistenceWorker(#[from] tokio::task::JoinError),
 
     #[error("No command specified")]
     MissingCmd,

@@ -33,6 +33,7 @@ static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 #[repr(u16)]
 pub enum DurableStateKind {
     FsStorage = 1,
+    ClientTrust = 2,
 }
 
 impl DurableStateKind {

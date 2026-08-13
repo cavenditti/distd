@@ -35,3 +35,4 @@ distd_core = { path = "../core" }
 
 [dev-dependencies]
 test-log = { workspace = true }
+tempfile = "3"

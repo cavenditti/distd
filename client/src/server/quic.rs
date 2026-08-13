@@ -20,7 +20,10 @@ use tokio::io::AsyncRead;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use crate::error::{ServerConnection, ServerRequest};
+use crate::{
+    error::{ServerConnection, ServerRequest},
+    server_url::CanonicalServerUrl,
+};
 
 #[derive(Debug)]
 struct PinnedServerCertVerifier {
@@ -88,16 +91,9 @@ impl ServerCertVerifier for PinnedServerCertVerifier {
     }
 }
 
-fn parse_quic_target(url: &str) -> Result<(SocketAddr, String), ServerRequest> {
-    let stripped = url
-        .strip_prefix("quic://")
-        .or_else(|| url.strip_prefix("udp://"))
-        .ok_or_else(|| {
-            ServerRequest::Connection(ServerConnection::Quic(format!(
-                "unsupported QUIC URL: {url}"
-            )))
-        })?;
-    let addresses = stripped
+fn resolve_quic_target(url: &CanonicalServerUrl) -> Result<(SocketAddr, String), ServerRequest> {
+    let addresses = url
+        .dial_authority()
         .to_socket_addrs()
         .map_err(ServerConnection::from)?
         .collect::<Vec<_>>();
@@ -107,19 +103,14 @@ fn parse_quic_target(url: &str) -> Result<(SocketAddr, String), ServerRequest> {
         .find(SocketAddr::is_ipv4)
         .or_else(|| addresses.first().copied())
         .ok_or_else(|| {
-            ServerRequest::Connection(ServerConnection::Quic(format!("cannot resolve {stripped}")))
+            ServerRequest::Connection(ServerConnection::Quic(
+                "canonical server authority resolved to no addresses".to_string(),
+            ))
         })?;
-    let server_name = stripped
-        .rsplit_once(':')
-        .map(|(host, _)| host)
-        .unwrap_or(stripped)
-        .trim_matches('[')
-        .trim_matches(']')
-        .to_string();
-    let server_name = if server_name.parse::<std::net::IpAddr>().is_ok() {
+    let server_name = if url.tls_server_name().parse::<std::net::IpAddr>().is_ok() {
         String::from("localhost")
     } else {
-        server_name
+        url.tls_server_name().to_owned()
     };
     Ok((addr, server_name))
 }
@@ -142,11 +133,11 @@ pub struct QuicSyncSession {
 
 impl QuicTransportClient {
     pub async fn connect(
-        url: &str,
+        url: &CanonicalServerUrl,
         client_uuid: Option<Uuid>,
         expected_certificate: Option<[u8; 32]>,
     ) -> Result<Self, ServerRequest> {
-        let (addr, server_name) = parse_quic_target(url)?;
+        let (addr, server_name) = resolve_quic_target(url)?;
         let bind_addr = if addr.is_ipv4() {
             "0.0.0.0:0"
         } else {
@@ -203,6 +194,11 @@ impl QuicTransportClient {
 
     pub fn certificate_fingerprint(&self) -> [u8; 32] {
         self.certificate_fingerprint
+    }
+
+    pub fn close(&self) {
+        self.connection
+            .close(quinn::VarInt::from_u32(0), b"enrollment not activated");
     }
 
     pub async fn set_client_uuid(&self, client_uuid: Uuid) {
@@ -479,7 +475,8 @@ impl<'a> SyncChunkDecoder<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_quic_target, read_sync_manifest_response, SyncChunkDecoder};
+    use super::{read_sync_manifest_response, resolve_quic_target, SyncChunkDecoder};
+    use crate::server_url::CanonicalServerUrl;
     use distd_core::proto::{
         sync_message::Msg, BulkData, ChunkData, ManifestResponse, PayloadCompression, SyncMessage,
     };
@@ -489,11 +486,20 @@ mod tests {
 
     #[test]
     fn localhost_prefers_an_ipv4_target_for_the_ipv4_server_listener() {
-        let (address, server_name) =
-            parse_quic_target("quic://localhost:50051").expect("resolve localhost");
+        let canonical = CanonicalServerUrl::parse("quic://localhost:50051").expect("canonical URL");
+        let (address, server_name) = resolve_quic_target(&canonical).expect("resolve localhost");
 
         assert!(address.is_ipv4());
         assert_eq!(server_name, "localhost");
+    }
+
+    #[test]
+    fn canonical_authority_drives_dial_and_tls_names() {
+        let canonical = CanonicalServerUrl::parse("udp://LOCALHOST:50051").expect("canonical URL");
+        assert_eq!(canonical.as_str(), "quic://localhost:50051");
+
+        let (_, server_name) = resolve_quic_target(&canonical).expect("resolve localhost");
+        assert_eq!(server_name, canonical.tls_server_name());
     }
 
     #[tokio::test]

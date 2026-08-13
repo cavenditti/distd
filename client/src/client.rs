@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
+    future::Future,
     path::{Path, PathBuf},
-    str::FromStr,
     sync::Arc,
 };
 
@@ -9,7 +9,11 @@ use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::{
-    error::Client as ClientError, persistence::ClientState, server::Server, settings::Settings,
+    error::Client as ClientError,
+    persistence::{ClientState, DurableTrustReceipt, ServerTrustRecord},
+    server::Server,
+    server_url::CanonicalServerUrl,
+    settings::Settings,
 };
 
 use distd_core::{
@@ -43,11 +47,7 @@ where
         settings: Settings,
         mut state: ClientState,
     ) -> Result<Self, ClientError> {
-        let client_uuid = state
-            .persistent
-            .client_uuid
-            .as_ref()
-            .and_then(|uuid_str| Uuid::from_str(uuid_str).ok());
+        let canonical_url = CanonicalServerUrl::parse(&settings.server.url)?;
         let configured_certificate = settings
             .server
             .certificate_fingerprint
@@ -56,34 +56,33 @@ where
             .transpose()
             .map_err(|_| ClientError::UnpinnedServer)?
             .map(|fingerprint| *fingerprint.as_bytes());
-        let persisted_certificate = state
-            .persistent
-            .server_certificates
-            .get(&settings.server.url)
-            .and_then(|fingerprint| blake3::Hash::from_hex(fingerprint).ok())
-            .map(|fingerprint| *fingerprint.as_bytes());
-        let expected_certificate = configured_certificate.or(persisted_certificate);
-        if expected_certificate.is_none() && !settings.server.allow_tofu {
-            return Err(ClientError::UnpinnedServer);
-        }
+        let stored_record = state.persistent.record(&canonical_url).copied();
+        let authority = enrollment_authority(
+            stored_record,
+            configured_certificate,
+            settings.server.allow_tofu,
+        )?;
 
-        let server = Server::new(
-            &settings.server.url,
+        let pending = Server::begin_enrollment(
+            canonical_url.clone(),
             &settings.client.name,
-            client_uuid,
-            expected_certificate,
+            authority.client_uuid,
+            authority.certificate_pin,
             settings.server.enrollment_token.as_deref(),
         )
         .await?;
 
-        state.persistent.client_uuid = Some(server.client_uuid().to_string());
-        state.persistent.server_certificates.insert(
-            settings.server.url.clone(),
-            blake3::Hash::from_bytes(server.pub_key)
-                .to_hex()
-                .to_string(),
-        );
-        state.persistent.commit().unwrap();
+        let candidate = ServerTrustRecord {
+            certificate_pin: pending.observed_pin(),
+            client_uuid: pending.client_uuid(),
+        };
+        let ClientState { pid, persistent } = state;
+        let (persistent, server) =
+            install_before_activation(persistent, canonical_url, candidate, |receipt| async move {
+                pending.activate(receipt).await.map_err(ClientError::from)
+            })
+            .await?;
+        state = ClientState { pid, persistent };
 
         let items = server.metadata().await.items;
         let server_ids: Vec<&String> = items.keys().collect();
@@ -118,6 +117,82 @@ where
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+}
+
+async fn install_before_activation<T, Activate, ActivateFuture>(
+    persistent: crate::persistence::ClientPersistentState,
+    canonical_url: CanonicalServerUrl,
+    candidate: ServerTrustRecord,
+    activate: Activate,
+) -> Result<(crate::persistence::ClientPersistentState, T), ClientError>
+where
+    Activate: FnOnce(DurableTrustReceipt) -> ActivateFuture,
+    ActivateFuture: Future<Output = Result<T, ClientError>>,
+{
+    install_before_activation_with(
+        persistent,
+        canonical_url,
+        candidate,
+        |persistent, url, record| persistent.install(url, record),
+        activate,
+    )
+    .await
+}
+
+async fn install_before_activation_with<T, Install, Activate, ActivateFuture>(
+    mut persistent: crate::persistence::ClientPersistentState,
+    canonical_url: CanonicalServerUrl,
+    candidate: ServerTrustRecord,
+    install: Install,
+    activate: Activate,
+) -> Result<(crate::persistence::ClientPersistentState, T), ClientError>
+where
+    Install: FnOnce(
+            &mut crate::persistence::ClientPersistentState,
+            CanonicalServerUrl,
+            ServerTrustRecord,
+        ) -> Result<DurableTrustReceipt, crate::persistence::PersistenceError>
+        + Send
+        + 'static,
+    Activate: FnOnce(DurableTrustReceipt) -> ActivateFuture,
+    ActivateFuture: Future<Output = Result<T, ClientError>>,
+{
+    let (persistent, receipt) = tokio::task::spawn_blocking(move || {
+        let receipt = install(&mut persistent, canonical_url, candidate)?;
+        Ok::<_, crate::persistence::PersistenceError>((persistent, receipt))
+    })
+    .await??;
+    let active = activate(receipt).await?;
+    Ok((persistent, active))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EnrollmentAuthority {
+    client_uuid: Option<Uuid>,
+    certificate_pin: Option<[u8; 32]>,
+}
+
+fn enrollment_authority(
+    stored: Option<ServerTrustRecord>,
+    configured_pin: Option<[u8; 32]>,
+    allow_tofu: bool,
+) -> Result<EnrollmentAuthority, ClientError> {
+    match stored {
+        Some(record) => {
+            if configured_pin.is_some_and(|pin| pin != record.certificate_pin) {
+                return Err(ClientError::TrustConflict);
+            }
+            Ok(EnrollmentAuthority {
+                client_uuid: Some(record.client_uuid),
+                certificate_pin: Some(record.certificate_pin),
+            })
+        }
+        None if configured_pin.is_some() || allow_tofu => Ok(EnrollmentAuthority {
+            client_uuid: None,
+            certificate_pin: configured_pin,
+        }),
+        None => Err(ClientError::UnpinnedServer),
     }
 }
 
@@ -307,12 +382,12 @@ pub mod cli {
 
         tracing::debug!("Running \"{cmd}\" {cmd_args:?}");
 
-        let state = ClientState::default();
+        let state = tokio::task::spawn_blocking(ClientState::load).await??;
         tracing::trace!("Client state initialized");
 
         let Ok(storage_root) = PathBuf::from_str(&settings.fsstorage.root);
         tracing::trace!("Storage root: {}", storage_root.to_string_lossy());
-        let storage = FsStorage::new(storage_root)?;
+        let storage = tokio::task::spawn_blocking(move || FsStorage::new(storage_root)).await??;
         //let storage = HashMapStorage::default(); // use this for benchmarking in order to avoid potential fs-related bottlenecks
         tracing::trace!("Client storage initialized");
         let client = Client::new(storage, settings, state).await?;
@@ -351,5 +426,203 @@ pub mod cli {
         let Ok(target) = PathBuf::from_str(target.as_str());
 
         client.get(&target, &path).await.map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod trust_tests {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    use uuid::Uuid;
+
+    use super::{
+        enrollment_authority, install_before_activation, install_before_activation_with,
+        EnrollmentAuthority,
+    };
+    use crate::{
+        error::Client as ClientError,
+        persistence::{ClientPersistentState, ServerTrustRecord},
+        server_url::CanonicalServerUrl,
+    };
+
+    #[test]
+    fn enrollment_authority_selects_pin_and_uuid_from_one_record() {
+        let uuid = Uuid::from_u128(7);
+        let pin = [0x5a; 32];
+        assert_eq!(
+            enrollment_authority(
+                Some(ServerTrustRecord {
+                    certificate_pin: pin,
+                    client_uuid: uuid,
+                }),
+                Some(pin),
+                false,
+            )
+            .unwrap(),
+            EnrollmentAuthority {
+                client_uuid: Some(uuid),
+                certificate_pin: Some(pin),
+            }
+        );
+    }
+
+    #[test]
+    fn enrollment_authority_rejects_pin_conflict_before_connection() {
+        let result = enrollment_authority(
+            Some(ServerTrustRecord {
+                certificate_pin: [1; 32],
+                client_uuid: Uuid::from_u128(9),
+            }),
+            Some([2; 32]),
+            true,
+        );
+        assert!(matches!(result, Err(ClientError::TrustConflict)));
+    }
+
+    #[test]
+    fn enrollment_authority_requires_pin_or_explicit_tofu_for_new_server() {
+        assert!(matches!(
+            enrollment_authority(None, None, false),
+            Err(ClientError::UnpinnedServer)
+        ));
+        assert_eq!(
+            enrollment_authority(None, None, true).unwrap(),
+            EnrollmentAuthority {
+                client_uuid: None,
+                certificate_pin: None,
+            }
+        );
+        assert_eq!(
+            enrollment_authority(None, Some([3; 32]), false).unwrap(),
+            EnrollmentAuthority {
+                client_uuid: None,
+                certificate_pin: Some([3; 32]),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_install_completes_before_activation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let current = temporary.path().join("trust.state");
+        let legacy = temporary.path().join("legacy.json");
+        let persistent =
+            ClientPersistentState::load_from_paths(current.clone(), legacy.clone()).unwrap();
+        let url = CanonicalServerUrl::parse("quic://example.com:443").unwrap();
+        let record = ServerTrustRecord {
+            certificate_pin: [0xa5; 32],
+            client_uuid: Uuid::from_u128(11),
+        };
+        let inspect_url = url.clone();
+        let (_, activated) =
+            install_before_activation(persistent, url, record, |_receipt| async move {
+                let reloaded = ClientPersistentState::load_from_paths(current, legacy).unwrap();
+                assert_eq!(reloaded.record(&inspect_url), Some(&record));
+                Ok::<_, ClientError>(true)
+            })
+            .await
+            .unwrap();
+        assert!(activated);
+    }
+
+    #[tokio::test]
+    async fn failed_install_never_invokes_activation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let absent_parent = temporary.path().join("absent");
+        let persistent = ClientPersistentState::load_from_paths(
+            absent_parent.join("trust.state"),
+            absent_parent.join("legacy.json"),
+        )
+        .unwrap();
+        let activated = Arc::new(AtomicBool::new(false));
+        let activation_flag = Arc::clone(&activated);
+        let result = install_before_activation(
+            persistent,
+            CanonicalServerUrl::parse("quic://example.com:443").unwrap(),
+            ServerTrustRecord {
+                certificate_pin: [7; 32],
+                client_uuid: Uuid::from_u128(12),
+            },
+            |_receipt| async move {
+                activation_flag.store(true, Ordering::SeqCst);
+                Ok::<_, ClientError>(())
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(ClientError::Persistence(_))));
+        assert!(!activated.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn indeterminate_commit_never_invokes_activation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let state_path = temporary.path().join("trust.state");
+        let persistent = ClientPersistentState::load_from_paths(
+            state_path.clone(),
+            temporary.path().join("legacy.json"),
+        )
+        .unwrap();
+        let error_path = state_path;
+        let activated = Arc::new(AtomicBool::new(false));
+        let activation_flag = Arc::clone(&activated);
+        let result = install_before_activation_with(
+            persistent,
+            CanonicalServerUrl::parse("quic://example.com:443").unwrap(),
+            ServerTrustRecord {
+                certificate_pin: [8; 32],
+                client_uuid: Uuid::from_u128(13),
+            },
+            move |persistent, url, record| {
+                let _published = persistent.install(url, record)?;
+                Err(crate::persistence::PersistenceError::Durable(
+                    distd_core::durable_state::DurableStateError::CommitIndeterminate {
+                        path: error_path,
+                        source: std::io::Error::other("injected indeterminate commit"),
+                    },
+                ))
+            },
+            |_receipt| async move {
+                activation_flag.store(true, Ordering::SeqCst);
+                Ok::<_, ClientError>(())
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(ClientError::Persistence(_))));
+        assert!(!activated.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn separate_authorities_never_share_client_identity() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut persistent = ClientPersistentState::load_from_paths(
+            temporary.path().join("trust.state"),
+            temporary.path().join("legacy.json"),
+        )
+        .unwrap();
+        let server_a = CanonicalServerUrl::parse("quic://a.example:443").unwrap();
+        let server_b = CanonicalServerUrl::parse("quic://b.example:443").unwrap();
+        let record_a = ServerTrustRecord {
+            certificate_pin: [0xa; 32],
+            client_uuid: Uuid::from_u128(101),
+        };
+        let record_b = ServerTrustRecord {
+            certificate_pin: [0xb; 32],
+            client_uuid: Uuid::from_u128(202),
+        };
+        persistent.install(server_a.clone(), record_a).unwrap();
+        persistent.install(server_b.clone(), record_b).unwrap();
+
+        let authority_a =
+            enrollment_authority(persistent.record(&server_a).copied(), None, false).unwrap();
+        let authority_b =
+            enrollment_authority(persistent.record(&server_b).copied(), None, false).unwrap();
+        assert_eq!(authority_a.client_uuid, Some(record_a.client_uuid));
+        assert_eq!(authority_a.certificate_pin, Some(record_a.certificate_pin));
+        assert_eq!(authority_b.client_uuid, Some(record_b.client_uuid));
+        assert_eq!(authority_b.certificate_pin, Some(record_b.certificate_pin));
+        assert_ne!(authority_a.client_uuid, authority_b.client_uuid);
     }
 }

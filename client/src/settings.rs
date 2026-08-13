@@ -1,12 +1,12 @@
 use config::{Config, Environment, File};
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::{fmt, path::PathBuf};
 
 use crate::error::Client as ClientError;
 
 pub use distd_core::utils::settings::{cache_dir, config_dir};
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[allow(unused)]
 pub struct Server {
     pub url: String,
@@ -16,6 +16,21 @@ pub struct Server {
     pub certificate_fingerprint: Option<String>,
     #[serde(default)]
     pub allow_tofu: bool,
+}
+
+impl fmt::Debug for Server {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Server")
+            .field("url", &self.url)
+            .field(
+                "enrollment_token",
+                &self.enrollment_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("certificate_fingerprint", &self.certificate_fingerprint)
+            .field("allow_tofu", &self.allow_tofu)
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -121,5 +136,19 @@ mod tests {
 
         assert_eq!(settings.server.url, "quic://localhost:50051");
         assert_eq!(settings.client.sync, [PathBuf::from("artifact")]);
+    }
+
+    #[test]
+    fn server_debug_redacts_the_enrollment_token() {
+        let server = super::Server {
+            url: String::from("quic://localhost:50051"),
+            enrollment_token: Some(String::from("do-not-log-this")),
+            certificate_fingerprint: None,
+            allow_tofu: true,
+        };
+
+        let debug = format!("{server:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("do-not-log-this"));
     }
 }
