@@ -1112,6 +1112,7 @@ fn is_long_zero_run(data: &[u8], offset: usize, cutoff: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{ChunkAlgorithm, Chunker, ContentDefinedChunker, CHUNK_SIZE};
+    use std::collections::HashSet;
     use std::path::Path;
 
     #[test]
@@ -1203,6 +1204,94 @@ mod tests {
         let algorithm = super::detect_chunking_algorithm(Path::new("foo.deb"), b"!<arch>\n", false);
 
         assert_eq!(algorithm, ChunkAlgorithm::package_default());
+    }
+
+    #[test]
+    fn auto_keeps_unknown_generic_binary_on_fastcdc() {
+        let sample: Vec<u8> = (0..64 * 1024)
+            .map(|index| ((index * 31 + index / 17) % 251) as u8)
+            .collect();
+
+        let algorithm = super::detect_chunking_algorithm(Path::new("artifact.bin"), &sample, false);
+
+        assert_eq!(algorithm, ChunkAlgorithm::fastcdc_default());
+    }
+
+    #[test]
+    fn explicit_fixed_chunks_keep_aligned_32_mib_update_payload_below_four_mib() {
+        let (v1, v2) = low_delta_binary_revisions();
+        let algorithm = ChunkAlgorithm::Fixed256K;
+        let basis: HashSet<[u8; 32]> = algorithm
+            .chunk_boundaries(&v1)
+            .into_iter()
+            .map(|(offset, length)| *blake3::hash(&v1[offset..offset + length]).as_bytes())
+            .collect();
+        let v2_boundaries = algorithm.chunk_boundaries(&v2);
+        let missing_chunks: Vec<usize> = v2_boundaries
+            .iter()
+            .filter_map(|(offset, length)| {
+                let hash = *blake3::hash(&v2[*offset..*offset + *length]).as_bytes();
+                (!basis.contains(&hash)).then_some(*length)
+            })
+            .collect();
+        let missing_payload_bytes: usize = missing_chunks.iter().sum();
+
+        assert_eq!(v2_boundaries.len(), 128);
+        assert_eq!(v2_boundaries.len() - missing_chunks.len(), 121);
+        assert_eq!(missing_payload_bytes, 7 * CHUNK_SIZE);
+        assert!(missing_payload_bytes <= 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn explicit_fixed_chunks_lose_reuse_after_unaligned_insertion() {
+        let (v1, _) = low_delta_binary_revisions();
+        let mut shifted = Vec::with_capacity(v1.len());
+        shifted.push(0x5a);
+        shifted.extend_from_slice(&v1[..v1.len() - 1]);
+        let algorithm = ChunkAlgorithm::Fixed256K;
+        let basis: HashSet<[u8; 32]> = algorithm
+            .chunk_boundaries(&v1)
+            .into_iter()
+            .map(|(offset, length)| *blake3::hash(&v1[offset..offset + length]).as_bytes())
+            .collect();
+        let reused_chunks = algorithm
+            .chunk_boundaries(&shifted)
+            .into_iter()
+            .filter(|(offset, length)| {
+                basis.contains(blake3::hash(&shifted[*offset..*offset + *length]).as_bytes())
+            })
+            .count();
+
+        assert_eq!(reused_chunks, 0);
+    }
+
+    fn low_delta_binary_revisions() -> (Vec<u8>, Vec<u8>) {
+        const CHUNK_COUNT: usize = 128;
+        const MUTATED_CHUNKS: [usize; 7] = [0, 18, 36, 54, 72, 90, 108];
+
+        let mut v1 = vec![0u8; CHUNK_COUNT * CHUNK_SIZE];
+        for (chunk_index, chunk) in v1.chunks_exact_mut(CHUNK_SIZE).enumerate() {
+            fill_deterministic_words(chunk, chunk_index as u64, 0x6a09_e667_f3bc_c909);
+        }
+        let mut v2 = v1.clone();
+        for chunk_index in MUTATED_CHUNKS {
+            fill_deterministic_words(
+                &mut v2[chunk_index * CHUNK_SIZE..(chunk_index + 1) * CHUNK_SIZE],
+                chunk_index as u64,
+                0xbb67_ae85_84ca_a73b,
+            );
+        }
+        (v1, v2)
+    }
+
+    fn fill_deterministic_words(data: &mut [u8], chunk_index: u64, seed: u64) {
+        for (word_index, word) in data.chunks_exact_mut(8).enumerate() {
+            let value = seed
+                .wrapping_add(chunk_index.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+                .wrapping_add((word_index as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9))
+                .rotate_left(((chunk_index + word_index as u64) & 63) as u32);
+            word.copy_from_slice(&value.to_le_bytes());
+        }
     }
 
     fn boundary_ends(boundaries: &[(usize, usize)]) -> Vec<usize> {

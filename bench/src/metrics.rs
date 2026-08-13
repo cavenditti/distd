@@ -31,6 +31,36 @@ pub struct RunMetrics {
     pub source_bytes: u64,
     /// Bytes actually transferred on the wire, or zero when unavailable.
     pub bytes_transferred: u64,
+    /// Reusable chunk hashes recovered from the client's local destination state.
+    pub local_basis_chunks: Option<u64>,
+    /// Chunks declared by the target manifest.
+    pub manifest_chunks: Option<u64>,
+    /// Chunks selected as missing by the server after possession negotiation.
+    pub server_missing_chunks: Option<u64>,
+    /// Chunks received and decoded by the client.
+    pub received_chunks: Option<u64>,
+    /// Uncompressed artifact payload bytes received by the client.
+    pub payload_bytes: Option<u64>,
+    /// QUIC UDP bytes received during the sync operation.
+    pub wire_bytes: Option<u64>,
+    /// Client manifest, possession, and chunk-transfer time.
+    pub client_network_ms: Option<u64>,
+    /// Client verification, staging, and activation time.
+    pub client_store_ms: Option<u64>,
+
+    // Evidence
+    /// Complete BLAKE3 hash of the expected source content.
+    pub expected_hash: Option<String>,
+    /// Complete BLAKE3 hash of the materialized destination content.
+    pub actual_hash: Option<String>,
+    /// Absolute path to the complete per-operation client stderr artifact.
+    pub client_stderr_path: Option<String>,
+    /// Absolute path to the complete per-operation server output artifact.
+    pub server_output_path: Option<String>,
+    /// Explicit publication chunking policy selected by the benchmark, if any.
+    pub chunking_policy: Option<String>,
+    /// Seed used to generate a byte-identical synthetic corpus, if configured.
+    pub corpus_seed: Option<u64>,
 
     // Resources
     /// Peak RSS growth in bytes during the operation, relative to the initial sample.
@@ -70,6 +100,20 @@ impl RunMetrics {
             throughput_mibs: 0.0,
             source_bytes: 0,
             bytes_transferred: 0,
+            local_basis_chunks: None,
+            manifest_chunks: None,
+            server_missing_chunks: None,
+            received_chunks: None,
+            payload_bytes: None,
+            wire_bytes: None,
+            client_network_ms: None,
+            client_store_ms: None,
+            expected_hash: None,
+            actual_hash: None,
+            client_stderr_path: None,
+            server_output_path: None,
+            chunking_policy: None,
+            corpus_seed: None,
             peak_rss_bytes: 0,
             cpu_seconds: 0.0,
             dest_size_bytes: 0,

@@ -20,10 +20,40 @@ use crate::{
     utils::settings::cache_dir,
 };
 
-use super::{ChunkStorage, Node};
+use super::{ChunkStorage, Node, ReceivedChunk};
 
 const DEFAULT_CHUNK_CACHE_BYTES: usize = 512 * 1024 * 1024;
 const DEFAULT_TREE_CACHE_ENTRIES: usize = 65_536;
+
+#[derive(Clone, Debug)]
+enum ChunkData {
+    Owned(Arc<Vec<u8>>),
+    Shared(ReceivedChunk),
+}
+
+impl ChunkData {
+    fn into_owned(self) -> Arc<Vec<u8>> {
+        match self {
+            Self::Owned(data) => data,
+            Self::Shared(data) => Arc::new(data.into_vec()),
+        }
+    }
+}
+
+impl AsRef<[u8]> for ChunkData {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Owned(data) => data.as_ref(),
+            Self::Shared(data) => data.as_ref(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SharedBackingUsage {
+    allocation_bytes: usize,
+    cached_views: usize,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct FsStorageCacheConfig {
@@ -45,7 +75,8 @@ struct HotChunkCache {
     max_bytes: usize,
     total_bytes: usize,
     order: VecDeque<Hash>,
-    entries: HashMap<Hash, Arc<Vec<u8>>>,
+    entries: HashMap<Hash, ChunkData>,
+    shared_backings: HashMap<u64, SharedBackingUsage>,
 }
 
 #[derive(Debug, Default)]
@@ -101,44 +132,106 @@ impl HotChunkCache {
             total_bytes: 0,
             order: VecDeque::new(),
             entries: HashMap::default(),
+            shared_backings: HashMap::default(),
         }
     }
 
-    fn get(&mut self, hash: &Hash) -> Option<Arc<Vec<u8>>> {
+    fn get(&mut self, hash: &Hash) -> Option<ChunkData> {
         let data = self.entries.get(hash)?.clone();
         self.order.push_back(*hash);
         Some(data)
     }
 
-    fn insert(&mut self, hash: Hash, data: Arc<Vec<u8>>) {
+    fn insert_owned(&mut self, hash: Hash, data: Arc<Vec<u8>>) {
+        self.insert(hash, ChunkData::Owned(data));
+    }
+
+    fn insert_shared(&mut self, hash: Hash, data: ReceivedChunk) {
+        self.insert(hash, ChunkData::Shared(data));
+    }
+
+    fn insert(&mut self, hash: Hash, data: ChunkData) {
         if self.max_bytes == 0 {
             return;
         }
 
-        let data_len = data.len();
-        if data_len > self.max_bytes {
+        let allocation_bytes = match &data {
+            ChunkData::Owned(data) => data.len(),
+            ChunkData::Shared(data) => data.backing_allocation_bytes(),
+        };
+        if allocation_bytes > self.max_bytes {
             return;
         }
 
-        if let Some(old) = self.entries.insert(hash, data) {
-            self.total_bytes = self.total_bytes.saturating_sub(old.len());
+        if let Some(old) = self.entries.remove(&hash) {
+            self.uncharge(&old);
+            self.order.retain(|queued| queued != &hash);
         }
 
-        self.total_bytes = self.total_bytes.saturating_add(data_len);
+        self.charge(&data);
+        self.entries.insert(hash, data);
         self.order.push_back(hash);
 
         while self.total_bytes > self.max_bytes {
             let Some(oldest_hash) = self.order.pop_front() else {
                 break;
             };
-            let remove = self
-                .entries
-                .get(&oldest_hash)
-                .map(|current| Arc::strong_count(current) == 1)
-                .unwrap_or(false);
+            let remove = match self.entries.get(&oldest_hash) {
+                Some(ChunkData::Owned(current)) => Arc::strong_count(current) == 1,
+                Some(ChunkData::Shared(_)) => true,
+                None => false,
+            };
             if remove {
                 if let Some(old) = self.entries.remove(&oldest_hash) {
-                    self.total_bytes = self.total_bytes.saturating_sub(old.len());
+                    self.uncharge(&old);
+                }
+            }
+        }
+    }
+
+    fn charge(&mut self, data: &ChunkData) {
+        match data {
+            ChunkData::Owned(data) => {
+                self.total_bytes = self.total_bytes.saturating_add(data.len());
+            }
+            ChunkData::Shared(data) => {
+                let id = data.backing_id();
+                if let Some(usage) = self.shared_backings.get_mut(&id) {
+                    usage.cached_views += 1;
+                } else {
+                    let allocation_bytes = data.backing_allocation_bytes();
+                    self.total_bytes = self.total_bytes.saturating_add(allocation_bytes);
+                    self.shared_backings.insert(
+                        id,
+                        SharedBackingUsage {
+                            allocation_bytes,
+                            cached_views: 1,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    fn uncharge(&mut self, data: &ChunkData) {
+        match data {
+            ChunkData::Owned(data) => {
+                self.total_bytes = self.total_bytes.saturating_sub(data.len());
+            }
+            ChunkData::Shared(data) => {
+                let id = data.backing_id();
+                let remove = self
+                    .shared_backings
+                    .get_mut(&id)
+                    .map(|usage| {
+                        usage.cached_views -= 1;
+                        usage.cached_views == 0
+                    })
+                    .unwrap_or(false);
+                if remove {
+                    if let Some(usage) = self.shared_backings.remove(&id) {
+                        self.total_bytes = self.total_bytes.saturating_sub(usage.allocation_bytes);
+                    }
                 }
             }
         }
@@ -621,7 +714,7 @@ impl FsStorage {
         self.inner.read().unwrap().item_for_root(root)
     }
 
-    fn cached_chunk_data(&self, hash: &Hash) -> Option<Arc<Vec<u8>>> {
+    fn cached_chunk_data(&self, hash: &Hash) -> Option<ChunkData> {
         self.chunk_cache.lock().unwrap().get(hash)
     }
 
@@ -630,8 +723,18 @@ impl FsStorage {
     }
 
     fn cache_chunk_data(&self, hash: Hash, data: Arc<Vec<u8>>) -> Arc<Vec<u8>> {
-        self.chunk_cache.lock().unwrap().insert(hash, data.clone());
+        self.chunk_cache
+            .lock()
+            .unwrap()
+            .insert_owned(hash, data.clone());
         data
+    }
+
+    fn cache_verified_received_chunks(&self, received_in_order: Vec<(Hash, ReceivedChunk)>) {
+        let mut cache = self.chunk_cache.lock().unwrap();
+        for (hash, data) in received_in_order {
+            cache.insert_shared(hash, data);
+        }
     }
 
     fn cache_tree_node(&self, hash: Hash, node: Arc<Node>) -> Arc<Node> {
@@ -639,7 +742,7 @@ impl FsStorage {
         node
     }
 
-    fn read_chunk_data(&self, hash: &Hash) -> Option<Arc<Vec<u8>>> {
+    fn read_chunk_data(&self, hash: &Hash) -> Option<ChunkData> {
         if let Some(cached) = self.cached_chunk_data(hash) {
             return Some(cached);
         }
@@ -663,7 +766,9 @@ impl FsStorage {
         // Try to read via the existing handle (avoids File::open per chunk)
         if let Some(handle) = self.handle_for_path(&entry.path) {
             if handle.lock().unwrap().read(&mut buf, entry.offset).is_ok() {
-                return Some(self.cache_chunk_data(*hash, Arc::new(buf)));
+                return Some(ChunkData::Owned(
+                    self.cache_chunk_data(*hash, Arc::new(buf)),
+                ));
             }
         }
 
@@ -671,11 +776,13 @@ impl FsStorage {
         let mut file = File::open(&entry.path).ok()?;
         file.seek(std::io::SeekFrom::Start(entry.offset)).ok()?;
         file.read_exact(&mut buf).ok()?;
-        Some(self.cache_chunk_data(*hash, Arc::new(buf)))
+        Some(ChunkData::Owned(
+            self.cache_chunk_data(*hash, Arc::new(buf)),
+        ))
     }
 
     fn stored_node(&self, hash: &Hash) -> Option<Arc<Node>> {
-        let data = self.read_chunk_data(hash)?;
+        let data = self.read_chunk_data(hash)?.into_owned();
         Some(Arc::new(Node::Stored { hash: *hash, data }))
     }
 
@@ -773,8 +880,9 @@ impl FsStorage {
         manifest: &Manifest,
         chunk_infos: &[ChunkInfo],
         available_hashes: &HashSet<Hash>,
-        received_chunks: &mut VecDeque<Vec<u8>>,
-        staged_data: &mut HashMap<Hash, Arc<Vec<u8>>>,
+        received_chunks: &mut VecDeque<ReceivedChunk>,
+        staged_data: &mut HashMap<Hash, ChunkData>,
+        received_in_order: &mut Vec<(Hash, ReceivedChunk)>,
     ) -> Result<(Vec<ChunkInfo>, Arc<Node>), Error> {
         let mut partials = Vec::with_capacity(chunk_infos.len());
         let mut chunks = Vec::with_capacity(chunk_infos.len());
@@ -801,9 +909,8 @@ impl FsStorage {
                     if do_hash(&data) != chunk_info.hash {
                         return Err(Error::Storage(StorageError::TreeReconstruct));
                     }
-                    let data = Arc::new(data);
-                    self.cache_chunk_data(chunk_info.hash, data.clone());
-                    staged_data.insert(chunk_info.hash, data);
+                    received_in_order.push((chunk_info.hash, data.clone()));
+                    staged_data.insert(chunk_info.hash, ChunkData::Shared(data));
                 }
 
                 partials.push(Arc::new(Node::Skipped {
@@ -822,7 +929,7 @@ impl FsStorage {
         item_root: &Path,
         manifest: &Manifest,
         chunks: &[ChunkInfo],
-        staged_data: &HashMap<Hash, Arc<Vec<u8>>>,
+        staged_data: &HashMap<Hash, ChunkData>,
     ) -> Result<(), Error> {
         let parent = item_root.parent().ok_or(Error::MissingData)?;
         create_dir_all(parent)?;
@@ -887,7 +994,9 @@ impl FsStorage {
                     let data = staged_data
                         .get(&chunk.hash)
                         .ok_or(Error::Storage(StorageError::TreeReconstruct))?;
-                    if data.len() as u64 != chunk.size || do_hash(data.as_ref()) != chunk.hash {
+                    if data.as_ref().len() as u64 != chunk.size
+                        || do_hash(data.as_ref()) != chunk.hash
+                    {
                         return Err(Error::Storage(StorageError::TreeReconstruct));
                     }
                     file.write_all(data.as_ref())?;
@@ -1113,14 +1222,41 @@ impl FsStorage {
         local_hashes: &[Hash],
         received_chunks: Vec<Vec<u8>>,
     ) -> Result<Item, Error> {
+        self.receive_sync_item_shared(
+            name,
+            path,
+            revision,
+            description,
+            manifest,
+            chunk_infos,
+            local_hashes,
+            received_chunks
+                .into_iter()
+                .map(ReceivedChunk::from_vec)
+                .collect(),
+        )
+    }
+
+    pub fn receive_sync_item_shared(
+        &self,
+        name: ItemName,
+        path: PathBuf,
+        revision: u32,
+        description: Option<String>,
+        manifest: &Manifest,
+        chunk_infos: &[ChunkInfo],
+        local_hashes: &[Hash],
+        received_chunks: Vec<ReceivedChunk>,
+    ) -> Result<Item, Error> {
         if chunk_infos.len() != manifest.chunk_count as usize {
             return Err(Error::Storage(StorageError::TreeReconstruct));
         }
 
         let stored_path = self.path(&path)?;
         let available_hashes: HashSet<Hash> = local_hashes.iter().copied().collect();
-        let mut received_chunks: VecDeque<Vec<u8>> = received_chunks.into();
+        let mut received_chunks: VecDeque<ReceivedChunk> = received_chunks.into();
         let mut staged_data = HashMap::default();
+        let mut received_in_order = Vec::with_capacity(received_chunks.len());
         let (chunks, root) = if manifest.entries.is_empty() {
             let mut partials = Vec::with_capacity(chunk_infos.len());
             let mut chunks = Vec::with_capacity(chunk_infos.len());
@@ -1144,9 +1280,8 @@ impl FsStorage {
                     if do_hash(&data) != chunk_info.hash {
                         return Err(Error::Storage(StorageError::TreeReconstruct));
                     }
-                    let data = Arc::new(data);
-                    self.cache_chunk_data(chunk_info.hash, data.clone());
-                    staged_data.insert(chunk_info.hash, data);
+                    received_in_order.push((chunk_info.hash, data.clone()));
+                    staged_data.insert(chunk_info.hash, ChunkData::Shared(data));
                     Arc::new(Node::Skipped {
                         hash: chunk_info.hash,
                         size: chunk_info.size,
@@ -1165,6 +1300,7 @@ impl FsStorage {
                 &available_hashes,
                 &mut received_chunks,
                 &mut staged_data,
+                &mut received_in_order,
             )?
         };
 
@@ -1177,6 +1313,8 @@ impl FsStorage {
         }
 
         self.activate_staged_chunks(&stored_path, manifest, &chunks, &staged_data)?;
+
+        self.cache_verified_received_chunks(received_in_order);
 
         let item = Item::make_with_entries(
             name,
@@ -1469,7 +1607,7 @@ impl ChunkStorage for FsStorage {
             let chunk = item.chunks.get(index as usize)?;
             return self
                 .read_chunk_data(&chunk.hash)
-                .map(|data| (*data).clone());
+                .map(|data| data.as_ref().to_vec());
         }
 
         let node = self.get(root)?;
@@ -1824,6 +1962,123 @@ mod tests {
         (data, hash, infile_chunk)
     }
 
+    #[test]
+    fn hot_chunk_cache_accounts_shared_backings_once_across_views_and_replacements() {
+        let backing = ReceivedChunk::from_vec(Vec::from(&b"abcdefghijkl"[..]));
+        let first = backing.slice(0..4);
+        let second = backing.slice(4..8);
+        let replacement = backing.slice(8..12);
+        let first_hash = do_hash(first.as_ref());
+        let second_hash = do_hash(second.as_ref());
+        let mut cache = HotChunkCache::new(12);
+
+        cache.insert_shared(first_hash, first);
+        cache.insert_shared(second_hash, second);
+        assert_eq!(cache.total_bytes, 12);
+        assert_eq!(cache.shared_backings.len(), 1);
+        assert_eq!(
+            cache.shared_backings.values().next().unwrap().cached_views,
+            2
+        );
+
+        cache.insert_shared(first_hash, replacement);
+        assert_eq!(cache.total_bytes, 12);
+        assert_eq!(
+            cache.shared_backings.values().next().unwrap().cached_views,
+            2
+        );
+    }
+
+    #[test]
+    fn hot_chunk_cache_evicts_every_view_before_unaccounting_shared_backing() {
+        let backing = ReceivedChunk::from_vec(Vec::from(&b"abcdefghijkl"[..]));
+        let first = backing.slice(0..4);
+        let second = backing.slice(4..8);
+        let other = ReceivedChunk::from_vec(Vec::from(&b"12345678"[..]));
+        let first_hash = do_hash(first.as_ref());
+        let second_hash = do_hash(second.as_ref());
+        let other_hash = do_hash(other.as_ref());
+        let other_backing_id = other.backing_id();
+        let mut cache = HotChunkCache::new(12);
+
+        cache.insert_shared(first_hash, first);
+        cache.insert_shared(second_hash, second);
+        cache.insert_shared(other_hash, other);
+
+        assert_eq!(cache.total_bytes, 8);
+        assert_eq!(cache.entries.len(), 1);
+        assert!(cache.entries.contains_key(&other_hash));
+        assert_eq!(cache.shared_backings.len(), 1);
+        assert!(cache.shared_backings.contains_key(&other_backing_id));
+    }
+
+    #[test]
+    fn hot_chunk_cache_repeated_hash_view_keeps_one_full_backing_charge() {
+        let backing = ReceivedChunk::from_vec(Vec::from(&b"samesame"[..]));
+        let first = backing.slice(0..4);
+        let repeated = backing.slice(4..8);
+        let hash = do_hash(first.as_ref());
+        assert_eq!(hash, do_hash(repeated.as_ref()));
+        let mut cache = HotChunkCache::new(8);
+
+        cache.insert_shared(hash, first);
+        cache.insert_shared(hash, repeated);
+
+        assert_eq!(cache.total_bytes, 8);
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(
+            cache.shared_backings.values().next().unwrap().cached_views,
+            1
+        );
+    }
+
+    #[test]
+    fn verified_received_cache_replays_manifest_order_with_repeated_hash_before_eviction() {
+        let storage = FsStorage::with_cache_config(
+            temp_path(),
+            FsStorageCacheConfig {
+                max_chunk_bytes: 8,
+                max_tree_entries: 1,
+            },
+        );
+        let first_a = ReceivedChunk::from_vec(b"aaaa".to_vec());
+        let b = ReceivedChunk::from_vec(b"bbbb".to_vec());
+        let refreshed_a = ReceivedChunk::from_vec(b"aaaa".to_vec());
+        let c = ReceivedChunk::from_vec(b"cccc".to_vec());
+        let a_hash = do_hash(first_a.as_ref());
+        let b_hash = do_hash(b.as_ref());
+        let c_hash = do_hash(c.as_ref());
+        let refreshed_a_backing = refreshed_a.backing_id();
+        let c_backing = c.backing_id();
+
+        storage.cache_verified_received_chunks(vec![
+            (a_hash, first_a),
+            (b_hash, b),
+            (a_hash, refreshed_a),
+            (c_hash, c),
+        ]);
+
+        let cache = storage.chunk_cache.lock().unwrap();
+        assert_eq!(
+            cache.order,
+            VecDeque::from([a_hash, c_hash]),
+            "repeated A must refresh after B, so later pressure evicts B"
+        );
+        assert_eq!(
+            cache.entries.keys().copied().collect::<HashSet<_>>(),
+            HashSet::from_iter([a_hash, c_hash])
+        );
+        assert_eq!(cache.total_bytes, 8);
+        assert_eq!(
+            cache
+                .shared_backings
+                .keys()
+                .copied()
+                .collect::<HashSet<_>>(),
+            HashSet::from_iter([refreshed_a_backing, c_backing])
+        );
+    }
+
     fn write_data_to_infile_chunk(
         data: &[u8],
         hash: Hash,
@@ -2139,15 +2394,15 @@ mod tests {
             ChunkAlgorithm::default(),
         );
         let local_hashes = old_root.flatten().unwrap();
-        let received_chunks: Vec<Vec<u8>> = v2
+        let received_chunks: Vec<ReceivedChunk> = v2
             .chunks(CHUNK_SIZE)
             .enumerate()
             .filter(|(index, _)| matches!(*index, 2 | 6))
-            .map(|(_, chunk)| chunk.to_vec())
+            .map(|(_, chunk)| ReceivedChunk::copy_from_slice(chunk))
             .collect();
 
         let item = storage
-            .receive_sync_item(
+            .receive_sync_item_shared(
                 old_item.metadata.name,
                 old_item.metadata.path,
                 2,
@@ -2165,10 +2420,51 @@ mod tests {
             .clone_data()
             .unwrap();
         assert_eq!(stored, v2);
+
+        // A later update must be able to use a previously received chunk from
+        // the activated destination even though it was not copied into the hot
+        // chunk cache.
+        let mut v3 = v2.clone();
+        let changed_start = 6 * CHUNK_SIZE;
+        for byte in &mut v3[changed_start..changed_start + CHUNK_SIZE] {
+            *byte = byte.wrapping_add(41);
+        }
+        let v3_root = source.insert(v3.clone().into()).unwrap();
+        let v3_chunk_infos = v3_root.flatten_with_sizes().unwrap();
+        let v3_manifest = Manifest::from_tree(
+            "sync-item".to_string(),
+            3,
+            &v3_root,
+            &v3_chunk_infos,
+            ChunkAlgorithm::default(),
+        );
+        let v2_hashes = new_root.flatten().unwrap();
+        let v3_received = vec![ReceivedChunk::copy_from_slice(
+            &v3[changed_start..changed_start + CHUNK_SIZE],
+        )];
+
+        let v3_item = storage
+            .receive_sync_item_shared(
+                item.metadata.name,
+                item.metadata.path,
+                3,
+                None,
+                &v3_manifest,
+                &v3_chunk_infos,
+                &v2_hashes,
+                v3_received,
+            )
+            .unwrap();
+        let stored_v3 = storage
+            .get(&v3_item.metadata.root.hash)
+            .unwrap()
+            .clone_data()
+            .unwrap();
+        assert_eq!(stored_v3, v3);
     }
 
     #[tokio::test]
-    async fn fs_storage_receive_sync_item_non_power_of_two_round_trip() {
+    async fn fs_storage_legacy_receive_sync_item_vec_round_trip() {
         use crate::chunk_storage::{hashmap_storage::HashMapStorage, ChunkStorage};
         use crate::item::Manifest;
 
@@ -2212,6 +2508,56 @@ mod tests {
             .clone_data()
             .unwrap();
         assert_eq!(stored, data);
+    }
+
+    #[test]
+    fn fs_storage_shared_receive_keeps_exact_bulk_slices_through_activation_and_cache() {
+        use crate::chunk_storage::{hashmap_storage::HashMapStorage, ChunkStorage};
+        use crate::item::Manifest;
+
+        let root = temp_path();
+        let storage = FsStorage::new(root.clone());
+        let source = HashMapStorage::default();
+        let mut data = vec![1u8; CHUNK_SIZE];
+        data.extend(vec![2u8; CHUNK_SIZE]);
+        let tree = source.chunk_tree(&data, ChunkAlgorithm::Fixed256K).unwrap();
+        let manifest = Manifest::from_tree(
+            "shared-item".to_string(),
+            1,
+            &tree.0,
+            &tree.1,
+            ChunkAlgorithm::Fixed256K,
+        );
+        let backing = ReceivedChunk::from_vec(data.clone());
+        let backing_id = backing.backing_id();
+        let chunks = vec![
+            backing.slice(0..CHUNK_SIZE),
+            backing.slice(CHUNK_SIZE..data.len()),
+        ];
+
+        storage
+            .receive_sync_item_shared(
+                "shared-item".to_string(),
+                PathBuf::from("shared.bin"),
+                1,
+                None,
+                &manifest,
+                &tree.1,
+                &[],
+                chunks,
+            )
+            .unwrap();
+
+        let cache = storage.chunk_cache.lock().unwrap();
+        assert_eq!(cache.total_bytes, data.len());
+        for chunk in &tree.1 {
+            let ChunkData::Shared(cached) = cache.entries.get(&chunk.hash).unwrap() else {
+                panic!("received chunk was copied into owned cache storage");
+            };
+            assert_eq!(cached.backing_id(), backing_id);
+        }
+        drop(cache);
+        assert_eq!(std::fs::read(root.join("shared.bin")).unwrap(), data);
     }
 
     #[test]
@@ -2362,6 +2708,75 @@ mod tests {
             std::fs::read(root.join("artifact.bin")).unwrap(),
             replacement
         );
+    }
+
+    #[test]
+    fn sync_rejects_bad_received_hash_before_destination_mutation() {
+        use crate::chunk_storage::hashmap_storage::HashMapStorage;
+
+        let root = temp_path();
+        let storage = FsStorage::new(root.clone());
+        let original = vec![1u8; CHUNK_SIZE];
+        storage
+            .create_item(
+                "artifact".to_string(),
+                PathBuf::from("artifact.bin"),
+                0,
+                None,
+                bytes::Bytes::from(original.clone()),
+                ChunkAlgorithm::default(),
+            )
+            .unwrap();
+
+        let expected = vec![9u8; CHUNK_SIZE];
+        let source = HashMapStorage::default();
+        let (replacement_root, chunks) = source
+            .chunk_tree(&expected, ChunkAlgorithm::default())
+            .unwrap();
+        let manifest = Manifest::from_tree(
+            "artifact".to_string(),
+            1,
+            &replacement_root,
+            &chunks,
+            ChunkAlgorithm::default(),
+        );
+        let corrupt = ReceivedChunk::from(vec![7u8; CHUNK_SIZE]);
+        let cached_before = {
+            let cache = storage.chunk_cache.lock().unwrap();
+            (
+                cache.entries.keys().copied().collect::<HashSet<_>>(),
+                cache.total_bytes,
+            )
+        };
+
+        let result = storage.receive_sync_item_shared(
+            "artifact".to_string(),
+            PathBuf::from("artifact.bin"),
+            1,
+            None,
+            &manifest,
+            &chunks,
+            &[],
+            vec![corrupt],
+        );
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(root.join("artifact.bin")).unwrap(), original);
+        let cache = storage.chunk_cache.lock().unwrap();
+        assert_eq!(
+            cache.entries.keys().copied().collect::<HashSet<_>>(),
+            cached_before.0,
+            "failed received data must not enter the cache"
+        );
+        assert_eq!(cache.total_bytes, cached_before.1);
+        drop(cache);
+        assert!(std::fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".distd-stage-")
+        }));
     }
 
     #[cfg(feature = "nightly-bench")]

@@ -141,8 +141,10 @@ impl Client<FsStorage> {
         from: &[Hash],
     ) -> Result<Item, ClientError> {
         let t0 = Instant::now();
-        let (manifest, chunk_infos, received_chunks, wire_bytes) =
-            self.server.sync_artifact(&target.artifact_id, from).await?;
+        let (manifest, chunk_infos, received_chunks, wire_bytes) = self
+            .server
+            .sync_artifact_shared(&target.artifact_id, from)
+            .await?;
         let network_elapsed = t0.elapsed();
 
         let received_chunk_count = received_chunks.len();
@@ -154,7 +156,7 @@ impl Client<FsStorage> {
         let t1 = Instant::now();
         let item = self
             .storage
-            .receive_sync_item(
+            .receive_sync_item_shared(
                 target.name,
                 destination,
                 target.revision,
@@ -168,7 +170,9 @@ impl Client<FsStorage> {
         let store_elapsed = t1.elapsed();
 
         tracing::info!(
-            "distd_sync_wire_bytes={wire_bytes} distd_sync_payload_bytes={payload_bytes} distd_sync_received_chunks={} distd_network_ms={} distd_store_ms={}",
+            "distd_sync_local_basis_chunks={} distd_sync_manifest_chunks={} distd_sync_wire_bytes={wire_bytes} distd_sync_payload_bytes={payload_bytes} distd_sync_received_chunks={} distd_network_ms={} distd_store_ms={}",
+            from.len(),
+            chunk_infos.len(),
             received_chunk_count,
             network_elapsed.as_millis(),
             store_elapsed.as_millis(),

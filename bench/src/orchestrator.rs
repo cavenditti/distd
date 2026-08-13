@@ -37,6 +37,7 @@ impl BenchmarkOrchestrator {
         small_file_count: u32,
         small_file_kib: u64,
         delta_fraction: f64,
+        corpus_seed: Option<u64>,
         group_by_workload: bool,
         runner_options: RunnerOptions,
     ) -> Self {
@@ -55,6 +56,7 @@ impl BenchmarkOrchestrator {
                 small_file_kib,
                 delta_fraction,
                 smoke,
+                corpus_seed,
             },
             group_by_workload,
             runner_options,

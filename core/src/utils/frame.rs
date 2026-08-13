@@ -14,8 +14,11 @@ pub enum FrameError {
     #[error("frame I/O error")]
     IoError(#[from] std::io::Error),
 
-    #[error("frame payload exceeds u32 length prefix")]
+    #[error("frame payload exceeds allowed limit")]
     FrameTooLarge,
+
+    #[error("configured frame payload limit exceeds protocol ceiling")]
+    InvalidPayloadLimit,
 
     #[error("malformed frame")]
     MalformedFrame,
@@ -111,10 +114,29 @@ where
     R: AsyncRead + Unpin,
     M: Message + Default,
 {
+    read_length_delimited_async_with_limit(reader, MAX_FRAME_PAYLOAD_BYTES).await
+}
+
+/// Read and decode one frame while enforcing a caller-specific payload limit.
+///
+/// The caller limit cannot exceed [`MAX_FRAME_PAYLOAD_BYTES`]. The declared frame length is
+/// checked against the caller limit before allocating or reading the payload.
+pub async fn read_length_delimited_async_with_limit<R, M>(
+    reader: &mut R,
+    max_payload_bytes: usize,
+) -> Result<M, FrameError>
+where
+    R: AsyncRead + Unpin,
+    M: Message + Default,
+{
+    if max_payload_bytes > MAX_FRAME_PAYLOAD_BYTES {
+        return Err(FrameError::InvalidPayloadLimit);
+    }
+
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf).await?;
     let frame_len = u32::from_be_bytes(len_buf) as usize;
-    if frame_len > MAX_FRAME_PAYLOAD_BYTES {
+    if frame_len > max_payload_bytes {
         return Err(FrameError::FrameTooLarge);
     }
     let mut payload = vec![0u8; frame_len];
@@ -177,7 +199,8 @@ mod tests {
 
     use super::{
         decode_length_delimited, encode_length_delimited, read_length_delimited_async,
-        try_decode_length_delimited, FrameError, MAX_FRAME_PAYLOAD_BYTES,
+        read_length_delimited_async_with_limit, try_decode_length_delimited, FrameError,
+        MAX_FRAME_PAYLOAD_BYTES,
     };
 
     fn message(artifact_id: &str) -> SyncMessage {
@@ -213,6 +236,77 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, FrameError::FrameTooLarge));
+    }
+
+    #[tokio::test]
+    async fn caller_limit_exact_boundary_decodes_frame() {
+        use tokio::io::AsyncWriteExt;
+
+        let expected = message("caller-limit-boundary");
+        let encoded = encode_length_delimited(&expected).unwrap();
+        let payload_len = encoded.len() - 4;
+        let (mut writer, mut reader) = tokio::io::duplex(encoded.len());
+        tokio::spawn(async move {
+            writer.write_all(&encoded).await.unwrap();
+        });
+
+        let decoded =
+            read_length_delimited_async_with_limit::<_, SyncMessage>(&mut reader, payload_len)
+                .await
+                .unwrap();
+        assert_eq!(decoded, expected);
+    }
+
+    #[tokio::test]
+    async fn caller_limit_rejects_declarations_from_prefix_without_reading_payload() {
+        use std::time::Duration;
+
+        use tokio::io::AsyncWriteExt;
+        use tokio::time::timeout;
+
+        async fn assert_prefix_rejected(caller_max: usize, declared_len: usize) {
+            let (mut writer, mut reader) = tokio::io::duplex(8);
+            writer
+                .write_all(&(declared_len as u32).to_be_bytes())
+                .await
+                .unwrap();
+
+            let error = timeout(
+                Duration::from_millis(100),
+                read_length_delimited_async_with_limit::<_, SyncMessage>(&mut reader, caller_max),
+            )
+            .await
+            .expect("prefix must be rejected without waiting for payload")
+            .unwrap_err();
+            assert!(matches!(error, FrameError::FrameTooLarge));
+        }
+
+        assert_prefix_rejected(64, 65).await;
+        assert_prefix_rejected(MAX_FRAME_PAYLOAD_BYTES - 1, MAX_FRAME_PAYLOAD_BYTES).await;
+    }
+
+    #[tokio::test]
+    async fn rejects_caller_limit_above_protocol_ceiling_without_reading() {
+        use std::time::Duration;
+
+        use tokio::time::timeout;
+
+        let (_writer, mut reader) = tokio::io::duplex(1);
+        let error = timeout(
+            Duration::from_millis(100),
+            read_length_delimited_async_with_limit::<_, SyncMessage>(
+                &mut reader,
+                MAX_FRAME_PAYLOAD_BYTES + 1,
+            ),
+        )
+        .await
+        .expect("invalid configured limit must fail before reading")
+        .unwrap_err();
+        assert!(matches!(error, FrameError::InvalidPayloadLimit));
+        assert_eq!(
+            error.to_string(),
+            "configured frame payload limit exceeds protocol ceiling"
+        );
     }
 
     #[test]

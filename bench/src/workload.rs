@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use flate2::{write::GzEncoder, Compression};
-use rand::RngCore;
+use rand::{rngs::StdRng, RngCore, SeedableRng};
 
 /// Describes the kind of synthetic workload to generate.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +108,8 @@ pub struct WorkloadParams {
     pub delta_fraction: f64,
     /// If true, generate minimal-size fixtures for smoke testing.
     pub smoke: bool,
+    /// Optional seed for byte-identical reproducible benchmark corpora.
+    pub corpus_seed: Option<u64>,
 }
 
 /// A generated workload with source directory (revision 1) and optionally
@@ -531,14 +533,18 @@ fn gen_delta_revision(base: &Path, params: &WorkloadParams, high: bool) -> Workl
 
     // Build v1
     let file_v1 = v1.join("artifact.bin");
-    write_random_file(&file_v1, size);
+    if let Some(seed) = params.corpus_seed {
+        write_seeded_random_file(&file_v1, size, seed);
+    } else {
+        write_random_file(&file_v1, size);
+    }
 
     // Build v2: copy v1 then mutate `delta` fraction of 256 KiB blocks
     fs::create_dir_all(&v2).expect("create v2");
     let file_v2 = v2.join("artifact.bin");
     fs::copy(&file_v1, &file_v2).expect("copy v1 to v2");
 
-    mutate_file_blocks(&file_v2, delta);
+    mutate_file_blocks(&file_v2, delta, params.corpus_seed);
 
     // Bump v2 file's mtime so that timestamp-aware tools (rsync) detect the change.
     // Without this, copy + mutate can finish within the same second, making rsync
@@ -601,7 +607,7 @@ fn gen_dedup_heavy(base: &Path, params: &WorkloadParams) -> Workload {
 }
 
 /// Mutate `fraction` of 256 KiB blocks in a file with random data.
-fn mutate_file_blocks(path: &Path, fraction: f64) {
+fn mutate_file_blocks(path: &Path, fraction: f64, corpus_seed: Option<u64>) {
     use std::io::{Seek, SeekFrom};
 
     let mut f = fs::OpenOptions::new()
@@ -614,7 +620,8 @@ fn mutate_file_blocks(path: &Path, fraction: f64) {
     let num_blocks = len.div_ceil(block_size);
     let blocks_to_mutate = ((num_blocks as f64) * fraction).ceil() as usize;
 
-    let mut rng = rand::thread_rng();
+    let mut seeded_rng = corpus_seed.map(|seed| StdRng::seed_from_u64(seed ^ 0xd15d_d31a_5eed));
+    let mut thread_rng = rand::thread_rng();
     let mut buf = vec![0u8; block_size];
 
     // Pick evenly spaced blocks to mutate for reproducibility
@@ -628,9 +635,66 @@ fn mutate_file_blocks(path: &Path, fraction: f64) {
         }
         let offset = block_idx * block_size;
         let this_block = block_size.min(len - offset);
-        rng.fill_bytes(&mut buf[..this_block]);
+        if let Some(rng) = seeded_rng.as_mut() {
+            rng.fill_bytes(&mut buf[..this_block]);
+        } else {
+            thread_rng.fill_bytes(&mut buf[..this_block]);
+        }
         f.seek(SeekFrom::Start(offset as u64)).expect("seek");
         f.write_all(&buf[..this_block]).expect("write block");
+    }
+}
+
+fn write_seeded_random_file(path: &Path, size: usize, seed: u64) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("Failed to create parent dir");
+    }
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut file = fs::File::create(path).expect("Failed to create file");
+    let mut remaining = size;
+    let mut buffer = vec![0u8; (1024 * 1024).min(remaining)];
+    while remaining > 0 {
+        let length = buffer.len().min(remaining);
+        rng.fill_bytes(&mut buffer[..length]);
+        file.write_all(&buffer[..length]).expect("Failed to write");
+        remaining -= length;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{generate_workloads, WorkloadKind, WorkloadParams};
+
+    #[test]
+    fn corpus_seed_reproduces_identical_delta_revisions() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let params = WorkloadParams {
+            large_file_mib: 1,
+            small_file_count: 1,
+            small_file_kib: 1,
+            delta_fraction: 0.05,
+            smoke: false,
+            corpus_seed: Some(0x5eed),
+        };
+
+        let first_workload =
+            generate_workloads(first.path(), &[WorkloadKind::LowDeltaRevision], &params)
+                .pop()
+                .unwrap();
+        let second_workload =
+            generate_workloads(second.path(), &[WorkloadKind::LowDeltaRevision], &params)
+                .pop()
+                .unwrap();
+
+        assert_eq!(
+            std::fs::read(first_workload.source_dir.join("artifact.bin")).unwrap(),
+            std::fs::read(second_workload.source_dir.join("artifact.bin")).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(first_workload.source_dir_v2.unwrap().join("artifact.bin")).unwrap(),
+            std::fs::read(second_workload.source_dir_v2.unwrap().join("artifact.bin")).unwrap()
+        );
     }
 }
 

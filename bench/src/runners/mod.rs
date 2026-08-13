@@ -7,7 +7,7 @@ pub mod ostree;
 pub mod rsync;
 pub mod zsync;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::time::{Duration, Instant};
 
@@ -18,6 +18,9 @@ use crate::workload::Workload;
 #[derive(Clone, Debug)]
 pub struct RunnerOptions {
     pub network: Option<NetworkProfile>,
+    pub artifacts_dir: PathBuf,
+    pub distd_low_delta_chunking: String,
+    pub corpus_seed: Option<u64>,
 }
 
 impl RunnerOptions {

@@ -1,4 +1,12 @@
-use std::{collections::HashSet, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashSet,
+    ops::{Deref, Range},
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 
 use bytes::Bytes;
 pub use node::Node;
@@ -11,6 +19,117 @@ use crate::{
     hash::merge_hashes,
     item::{Item, Name as ItemName},
 };
+
+static NEXT_RECEIVED_BACKING_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Debug)]
+struct ReceivedBacking {
+    id: u64,
+    allocation_bytes: usize,
+}
+
+/// An immutable chunk received from a sync transport.
+///
+/// Slices share both the underlying bytes and allocation metadata, allowing a
+/// cache to charge one bulk allocation exactly once across all retained views.
+#[derive(Clone, Debug)]
+pub struct ReceivedChunk {
+    bytes: Bytes,
+    backing: Arc<ReceivedBacking>,
+}
+
+impl ReceivedChunk {
+    #[must_use]
+    pub fn from_vec(data: Vec<u8>) -> Self {
+        let allocation_bytes = data.capacity();
+        Self {
+            bytes: Bytes::from(data),
+            backing: Arc::new(ReceivedBacking {
+                id: NEXT_RECEIVED_BACKING_ID.fetch_add(1, Ordering::Relaxed),
+                allocation_bytes,
+            }),
+        }
+    }
+
+    #[must_use]
+    pub fn copy_from_slice(data: &[u8]) -> Self {
+        Self::from_vec(data.to_vec())
+    }
+
+    #[must_use]
+    pub fn from_static(data: &'static [u8]) -> Self {
+        Self {
+            bytes: Bytes::from_static(data),
+            backing: Arc::new(ReceivedBacking {
+                id: NEXT_RECEIVED_BACKING_ID.fetch_add(1, Ordering::Relaxed),
+                allocation_bytes: 0,
+            }),
+        }
+    }
+
+    #[must_use]
+    pub fn slice(&self, range: Range<usize>) -> Self {
+        Self {
+            bytes: self.bytes.slice(range),
+            backing: self.backing.clone(),
+        }
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn backing_id(&self) -> u64 {
+        self.backing.id
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn backing_allocation_bytes(&self) -> usize {
+        self.backing.allocation_bytes
+    }
+
+    #[must_use]
+    pub fn into_vec(self) -> Vec<u8> {
+        self.bytes.as_ref().to_vec()
+    }
+}
+
+impl From<Vec<u8>> for ReceivedChunk {
+    fn from(data: Vec<u8>) -> Self {
+        Self::from_vec(data)
+    }
+}
+
+impl AsRef<[u8]> for ReceivedChunk {
+    fn as_ref(&self) -> &[u8] {
+        self.bytes.as_ref()
+    }
+}
+
+impl Deref for ReceivedChunk {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_ref()
+    }
+}
+
+impl PartialEq for ReceivedChunk {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+    }
+}
+
+impl Eq for ReceivedChunk {}
 
 pub mod cas;
 pub mod fs_storage;

@@ -9,6 +9,7 @@ use tokio::{sync::RwLock, time::Instant};
 //use ring::agreement::PublicKey;
 
 use distd_core::{
+    chunk_storage::ReceivedChunk,
     chunks::{ChunkAlgorithm, ChunkInfo},
     hash::Hash,
     item::{FileEntry, Manifest},
@@ -76,15 +77,30 @@ impl TransportClient {
 }
 
 impl SyncContinuation {
+    #[allow(dead_code)]
     async fn send_possession_and_collect_chunks(
         self,
         possession: proto::PossessionBitfield,
         chunk_sizes: &[usize],
     ) -> Result<(Vec<Vec<u8>>, u64), ServerRequest> {
+        let (received, wire_bytes) = self
+            .send_possession_and_collect_chunks_shared(possession, chunk_sizes)
+            .await?;
+        Ok((
+            received.into_iter().map(ReceivedChunk::into_vec).collect(),
+            wire_bytes,
+        ))
+    }
+
+    async fn send_possession_and_collect_chunks_shared(
+        self,
+        possession: proto::PossessionBitfield,
+        chunk_sizes: &[usize],
+    ) -> Result<(Vec<ReceivedChunk>, u64), ServerRequest> {
         match self {
             Self::Quic(session) => {
                 session
-                    .send_possession_and_collect_chunks(possession, chunk_sizes)
+                    .send_possession_and_collect_chunks_shared(possession, chunk_sizes)
                     .await
             }
         }
@@ -283,6 +299,22 @@ impl Server {
         artifact_id: &str,
         local_hashes: &[Hash],
     ) -> Result<(Manifest, Vec<ChunkInfo>, Vec<Vec<u8>>, u64), ServerRequest> {
+        let (manifest, chunk_infos, received, wire_bytes) =
+            self.sync_artifact_shared(artifact_id, local_hashes).await?;
+        Ok((
+            manifest,
+            chunk_infos,
+            received.into_iter().map(ReceivedChunk::into_vec).collect(),
+            wire_bytes,
+        ))
+    }
+
+    /// Shared-backing sync path used by the built-in filesystem client.
+    pub async fn sync_artifact_shared(
+        &self,
+        artifact_id: &str,
+        local_hashes: &[Hash],
+    ) -> Result<(Manifest, Vec<ChunkInfo>, Vec<ReceivedChunk>, u64), ServerRequest> {
         let mut shared = self.shared.write().await;
         let manifest_request = proto::ManifestRequest {
             artifact_id: artifact_id.to_string(),
@@ -350,7 +382,7 @@ impl Server {
             .collect();
 
         let (received, wire_bytes) = continuation
-            .send_possession_and_collect_chunks(
+            .send_possession_and_collect_chunks_shared(
                 proto::PossessionBitfield {
                     bitfield: local_bitfield.to_bytes(),
                 },

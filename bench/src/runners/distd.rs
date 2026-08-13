@@ -17,7 +17,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::metrics::{self, ProcessMonitor, RunMetrics};
 use crate::network::{NetworkProfile, UdpShaperProxy};
-use crate::workload::{self, Workload};
+use crate::workload::{self, Workload, WorkloadKind};
 
 use super::{
     wait_child_with_timeout, RunnerOptions, ToolRunner, DEFAULT_CHILD_TIMEOUT, SMOKE_CHILD_TIMEOUT,
@@ -55,17 +55,33 @@ impl ServerGuard {
     fn pid(&self) -> u32 {
         self.pid
     }
+
+    fn stop_and_collect_output(&mut self) -> String {
+        let Some(mut child) = self.child.take() else {
+            return String::new();
+        };
+        let _ = child.kill();
+        match child.wait_with_output() {
+            Ok(output) => format!(
+                "--- stdout ---\n{}\n--- stderr ---\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            ),
+            Err(error) => format!("cannot collect distd server output: {error}"),
+        }
+    }
 }
 
 impl Drop for ServerGuard {
     fn drop(&mut self) {
+        let had_child = self.child.is_some();
         if let Some(ref mut child) = self.child {
             let _ = child.kill();
             let _ = child.wait();
         }
         // Belt-and-suspenders: also signal by PID in case the handle was consumed
         #[cfg(unix)]
-        {
+        if had_child {
             unsafe {
                 libc::kill(self.pid as i32, libc::SIGKILL);
             }
@@ -75,8 +91,11 @@ impl Drop for ServerGuard {
 
 pub struct DistdRunner {
     work_dir: PathBuf,
+    artifacts_dir: PathBuf,
     display_name: String,
     network: Option<NetworkProfile>,
+    low_delta_chunking: String,
+    corpus_seed: Option<u64>,
     server_guard: Mutex<Option<ServerGuard>>,
     sync_udp_proxy: Mutex<Option<UdpShaperProxy>>,
 }
@@ -121,8 +140,11 @@ impl DistdRunner {
     pub fn new(work_dir: &Path, options: RunnerOptions) -> Self {
         Self {
             work_dir: work_dir.join("distd"),
+            artifacts_dir: options.artifacts_dir.join("distd"),
             display_name: "distd-quic".to_string(),
             network: options.network,
+            low_delta_chunking: options.distd_low_delta_chunking,
+            corpus_seed: options.corpus_seed,
             server_guard: Mutex::new(None),
             sync_udp_proxy: Mutex::new(None),
         }
@@ -261,10 +283,47 @@ impl DistdRunner {
         Ok(pid)
     }
 
-    fn stop_server(&self) {
+    fn stop_server_and_collect_output(&self) -> String {
         self.stop_shapers();
-        // Dropping the guard kills the child process
-        *self.server_guard.lock().unwrap() = None;
+        self.server_guard
+            .lock()
+            .unwrap()
+            .take()
+            .map(|mut guard| guard.stop_and_collect_output())
+            .unwrap_or_default()
+    }
+
+    fn stop_server(&self) {
+        let _ = self.stop_server_and_collect_output();
+    }
+
+    fn persist_operation_evidence(
+        &self,
+        metrics: &mut RunMetrics,
+        client_stderr: &str,
+        server_output: &str,
+    ) -> Result<(), String> {
+        std::fs::create_dir_all(&self.artifacts_dir).map_err(|error| {
+            format!(
+                "cannot create distd evidence directory {}: {error}",
+                self.artifacts_dir.display()
+            )
+        })?;
+        let evidence_dir = std::fs::canonicalize(&self.artifacts_dir).map_err(|error| {
+            format!(
+                "cannot resolve distd evidence directory {}: {error}",
+                self.artifacts_dir.display()
+            )
+        })?;
+        let stem = operation_evidence_stem(metrics);
+        let client_path = evidence_dir.join(format!("{stem}--client-stderr.log"));
+        let server_path = evidence_dir.join(format!("{stem}--server-output.log"));
+
+        write_new_evidence_file(&client_path, client_stderr)?;
+        write_new_evidence_file(&server_path, server_output)?;
+        metrics.client_stderr_path = Some(client_path.to_string_lossy().into_owned());
+        metrics.server_output_path = Some(server_path.to_string_lossy().into_owned());
+        Ok(())
     }
 
     fn start_shapers(&self) -> Result<(), String> {
@@ -296,14 +355,26 @@ impl DistdRunner {
             .unwrap_or_else(|| format!("quic://{SYNC_SERVER_ADDR}"))
     }
 
+    fn selected_chunking_policy<'a>(&'a self, workload: &Workload) -> Option<&'a str> {
+        (workload.kind == WorkloadKind::LowDeltaRevision)
+            .then_some(self.low_delta_chunking.as_str())
+    }
+
     /// Publish a file to the running server via HTTP REST API.
     fn publish_file(
         &self,
         source_file: &Path,
         item_name: &str,
         item_path: &str,
+        chunking_policy: Option<&str>,
     ) -> Result<(), String> {
         for attempt in 1..=PUBLISH_RETRIES {
+            let publish_url = item_publish_url(
+                &self.publish_base_url(),
+                item_name,
+                item_path,
+                chunking_policy,
+            );
             let output = Command::new("curl")
                 .args([
                     "-sS",
@@ -316,12 +387,7 @@ impl DistdRunner {
                     "POST",
                     "-H",
                     &format!("Authorization: Bearer {BENCH_AUTH_TOKEN}"),
-                    &format!(
-                        "{}/items?name={}&path={}",
-                        self.publish_base_url(),
-                        item_name,
-                        item_path
-                    ),
+                    &publish_url,
                     "-F",
                     &format!("item=@{}", source_file.to_string_lossy()),
                 ])
@@ -357,6 +423,7 @@ impl DistdRunner {
         source_files: &[PathBuf],
         item_name: &str,
         item_path: &str,
+        chunking_policy: Option<&str>,
     ) -> Result<(), String> {
         for attempt in 1..=PUBLISH_RETRIES {
             let mut cmd = Command::new("curl");
@@ -370,11 +437,11 @@ impl DistdRunner {
                 .arg("POST")
                 .arg("-H")
                 .arg(format!("Authorization: Bearer {BENCH_AUTH_TOKEN}"))
-                .arg(format!(
-                    "{}/items?name={}&path={}",
-                    self.publish_base_url(),
+                .arg(item_publish_url(
+                    &self.publish_base_url(),
                     item_name,
-                    item_path
+                    item_path,
+                    chunking_policy,
                 ));
 
             for source_file in source_files {
@@ -491,6 +558,9 @@ impl ToolRunner for DistdRunner {
         m: &mut RunMetrics,
     ) -> Result<(), String> {
         self.reset_client_cache()?;
+        let chunking_policy = self.selected_chunking_policy(workload);
+        m.chunking_policy = chunking_policy.map(str::to_string);
+        m.corpus_seed = self.corpus_seed;
 
         // Start server (stop any previous one first)
         let server_pid = self.start_server()?;
@@ -506,9 +576,15 @@ impl ToolRunner for DistdRunner {
         let item_path = "bench-artifact";
 
         if let Err(e) = if source_files.len() > 1 {
-            self.publish_files(&workload.source_dir, &source_files, item_name, item_path)
+            self.publish_files(
+                &workload.source_dir,
+                &source_files,
+                item_name,
+                item_path,
+                chunking_policy,
+            )
         } else {
-            self.publish_file(&source_files[0], item_name, item_path)
+            self.publish_file(&source_files[0], item_name, item_path, chunking_policy)
         } {
             self.stop_server();
             return Err(e);
@@ -541,36 +617,23 @@ impl ToolRunner for DistdRunner {
 
         let elapsed = start.elapsed();
         let (peak_rss, cpu_secs) = monitor.finish();
+        let mut client_stderr = String::new();
+        if let Some(ref mut stderr) = client_child.stderr {
+            let _ = stderr.read_to_string(&mut client_stderr);
+        }
 
         match wait_result {
             Ok(_) => {
-                let mut stderr_buf = String::new();
-                if let Some(ref mut stderr) = client_child.stderr {
-                    use std::io::Read;
-                    let _ = stderr.read_to_string(&mut stderr_buf);
-                }
                 if let Ok(status) = client_child.wait() {
                     if !status.success() {
-                        tracing::warn!("distd client exited with error: {stderr_buf}");
-                        m.notes.push_str(&format!(" | client error: {stderr_buf}"));
+                        tracing::warn!(
+                            "distd client exited with error; preserving full stderr as evidence"
+                        );
+                        m.notes.push_str(" | client exited unsuccessfully");
                     }
                 } else {
                     // Already reaped by wait_child_with_timeout
                 }
-
-                if let Some(bytes) = extract_payload_bytes(&stderr_buf) {
-                    m.bytes_transferred = bytes;
-                } else {
-                    m.notes.push_str(" | missing payload byte metric");
-                }
-
-                // Log client timing info for analysis
-                for line in stderr_buf.lines() {
-                    if line.contains("distd_network_ms") || line.contains("distd_store_ms") {
-                        tracing::info!("    client: {}", line.trim());
-                    }
-                }
-                let _ = std::fs::write(self.work_dir.join("client-stderr.log"), &stderr_buf);
             }
             Err(timeout_msg) => {
                 tracing::error!("distd client timed out: {timeout_msg}");
@@ -582,35 +645,17 @@ impl ToolRunner for DistdRunner {
         m.wall_clock_secs = elapsed.as_secs_f64();
         m.source_bytes = workload.total_bytes_v1;
         m.dest_size_bytes = metrics::dir_size(dest_dir);
-        if m.bytes_transferred == 0 {
-            m.notes.push_str(" | wire-byte measurement unavailable");
-        }
         m.peak_rss_bytes = peak_rss;
         m.cpu_seconds = cpu_secs;
 
-        // Validate correctness by comparing source and dest hashes
         let dest_file = dest_dir.join(item_path);
-        if dest_file.exists() {
-            let (src_hash, dst_hash) = if source_files.len() > 1 {
-                (
-                    metrics::hash_dir(&workload.source_dir),
-                    metrics::hash_dir(&dest_file),
-                )
-            } else {
-                (
-                    metrics::hash_file(&source_files[0]),
-                    metrics::hash_file(&dest_file),
-                )
-            };
-            m.correct = src_hash == dst_hash;
-            if !m.correct {
-                m.notes
-                    .push_str(&format!(" | hash mismatch: src={src_hash} dst={dst_hash}"));
-            }
-        } else {
-            m.correct = false;
-            m.notes.push_str(" | dest file not found");
-        }
+        record_complete_hashes(
+            m,
+            &workload.source_dir,
+            &source_files,
+            &dest_file,
+            "dest file not found",
+        );
 
         // Check server store size via REST API (with timeout)
         if let Ok(store_size) = query_store_size() {
@@ -618,7 +663,9 @@ impl ToolRunner for DistdRunner {
                 .push_str(&format!(" | server_store_bytes={store_size}"));
         }
 
-        self.stop_server();
+        let server_output = self.stop_server_and_collect_output();
+        apply_sync_diagnostics(m, &client_stderr, &server_output);
+        self.persist_operation_evidence(m, &client_stderr, &server_output)?;
         m.finalize();
         Ok(())
     }
@@ -629,6 +676,9 @@ impl ToolRunner for DistdRunner {
         dest_dir: &Path,
         m: &mut RunMetrics,
     ) -> Result<(), String> {
+        let chunking_policy = self.selected_chunking_policy(workload);
+        m.chunking_policy = chunking_policy.map(str::to_string);
+        m.corpus_seed = self.corpus_seed;
         let v2_dir = workload
             .source_dir_v2
             .as_ref()
@@ -649,9 +699,15 @@ impl ToolRunner for DistdRunner {
         let item_path = "bench-artifact";
 
         if v1_files.len() > 1 {
-            self.publish_files(&workload.source_dir, &v1_files, item_name, item_path)
+            self.publish_files(
+                &workload.source_dir,
+                &v1_files,
+                item_name,
+                item_path,
+                chunking_policy,
+            )
         } else {
-            self.publish_file(&v1_files[0], item_name, item_path)
+            self.publish_file(&v1_files[0], item_name, item_path, chunking_policy)
         }
         .inspect_err(|_e| {
             self.stop_server();
@@ -677,9 +733,9 @@ impl ToolRunner for DistdRunner {
             return Err("No files in v2 source".to_string());
         }
         if v2_files.len() > 1 {
-            self.publish_files(v2_dir, &v2_files, item_name, item_path)
+            self.publish_files(v2_dir, &v2_files, item_name, item_path, chunking_policy)
         } else {
-            self.publish_file(&v2_files[0], item_name, item_path)
+            self.publish_file(&v2_files[0], item_name, item_path, chunking_policy)
         }
         .inspect_err(|_e| {
             self.stop_server();
@@ -704,28 +760,23 @@ impl ToolRunner for DistdRunner {
         let wait_result = wait_child_with_timeout(&mut client_child, &mut monitor, timeout);
         let elapsed = start.elapsed();
         let (peak_rss, cpu_secs) = monitor.finish();
+        let mut client_stderr = String::new();
+        if let Some(ref mut stderr) = client_child.stderr {
+            let _ = stderr.read_to_string(&mut client_stderr);
+        }
 
         match wait_result {
             Ok(_) => {
-                let mut stderr_buf = String::new();
-                if let Some(ref mut stderr) = client_child.stderr {
-                    use std::io::Read;
-                    let _ = stderr.read_to_string(&mut stderr_buf);
-                }
                 if let Ok(status) = client_child.wait() {
                     if !status.success() {
-                        tracing::warn!("distd client update exited with error: {stderr_buf}");
-                        m.notes.push_str(&format!(" | client error: {stderr_buf}"));
+                        tracing::warn!(
+                            "distd client update exited with error; preserving full stderr as evidence"
+                        );
+                        m.notes.push_str(" | client exited unsuccessfully");
                     }
-                    if stderr_buf.contains("QUIC transport error") {
+                    if client_stderr.contains("QUIC transport error") {
                         m.correct = false;
                         m.notes.push_str(" | transfer stream error observed");
-                    }
-
-                    if let Some(bytes) = extract_payload_bytes(&stderr_buf) {
-                        m.bytes_transferred = bytes;
-                    } else {
-                        m.notes.push_str(" | missing payload byte metric");
                     }
                 }
             }
@@ -739,38 +790,24 @@ impl ToolRunner for DistdRunner {
         m.wall_clock_secs = elapsed.as_secs_f64();
         m.source_bytes = expected_source_bytes;
         m.dest_size_bytes = metrics::dir_size(dest_dir);
-        if m.bytes_transferred == 0 {
-            m.notes.push_str(" | wire-byte measurement unavailable");
-        }
         m.peak_rss_bytes = peak_rss;
         m.cpu_seconds = cpu_secs;
 
+        record_complete_hashes(
+            m,
+            v2_dir,
+            &v2_files,
+            &dest_file,
+            "dest file not found after update",
+        );
+
+        let server_output = self.stop_server_and_collect_output();
+        apply_sync_diagnostics(m, &client_stderr, &server_output);
         if m.bytes_transferred >= expected_source_bytes {
             m.notes
                 .push_str(" | update transferred full artifact or more");
         }
-
-        // Validate v2 output hash
-        if dest_file.exists() {
-            let (src_hash, dst_hash) = if v2_files.len() > 1 {
-                (metrics::hash_dir(v2_dir), metrics::hash_dir(&dest_file))
-            } else {
-                (
-                    metrics::hash_file(&v2_files[0]),
-                    metrics::hash_file(&dest_file),
-                )
-            };
-            m.correct = src_hash == dst_hash;
-            if !m.correct {
-                m.notes
-                    .push_str(&format!(" | hash mismatch: src={src_hash} dst={dst_hash}"));
-            }
-        } else {
-            m.correct = false;
-            m.notes.push_str(" | dest file not found after update");
-        }
-
-        self.stop_server();
+        self.persist_operation_evidence(m, &client_stderr, &server_output)?;
         m.finalize();
         Ok(())
     }
@@ -784,6 +821,210 @@ impl ToolRunner for DistdRunner {
 impl Drop for DistdRunner {
     fn drop(&mut self) {
         self.stop_server();
+    }
+}
+
+fn item_publish_url(
+    base_url: &str,
+    item_name: &str,
+    item_path: &str,
+    chunking_policy: Option<&str>,
+) -> String {
+    let mut url = format!("{base_url}/items?name={item_name}&path={item_path}");
+    if let Some(policy) = chunking_policy {
+        url.push_str("&chunking=");
+        url.push_str(policy);
+    }
+    url
+}
+
+fn operation_evidence_stem(metrics: &RunMetrics) -> String {
+    let operation = if metrics.workload.ends_with("-update") {
+        "update"
+    } else if metrics.cache_state == "setup" {
+        "setup-full"
+    } else {
+        "full"
+    };
+    format!(
+        "{}--{}--{}--iteration-{:03}",
+        sanitize_evidence_component(&metrics.workload),
+        operation,
+        sanitize_evidence_component(&metrics.cache_state),
+        metrics.iteration,
+    )
+}
+
+fn sanitize_evidence_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn write_new_evidence_file(path: &Path, contents: &str) -> Result<(), String> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| format!("cannot create evidence file {}: {error}", path.display()))?;
+    file.write_all(contents.as_bytes())
+        .map_err(|error| format!("cannot write evidence file {}: {error}", path.display()))
+}
+
+fn record_complete_hashes(
+    metrics: &mut RunMetrics,
+    source_root: &Path,
+    source_files: &[PathBuf],
+    destination: &Path,
+    destination_missing_note: &str,
+) {
+    let expected_hash = if source_files.len() > 1 {
+        metrics::hash_dir(source_root)
+    } else {
+        metrics::hash_file(&source_files[0])
+    };
+    metrics.expected_hash = Some(expected_hash.clone());
+
+    if !destination.exists() {
+        metrics.correct = false;
+        metrics
+            .notes
+            .push_str(&format!(" | {destination_missing_note}"));
+        return;
+    }
+
+    let actual_hash = if source_files.len() > 1 {
+        metrics::hash_dir(destination)
+    } else {
+        metrics::hash_file(destination)
+    };
+    metrics.actual_hash = Some(actual_hash.clone());
+    metrics.correct = expected_hash == actual_hash;
+    if !metrics.correct {
+        metrics.notes.push_str(&format!(
+            " | hash mismatch: expected={expected_hash} actual={actual_hash}"
+        ));
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ClientSyncDiagnostics {
+    local_basis_chunks: Option<u64>,
+    manifest_chunks: Option<u64>,
+    received_chunks: Option<u64>,
+    payload_bytes: Option<u64>,
+    wire_bytes: Option<u64>,
+    network_ms: Option<u64>,
+    store_ms: Option<u64>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ServerSyncDiagnostics {
+    manifest_chunks: Option<u64>,
+    missing_chunks: Option<u64>,
+}
+
+fn parse_metric_value(output: &str, key: &str) -> Option<u64> {
+    let prefix = format!("{key}=");
+    output.lines().rev().find_map(|line| {
+        line.split_whitespace().find_map(|token| {
+            token
+                .strip_prefix(&prefix)
+                .and_then(|value| value.parse::<u64>().ok())
+        })
+    })
+}
+
+fn parse_client_sync_diagnostics(stderr: &str) -> ClientSyncDiagnostics {
+    ClientSyncDiagnostics {
+        local_basis_chunks: parse_metric_value(stderr, "distd_sync_local_basis_chunks"),
+        manifest_chunks: parse_metric_value(stderr, "distd_sync_manifest_chunks"),
+        received_chunks: parse_metric_value(stderr, "distd_sync_received_chunks"),
+        payload_bytes: parse_metric_value(stderr, "distd_sync_payload_bytes"),
+        wire_bytes: parse_metric_value(stderr, "distd_sync_wire_bytes"),
+        network_ms: parse_metric_value(stderr, "distd_network_ms"),
+        store_ms: parse_metric_value(stderr, "distd_store_ms"),
+    }
+}
+
+fn parse_server_sync_diagnostics(output: &str) -> ServerSyncDiagnostics {
+    ServerSyncDiagnostics {
+        manifest_chunks: parse_metric_value(output, "distd_sync_manifest_chunks"),
+        missing_chunks: parse_metric_value(output, "distd_sync_missing_chunks"),
+    }
+}
+
+fn apply_sync_diagnostics(metrics: &mut RunMetrics, client_stderr: &str, server_output: &str) {
+    let client = parse_client_sync_diagnostics(client_stderr);
+    let server = parse_server_sync_diagnostics(server_output);
+
+    metrics.local_basis_chunks = client.local_basis_chunks;
+    metrics.manifest_chunks = client.manifest_chunks.or(server.manifest_chunks);
+    metrics.server_missing_chunks = server.missing_chunks;
+    metrics.received_chunks = client.received_chunks;
+    metrics.payload_bytes = client.payload_bytes;
+    metrics.wire_bytes = client.wire_bytes;
+    metrics.client_network_ms = client.network_ms;
+    metrics.client_store_ms = client.store_ms;
+    metrics.bytes_transferred = metrics.wire_bytes.unwrap_or(0);
+
+    for line in client_stderr
+        .lines()
+        .filter(|line| line.contains("distd_sync_local_basis_chunks="))
+    {
+        tracing::info!("    client: {}", line.trim());
+    }
+    for line in server_output
+        .lines()
+        .filter(|line| line.contains("distd_sync_missing_chunks="))
+    {
+        tracing::info!("    server: {}", line.trim());
+    }
+
+    let missing: Vec<&str> = [
+        ("local_basis_chunks", metrics.local_basis_chunks),
+        ("manifest_chunks", metrics.manifest_chunks),
+        ("server_missing_chunks", metrics.server_missing_chunks),
+        ("received_chunks", metrics.received_chunks),
+        ("payload_bytes", metrics.payload_bytes),
+        ("wire_bytes", metrics.wire_bytes),
+        ("client_network_ms", metrics.client_network_ms),
+        ("client_store_ms", metrics.client_store_ms),
+    ]
+    .into_iter()
+    .filter_map(|(name, value)| value.is_none().then_some(name))
+    .collect();
+    if !missing.is_empty() {
+        metrics.notes.push_str(&format!(
+            " | missing structured sync diagnostics: {}",
+            missing.join(",")
+        ));
+    }
+
+    if let (Some(client_count), Some(server_count)) =
+        (client.manifest_chunks, server.manifest_chunks)
+    {
+        if client_count != server_count {
+            metrics.notes.push_str(&format!(
+                " | manifest chunk count mismatch: client={client_count} server={server_count}"
+            ));
+        }
+    }
+    if let (Some(missing_count), Some(received_count)) =
+        (server.missing_chunks, client.received_chunks)
+    {
+        if missing_count != received_count {
+            metrics.notes.push_str(&format!(
+                " | missing/received chunk count mismatch: server={missing_count} client={received_count}"
+            ));
+        }
     }
 }
 
@@ -808,23 +1049,6 @@ fn query_store_size() -> Result<u64, String> {
     body.trim()
         .parse::<u64>()
         .map_err(|e| format!("Failed to parse store size: {e}"))
-}
-
-fn extract_payload_bytes(stderr: &str) -> Option<u64> {
-    stderr.lines().find_map(|line| {
-        [
-            "distd_sync_wire_bytes=",
-            "distd_sync_payload_bytes=",
-            "distd_payload_bytes=",
-        ]
-        .into_iter()
-        .find_map(|needle| {
-            line.split(needle)
-                .nth(1)
-                .and_then(|value| value.split_whitespace().next())
-                .and_then(|value| value.parse::<u64>().ok())
-        })
-    })
 }
 
 /// Find the workspace root by walking up from the current executable or CARGO_MANIFEST_DIR.
@@ -853,19 +1077,139 @@ fn workspace_root() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_payload_bytes;
+    use std::fs;
+
+    use crate::metrics::RunMetrics;
+
+    use super::{
+        apply_sync_diagnostics, item_publish_url, operation_evidence_stem,
+        parse_client_sync_diagnostics, parse_server_sync_diagnostics, record_complete_hashes,
+        write_new_evidence_file, ClientSyncDiagnostics, ServerSyncDiagnostics,
+    };
 
     #[test]
-    fn extracts_current_sync_payload_metric() {
-        let stderr = "INFO distd_sync_wire_bytes=1234 distd_sync_payload_bytes=65536000 distd_sync_received_chunks=1000";
+    fn parses_complete_client_sync_diagnostics() {
+        let stderr = "INFO distd_sync_local_basis_chunks=100 distd_sync_manifest_chunks=107 distd_sync_wire_bytes=1800000 distd_sync_payload_bytes=1750000 distd_sync_received_chunks=7 distd_network_ms=24 distd_store_ms=31";
 
-        assert_eq!(extract_payload_bytes(stderr), Some(1234));
+        assert_eq!(
+            parse_client_sync_diagnostics(stderr),
+            ClientSyncDiagnostics {
+                local_basis_chunks: Some(100),
+                manifest_chunks: Some(107),
+                received_chunks: Some(7),
+                payload_bytes: Some(1_750_000),
+                wire_bytes: Some(1_800_000),
+                network_ms: Some(24),
+                store_ms: Some(31),
+            }
+        );
     }
 
     #[test]
-    fn extracts_legacy_payload_metric() {
-        let stderr = "INFO distd_payload_bytes=42";
+    fn parses_server_selection_diagnostics() {
+        let output =
+            "INFO distd_sync_manifest_chunks=107 distd_sync_missing_chunks=7 distd_sync_selection";
 
-        assert_eq!(extract_payload_bytes(stderr), Some(42));
+        assert_eq!(
+            parse_server_sync_diagnostics(output),
+            ServerSyncDiagnostics {
+                manifest_chunks: Some(107),
+                missing_chunks: Some(7),
+            }
+        );
+    }
+
+    #[test]
+    fn applies_diagnostics_to_structured_run_metrics() {
+        let client = "INFO distd_sync_local_basis_chunks=100 distd_sync_manifest_chunks=107 distd_sync_wire_bytes=1800000 distd_sync_payload_bytes=1750000 distd_sync_received_chunks=7 distd_network_ms=24 distd_store_ms=31";
+        let server =
+            "INFO distd_sync_manifest_chunks=107 distd_sync_missing_chunks=7 distd_sync_selection";
+        let mut metrics = RunMetrics::new("distd-quic", "fixture", "default", 0, "warm");
+
+        apply_sync_diagnostics(&mut metrics, client, server);
+
+        assert_eq!(metrics.local_basis_chunks, Some(100));
+        assert_eq!(metrics.manifest_chunks, Some(107));
+        assert_eq!(metrics.server_missing_chunks, Some(7));
+        assert_eq!(metrics.received_chunks, Some(7));
+        assert_eq!(metrics.payload_bytes, Some(1_750_000));
+        assert_eq!(metrics.wire_bytes, Some(1_800_000));
+        assert_eq!(metrics.bytes_transferred, 1_800_000);
+        assert_eq!(metrics.client_network_ms, Some(24));
+        assert_eq!(metrics.client_store_ms, Some(31));
+        assert!(metrics.notes.is_empty());
+    }
+
+    #[test]
+    fn evidence_names_are_unique_by_operation_and_iteration_and_never_overwrite() {
+        let full = RunMetrics::new("distd-quic", "low-delta-revision", "default", 2, "warm");
+        let update = RunMetrics::new(
+            "distd-quic",
+            "low-delta-revision-update",
+            "default",
+            2,
+            "warm",
+        );
+        let next = RunMetrics::new("distd-quic", "low-delta-revision", "default", 3, "warm");
+
+        assert_ne!(
+            operation_evidence_stem(&full),
+            operation_evidence_stem(&update)
+        );
+        assert_ne!(
+            operation_evidence_stem(&full),
+            operation_evidence_stem(&next)
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("evidence.log");
+        write_new_evidence_file(&path, "complete first log\n").unwrap();
+        assert!(write_new_evidence_file(&path, "replacement").is_err());
+        assert_eq!(fs::read_to_string(path).unwrap(), "complete first log\n");
+    }
+
+    #[test]
+    fn records_complete_expected_and_actual_hashes() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.bin");
+        let destination = temp.path().join("destination.bin");
+        fs::write(&source, b"complete benchmark content").unwrap();
+        fs::write(&destination, b"complete benchmark content").unwrap();
+        let mut metrics = RunMetrics::new("distd-quic", "fixture", "default", 0, "warm");
+
+        record_complete_hashes(
+            &mut metrics,
+            temp.path(),
+            std::slice::from_ref(&source),
+            &destination,
+            "destination missing",
+        );
+
+        assert!(metrics.correct);
+        assert!(metrics.expected_hash.is_some());
+        assert_eq!(metrics.expected_hash, metrics.actual_hash);
+        assert_eq!(metrics.expected_hash.as_deref().unwrap().len(), 64);
+    }
+
+    #[test]
+    fn low_delta_publication_uses_existing_explicit_chunking_query() {
+        assert_eq!(
+            item_publish_url(
+                "http://127.0.0.1:3000",
+                "bench-artifact",
+                "bench-artifact",
+                Some("fixed"),
+            ),
+            "http://127.0.0.1:3000/items?name=bench-artifact&path=bench-artifact&chunking=fixed"
+        );
+        assert_eq!(
+            item_publish_url(
+                "http://127.0.0.1:3000",
+                "bench-artifact",
+                "bench-artifact",
+                None,
+            ),
+            "http://127.0.0.1:3000/items?name=bench-artifact&path=bench-artifact"
+        );
     }
 }

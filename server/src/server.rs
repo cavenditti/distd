@@ -380,10 +380,10 @@ where
         let likely_precompressed =
             chunk_algorithm_likely_precompressed(item.manifest.chunk_algorithm);
         let missing = bitfield.missing_indices();
-        tracing::debug!(
-            "Sync: {} missing chunks out of {}",
-            missing.len(),
-            bitfield.chunk_count()
+        tracing::info!(
+            distd_sync_manifest_chunks = expected_chunk_count,
+            distd_sync_missing_chunks = missing.len(),
+            "distd_sync_selection"
         );
 
         Ok(SyncChunkIterState {

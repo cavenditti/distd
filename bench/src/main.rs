@@ -71,6 +71,14 @@ struct Cli {
     #[arg(long, default_value_t = 0.05)]
     delta_fraction: f64,
 
+    /// Seed synthetic corpus bytes for byte-identical repeated runs
+    #[arg(long)]
+    corpus_seed: Option<u64>,
+
+    /// Explicit REST chunking policy for distd low-delta publications
+    #[arg(long, default_value = "fixed", value_parser = ["auto", "fixed"])]
+    distd_low_delta_chunking: String,
+
     /// List available tools and exit
     #[arg(long)]
     list_tools: bool,
@@ -152,7 +160,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli.net_bandwidth_mbps,
         cli.net_loss_percent,
     )?;
-    let runner_options = RunnerOptions { network };
+    let runner_options = RunnerOptions {
+        network,
+        artifacts_dir: cli.output.join("artifacts"),
+        distd_low_delta_chunking: cli.distd_low_delta_chunking,
+        corpus_seed: cli.corpus_seed,
+    };
 
     let orchestrator = BenchmarkOrchestrator::new(
         data_dir,
@@ -167,6 +180,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli.small_file_count,
         cli.small_file_kib,
         cli.delta_fraction,
+        cli.corpus_seed,
         group_by_workload,
         runner_options,
     );

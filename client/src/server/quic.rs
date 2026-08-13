@@ -1,6 +1,8 @@
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 
+use distd_core::chunk_storage::ReceivedChunk;
+use distd_core::possession::Bitfield;
 use distd_core::proto::{
     sync_message::Msg, ClientKeepAlive, ClientRegister, ManifestRequest, ManifestResponse,
     PossessionBitfield, ServerMetadata, SyncMessage,
@@ -302,11 +304,31 @@ where
 }
 
 impl QuicSyncSession {
+    #[allow(dead_code)]
     pub async fn send_possession_and_collect_chunks(
-        mut self,
+        self,
         possession: PossessionBitfield,
         chunk_sizes: &[usize],
     ) -> Result<(Vec<Vec<u8>>, u64), ServerRequest> {
+        let (received, wire_bytes) = self
+            .send_possession_and_collect_chunks_shared(possession, chunk_sizes)
+            .await?;
+        Ok((
+            received.into_iter().map(ReceivedChunk::into_vec).collect(),
+            wire_bytes,
+        ))
+    }
+
+    pub async fn send_possession_and_collect_chunks_shared(
+        mut self,
+        possession: PossessionBitfield,
+        chunk_sizes: &[usize],
+    ) -> Result<(Vec<ReceivedChunk>, u64), ServerRequest> {
+        let bitfield = Bitfield::from_bytes(&possession.bitfield)
+            .filter(|bitfield| bitfield.chunk_count() as usize == chunk_sizes.len())
+            .ok_or(ServerRequest::UnexpectedMessage)?;
+        let expected_missing = bitfield.missing_indices();
+
         write_length_delimited_async(&mut self.send, &possession)
             .await
             .map_err(|err| ServerRequest::Quic(err.to_string()))?;
@@ -314,10 +336,10 @@ impl QuicSyncSession {
             .finish()
             .map_err(|err| ServerRequest::Quic(err.to_string()))?;
 
-        let mut received = Vec::new();
+        let mut decoder = SyncChunkDecoder::new(chunk_sizes, expected_missing);
         loop {
             match read_length_delimited_async::<_, SyncMessage>(&mut self.recv).await {
-                Ok(message) => decode_sync_message_into(message, chunk_sizes, &mut received)?,
+                Ok(message) => decoder.push(message)?,
                 Err(distd_core::utils::frame::FrameError::IoError(err))
                     if err.kind() == std::io::ErrorKind::UnexpectedEof =>
                 {
@@ -326,6 +348,7 @@ impl QuicSyncSession {
                 Err(err) => return Err(ServerRequest::Quic(err.to_string())),
             }
         }
+        let received = decoder.finish()?;
 
         let wire_bytes = self
             .connection
@@ -337,55 +360,130 @@ impl QuicSyncSession {
     }
 }
 
-fn decode_sync_message_into(
-    message: SyncMessage,
-    chunk_sizes: &[usize],
-    received: &mut Vec<Vec<u8>>,
-) -> Result<(), ServerRequest> {
-    match message {
-        SyncMessage {
-            msg: Some(Msg::ChunkData(cd)),
-        } => {
-            received.push(decode_sync_payload_owned(
-                cd.compression,
-                cd.data,
-                cd.uncompressed_size,
-            )?);
-            Ok(())
+struct SyncChunkDecoder<'a> {
+    chunk_sizes: &'a [usize],
+    expected_missing: Vec<u32>,
+    next_expected: usize,
+    received: Vec<ReceivedChunk>,
+}
+
+impl<'a> SyncChunkDecoder<'a> {
+    fn new(chunk_sizes: &'a [usize], expected_missing: Vec<u32>) -> Self {
+        Self {
+            chunk_sizes,
+            expected_missing,
+            next_expected: 0,
+            received: Vec::new(),
         }
-        SyncMessage {
-            msg: Some(Msg::BulkData(bd)),
-        } => {
-            let decoded = decode_sync_payload_owned(bd.compression, bd.data, bd.uncompressed_size)?;
-            let mut offset = 0;
-            for i in 0..bd.count {
-                let idx = bd.start_index + i;
-                let this_size = *chunk_sizes
-                    .get(idx as usize)
-                    .ok_or(ServerRequest::UnexpectedMessage)?;
-                if offset + this_size > decoded.len() {
+    }
+
+    fn push(&mut self, message: SyncMessage) -> Result<(), ServerRequest> {
+        match message {
+            SyncMessage {
+                msg: Some(Msg::ChunkData(cd)),
+            } => {
+                if self.expected_missing.get(self.next_expected) != Some(&cd.chunk_index) {
                     return Err(ServerRequest::UnexpectedMessage);
                 }
-                received.push(decoded[offset..offset + this_size].to_vec());
-                offset += this_size;
+                let decoded = ReceivedChunk::from(decode_sync_payload_owned(
+                    cd.compression,
+                    cd.data,
+                    cd.uncompressed_size,
+                )?);
+                let expected_size = *self
+                    .chunk_sizes
+                    .get(cd.chunk_index as usize)
+                    .ok_or(ServerRequest::UnexpectedMessage)?;
+                if decoded.len() != expected_size {
+                    return Err(ServerRequest::UnexpectedMessage);
+                }
+                self.received.push(decoded);
+                self.next_expected += 1;
+                Ok(())
             }
+            SyncMessage {
+                msg: Some(Msg::BulkData(bd)),
+            } => {
+                let count =
+                    usize::try_from(bd.count).map_err(|_| ServerRequest::UnexpectedMessage)?;
+                if count == 0 {
+                    return Err(ServerRequest::UnexpectedMessage);
+                }
+                let expected_end = self
+                    .next_expected
+                    .checked_add(count)
+                    .ok_or(ServerRequest::UnexpectedMessage)?;
+                let expected = self
+                    .expected_missing
+                    .get(self.next_expected..expected_end)
+                    .ok_or(ServerRequest::UnexpectedMessage)?;
+                if expected.first() != Some(&bd.start_index)
+                    || !expected
+                        .windows(2)
+                        .all(|pair| pair[0].checked_add(1) == Some(pair[1]))
+                {
+                    return Err(ServerRequest::UnexpectedMessage);
+                }
 
-            if offset != decoded.len() {
-                return Err(ServerRequest::UnexpectedMessage);
+                let end_index = bd
+                    .start_index
+                    .checked_add(bd.count)
+                    .ok_or(ServerRequest::UnexpectedMessage)?;
+                let start_index = usize::try_from(bd.start_index)
+                    .map_err(|_| ServerRequest::UnexpectedMessage)?;
+                let end_index =
+                    usize::try_from(end_index).map_err(|_| ServerRequest::UnexpectedMessage)?;
+                let selected_sizes = self
+                    .chunk_sizes
+                    .get(start_index..end_index)
+                    .ok_or(ServerRequest::UnexpectedMessage)?;
+                let decoded = ReceivedChunk::from(decode_sync_payload_owned(
+                    bd.compression,
+                    bd.data,
+                    bd.uncompressed_size,
+                )?);
+
+                let mut offset = 0usize;
+                let mut ranges = Vec::with_capacity(selected_sizes.len());
+                for &this_size in selected_sizes {
+                    let end = offset
+                        .checked_add(this_size)
+                        .ok_or(ServerRequest::UnexpectedMessage)?;
+                    if end > decoded.len() {
+                        return Err(ServerRequest::UnexpectedMessage);
+                    }
+                    ranges.push(offset..end);
+                    offset = end;
+                }
+
+                if offset != decoded.len() {
+                    return Err(ServerRequest::UnexpectedMessage);
+                }
+
+                self.received
+                    .extend(ranges.into_iter().map(|range| decoded.slice(range)));
+                self.next_expected = expected_end;
+                Ok(())
             }
-
-            Ok(())
+            _ => Err(ServerRequest::UnexpectedMessage),
         }
-        _ => Err(ServerRequest::UnexpectedMessage),
+    }
+
+    fn finish(self) -> Result<Vec<ReceivedChunk>, ServerRequest> {
+        if self.next_expected != self.expected_missing.len() {
+            return Err(ServerRequest::UnexpectedMessage);
+        }
+        Ok(self.received)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_sync_message_into, parse_quic_target, read_sync_manifest_response};
+    use super::{parse_quic_target, read_sync_manifest_response, SyncChunkDecoder};
     use distd_core::proto::{
         sync_message::Msg, BulkData, ChunkData, ManifestResponse, PayloadCompression, SyncMessage,
     };
+    use distd_core::transport::maybe_compress_sync_payload_owned;
     use distd_core::utils::frame::write_length_delimited_async;
     use tokio::io::duplex;
 
@@ -459,7 +557,7 @@ mod tests {
 
     #[test]
     fn decodes_bulk_data_frames_directly_into_chunks() {
-        let mut received = Vec::new();
+        let mut decoder = SyncChunkDecoder::new(&[2, 2, 3], vec![1, 2]);
         let message = SyncMessage {
             msg: Some(Msg::BulkData(BulkData {
                 start_index: 1,
@@ -470,14 +568,21 @@ mod tests {
             })),
         };
 
-        decode_sync_message_into(message, &[2, 2, 3], &mut received).expect("decode bulk frame");
+        decoder.push(message).expect("decode bulk frame");
+        let received = decoder.finish().expect("all chunks consumed");
 
-        assert_eq!(received, vec![vec![3, 4], vec![5, 6, 7]]);
+        assert_eq!(received[0].as_ref(), [3, 4]);
+        assert_eq!(received[1].as_ref(), [5, 6, 7]);
+        assert_eq!(
+            received[1].as_ptr(),
+            received[0].as_ptr().wrapping_add(received[0].len()),
+            "bulk chunks must be adjacent views into one decoded allocation"
+        );
     }
 
     #[test]
     fn rejects_bulk_data_with_invalid_decoded_length() {
-        let mut received = Vec::new();
+        let mut decoder = SyncChunkDecoder::new(&[2, 2], vec![0, 1]);
         let message = SyncMessage {
             msg: Some(Msg::BulkData(BulkData {
                 start_index: 0,
@@ -488,11 +593,228 @@ mod tests {
             })),
         };
 
-        let err = decode_sync_message_into(message, &[2, 2], &mut received)
+        let err = decoder
+            .push(message)
             .expect_err("short bulk frame should fail");
         assert!(matches!(
             err,
             crate::error::ServerRequest::UnexpectedMessage
         ));
+        assert!(decoder.received.is_empty(), "a malformed frame is atomic");
+    }
+
+    #[test]
+    fn rejects_bulk_data_with_invalid_index_range_without_appending() {
+        let mut decoder = SyncChunkDecoder::new(&[2, 2], vec![0, 1]);
+        let message = SyncMessage {
+            msg: Some(Msg::BulkData(BulkData {
+                start_index: u32::MAX,
+                count: 2,
+                data: Vec::new(),
+                compression: PayloadCompression::Unspecified as i32,
+                uncompressed_size: 0,
+            })),
+        };
+
+        let err = decoder
+            .push(message)
+            .expect_err("overflowing bulk range should fail");
+
+        assert!(matches!(
+            err,
+            crate::error::ServerRequest::UnexpectedMessage
+        ));
+        assert!(decoder.received.is_empty(), "a malformed frame is atomic");
+    }
+
+    #[test]
+    fn bulk_chunk_slices_own_the_decoded_payload_lifetime() {
+        let mut decoder = SyncChunkDecoder::new(&[2, 2], vec![0, 1]);
+        decoder
+            .push(SyncMessage {
+                msg: Some(Msg::BulkData(BulkData {
+                    start_index: 0,
+                    count: 2,
+                    data: vec![10, 11, 12, 13],
+                    compression: PayloadCompression::Unspecified as i32,
+                    uncompressed_size: 4,
+                })),
+            })
+            .expect("decode bulk frame");
+        let received = decoder.finish().expect("all chunks consumed");
+
+        let retained = received[1].clone();
+        drop(received);
+
+        assert_eq!(retained.as_ref(), [12, 13]);
+    }
+
+    #[test]
+    fn mixed_chunk_and_bulk_messages_preserve_wire_order() {
+        let mut decoder = SyncChunkDecoder::new(&[2, 2, 3], vec![0, 1, 2]);
+        decoder
+            .push(SyncMessage {
+                msg: Some(Msg::ChunkData(ChunkData {
+                    chunk_index: 0,
+                    data: vec![1, 2],
+                    compression: PayloadCompression::Unspecified as i32,
+                    uncompressed_size: 2,
+                })),
+            })
+            .expect("decode single chunk");
+        decoder
+            .push(SyncMessage {
+                msg: Some(Msg::BulkData(BulkData {
+                    start_index: 1,
+                    count: 2,
+                    data: vec![3, 4, 5, 6, 7],
+                    compression: PayloadCompression::Unspecified as i32,
+                    uncompressed_size: 5,
+                })),
+            })
+            .expect("decode bulk chunks");
+        let received = decoder.finish().expect("all chunks consumed");
+
+        assert_eq!(
+            received
+                .iter()
+                .map(|chunk| chunk.as_ref())
+                .collect::<Vec<_>>(),
+            vec![&[1, 2][..], &[3, 4][..], &[5, 6, 7][..]]
+        );
+    }
+
+    #[test]
+    fn single_chunk_data_keeps_existing_decompression_behavior() {
+        let expected = vec![0x2a; 128 * 1024];
+        let encoded = maybe_compress_sync_payload_owned(expected.clone(), None, false)
+            .expect("encode compressible chunk");
+        assert_eq!(
+            encoded.compression,
+            PayloadCompression::Zstd as i32,
+            "fixture should exercise the decompression path"
+        );
+        let chunk_sizes = [expected.len()];
+        let mut decoder = SyncChunkDecoder::new(&chunk_sizes, vec![0]);
+
+        decoder
+            .push(SyncMessage {
+                msg: Some(Msg::ChunkData(ChunkData {
+                    chunk_index: 0,
+                    data: encoded.data,
+                    compression: encoded.compression,
+                    uncompressed_size: encoded.uncompressed_size,
+                })),
+            })
+            .expect("decode compressed single chunk");
+        let received = decoder.finish().expect("all chunks consumed");
+
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].as_ref(), expected);
+    }
+
+    #[test]
+    fn compressed_bulk_data_retains_one_shared_backing() {
+        let expected = vec![0x33; 128 * 1024];
+        let encoded = maybe_compress_sync_payload_owned(expected.clone(), None, false)
+            .expect("encode compressible bulk payload");
+        assert_eq!(encoded.compression, PayloadCompression::Zstd as i32);
+        let mut decoder = SyncChunkDecoder::new(&[64 * 1024, 64 * 1024], vec![0, 1]);
+
+        decoder
+            .push(SyncMessage {
+                msg: Some(Msg::BulkData(BulkData {
+                    start_index: 0,
+                    count: 2,
+                    data: encoded.data,
+                    compression: encoded.compression,
+                    uncompressed_size: encoded.uncompressed_size,
+                })),
+            })
+            .expect("decode compressed bulk frame");
+        let received = decoder.finish().expect("all chunks consumed");
+
+        let combined = received
+            .iter()
+            .flat_map(|chunk| chunk.as_ref().iter().copied())
+            .collect::<Vec<_>>();
+        assert_eq!(combined, expected);
+        assert_eq!(received[0].backing_id(), received[1].backing_id());
+        assert!(received[0].backing_allocation_bytes() >= expected.len());
+    }
+
+    #[test]
+    fn rejects_duplicate_out_of_order_gap_zero_count_and_incomplete_eof() {
+        fn chunk(index: u32, data: &[u8]) -> SyncMessage {
+            SyncMessage {
+                msg: Some(Msg::ChunkData(ChunkData {
+                    chunk_index: index,
+                    data: data.to_vec(),
+                    compression: PayloadCompression::Unspecified as i32,
+                    uncompressed_size: data.len() as u32,
+                })),
+            }
+        }
+
+        let mut duplicate = SyncChunkDecoder::new(&[1, 1], vec![0, 1]);
+        duplicate.push(chunk(0, &[1])).unwrap();
+        assert!(duplicate.push(chunk(0, &[1])).is_err());
+
+        let mut out_of_order = SyncChunkDecoder::new(&[1, 1], vec![0, 1]);
+        assert!(out_of_order.push(chunk(1, &[2])).is_err());
+
+        let mut gap = SyncChunkDecoder::new(&[1, 1, 1], vec![0, 2]);
+        assert!(gap
+            .push(SyncMessage {
+                msg: Some(Msg::BulkData(BulkData {
+                    start_index: 0,
+                    count: 2,
+                    data: vec![1, 3],
+                    compression: PayloadCompression::Unspecified as i32,
+                    uncompressed_size: 2,
+                })),
+            })
+            .is_err());
+
+        let mut overlap = SyncChunkDecoder::new(&[1, 1, 1], vec![0, 1, 2]);
+        overlap
+            .push(SyncMessage {
+                msg: Some(Msg::BulkData(BulkData {
+                    start_index: 0,
+                    count: 2,
+                    data: vec![1, 2],
+                    compression: PayloadCompression::Unspecified as i32,
+                    uncompressed_size: 2,
+                })),
+            })
+            .unwrap();
+        assert!(overlap
+            .push(SyncMessage {
+                msg: Some(Msg::BulkData(BulkData {
+                    start_index: 1,
+                    count: 2,
+                    data: vec![2, 3],
+                    compression: PayloadCompression::Unspecified as i32,
+                    uncompressed_size: 2,
+                })),
+            })
+            .is_err());
+        assert_eq!(overlap.received.len(), 2, "rejected overlap is atomic");
+
+        let mut zero_count = SyncChunkDecoder::new(&[], Vec::new());
+        assert!(zero_count
+            .push(SyncMessage {
+                msg: Some(Msg::BulkData(BulkData {
+                    start_index: 0,
+                    count: 0,
+                    data: Vec::new(),
+                    compression: PayloadCompression::Unspecified as i32,
+                    uncompressed_size: 0,
+                })),
+            })
+            .is_err());
+
+        let incomplete = SyncChunkDecoder::new(&[1], vec![0]);
+        assert!(incomplete.finish().is_err());
     }
 }
