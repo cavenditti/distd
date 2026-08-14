@@ -5,7 +5,7 @@ use std::{
     io::{BufWriter, Read, Seek, Write},
     path::{Path, PathBuf},
     sync::{
-        atomic::AtomicBool,
+        atomic::{AtomicBool, AtomicUsize},
         mpsc::{sync_channel, SyncSender, TrySendError},
         Arc, Mutex, RwLock,
     },
@@ -2319,6 +2319,32 @@ struct ActivationLockLease<'a> {
     registry: &'a Mutex<HashMap<[u8; 32], ActivationLockSlot>>,
 }
 
+struct ActiveRefReservation<'a> {
+    count: &'a AtomicUsize,
+    newly_reserved: bool,
+    committed: bool,
+}
+
+impl ActiveRefReservation<'_> {
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for ActiveRefReservation<'_> {
+    fn drop(&mut self) {
+        if self.newly_reserved && !self.committed {
+            self.count
+                .fetch_update(
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                    |current| current.checked_sub(1),
+                )
+                .expect("active revision reservation count underflow");
+        }
+    }
+}
+
 impl Drop for ActivationLockLease<'_> {
     fn drop(&mut self) {
         let mut registry = self
@@ -2477,6 +2503,7 @@ pub struct FsStorage {
     inner: RwLock<FsStorageState>,
     persistence_lock: Mutex<()>,
     activation_locks: Mutex<HashMap<[u8; 32], ActivationLockSlot>>,
+    activation_active_count: AtomicUsize,
     activation_poisoned: Arc<AtomicBool>,
     active_refs: RwLock<HashMap<[u8; 32], Arc<FsActivationActiveV1>>>,
     activation_fault_hook: Arc<RwLock<Option<ActivationFaultHook>>>,
@@ -2499,6 +2526,7 @@ impl Default for FsStorage {
             inner: RwLock::new(FsStorageState::default()),
             persistence_lock: Mutex::new(()),
             activation_locks: Mutex::new(HashMap::default()),
+            activation_active_count: AtomicUsize::new(0),
             activation_poisoned: activation_poisoned.clone(),
             active_refs: RwLock::new(HashMap::default()),
             activation_fault_hook: activation_fault_hook.clone(),
@@ -3470,6 +3498,34 @@ impl FsStorage {
             lock,
             registry: &self.activation_locks,
         }
+    }
+
+    fn reserve_active_ref(&self, already_active: bool) -> Result<ActiveRefReservation<'_>, Error> {
+        if already_active {
+            return Ok(ActiveRefReservation {
+                count: &self.activation_active_count,
+                newly_reserved: false,
+                committed: true,
+            });
+        }
+        self.activation_active_count
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |current| {
+                    if current < FS_ACTIVATION_MAX_RECORDS {
+                        current.checked_add(1)
+                    } else {
+                        None
+                    }
+                },
+            )
+            .map_err(|_| invalid_state("active revision record limit reached"))?;
+        Ok(ActiveRefReservation {
+            count: &self.activation_active_count,
+            newly_reserved: true,
+            committed: false,
+        })
     }
 
     fn artifact_entry_path(root: &Path, relative_path: &Path) -> Result<PathBuf, Error> {
@@ -5126,6 +5182,7 @@ impl FsStorage {
                 ));
             }
         }
+        let mut active_ref_reservation = self.reserve_active_ref(previous.is_some())?;
 
         self.ensure_activation_namespace(&["transactions"])?;
         self.ensure_activation_namespace(&["staging"])?;
@@ -5279,6 +5336,7 @@ impl FsStorage {
             }
             return Err(error);
         }
+        active_ref_reservation.commit();
         let active = Arc::new(active);
         self.active_refs
             .write()
@@ -5821,6 +5879,7 @@ impl FsStorage {
             }),
             persistence_lock: Mutex::new(()),
             activation_locks: Mutex::new(HashMap::default()),
+            activation_active_count: AtomicUsize::new(0),
             activation_poisoned: activation_poisoned.clone(),
             active_refs: RwLock::new(HashMap::default()),
             activation_fault_hook: activation_fault_hook.clone(),
@@ -5850,6 +5909,9 @@ impl FsStorage {
             .values()
             .cloned()
             .collect::<Vec<_>>();
+        storage
+            .activation_active_count
+            .store(selected.len(), std::sync::atomic::Ordering::Release);
 
         let state = match fs::symlink_metadata(&persistance_path) {
             Ok(_) => {
@@ -9637,6 +9699,122 @@ mod tests {
     }
 
     #[test]
+    fn active_selector_count_is_exact_under_concurrent_final_slot_reservation() {
+        let storage = Arc::new(FsStorage::default());
+        storage.activation_active_count.store(
+            FS_ACTIVATION_MAX_RECORDS - 1,
+            std::sync::atomic::Ordering::Release,
+        );
+        let start = Arc::new(std::sync::Barrier::new(3));
+        let hold = Arc::new(std::sync::Barrier::new(3));
+        let (sender, receiver) = std::sync::mpsc::sync_channel(2);
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let storage = storage.clone();
+            let start = start.clone();
+            let hold = hold.clone();
+            let sender = sender.clone();
+            workers.push(std::thread::spawn(move || {
+                start.wait();
+                let reservation = storage.reserve_active_ref(false).ok();
+                sender.send(reservation.is_some()).unwrap();
+                hold.wait();
+                drop(reservation);
+            }));
+        }
+        drop(sender);
+        start.wait();
+        let accepted = [receiver.recv().unwrap(), receiver.recv().unwrap()];
+        assert_eq!(accepted.into_iter().filter(|accepted| *accepted).count(), 1);
+        assert_eq!(
+            storage
+                .activation_active_count
+                .load(std::sync::atomic::Ordering::Acquire),
+            FS_ACTIVATION_MAX_RECORDS
+        );
+        hold.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(
+            storage
+                .activation_active_count
+                .load(std::sync::atomic::Ordering::Acquire),
+            FS_ACTIVATION_MAX_RECORDS - 1
+        );
+    }
+
+    #[test]
+    fn active_selector_limit_rejects_new_destination_but_allows_update_and_rebuilds() {
+        let root = temp_path();
+        let storage = FsStorage::new(root.clone()).unwrap();
+        let first_bytes = b"abcdefgh";
+        let first = activation_test_item(first_bytes, 1);
+        storage
+            .receive_sync_item(
+                first.metadata.name.clone(),
+                first.metadata.path.clone(),
+                first.metadata.revision,
+                first.metadata.description.clone(),
+                &first.manifest,
+                &first.chunks,
+                &[],
+                vec![b"abcd".to_vec(), b"efgh".to_vec()],
+            )
+            .unwrap();
+        assert_eq!(
+            storage
+                .activation_active_count
+                .load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+        storage.activation_active_count.store(
+            FS_ACTIVATION_MAX_RECORDS,
+            std::sync::atomic::Ordering::Release,
+        );
+
+        let mut blocked = activation_test_item(b"blocked!", 1);
+        blocked.metadata.path = PathBuf::from("blocked.bin");
+        let blocked_data = activation_staged_data(b"blocked!", &blocked);
+        assert!(storage
+            .activate_verified_item(blocked, Path::new("blocked.bin"), &blocked_data)
+            .is_err());
+        assert!(!root.join("blocked.bin").exists());
+        assert_eq!(storage.active_refs.read().unwrap().len(), 1);
+
+        let second_bytes = b"ijklmnop";
+        let second = activation_test_item(second_bytes, 2);
+        storage
+            .receive_sync_item(
+                second.metadata.name.clone(),
+                second.metadata.path.clone(),
+                second.metadata.revision,
+                second.metadata.description.clone(),
+                &second.manifest,
+                &second.chunks,
+                &[],
+                vec![b"ijkl".to_vec(), b"mnop".to_vec()],
+            )
+            .unwrap();
+        assert_eq!(
+            storage
+                .activation_active_count
+                .load(std::sync::atomic::Ordering::Acquire),
+            FS_ACTIVATION_MAX_RECORDS
+        );
+        drop(storage);
+
+        let restarted = FsStorage::new(root).unwrap();
+        assert_eq!(restarted.active_refs.read().unwrap().len(), 1);
+        assert_eq!(
+            restarted
+                .activation_active_count
+                .load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+    }
+
+    #[test]
     #[ignore = "release-only local activation-lock registry reference"]
     fn activation_lock_registry_reference_performance() {
         assert!(
@@ -9660,6 +9838,35 @@ mod tests {
         println!("activation_lock_registry_p95_ns={p95}");
         assert!(p95 <= 10_000, "activation-lock registry p95 {p95}ns");
         assert!(storage.activation_locks.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    #[ignore = "release-only local active-selector reservation reference"]
+    fn active_selector_reservation_reference_performance() {
+        assert!(
+            !cfg!(debug_assertions),
+            "run the active-selector reservation reference in release mode"
+        );
+        let storage = FsStorage::default();
+        let mut samples = Vec::with_capacity(20_000);
+        for _ in 0..20_000 {
+            let started = std::time::Instant::now();
+            let reservation = storage.reserve_active_ref(false).unwrap();
+            drop(reservation);
+            samples.push(started.elapsed().as_nanos());
+        }
+        let mut sorted = samples.clone();
+        sorted.sort_unstable();
+        let p95 = sorted[(sorted.len() * 95).div_ceil(100) - 1];
+        println!("active_selector_reservation_raw_ns={samples:?}");
+        println!("active_selector_reservation_p95_ns={p95}");
+        assert!(p95 <= 1_000, "active-selector reservation p95 {p95}ns");
+        assert_eq!(
+            storage
+                .activation_active_count
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
     }
 
     #[test]

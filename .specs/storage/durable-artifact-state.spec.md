@@ -44,6 +44,11 @@ and [server publication](spec:src:server/src/server.rs).
   exact canonical destination. Completion, rejection, and abandoned waiters
   MUST release their participant leases, and the last participant MUST remove
   the slot without weakening same-destination serialization.
+- {#c-activation-count} Runtime activation MUST enforce the same 65,536 active
+  destination ceiling as startup recovery. Concurrent first activations MUST
+  reserve capacity atomically before creating activation-owned state; updates
+  to an already active destination MUST remain admissible at the ceiling, and
+  failed pre-selector reservations MUST release capacity.
 - {#c-publication-commit} A server revision MUST NOT become visible through
   latest lookup, exact-version lookup, or metadata fetch until all referenced
   storage and metadata are durably committed; a failed commit MUST preserve the
