@@ -351,7 +351,9 @@ impl ImmutableReaderCache {
 
     fn get_or_open(&mut self, path: &Path) -> Result<Arc<File>, Error> {
         if let Some(file) = self.entries.get(path).cloned() {
+            self.order.retain(|queued| queued != path);
             self.order.push_back(path.to_path_buf());
+            debug_assert_eq!(self.order.len(), self.entries.len());
             return Ok(file);
         }
         let metadata = fs::symlink_metadata(path)?;
@@ -365,15 +367,15 @@ impl ImmutableReaderCache {
             return Ok(file);
         }
         self.entries.insert(path.to_path_buf(), file.clone());
+        self.order.retain(|queued| queued != path);
         self.order.push_back(path.to_path_buf());
         while self.entries.len() > self.max_entries {
             let Some(oldest) = self.order.pop_front() else {
                 break;
             };
-            if self.entries.remove(&oldest).is_some() {
-                self.order.retain(|queued| queued != &oldest);
-            }
+            self.entries.remove(&oldest);
         }
+        debug_assert_eq!(self.order.len(), self.entries.len());
         Ok(file)
     }
 }
@@ -10486,10 +10488,82 @@ mod tests {
             storage.read_immutable_backing(&path, 0, &mut byte).unwrap();
             assert_eq!(byte, [index as u8]);
         }
-        assert!(
-            storage.immutable_readers.lock().unwrap().entries.len()
-                <= DEFAULT_IMMUTABLE_READER_ENTRIES
+        let readers = storage.immutable_readers.lock().unwrap();
+        assert!(readers.entries.len() <= DEFAULT_IMMUTABLE_READER_ENTRIES);
+        assert_eq!(readers.order.len(), readers.entries.len());
+        assert_eq!(
+            readers.order.iter().collect::<HashSet<_>>().len(),
+            readers.entries.len()
         );
+    }
+
+    #[test]
+    fn immutable_reader_hits_keep_exact_recency_and_evict_the_true_lru() {
+        let root = temp_path();
+        fs::create_dir_all(&root).unwrap();
+        let paths = (0..=DEFAULT_IMMUTABLE_READER_ENTRIES)
+            .map(|index| {
+                let path = root.join(format!("{index}.bin"));
+                fs::write(&path, [index as u8]).unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        let mut cache = ImmutableReaderCache::new(DEFAULT_IMMUTABLE_READER_ENTRIES);
+        for path in paths.iter().take(DEFAULT_IMMUTABLE_READER_ENTRIES) {
+            cache.get_or_open(path).unwrap();
+        }
+        for _ in 0..100_000 {
+            cache.get_or_open(&paths[0]).unwrap();
+        }
+        assert_eq!(cache.entries.len(), DEFAULT_IMMUTABLE_READER_ENTRIES);
+        assert_eq!(cache.order.len(), cache.entries.len());
+        assert_eq!(
+            cache.order.iter().collect::<HashSet<_>>().len(),
+            cache.entries.len()
+        );
+
+        cache
+            .get_or_open(&paths[DEFAULT_IMMUTABLE_READER_ENTRIES])
+            .unwrap();
+        assert!(cache.entries.contains_key(&paths[0]));
+        assert!(!cache.entries.contains_key(&paths[1]));
+        assert_eq!(cache.order.len(), cache.entries.len());
+    }
+
+    #[test]
+    #[ignore = "release-only local immutable-reader recency reference"]
+    fn immutable_reader_recency_reference_performance() {
+        assert!(
+            !cfg!(debug_assertions),
+            "run the immutable-reader recency reference in release mode"
+        );
+        let root = temp_path();
+        fs::create_dir_all(&root).unwrap();
+        let paths = (0..DEFAULT_IMMUTABLE_READER_ENTRIES)
+            .map(|index| {
+                let path = root.join(format!("{index}.bin"));
+                fs::write(&path, [index as u8]).unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        let mut cache = ImmutableReaderCache::new(DEFAULT_IMMUTABLE_READER_ENTRIES);
+        for path in &paths {
+            cache.get_or_open(path).unwrap();
+        }
+        let mut samples = Vec::with_capacity(20_000);
+        for index in 0..20_000 {
+            let started = std::time::Instant::now();
+            cache.get_or_open(&paths[index % paths.len()]).unwrap();
+            samples.push(started.elapsed().as_nanos());
+        }
+        let mut sorted = samples.clone();
+        sorted.sort_unstable();
+        let p95 = sorted[(sorted.len() * 95).div_ceil(100) - 1];
+        println!("immutable_reader_recency_raw_ns={samples:?}");
+        println!("immutable_reader_recency_p95_ns={p95}");
+        assert!(p95 <= 10_000, "immutable-reader recency p95 {p95}ns");
+        assert_eq!(cache.entries.len(), DEFAULT_IMMUTABLE_READER_ENTRIES);
+        assert_eq!(cache.order.len(), cache.entries.len());
     }
 
     #[test]

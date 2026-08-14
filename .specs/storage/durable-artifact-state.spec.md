@@ -49,6 +49,10 @@ and [server publication](spec:src:server/src/server.rs).
   reserve capacity atomically before creating activation-owned state; updates
   to an already active destination MUST remain admissible at the ceiling, and
   failed pre-selector reservations MUST release capacity.
+- {#c-immutable-reader-cache} Immutable revision reader caching MUST retain at
+  most one recency record per cached path. A successful hit MUST make that path
+  most-recently used, eviction MUST remove the true least-recently used path,
+  and repeated reads MUST NOT grow cache metadata.
 - {#c-publication-commit} A server revision MUST NOT become visible through
   latest lookup, exact-version lookup, or metadata fetch until all referenced
   storage and metadata are durably committed; a failed commit MUST preserve the
