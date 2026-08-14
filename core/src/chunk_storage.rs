@@ -608,9 +608,60 @@ pub trait ChunkStorage: HashTreeCapable<Arc<Node>, Error> {
                 "directory revision contains duplicate paths".to_string(),
             ));
         }
+        self.prepare_revision_from_sorted_files(
+            artifact_id,
+            name,
+            path,
+            revision,
+            description,
+            &files,
+            chunk_algorithm,
+        )
+    }
+
+    /// Build exact multi-file revision metadata from caller-owned files that
+    /// are already in canonical path order, without cloning their path table.
+    fn prepare_revision_from_sorted_files(
+        &self,
+        artifact_id: ArtifactId,
+        name: ItemName,
+        path: PathBuf,
+        revision: u32,
+        description: Option<String>,
+        files: &[(PathBuf, Bytes)],
+        chunk_algorithm: ChunkAlgorithm,
+    ) -> Result<Item, Error>
+    where
+        Self: Sized,
+    {
+        let path = validate_revision_authority(&artifact_id, &path)?;
+        if files.is_empty() {
+            return Err(Error::MissingData);
+        }
         let mut chunks = Vec::new();
         let mut entries = Vec::with_capacity(files.len());
+        let mut previous: Option<&PathBuf> = None;
         for (relative_path, data) in files {
+            let canonical = crate::utils::path::validate_relative(relative_path)?;
+            if &canonical != relative_path || relative_path.to_str().is_none() {
+                return Err(Error::Other(
+                    "directory revision paths must be canonical UTF-8".to_string(),
+                ));
+            }
+            if relative_path.components().next().is_some_and(|component| {
+                component.as_os_str() == std::ffi::OsStr::new(".distd-revisions-v1")
+                    || component.as_os_str() == std::ffi::OsStr::new(".distd-activation-v1")
+            }) {
+                return Err(Error::Other(
+                    "directory revision path uses the reserved storage namespace".to_string(),
+                ));
+            }
+            if previous.is_some_and(|previous| previous >= relative_path) {
+                return Err(Error::Other(
+                    "directory revision paths must be strictly ordered and unique".to_string(),
+                ));
+            }
+            previous = Some(relative_path);
             let relative_path = relative_path
                 .to_str()
                 .expect("validated directory revision path is UTF-8");

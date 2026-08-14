@@ -480,7 +480,91 @@ fn validate_manifest_after_valid_item(
     manifest: &Manifest,
     chunks: &[ChunkInfo],
 ) -> Result<usize, SignatureEnvelopeError> {
-    validate_manifest(manifest, chunks)
+    // `validate_revision_metadata` already proved the redundant Item identity,
+    // chunk tree/root, entry ranges, sizes, coverage, and nominal chunk size.
+    // Keep only signing-format constraints here so Item verification does not
+    // reconstruct the same potentially large tree twice.
+    validate_nfc(&manifest.artifact_id, "artifact ID")?;
+    if chunks.len() > MAX_CHUNKS {
+        return Err(SignatureEnvelopeError::StatementLimit {
+            field: "chunks",
+            limit: MAX_CHUNKS,
+        });
+    }
+    if manifest.entries.len() > MAX_ENTRIES {
+        return Err(SignatureEnvelopeError::StatementLimit {
+            field: "entries",
+            limit: MAX_ENTRIES,
+        });
+    }
+    validate_algorithm(manifest.chunk_algorithm)?;
+
+    let empty_hash = hash(&[]);
+    for chunk in chunks {
+        if chunk.size > u64::from(u32::MAX) {
+            return Err(SignatureEnvelopeError::InvalidStatement(
+                "chunk size exceeds u32 transport limit",
+            ));
+        }
+        if chunk.size == 0 && chunk.hash != empty_hash {
+            return Err(SignatureEnvelopeError::InvalidStatement(
+                "zero-size chunk has the wrong hash",
+            ));
+        }
+    }
+
+    let mut previous: Option<&str> = None;
+    let mut encoded_entry_bytes = 0usize;
+    if manifest.entries.is_empty() {
+        if chunks.iter().any(|chunk| chunk.size == 0) && !(chunks.len() == 1 && chunks[0].size == 0)
+        {
+            return Err(SignatureEnvelopeError::InvalidStatement(
+                "single-file artifact has an invalid zero-size chunk",
+            ));
+        }
+    } else {
+        for entry in &manifest.entries {
+            validate_entry_path(&entry.relative_path)?;
+            encoded_entry_bytes = encoded_entry_bytes
+                .checked_add(2 + entry.relative_path.len() + 8 + 4 + 4)
+                .ok_or(SignatureEnvelopeError::StatementLimit {
+                    field: "statement bytes",
+                    limit: MAX_FRAME_PAYLOAD_BYTES,
+                })?;
+            if let Some(previous) = previous {
+                if previous.as_bytes() >= entry.relative_path.as_bytes() {
+                    return Err(SignatureEnvelopeError::InvalidStatement(
+                        "entry paths are not strictly ordered",
+                    ));
+                }
+                if entry.relative_path.starts_with(previous)
+                    && entry.relative_path.as_bytes().get(previous.len()) == Some(&b'/')
+                {
+                    return Err(SignatureEnvelopeError::InvalidStatement(
+                        "entry path conflicts with ancestor file",
+                    ));
+                }
+            }
+            previous = Some(&entry.relative_path);
+            let start = usize::try_from(entry.chunk_range.0)
+                .expect("validate_revision_metadata proved entry start fits usize");
+            let end = usize::try_from(entry.chunk_range.1)
+                .expect("validate_revision_metadata proved entry end fits usize");
+            let entry_chunks = &chunks[start..end];
+            if entry.size == 0 {
+                if entry_chunks.len() != 1 || entry_chunks[0].size != 0 {
+                    return Err(SignatureEnvelopeError::InvalidStatement(
+                        "empty entry must cover exactly one empty chunk",
+                    ));
+                }
+            } else if entry_chunks.iter().any(|chunk| chunk.size == 0) {
+                return Err(SignatureEnvelopeError::InvalidStatement(
+                    "nonempty entry contains an empty chunk",
+                ));
+            }
+        }
+    }
+    estimated_statement_size(manifest, chunks, encoded_entry_bytes)
 }
 
 fn validate_entries(
@@ -640,80 +724,7 @@ fn validate_nfc(value: &str, field: &'static str) -> Result<(), SignatureEnvelop
 }
 
 fn validate_algorithm(algorithm: ChunkAlgorithm) -> Result<(), SignatureEnvelopeError> {
-    let valid = match algorithm {
-        ChunkAlgorithm::Fixed256K => true,
-        ChunkAlgorithm::FixedAligned {
-            chunk_size,
-            alignment,
-            header_size,
-            profile_version,
-        } => {
-            profile_version == 1
-                && chunk_size > 0
-                && alignment > 0
-                && alignment <= chunk_size
-                && header_size <= chunk_size
-        }
-        ChunkAlgorithm::FastCdc {
-            min_size,
-            avg_size,
-            max_size,
-            normalization_level,
-            seed: _,
-            profile_version,
-        } => {
-            profile_version == 1
-                && min_size > 0
-                && min_size <= avg_size
-                && avg_size <= max_size
-                && normalization_level <= 62
-        }
-        ChunkAlgorithm::BlockAlignedFastCdc {
-            min_size,
-            avg_size,
-            max_size,
-            alignment,
-            zero_run_cutoff,
-            normalization_level,
-            seed: _,
-            profile_version,
-        } => {
-            profile_version == 1
-                && min_size > 0
-                && min_size <= avg_size
-                && avg_size <= max_size
-                && alignment > 0
-                && min_size % alignment == 0
-                && avg_size % alignment == 0
-                && max_size % alignment == 0
-                && zero_run_cutoff > 0
-                && zero_run_cutoff % alignment == 0
-                && normalization_level <= 62
-        }
-        ChunkAlgorithm::ArchiveAwareFastCdc {
-            min_size,
-            avg_size,
-            max_size,
-            record_size,
-            alignment,
-            normalization_level,
-            seed: _,
-            profile_version,
-        } => {
-            profile_version == 1
-                && min_size > 0
-                && min_size <= avg_size
-                && avg_size <= max_size
-                && record_size > 0
-                && alignment > 0
-                && alignment.is_multiple_of(record_size)
-                && min_size.is_multiple_of(alignment)
-                && avg_size.is_multiple_of(alignment)
-                && max_size.is_multiple_of(alignment)
-                && normalization_level <= 62
-        }
-    };
-    if valid {
+    if algorithm.is_canonical_publisher_profile() {
         Ok(())
     } else {
         Err(SignatureEnvelopeError::InvalidStatement(

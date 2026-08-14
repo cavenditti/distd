@@ -4,8 +4,8 @@ use std::{
     io,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -21,13 +21,19 @@ use distd_core::{
     hash::Hash,
     item::{ArtifactId, FileEntry, Format as ItemFormat, Item, Manifest},
     metadata::Item as ItemMetadata,
+    signature::{PublisherPublicKey, PublisherSignature, PublisherSignatureEnvelope},
     version::Version,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{error::Server as ServerError, server::InternalMetadata};
+use crate::{
+    error::Server as ServerError,
+    publication::{PublicationAttestation, PublishedRevision, PublisherPolicy},
+    server::InternalMetadata,
+};
 
-pub const SERVER_PUBLICATION_SCHEMA: u16 = 1;
+pub const SERVER_PUBLICATION_SCHEMA: u16 = 2;
+const LEGACY_SERVER_PUBLICATION_SCHEMA: u16 = 1;
 pub const MAX_SERVER_PUBLICATION_PAYLOAD: u64 = 64 * 1024 * 1024;
 const MAX_FEEDS: usize = 65_536;
 const MAX_ARTIFACTS: usize = 65_536;
@@ -36,6 +42,7 @@ const MAX_REVISIONS: usize = 1_048_576;
 #[derive(Clone, Debug)]
 pub struct MetadataPaths {
     pub current: PathBuf,
+    pub schema1: PathBuf,
     pub legacy: PathBuf,
 }
 
@@ -43,7 +50,8 @@ impl MetadataPaths {
     #[must_use]
     pub fn in_state_directory(directory: &Path) -> Self {
         Self {
-            current: directory.join("metadata.state"),
+            current: directory.join("metadata.signed.state"),
+            schema1: directory.join("metadata.state"),
             legacy: directory.join("metadata.bitcode"),
         }
     }
@@ -150,16 +158,18 @@ impl MetadataStateStore {
             replacer,
             poisoned: AtomicBool::new(false),
         });
-        let current_present = path_entry_present(&store.paths.current)?;
-        let legacy_present = path_entry_present(&store.paths.legacy)?;
-        let (metadata, needs_current_write) = if current_present {
+        let (metadata, needs_current_write) = if path_entry_present(&store.paths.current)? {
             (read_current(&store.paths.current)?, false)
-        } else if legacy_present {
+        } else if path_entry_present(&store.paths.schema1)? {
+            (read_schema1(&store.paths.schema1)?, true)
+        } else if path_entry_present(&store.paths.legacy)? {
             (read_legacy(&store.paths.legacy)?, true)
         } else {
             (InternalMetadata::default(), true)
         };
-        validate_runtime_metadata(&metadata)?;
+        // Every selected decoder/converter above performs complete structural
+        // and cryptographic validation before returning. The caller-provided
+        // validator adds deployment policy without repeating that work.
         validate(&metadata)?;
         if needs_current_write {
             store.replace_and_verify(&metadata)?;
@@ -169,9 +179,11 @@ impl MetadataStateStore {
 
     #[must_use]
     pub fn for_current_path(path: PathBuf) -> Arc<Self> {
+        let parent = path.parent().unwrap_or_else(|| Path::new(""));
         Arc::new(Self {
             paths: MetadataPaths {
-                legacy: path.with_extension("bitcode"),
+                schema1: parent.join("metadata.state"),
+                legacy: parent.join("metadata.bitcode"),
                 current: path,
             },
             replacer: Arc::new(DurableMetadataReplace),
@@ -260,7 +272,8 @@ impl MetadataStateStore {
     }
 }
 
-const CURRENT_PAYLOAD_MAGIC: &[u8; 8] = b"DSPUBV1\0";
+const CURRENT_PAYLOAD_MAGIC: &[u8; 8] = b"DSPUBV2\0";
+const SCHEMA1_PAYLOAD_MAGIC: &[u8; 8] = b"DSPUBV1\0";
 const MAX_STRING_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -280,6 +293,13 @@ struct LegacyMetadataV1 {
 }
 
 fn canonical_payload(metadata: &InternalMetadata) -> Result<Vec<u8>, ServerError> {
+    // `PublishedRevision` is a verified type: its public signed constructor
+    // verifies the Item, and the only crate-private no-reverify constructor is
+    // reserved for binding the same verified statement after changing solely
+    // its unsigned server revision. Rechecking every historical Ed25519
+    // signature here would make each publication O(all signatures). The
+    // durable reread below cryptographically revalidates every record.
+    validate_runtime_metadata_structure(metadata)?;
     let mut writer = WireWriterV1::new();
     writer.bytes(CURRENT_PAYLOAD_MAGIC)?;
     writer.version(metadata.version)?;
@@ -300,7 +320,7 @@ fn canonical_payload(metadata: &InternalMetadata) -> Result<Vec<u8>, ServerError
         writer.count(revisions.len())?;
         for (version, item) in revisions {
             writer.u64(*version)?;
-            writer.item(item)?;
+            writer.published_revision(item)?;
         }
     }
     Ok(writer.finish())
@@ -531,6 +551,18 @@ impl WireWriterV1 {
         Ok(())
     }
 
+    fn published_revision(&mut self, revision: &PublishedRevision) -> Result<(), ServerError> {
+        self.item(revision.item())?;
+        match revision.attestation() {
+            PublicationAttestation::Unsigned => self.u8(0),
+            PublicationAttestation::Signed(envelope) => {
+                self.u8(1)?;
+                self.bytes(envelope.public_key().as_bytes())?;
+                self.bytes(envelope.signature().as_bytes())
+            }
+        }
+    }
+
     fn feed(&mut self, feed: &Feed) -> Result<(), ServerError> {
         self.string(&feed.name)?;
         self.count(feed.paths.len())?;
@@ -646,6 +678,10 @@ impl<'a> WireReaderV1<'a> {
         Ok(Hash::from_bytes(
             self.take(32)?.try_into().expect("fixed length"),
         ))
+    }
+
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], ServerError> {
+        Ok(self.take(N)?.try_into().expect("fixed length"))
     }
 
     fn chunk_info(&mut self) -> Result<ChunkInfo, ServerError> {
@@ -773,6 +809,27 @@ impl<'a> WireReaderV1<'a> {
         })
     }
 
+    fn published_revision(&mut self) -> Result<PublishedRevision, ServerError> {
+        let item = self.item()?;
+        let attestation = match self.u8()? {
+            0 => PublicationAttestation::Unsigned,
+            1 => PublicationAttestation::Signed(PublisherSignatureEnvelope::from_parts(
+                PublisherPublicKey::from_bytes(self.array()?),
+                PublisherSignature::from_bytes(self.array()?),
+            )),
+            _ => {
+                return Err(ServerError::State(
+                    "server publication attestation tag is invalid".to_string(),
+                ));
+            }
+        };
+        // `decode_payload` performs the single complete metadata validation
+        // after structural parsing. Constructing here without a second
+        // signature verification keeps the bounded 10k reread path linear
+        // with exactly one Ed25519 verification per retained revision.
+        Ok(PublishedRevision::from_verified_parts(item, attestation))
+    }
+
     fn feed(&mut self) -> Result<Feed, ServerError> {
         let name = self.string()?;
         let path_count = self.count(MAX_REVISIONS, "feed path")?;
@@ -813,6 +870,16 @@ fn read_current(path: &Path) -> Result<InternalMetadata, ServerError> {
     decode_current_payload(&payload)
 }
 
+fn read_schema1(path: &Path) -> Result<InternalMetadata, ServerError> {
+    let payload = read_enveloped_state(
+        path,
+        DurableStateKind::ServerPublication,
+        LEGACY_SERVER_PUBLICATION_SCHEMA,
+        MAX_SERVER_PUBLICATION_PAYLOAD,
+    )?;
+    decode_schema1_payload(&payload)
+}
+
 fn read_legacy(path: &Path) -> Result<InternalMetadata, ServerError> {
     let bytes = read_bounded_file(path, MAX_SERVER_PUBLICATION_PAYLOAD)?;
     let four = bitcode::deserialize::<LegacyMetadataV1>(&bytes)
@@ -836,26 +903,21 @@ fn read_legacy(path: &Path) -> Result<InternalMetadata, ServerError> {
 }
 
 fn legacy_v0_into_runtime(legacy: LegacyMetadataV0) -> Result<InternalMetadata, ServerError> {
-    normalize_runtime(InternalMetadata {
-        version: legacy.version,
-        feeds: legacy.feeds,
-        items: legacy.items,
-        versions: HashMap::new(),
-    })
+    normalize_legacy_runtime(legacy.version, legacy.feeds, legacy.items, HashMap::new())
 }
 
 fn legacy_v1_into_runtime(legacy: LegacyMetadataV1) -> Result<InternalMetadata, ServerError> {
-    normalize_runtime(InternalMetadata {
-        version: legacy.version,
-        feeds: legacy.feeds,
-        items: legacy.items,
-        versions: legacy.versions,
-    })
+    normalize_legacy_runtime(legacy.version, legacy.feeds, legacy.items, legacy.versions)
 }
 
-fn normalize_runtime(mut metadata: InternalMetadata) -> Result<InternalMetadata, ServerError> {
-    for (artifact_id, item) in metadata.items.clone() {
-        let versions = metadata.versions.entry(artifact_id).or_default();
+fn normalize_legacy_runtime(
+    version: Version,
+    feeds: HashMap<FeedName, Feed>,
+    items: HashMap<ArtifactId, Item>,
+    mut item_versions: HashMap<ArtifactId, BTreeMap<u64, Item>>,
+) -> Result<InternalMetadata, ServerError> {
+    for (artifact_id, item) in items {
+        let versions = item_versions.entry(artifact_id).or_default();
         match versions.entry(item.manifest.version) {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(item);
@@ -868,13 +930,51 @@ fn normalize_runtime(mut metadata: InternalMetadata) -> Result<InternalMetadata,
             }
         }
     }
+    let versions = item_versions
+        .into_iter()
+        .map(|(artifact_id, history)| {
+            (
+                artifact_id,
+                history
+                    .into_iter()
+                    .map(|(revision, item)| (revision, PublishedRevision::unsigned(item)))
+                    .collect::<BTreeMap<_, _>>(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let latest = versions
+        .iter()
+        .filter_map(|(artifact_id, history)| {
+            history
+                .last_key_value()
+                .map(|(_, revision)| (artifact_id.clone(), revision.clone()))
+        })
+        .collect();
+    let metadata = InternalMetadata {
+        version,
+        feeds,
+        items: latest,
+        versions,
+    };
     validate_runtime_metadata(&metadata)?;
     Ok(metadata)
 }
 
 fn decode_current_payload(payload: &[u8]) -> Result<InternalMetadata, ServerError> {
+    decode_payload(payload, CURRENT_PAYLOAD_MAGIC, true)
+}
+
+fn decode_schema1_payload(payload: &[u8]) -> Result<InternalMetadata, ServerError> {
+    decode_payload(payload, SCHEMA1_PAYLOAD_MAGIC, false)
+}
+
+fn decode_payload(
+    payload: &[u8],
+    magic: &[u8; 8],
+    signed_schema: bool,
+) -> Result<InternalMetadata, ServerError> {
     let mut reader = WireReaderV1::new(payload);
-    reader.expect_bytes(CURRENT_PAYLOAD_MAGIC)?;
+    reader.expect_bytes(magic)?;
     let version = reader.version()?;
 
     let feed_count = reader.count(MAX_FEEDS, "feed")?;
@@ -920,14 +1020,18 @@ fn decode_current_payload(payload: &[u8]) -> Result<InternalMetadata, ServerErro
                     "revision records are not strictly increasing".to_string(),
                 ));
             }
-            let item = reader.item()?;
-            if revision != item.manifest.version {
+            let published = if signed_schema {
+                reader.published_revision()?
+            } else {
+                PublishedRevision::unsigned(reader.item()?)
+            };
+            if revision != published.item().manifest.version {
                 return Err(ServerError::State(
                     "revision key disagrees with Item version".to_string(),
                 ));
             }
             previous_revision = Some(revision);
-            history.insert(revision, item);
+            history.insert(revision, published);
         }
         let current = history
             .last_key_value()
@@ -963,6 +1067,110 @@ fn require_next_string(
 }
 
 pub(crate) fn validate_runtime_metadata(metadata: &InternalMetadata) -> Result<(), ServerError> {
+    validate_runtime_metadata_structure(metadata)?;
+    verify_runtime_attestations(metadata)
+}
+
+const MIN_PARALLEL_ATTESTATIONS: usize = 512;
+const MAX_ATTESTATION_WORKERS: usize = 16;
+const MAX_PARALLEL_STATEMENT_BYTES: usize = 8 * 1024 * 1024;
+
+fn verify_runtime_attestations(metadata: &InternalMetadata) -> Result<(), ServerError> {
+    let histories = metadata.versions.iter().collect::<Vec<_>>();
+    let signed_count = histories
+        .iter()
+        .map(|(_, history)| {
+            history
+                .values()
+                .filter(|revision| revision.attestation().envelope().is_some())
+                .count()
+        })
+        .sum::<usize>();
+    let maximum_statement = histories
+        .iter()
+        .flat_map(|(_, history)| history.values())
+        .filter(|revision| revision.attestation().envelope().is_some())
+        .map(|revision| estimated_statement_bytes(revision.item()))
+        .max()
+        .unwrap_or(0);
+    let memory_workers = if maximum_statement == 0 {
+        MAX_ATTESTATION_WORKERS
+    } else {
+        (MAX_PARALLEL_STATEMENT_BYTES / maximum_statement).max(1)
+    };
+    let workers = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(MAX_ATTESTATION_WORKERS)
+        .min(memory_workers)
+        .min(histories.len().max(1));
+    if signed_count < MIN_PARALLEL_ATTESTATIONS || workers == 1 {
+        return verify_attestation_histories(&histories);
+    }
+
+    let next = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    let failure = Mutex::new(None);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                while !failed.load(Ordering::Acquire) {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some((artifact_id, history)) = histories.get(index).copied() else {
+                        break;
+                    };
+                    for (version, revision) in history {
+                        let Some(envelope) = revision.attestation().envelope() else {
+                            continue;
+                        };
+                        if let Err(error) = envelope.verify(revision.item()) {
+                            if !failed.swap(true, Ordering::AcqRel) {
+                                *failure.lock().expect("attestation failure lock") = Some(format!(
+                                    "artifact {artifact_id} version {version} publisher signature is invalid: {error}"
+                                ));
+                            }
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    match failure.into_inner().expect("attestation failure lock") {
+        Some(message) => Err(ServerError::State(message)),
+        None => Ok(()),
+    }
+}
+
+fn verify_attestation_histories(
+    histories: &[(&ArtifactId, &BTreeMap<u64, PublishedRevision>)],
+) -> Result<(), ServerError> {
+    for (artifact_id, history) in histories {
+        for (version, revision) in *history {
+            if let Some(envelope) = revision.attestation().envelope() {
+                envelope.verify(revision.item()).map_err(|error| {
+                    ServerError::State(format!(
+                        "artifact {artifact_id} version {version} publisher signature is invalid: {error}"
+                    ))
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn estimated_statement_bytes(item: &Item) -> usize {
+    let chunks = item.chunks.len().saturating_mul(40);
+    let entries = item.manifest.entries.iter().fold(0usize, |total, entry| {
+        total.saturating_add(18usize.saturating_add(entry.relative_path.len()))
+    });
+    256usize
+        .saturating_add(item.manifest.artifact_id.len())
+        .saturating_add(chunks)
+        .saturating_add(entries)
+}
+
+fn validate_runtime_metadata_structure(metadata: &InternalMetadata) -> Result<(), ServerError> {
     if metadata.feeds.len() > MAX_FEEDS
         || metadata.items.len() > MAX_ARTIFACTS
         || metadata.versions.len() > MAX_ARTIFACTS
@@ -997,25 +1205,36 @@ pub(crate) fn validate_runtime_metadata(metadata: &InternalMetadata) -> Result<(
                     "feed {name} contains an invalid published revision: {error}"
                 ))
             })?;
+            let published = metadata
+                .versions
+                .get(&item.metadata.artifact_id)
+                .and_then(|history| history.get(&item.manifest.version));
+            if published.map(PublishedRevision::item) != Some(item) {
+                return Err(ServerError::State(format!(
+                    "feed {name} item does not resolve to an exact published revision"
+                )));
+            }
         }
     }
     for (artifact_id, current) in &metadata.items {
-        validate_item_identity(artifact_id, current)?;
-        validate_revision_metadata(current).map_err(|error| {
-            ServerError::State(format!(
-                "artifact {artifact_id} current revision is invalid: {error}"
-            ))
-        })?;
         let versions = metadata.versions.get(artifact_id).ok_or_else(|| {
             ServerError::State(format!("artifact {artifact_id} has no revision history"))
         })?;
-        for (version, item) in versions {
+        for (version, revision) in versions {
+            let item = revision.item();
             validate_item_identity(artifact_id, item)?;
-            validate_revision_metadata(item).map_err(|error| {
-                ServerError::State(format!(
-                    "artifact {artifact_id} version {version} is invalid: {error}"
-                ))
-            })?;
+            // A signed `PublishedRevision` is a verified type on the write
+            // path, while the read path validates its Item as part of the
+            // canonical statement reconstruction in the attestation pass.
+            // Unsigned compatibility records have no such pass and therefore
+            // require their complete Item validation here.
+            if revision.attestation().is_unsigned() {
+                validate_revision_metadata(item).map_err(|error| {
+                    ServerError::State(format!(
+                        "artifact {artifact_id} version {version} is invalid: {error}"
+                    ))
+                })?;
+            }
             if version != &item.manifest.version {
                 return Err(ServerError::State(
                     "history key disagrees with Item version".to_string(),
@@ -1036,6 +1255,34 @@ pub(crate) fn validate_runtime_metadata(metadata: &InternalMetadata) -> Result<(
         return Err(ServerError::State(
             "revision history has no current Item".to_string(),
         ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_runtime_metadata_with_policy(
+    metadata: &InternalMetadata,
+    policy: &PublisherPolicy,
+) -> Result<(), ServerError> {
+    for (artifact_id, history) in &metadata.versions {
+        for (version, revision) in history {
+            let incompatible = match revision.attestation() {
+                PublicationAttestation::Signed(envelope)
+                    if !policy.permits_unsigned()
+                        && !policy.contains_exact_key(envelope.public_key()) =>
+                {
+                    Some(crate::publication::PublicationError::UntrustedPublisher)
+                }
+                PublicationAttestation::Unsigned if !policy.permits_unsigned() => {
+                    Some(crate::publication::PublicationError::UnsignedForbidden)
+                }
+                _ => None,
+            };
+            if let Some(error) = incompatible {
+                return Err(ServerError::State(format!(
+                    "artifact {artifact_id} version {version} is incompatible with publisher policy: {error}"
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -1067,7 +1314,9 @@ mod tests {
     use distd_core::{
         chunk_storage::{hashmap_storage::HashMapStorage, ChunkStorage},
         chunks::ChunkAlgorithm,
+        signature::{PublisherSignature, PublisherStatement},
     };
+    use ring::signature::{Ed25519KeyPair, KeyPair};
     use std::sync::atomic::{AtomicU64, AtomicUsize};
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -1129,30 +1378,121 @@ mod tests {
         storage
             .commit_revision(item.clone(), Bytes::from_static(payload))
             .unwrap();
+        let published = PublishedRevision::unsigned(item.clone());
         InternalMetadata {
-            items: HashMap::from([(artifact_id.to_string(), item.clone())]),
+            items: HashMap::from([(artifact_id.to_string(), published.clone())]),
             versions: HashMap::from([(
                 artifact_id.to_string(),
-                BTreeMap::from([(item.manifest.version, item)]),
+                BTreeMap::from([(item.manifest.version, published)]),
             )]),
             ..InternalMetadata::default()
         }
     }
 
+    fn envelope(item: &Item, seed: [u8; 32]) -> PublisherSignatureEnvelope {
+        let pair = Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
+        let statement = PublisherStatement::from_item(item).unwrap();
+        PublisherSignatureEnvelope::from_parts(
+            PublisherPublicKey::try_from(pair.public_key().as_ref()).unwrap(),
+            PublisherSignature::try_from(pair.sign(statement.as_bytes()).as_ref()).unwrap(),
+        )
+    }
+
+    fn signed_metadata_with(
+        artifact_id: &str,
+        payload: &'static [u8],
+        seed: [u8; 32],
+    ) -> InternalMetadata {
+        let mut metadata = metadata_with(artifact_id, payload);
+        let mut item = metadata.items[artifact_id].item().clone();
+        let fixed_time = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        item.metadata.created = fixed_time;
+        item.metadata.updated = fixed_time;
+        let published = PublishedRevision::new(
+            item.clone(),
+            PublicationAttestation::Signed(envelope(&item, seed)),
+        )
+        .unwrap();
+        metadata
+            .items
+            .insert(artifact_id.to_string(), published.clone());
+        metadata.versions.insert(
+            artifact_id.to_string(),
+            BTreeMap::from([(item.manifest.version, published)]),
+        );
+        metadata
+    }
+
+    fn schema2_golden_metadata() -> InternalMetadata {
+        let mut alpha = signed_metadata_with("alpha", b"alpha payload", [17; 32]);
+        let alpha_zero = alpha.versions.remove("alpha").unwrap().remove(&0).unwrap();
+        let alpha_one = PublishedRevision::from_verified_parts(
+            alpha_zero.item().clone().with_revision(1),
+            *alpha_zero.attestation(),
+        );
+        let bravo = signed_metadata_with("bravo", b"bravo payload", [29; 32]);
+        let bravo_zero = bravo.versions["bravo"][&0].clone();
+        InternalMetadata {
+            version: Version::from((1, 2, 3)),
+            feeds: HashMap::new(),
+            items: HashMap::from([
+                ("bravo".to_string(), bravo_zero.clone()),
+                ("alpha".to_string(), alpha_one.clone()),
+            ]),
+            versions: HashMap::from([
+                (
+                    "alpha".to_string(),
+                    BTreeMap::from([(0, alpha_zero), (1, alpha_one)]),
+                ),
+                ("bravo".to_string(), BTreeMap::from([(0, bravo_zero)])),
+            ]),
+        }
+    }
+
+    fn canonical_schema1_payload(metadata: &InternalMetadata) -> Vec<u8> {
+        let mut writer = WireWriterV1::new();
+        writer.bytes(SCHEMA1_PAYLOAD_MAGIC).unwrap();
+        writer.version(metadata.version).unwrap();
+        let mut feeds = metadata.feeds.iter().collect::<Vec<_>>();
+        feeds.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        writer.count(feeds.len()).unwrap();
+        for (name, feed) in feeds {
+            writer.string(name).unwrap();
+            writer.feed(feed).unwrap();
+        }
+        let mut artifacts = metadata.versions.iter().collect::<Vec<_>>();
+        artifacts.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        writer.count(artifacts.len()).unwrap();
+        for (artifact_id, history) in artifacts {
+            writer.string(artifact_id).unwrap();
+            writer.count(history.len()).unwrap();
+            for (version, revision) in history {
+                writer.u64(*version).unwrap();
+                writer.item(revision.item()).unwrap();
+            }
+        }
+        writer.finish()
+    }
+
     fn fixed_legacy_metadata() -> InternalMetadata {
         let mut metadata = metadata_with("legacy", b"legacy payload");
         let fixed_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(42);
-        let fixed_item = metadata
+        let fixed_revision = metadata
             .versions
             .get_mut("legacy")
             .unwrap()
-            .get_mut(&0)
+            .remove(&0)
             .unwrap();
+        let (mut fixed_item, _) = fixed_revision.into_parts();
         fixed_item.metadata.created = fixed_time;
         fixed_item.metadata.updated = fixed_time;
+        let fixed_revision = PublishedRevision::unsigned(fixed_item);
         metadata
-            .items
-            .insert("legacy".to_string(), fixed_item.clone());
+            .versions
+            .get_mut("legacy")
+            .unwrap()
+            .insert(0, fixed_revision.clone());
+        metadata.items.insert("legacy".to_string(), fixed_revision);
         metadata
     }
 
@@ -1177,13 +1517,87 @@ mod tests {
 
         let empty = canonical_payload(&InternalMetadata::default()).unwrap();
         assert_eq!(
-            blake3::hash(&empty).to_hex().as_str(),
-            "0cee528da2ce51c0c59262c5e30850ff3786c45d221fa7ddbb78a5425bffc409"
+            empty,
+            b"DSPUBV2\0\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
         );
     }
 
     #[test]
-    fn nonempty_payload_has_frozen_literal_and_roundtrips_every_nested_wire_kind() {
+    fn signed_schema2_roundtrips_exact_envelopes_and_adds_ninety_seven_bytes() {
+        let unsigned = metadata_with("signed", b"signed payload");
+        let signed = signed_metadata_with("signed", b"signed payload", [11; 32]);
+        let unsigned_payload = canonical_payload(&unsigned).unwrap();
+        let signed_payload = canonical_payload(&signed).unwrap();
+        assert_eq!(signed_payload.len(), unsigned_payload.len() + 96);
+        assert_eq!(decode_current_payload(&signed_payload).unwrap(), signed);
+        assert_eq!(canonical_payload(&signed).unwrap(), signed_payload);
+
+        let mut invalid_signature = signed_payload.clone();
+        *invalid_signature.last_mut().unwrap() ^= 1;
+        assert!(decode_current_payload(&invalid_signature).is_err());
+
+        let mut invalid_tag = signed_payload;
+        let tag = invalid_tag.len() - 97;
+        invalid_tag[tag] = 2;
+        assert!(decode_current_payload(&invalid_tag).is_err());
+    }
+
+    #[test]
+    fn schema2_multi_artifact_multi_revision_golden_is_stable() {
+        let metadata = schema2_golden_metadata();
+        let payload = canonical_payload(&metadata).unwrap();
+        assert_eq!(&payload[..8], CURRENT_PAYLOAD_MAGIC);
+        assert_eq!(payload.len(), 1056);
+        assert_eq!(
+            blake3::hash(&payload).to_hex().as_str(),
+            "9593bf33ffcaee6381b6dda8af7eedee84c27a3b549b63bb20c47a6f717d3641"
+        );
+        assert_eq!(decode_current_payload(&payload).unwrap(), metadata);
+        assert_eq!(canonical_payload(&metadata).unwrap(), payload);
+    }
+
+    #[test]
+    fn feeds_and_envelopes_resolve_to_the_exact_published_revision() {
+        let mut metadata = signed_metadata_with("alpha", b"alpha payload", [3; 32]);
+        let item = metadata.items["alpha"].item().clone();
+        metadata.feeds.insert(
+            "stable".to_string(),
+            Feed {
+                name: "stable".to_string(),
+                paths: BTreeMap::from([(item.metadata.path.clone(), item.clone())]),
+            },
+        );
+        validate_runtime_metadata(&metadata).unwrap();
+
+        let mut wrong_feed = metadata.clone();
+        wrong_feed
+            .feeds
+            .get_mut("stable")
+            .unwrap()
+            .paths
+            .values_mut()
+            .next()
+            .unwrap()
+            .metadata
+            .name
+            .push_str(" changed");
+        assert!(validate_runtime_metadata(&wrong_feed).is_err());
+
+        let bravo = signed_metadata_with("bravo", b"bravo payload", [5; 32]);
+        let wrong_envelope = *bravo.items["bravo"].attestation();
+        let mut swapped = metadata;
+        let malformed = PublishedRevision::from_verified_parts(item, wrong_envelope);
+        swapped.items.insert("alpha".to_string(), malformed.clone());
+        swapped
+            .versions
+            .insert("alpha".to_string(), BTreeMap::from([(0, malformed)]));
+        assert!(validate_runtime_metadata(&swapped).is_err());
+        let swapped_payload = canonical_payload(&swapped).unwrap();
+        assert!(decode_current_payload(&swapped_payload).is_err());
+    }
+
+    #[test]
+    fn nonempty_unsigned_payload_roundtrips_every_nested_wire_kind() {
         let chunk = ChunkInfo {
             size: 7,
             hash: Hash::from_bytes([0x11; 32]),
@@ -1231,17 +1645,18 @@ mod tests {
         let metadata = InternalMetadata {
             version: Version::from((1, 2, 3)),
             feeds: HashMap::from([("stable".to_string(), feed)]),
-            items: HashMap::from([("artifact".to_string(), item.clone())]),
-            versions: HashMap::from([("artifact".to_string(), BTreeMap::from([(7, item)]))]),
+            items: HashMap::from([(
+                "artifact".to_string(),
+                PublishedRevision::unsigned(item.clone()),
+            )]),
+            versions: HashMap::from([(
+                "artifact".to_string(),
+                BTreeMap::from([(7, PublishedRevision::unsigned(item))]),
+            )]),
         };
 
         let payload = canonical_payload(&metadata).unwrap();
-        assert_eq!(&payload[..8], b"DSPUBV1\0");
-        assert_eq!(payload.len(), 709);
-        assert_eq!(
-            blake3::hash(&payload).to_hex().as_str(),
-            "4a2449965f978fe65d112121bc48eaa3cf6b26620e57f9c2490f2334e590b435"
-        );
+        assert_eq!(&payload[..8], b"DSPUBV2\0");
         assert_eq!(decode_current_payload(&payload).unwrap(), metadata);
         assert_eq!(
             canonical_payload(&decode_current_payload(&payload).unwrap()).unwrap(),
@@ -1255,21 +1670,31 @@ mod tests {
         let template = metadata_with("template", b"benchmark")
             .items
             .remove("template")
-            .unwrap();
+            .unwrap()
+            .into_parts()
+            .0;
         let mut metadata = InternalMetadata::default();
         for index in 0..10_000 {
             let artifact_id = format!("artifact-{index:05}");
             let item = template.clone().with_artifact_id(artifact_id.clone());
-            metadata.items.insert(artifact_id.clone(), item.clone());
+            let published = PublishedRevision::new(
+                item.clone(),
+                PublicationAttestation::Signed(envelope(&item, [41; 32])),
+            )
+            .unwrap();
             metadata
-                .versions
-                .insert(artifact_id, BTreeMap::from([(item.manifest.version, item)]));
+                .items
+                .insert(artifact_id.clone(), published.clone());
+            metadata.versions.insert(
+                artifact_id,
+                BTreeMap::from([(item.manifest.version, published)]),
+            );
         }
 
         let mut encode_samples = Vec::new();
         let mut decode_samples = Vec::new();
         let mut payload_size = 0;
-        for _ in 0..7 {
+        for _ in 0..20 {
             let started = std::time::Instant::now();
             let payload = canonical_payload(&metadata).unwrap();
             encode_samples.push(started.elapsed());
@@ -1281,8 +1706,14 @@ mod tests {
         encode_samples.sort_unstable();
         decode_samples.sort_unstable();
         eprintln!(
-            "schema1 current codec 10k: payload={payload_size} encode_median={:?} encode_max={:?} decode_median={:?} decode_max={:?}",
-            encode_samples[3], encode_samples[6], decode_samples[3], decode_samples[6]
+            "schema2 current codec 10k: payload={payload_size} available_parallelism={:?} encode_median={:?} encode_p95={:?} encode_max={:?} decode_median={:?} decode_p95={:?} decode_max={:?}",
+            std::thread::available_parallelism(),
+            encode_samples[10],
+            encode_samples[18],
+            encode_samples[19],
+            decode_samples[10],
+            decode_samples[18],
+            decode_samples[19]
         );
     }
 
@@ -1310,19 +1741,137 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_schema1_never_falls_back_to_raw_legacy() {
+        let directory = directory();
+        let paths = MetadataPaths::in_state_directory(&directory);
+        std::fs::write(&paths.schema1, b"corrupt schema1").unwrap();
+        std::fs::write(&paths.legacy, LEGACY_FOUR_FIELD_FIXTURE).unwrap();
+        let schema1_before = std::fs::read(&paths.schema1).unwrap();
+        let legacy_before = std::fs::read(&paths.legacy).unwrap();
+        assert!(MetadataStateStore::open_with_validator(paths.clone(), |_| Ok(())).is_err());
+        assert!(!paths.current.exists());
+        assert_eq!(std::fs::read(&paths.schema1).unwrap(), schema1_before);
+        assert_eq!(std::fs::read(&paths.legacy).unwrap(), legacy_before);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn both_declared_legacy_layouts_migrate_and_retain_exact_source() {
         let metadata = fixed_legacy_metadata();
+        let policy = PublisherPolicy::explicitly_insecure_unsigned();
         for bytes in [LEGACY_THREE_FIELD_FIXTURE, LEGACY_FOUR_FIELD_FIXTURE] {
             let directory = directory();
             let paths = MetadataPaths::in_state_directory(&directory);
             std::fs::write(&paths.legacy, bytes).unwrap();
-            let (_, migrated) =
-                MetadataStateStore::open_with_validator(paths.clone(), |_| Ok(())).unwrap();
+            let (_, migrated) = MetadataStateStore::open_with_validator(paths.clone(), |value| {
+                validate_runtime_metadata_with_policy(value, &policy)
+            })
+            .unwrap();
             assert_eq!(migrated, metadata);
+            assert!(migrated
+                .versions
+                .values()
+                .flat_map(BTreeMap::values)
+                .all(|revision| revision.attestation().is_unsigned()));
             assert_eq!(std::fs::read(&paths.legacy).unwrap(), bytes);
             assert_eq!(read_current(&paths.current).unwrap(), metadata);
+            let (_, restarted) = MetadataStateStore::open_with_validator(paths.clone(), |value| {
+                validate_runtime_metadata_with_policy(value, &policy)
+            })
+            .unwrap();
+            assert_eq!(restarted, metadata);
             std::fs::remove_dir_all(directory).unwrap();
         }
+    }
+
+    #[test]
+    fn secure_policy_rejects_schema1_and_raw_legacy_without_writing_current() {
+        let secure = PublisherPolicy::required([]);
+        for source in ["schema1", "raw"] {
+            let directory = directory();
+            let paths = MetadataPaths::in_state_directory(&directory);
+            let metadata = fixed_legacy_metadata();
+            let selected = if source == "schema1" {
+                let payload = canonical_schema1_payload(&metadata);
+                replace_enveloped_state(
+                    &paths.schema1,
+                    DurableStateKind::ServerPublication,
+                    LEGACY_SERVER_PUBLICATION_SCHEMA,
+                    &payload,
+                    MAX_SERVER_PUBLICATION_PAYLOAD,
+                )
+                .unwrap();
+                paths.schema1.clone()
+            } else {
+                std::fs::write(&paths.legacy, LEGACY_FOUR_FIELD_FIXTURE).unwrap();
+                paths.legacy.clone()
+            };
+            let before = std::fs::read(&selected).unwrap();
+            assert!(
+                MetadataStateStore::open_with_validator(paths.clone(), |value| {
+                    validate_runtime_metadata_with_policy(value, &secure)
+                })
+                .is_err()
+            );
+            assert!(!paths.current.exists());
+            assert_eq!(std::fs::read(selected).unwrap(), before);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn secure_policy_rejects_unallowlisted_schema2_key_without_rewriting_current() {
+        let directory = directory();
+        let paths = MetadataPaths::in_state_directory(&directory);
+        let metadata = signed_metadata_with("signed", b"signed payload", [41; 32]);
+        let payload = canonical_payload(&metadata).unwrap();
+        replace_enveloped_state(
+            &paths.current,
+            DurableStateKind::ServerPublication,
+            SERVER_PUBLICATION_SCHEMA,
+            &payload,
+            MAX_SERVER_PUBLICATION_PAYLOAD,
+        )
+        .unwrap();
+        let current_before = std::fs::read(&paths.current).unwrap();
+        let item = metadata.items["signed"].item();
+        let unallowlisted = PublisherPolicy::required([envelope(item, [43; 32]).public_key()]);
+
+        assert!(
+            MetadataStateStore::open_with_validator(paths.clone(), |value| {
+                validate_runtime_metadata_with_policy(value, &unallowlisted)
+            })
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&paths.current).unwrap(), current_before);
+        assert_eq!(read_current(&paths.current).unwrap(), metadata);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn schema1_migrates_only_when_current_is_absent_and_retains_exact_source() {
+        let directory = directory();
+        let paths = MetadataPaths::in_state_directory(&directory);
+        let metadata = fixed_legacy_metadata();
+        let payload = canonical_schema1_payload(&metadata);
+        replace_enveloped_state(
+            &paths.schema1,
+            DurableStateKind::ServerPublication,
+            LEGACY_SERVER_PUBLICATION_SCHEMA,
+            &payload,
+            MAX_SERVER_PUBLICATION_PAYLOAD,
+        )
+        .unwrap();
+        let source_before = std::fs::read(&paths.schema1).unwrap();
+        let policy = PublisherPolicy::explicitly_insecure_unsigned();
+        let (_, migrated) = MetadataStateStore::open_with_validator(paths.clone(), |value| {
+            validate_runtime_metadata_with_policy(value, &policy)
+        })
+        .unwrap();
+        assert_eq!(migrated, metadata);
+        assert_eq!(std::fs::read(&paths.schema1).unwrap(), source_before);
+        assert_eq!(read_current(&paths.current).unwrap(), metadata);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[derive(Debug)]
@@ -1366,8 +1915,10 @@ mod tests {
         for mode in [FailureMode::BeforeRename, FailureMode::AfterRename] {
             let directory = directory();
             let paths = MetadataPaths::in_state_directory(&directory);
-            let (initial, old) =
+            let (initial, empty) =
                 MetadataStateStore::open_with_validator(paths.clone(), |_| Ok(())).unwrap();
+            let old = signed_metadata_with("old", b"old", [7; 32]);
+            initial.commit(&empty, &old).unwrap().acknowledge();
             drop(initial);
             let replacer = Arc::new(FailingReplace {
                 mode,
@@ -1378,7 +1929,7 @@ mod tests {
                 replacer,
                 poisoned: AtomicBool::new(false),
             };
-            let new = metadata_with("candidate", b"candidate");
+            let new = signed_metadata_with("candidate", b"candidate", [9; 32]);
             assert!(store.commit(&old, &new).is_err());
             match mode {
                 FailureMode::BeforeRename => {

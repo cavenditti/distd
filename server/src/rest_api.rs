@@ -11,7 +11,7 @@ use axum::{
         connect_info::IntoMakeServiceWithConnectInfo, ConnectInfo, DefaultBodyLimit, Multipart,
         Path, Query, State,
     },
-    http::{Method, Request, StatusCode},
+    http::{HeaderMap, HeaderValue, Method, Request, StatusCode},
     middleware::{self, Next},
     response::IntoResponse,
     routing::get, //, post},
@@ -29,15 +29,87 @@ use distd_core::{
     feed::{Feed, Name as FeedName},
     hash::Hash,
     metadata::Server as ServerMetadata,
+    signature::{PublisherPublicKey, PublisherSignature, PublisherSignatureEnvelope},
     utils::path::validate_relative,
     utils::serde::empty_string_as_none,
     version::Version,
 };
 
+use crate::error::Server as ServerError;
+use crate::publication::PublicationError;
 use crate::Client;
 use crate::Server as RawServer;
 
 type Server<T> = Arc<RawServer<T>>;
+
+const PUBLISHER_VERSION_HEADER: &str = "x-distd-publisher-statement-version";
+const PUBLISHER_KEY_HEADER: &str = "x-distd-publisher-public-key";
+const PUBLISHER_SIGNATURE_HEADER: &str = "x-distd-publisher-signature";
+const MAX_PUBLICATION_BODY_BYTES: usize = 512 * 1024 * 1024;
+
+fn singleton_header<'a>(
+    headers: &'a HeaderMap,
+    name: &'static str,
+) -> Result<Option<&'a HeaderValue>, StatusCode> {
+    let mut values = headers.get_all(name).iter();
+    let first = values.next();
+    if values.next().is_some() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(first)
+}
+
+fn decode_lower_hex<const N: usize>(value: &HeaderValue) -> Result<[u8; N], StatusCode> {
+    let value = value.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
+    if value.len() != N * 2
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut decoded = [0u8; N];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let nibble = |byte: u8| match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            _ => unreachable!("validated lowercase hexadecimal"),
+        };
+        decoded[index] = nibble(pair[0]) << 4 | nibble(pair[1]);
+    }
+    Ok(decoded)
+}
+
+fn publication_envelope(
+    headers: &HeaderMap,
+) -> Result<Option<PublisherSignatureEnvelope>, StatusCode> {
+    let version = singleton_header(headers, PUBLISHER_VERSION_HEADER)?;
+    let key = singleton_header(headers, PUBLISHER_KEY_HEADER)?;
+    let signature = singleton_header(headers, PUBLISHER_SIGNATURE_HEADER)?;
+    match (version, key, signature) {
+        (None, None, None) => Ok(None),
+        (Some(version), Some(key), Some(signature)) if version.as_bytes() == b"1" => {
+            Ok(Some(PublisherSignatureEnvelope::from_parts(
+                PublisherPublicKey::from_bytes(decode_lower_hex(key)?),
+                PublisherSignature::from_bytes(decode_lower_hex(signature)?),
+            )))
+        }
+        _ => Err(StatusCode::BAD_REQUEST),
+    }
+}
+
+fn publication_error_status(error: &ServerError) -> StatusCode {
+    match error {
+        ServerError::Publication(PublicationError::UntrustedPublisher)
+        | ServerError::Publication(PublicationError::InvalidSignature(_)) => StatusCode::FORBIDDEN,
+        ServerError::Publication(PublicationError::AttestationConflict) => StatusCode::CONFLICT,
+        ServerError::Publication(PublicationError::UnsignedForbidden) => StatusCode::BAD_REQUEST,
+        ServerError::State(message) if message.contains("read-only until restart") => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
 
 fn bearer_token(request: &Request<Body>) -> Option<&str> {
     request
@@ -71,6 +143,26 @@ async fn authorize_rest(request: Request<Body>, next: Next) -> impl IntoResponse
         .is_err()
     {
         return StatusCode::UNAUTHORIZED.into_response();
+    }
+    next.run(request).await
+}
+
+async fn authorize_publisher_headers<T>(
+    State(server): State<Server<T>>,
+    request: Request<Body>,
+    next: Next,
+) -> impl IntoResponse
+where
+    T: ChunkStorage + Sync + Send + Debug + 'static,
+{
+    if request.method() == Method::POST && request.uri().path() == "/items" {
+        let envelope = match publication_envelope(request.headers()) {
+            Ok(envelope) => envelope,
+            Err(status) => return status.into_response(),
+        };
+        if let Err(error) = server.precheck_publication_attestation(envelope.as_ref()) {
+            return publication_error_status(&error).into_response();
+        }
     }
     next.run(request).await
 }
@@ -228,13 +320,16 @@ where
 {
     let metadata = server.metadata_snapshot().await;
     let found = if let Some(ref aid) = item.artifact_id {
-        metadata.items.get(aid).cloned()
+        metadata
+            .items
+            .get(aid)
+            .map(|revision| revision.item().clone())
     } else if let Some(ref path) = item.path {
         metadata
             .items
             .values()
-            .find(|i| &i.metadata.path == path)
-            .cloned()
+            .find(|revision| &revision.item().metadata.path == path)
+            .map(|revision| revision.item().clone())
     } else {
         None
     };
@@ -257,6 +352,7 @@ fn sanitize_relative_upload_path(path: &str) -> Option<PathBuf> {
 
 /// Publish an item
 async fn publish_item<T>(
+    headers: HeaderMap,
     Query(item_data): Query<ItemPostObj>,
     State(server): State<Server<T>>,
     mut multipart: Multipart,
@@ -264,6 +360,7 @@ async fn publish_item<T>(
 where
     T: ChunkStorage + Sync + Send + Debug + 'static,
 {
+    let envelope = publication_envelope(&headers)?;
     let destination = validate_relative(&item_data.path).map_err(|_| StatusCode::BAD_REQUEST)?;
     let artifact_id = item_data
         .artifact_id
@@ -278,7 +375,7 @@ where
     while let Some(field) = multipart
         .next_field()
         .await
-        .map_err(|_| StatusCode::BAD_REQUEST)?
+        .map_err(|error| error.status())?
     {
         if field.name() != Some("item") {
             continue;
@@ -296,7 +393,7 @@ where
             .bytes()
             .await
             .inspect_err(|e| tracing::warn!("Cannot extract bytes from item field: {e}"))
-            .map_err(|_| StatusCode::BAD_REQUEST)?;
+            .map_err(|error| error.status())?;
         uploaded_files.push((file_name, data));
     }
 
@@ -324,33 +421,67 @@ where
 
     let result = if uploaded_files.len() == 1 {
         let (_, file) = uploaded_files.pop().unwrap();
-        server
-            .publish_item_as(
-                artifact_id,
-                item_data.name,
-                destination,
-                item_data.description,
-                file,
-                chunk_algorithm,
-            )
-            .await
+        match envelope {
+            Some(envelope) => {
+                server
+                    .publish_signed_item_as(
+                        artifact_id,
+                        item_data.name,
+                        destination,
+                        item_data.description,
+                        file,
+                        chunk_algorithm,
+                        envelope,
+                    )
+                    .await
+            }
+            None => {
+                server
+                    .publish_item_as(
+                        artifact_id,
+                        item_data.name,
+                        destination,
+                        item_data.description,
+                        file,
+                        chunk_algorithm,
+                    )
+                    .await
+            }
+        }
     } else {
-        server
-            .publish_item_from_files_as(
-                artifact_id,
-                item_data.name,
-                destination,
-                item_data.description,
-                uploaded_files,
-                chunk_algorithm,
-            )
-            .await
+        match envelope {
+            Some(envelope) => {
+                server
+                    .publish_signed_item_from_files_as(
+                        artifact_id,
+                        item_data.name,
+                        destination,
+                        item_data.description,
+                        uploaded_files,
+                        chunk_algorithm,
+                        envelope,
+                    )
+                    .await
+            }
+            None => {
+                server
+                    .publish_item_from_files_as(
+                        artifact_id,
+                        item_data.name,
+                        destination,
+                        item_data.description,
+                        uploaded_files,
+                        chunk_algorithm,
+                    )
+                    .await
+            }
+        }
     };
     let result = result.map(|item| item.metadata);
     tracing::debug!("{:?}", result);
     result
         .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|error| publication_error_status(&error))
 }
 
 /// Get one feed
@@ -395,10 +526,11 @@ where
 }
 
 /// Create a new `axum::Router` with all the routes
-pub fn make_app<T>(server: RawServer<T>) -> IntoMakeServiceWithConnectInfo<Router, SocketAddr>
+fn make_router_with_body_limit<T>(server: RawServer<T>, body_limit: usize) -> Router
 where
     T: ChunkStorage + Sync + Send + Debug + 'static,
 {
+    let server = Arc::new(server);
     Router::new()
         .route("/", get(version))
         .route("/version", get(version))
@@ -412,9 +544,13 @@ where
         .route("/feeds", get(get_feeds))
         .route("/feeds/{feed_name}", get(get_one_feed))
         .route("/metadata", get(get_metadata))
-        .with_state(Arc::new(server))
+        .with_state(Arc::clone(&server))
+        .layer(middleware::from_fn_with_state(
+            server,
+            authorize_publisher_headers::<T>,
+        ))
         .layer(middleware::from_fn(authorize_rest))
-        .layer(DefaultBodyLimit::max(512 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(body_limit))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(DefaultMakeSpan::new().include_headers(false))
@@ -425,5 +561,230 @@ where
                         .latency_unit(LatencyUnit::Micros),
                 ),
         )
+}
+
+/// Create a new `axum::Router` with all the routes
+pub fn make_app<T>(server: RawServer<T>) -> IntoMakeServiceWithConnectInfo<Router, SocketAddr>
+where
+    T: ChunkStorage + Sync + Send + Debug + 'static,
+{
+    make_router_with_body_limit(server, MAX_PUBLICATION_BODY_BYTES)
         .into_make_service_with_connect_info::<SocketAddr>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::InternalMetadata;
+    use distd_core::chunk_storage::hashmap_storage::HashMapStorage;
+    use tower::ServiceExt;
+
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    struct PublishTokenGuard(Option<std::ffi::OsString>);
+
+    impl PublishTokenGuard {
+        fn install(value: &str) -> Self {
+            let previous = std::env::var_os("DISTD_PUBLISH_TOKEN");
+            std::env::set_var("DISTD_PUBLISH_TOKEN", value);
+            Self(previous)
+        }
+    }
+
+    impl Drop for PublishTokenGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.0.take() {
+                std::env::set_var("DISTD_PUBLISH_TOKEN", previous);
+            } else {
+                std::env::remove_var("DISTD_PUBLISH_TOKEN");
+            }
+        }
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn multipart_body(payload: &[u8]) -> Vec<u8> {
+        let mut body = b"--distd-test\r\nContent-Disposition: form-data; name=\"item\"; filename=\"item.bin\"\r\nContent-Type: application/octet-stream\r\n\r\n".to_vec();
+        body.extend_from_slice(payload);
+        body.extend_from_slice(b"\r\n--distd-test--\r\n");
+        body
+    }
+
+    fn request(body: Vec<u8>, bearer: Option<&str>, key: [u8; 32]) -> Request<Body> {
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("/items?artifact_id=route-test&name=route-test&path=route.bin&chunking=fixed")
+            .header(
+                axum::http::header::CONTENT_TYPE,
+                "multipart/form-data; boundary=distd-test",
+            )
+            .header(PUBLISHER_VERSION_HEADER, "1")
+            .header(PUBLISHER_KEY_HEADER, hex(&key))
+            .header(PUBLISHER_SIGNATURE_HEADER, "00".repeat(64));
+        if let Some(bearer) = bearer {
+            request = request.header(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {bearer}"),
+            );
+        }
+        request.body(Body::from(body)).unwrap()
+    }
+
+    fn signed_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(PUBLISHER_VERSION_HEADER, HeaderValue::from_static("1"));
+        headers.insert(
+            PUBLISHER_KEY_HEADER,
+            HeaderValue::from_str(&"12".repeat(32)).unwrap(),
+        );
+        headers.insert(
+            PUBLISHER_SIGNATURE_HEADER,
+            HeaderValue::from_str(&"34".repeat(64)).unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn publication_headers_are_exact_singletons() {
+        let headers = signed_headers();
+        let envelope = publication_envelope(&headers)
+            .expect("valid headers")
+            .expect("signed envelope");
+        assert_eq!(envelope.public_key().as_bytes(), &[0x12; 32]);
+        assert_eq!(envelope.signature().as_bytes(), &[0x34; 64]);
+        assert_eq!(publication_envelope(&HeaderMap::new()), Ok(None));
+
+        for name in [
+            PUBLISHER_VERSION_HEADER,
+            PUBLISHER_KEY_HEADER,
+            PUBLISHER_SIGNATURE_HEADER,
+        ] {
+            let mut missing = signed_headers();
+            missing.remove(name);
+            assert_eq!(publication_envelope(&missing), Err(StatusCode::BAD_REQUEST));
+
+            let mut duplicate = signed_headers();
+            duplicate.append(name, HeaderValue::from_static("1"));
+            assert_eq!(
+                publication_envelope(&duplicate),
+                Err(StatusCode::BAD_REQUEST)
+            );
+        }
+    }
+
+    #[test]
+    fn publication_headers_reject_aliases_and_malformed_values() {
+        for version in ["0", "01", "2", "+1", " 1"] {
+            let mut headers = signed_headers();
+            headers.insert(
+                PUBLISHER_VERSION_HEADER,
+                HeaderValue::from_str(version).unwrap(),
+            );
+            assert_eq!(publication_envelope(&headers), Err(StatusCode::BAD_REQUEST));
+        }
+
+        for key in ["12".repeat(31), "12".repeat(33), "AB".repeat(32)] {
+            let mut headers = signed_headers();
+            headers.insert(PUBLISHER_KEY_HEADER, HeaderValue::from_str(&key).unwrap());
+            assert_eq!(publication_envelope(&headers), Err(StatusCode::BAD_REQUEST));
+        }
+        for signature in ["34".repeat(63), "34".repeat(65), "CD".repeat(64)] {
+            let mut headers = signed_headers();
+            headers.insert(
+                PUBLISHER_SIGNATURE_HEADER,
+                HeaderValue::from_str(&signature).unwrap(),
+            );
+            assert_eq!(publication_envelope(&headers), Err(StatusCode::BAD_REQUEST));
+        }
+    }
+
+    #[test]
+    fn publication_failures_have_stable_non_secret_statuses() {
+        assert_eq!(
+            publication_error_status(&PublicationError::UntrustedPublisher.into()),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            publication_error_status(&PublicationError::AttestationConflict.into()),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            publication_error_status(&PublicationError::UnsignedForbidden.into()),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            publication_error_status(&ServerError::State(
+                "metadata publication is read-only until restart".to_string()
+            )),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn router_orders_bearer_publisher_and_body_limit_without_mutation() {
+        let _environment = ENV_LOCK.lock().await;
+        let _token = PublishTokenGuard::install("route-secret");
+        let allowed_key = [0x41; 32];
+        let directory = std::env::temp_dir().join(format!(
+            "distd-rest-publication-order-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let paths = crate::metadata_state::MetadataPaths::in_state_directory(&directory);
+        let (store, metadata) =
+            crate::metadata_state::MetadataStateStore::open_with_validator(paths.clone(), |_| {
+                Ok(())
+            })
+            .unwrap();
+        let durable_before = std::fs::read(&paths.current).unwrap();
+        let server = RawServer::new_ephemeral_with_metadata(HashMapStorage::default(), metadata)
+            .with_publisher_policy(crate::publication::PublisherPolicy::required([
+                PublisherPublicKey::from_bytes(allowed_key),
+            ]))
+            .with_metadata_store(store);
+        let storage = server.storage().clone();
+        let metadata_before = server.metadata_snapshot().await;
+        let observed_server = server.clone();
+        let exact_body = multipart_body(b"x");
+        let over_body = multipart_body(b"xy");
+        assert_eq!(over_body.len(), exact_body.len() + 1);
+        let router = make_router_with_body_limit(server, exact_body.len());
+
+        let status = router
+            .clone()
+            .oneshot(request(over_body.clone(), None, [0x42; 32]))
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let status = router
+            .clone()
+            .oneshot(request(over_body.clone(), Some("route-secret"), [0x42; 32]))
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let exact = router
+            .clone()
+            .oneshot(request(exact_body, Some("route-secret"), allowed_key))
+            .await
+            .unwrap()
+            .status();
+        assert_ne!(exact, StatusCode::PAYLOAD_TOO_LARGE);
+        let over = router
+            .oneshot(request(over_body, Some("route-secret"), allowed_key))
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(over, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(storage.size(), 0);
+        assert_eq!(observed_server.metadata_snapshot().await, metadata_before);
+        assert_eq!(metadata_before, InternalMetadata::default());
+        assert_eq!(std::fs::read(&paths.current).unwrap(), durable_before);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

@@ -516,6 +516,8 @@ mod tests {
             entries: Vec::new(),
             chunk_algorithm: None,
             chunk_sizes: vec![42],
+            publisher_public_key: Vec::new(),
+            publisher_signature: Vec::new(),
         };
         let expected_for_writer = expected.clone();
 

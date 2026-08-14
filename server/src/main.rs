@@ -2,16 +2,19 @@ use distd_core::chunk_storage::fs_storage::{FsStorage, FsStorageCacheConfig};
 use distd_core::chunk_storage::hashmap_storage::HashMapStorage;
 use distd_core::chunk_storage::ChunkStorage;
 use distd_core::feed::Feed;
-use std::net::SocketAddr;
+use distd_core::signature::PublisherPublicKey;
+use std::{collections::HashSet, net::SocketAddr};
 
 use crate::client::Client;
 use crate::metadata_state::{MetadataPaths, MetadataStateStore};
+use crate::publication::PublisherPolicy;
 use crate::quic::QuicResourceSettings;
 use crate::server::{InternalMetadata, Server};
 
 pub mod client;
 pub mod error;
 pub mod metadata_state;
+pub mod publication;
 pub mod quic;
 pub mod rest_api;
 pub mod server;
@@ -19,6 +22,111 @@ pub mod server;
 const DEFAULT_HTTP_BIND: &str = "127.0.0.1:3000";
 const HTTP_BIND_ENV: &str = "DISTD_HTTP_BIND";
 const ALLOW_INSECURE_REMOTE_HTTP_ENV: &str = "DISTD_ALLOW_INSECURE_REMOTE_HTTP";
+const PUBLISHER_PUBLIC_KEYS_ENV: &str = "DISTD_PUBLISHER_PUBLIC_KEYS";
+const ALLOW_UNSIGNED_PUBLICATION_ENV: &str = "DISTD_ALLOW_UNSIGNED_PUBLICATION";
+const MAX_PUBLISHER_KEYS: usize = 1_024;
+
+#[derive(Clone)]
+struct ConfiguredPublisherPolicy {
+    policy: PublisherPolicy,
+    fingerprints: Vec<String>,
+}
+
+fn decode_publisher_public_key(value: &str) -> Result<PublisherPublicKey, String> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(
+            "publisher keys must be exactly 64 lowercase hexadecimal characters".to_string(),
+        );
+    }
+    let mut bytes = [0u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let decode = |byte: u8| match byte {
+            b'0'..=b'9' => Ok(byte - b'0'),
+            b'a'..=b'f' => Ok(byte - b'a' + 10),
+            _ => Err("publisher key contains invalid hexadecimal".to_string()),
+        };
+        bytes[index] = decode(pair[0])? << 4 | decode(pair[1])?;
+    }
+    Ok(PublisherPublicKey::from_bytes(bytes))
+}
+
+fn parse_publisher_policy(
+    configured_keys: Option<&str>,
+    configured_unsigned: Option<&str>,
+) -> Result<ConfiguredPublisherPolicy, String> {
+    let allow_unsigned = match configured_unsigned {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(_) => {
+            return Err(format!(
+                "{ALLOW_UNSIGNED_PUBLICATION_ENV} must be exactly \"true\" or \"false\""
+            ));
+        }
+    };
+
+    if allow_unsigned {
+        if configured_keys.is_some() {
+            return Err(format!(
+                "{ALLOW_UNSIGNED_PUBLICATION_ENV}=true cannot be combined with {PUBLISHER_PUBLIC_KEYS_ENV}"
+            ));
+        }
+        return Ok(ConfiguredPublisherPolicy {
+            policy: PublisherPolicy::explicitly_insecure_unsigned(),
+            fingerprints: Vec::new(),
+        });
+    }
+
+    let configured_keys = configured_keys.ok_or_else(|| {
+        format!(
+            "{PUBLISHER_PUBLIC_KEYS_ENV} must contain at least one publisher key unless {ALLOW_UNSIGNED_PUBLICATION_ENV}=true"
+        )
+    })?;
+    let mut keys = Vec::new();
+    let mut unique = HashSet::new();
+    for (index, raw) in configured_keys.split(',').enumerate() {
+        if index >= MAX_PUBLISHER_KEYS {
+            return Err(format!(
+                "{PUBLISHER_PUBLIC_KEYS_ENV} supports at most {MAX_PUBLISHER_KEYS} keys"
+            ));
+        }
+        let value = raw.trim_matches(|character: char| character.is_ascii_whitespace());
+        if value.is_empty() {
+            return Err(format!(
+                "{PUBLISHER_PUBLIC_KEYS_ENV} contains an empty entry"
+            ));
+        }
+        let key = decode_publisher_public_key(value).map_err(|reason| {
+            format!(
+                "invalid {PUBLISHER_PUBLIC_KEYS_ENV} entry {}: {reason}",
+                index + 1
+            )
+        })?;
+        if !unique.insert(key) {
+            return Err(format!(
+                "{PUBLISHER_PUBLIC_KEYS_ENV} contains a duplicate key"
+            ));
+        }
+        keys.push(key);
+    }
+    if keys.is_empty() {
+        return Err(format!(
+            "{PUBLISHER_PUBLIC_KEYS_ENV} must contain at least one publisher key"
+        ));
+    }
+    let mut fingerprints = keys
+        .iter()
+        .map(|key| key.fingerprint().to_string())
+        .collect::<Vec<_>>();
+    fingerprints.sort_unstable();
+    Ok(ConfiguredPublisherPolicy {
+        policy: PublisherPolicy::required(keys),
+        fingerprints,
+    })
+}
 
 fn parse_http_bind_policy(
     configured_bind: Option<&str>,
@@ -82,16 +190,19 @@ fn required_secret(name: &str) -> String {
 fn load_metadata<T>(
     paths: MetadataPaths,
     storage: &T,
+    publisher_policy: &PublisherPolicy,
 ) -> (std::sync::Arc<MetadataStateStore>, InternalMetadata)
 where
     T: ChunkStorage,
 {
-    let (store, metadata) =
-        MetadataStateStore::open_with_validator(paths, |metadata| metadata.verify_storage(storage))
-            .unwrap_or_else(|error| {
-                eprintln!("Cannot load server metadata: {error}");
-                std::process::exit(2);
-            });
+    let (store, metadata) = MetadataStateStore::open_with_validator(paths, |metadata| {
+        metadata.verify_storage_after_metadata_validation(storage)?;
+        crate::metadata_state::validate_runtime_metadata_with_policy(metadata, publisher_policy)
+    })
+    .unwrap_or_else(|error| {
+        eprintln!("Cannot load server metadata: {error}");
+        std::process::exit(2);
+    });
     storage
         .reconcile_published_revisions(&metadata.published_revisions())
         .unwrap_or_else(|error| {
@@ -155,6 +266,32 @@ async fn main() {
         eprintln!("Invalid QUIC resource configuration: {error}");
         std::process::exit(2);
     });
+    let publisher_keys =
+        optional_utf8_environment(PUBLISHER_PUBLIC_KEYS_ENV).unwrap_or_else(|error| {
+            eprintln!("Invalid publisher configuration: {error}");
+            std::process::exit(2);
+        });
+    let allow_unsigned =
+        optional_utf8_environment(ALLOW_UNSIGNED_PUBLICATION_ENV).unwrap_or_else(|error| {
+            eprintln!("Invalid publisher configuration: {error}");
+            std::process::exit(2);
+        });
+    let publisher = parse_publisher_policy(publisher_keys.as_deref(), allow_unsigned.as_deref())
+        .unwrap_or_else(|error| {
+            eprintln!("Invalid publisher configuration: {error}");
+            std::process::exit(2);
+        });
+    if publisher.policy.permits_unsigned() {
+        tracing::warn!(
+            "publisher authentication is explicitly disabled; unsigned publication is insecure"
+        );
+    } else {
+        tracing::info!(
+            publisher_count = publisher.fingerprints.len(),
+            publisher_fingerprints = ?publisher.fingerprints,
+            "configured publisher trust anchors"
+        );
+    }
     let enrollment_token = required_secret("DISTD_ENROLLMENT_TOKEN");
     let state_dir = std::env::var("DISTD_SERVER_STATE_DIR")
         .map(std::path::PathBuf::from)
@@ -170,6 +307,7 @@ async fn main() {
             "fs".to_string()
         }
     });
+    let publisher_policy = publisher.policy;
 
     match storage_kind.as_str() {
         "fs" => {
@@ -190,6 +328,7 @@ async fn main() {
                 chunk_cache_mb,
                 tree_cache_entries,
             );
+            let policy_for_load = publisher_policy.clone();
             let (storage, metadata_store, metadata) = tokio::task::spawn_blocking(move || {
                 let storage = FsStorage::with_cache_config(
                     root,
@@ -202,7 +341,8 @@ async fn main() {
                     eprintln!("Cannot initialize filesystem storage: {error}");
                     std::process::exit(2);
                 });
-                let (metadata_store, metadata) = load_metadata(metadata_paths, &storage);
+                let (metadata_store, metadata) =
+                    load_metadata(metadata_paths, &storage, &policy_for_load);
                 (storage, metadata_store, metadata)
             })
             .await
@@ -212,6 +352,7 @@ async fn main() {
             });
             let server = Server::new_ephemeral_with_metadata(storage, metadata.clone())
                 .with_enrollment_token(enrollment_token.clone())
+                .with_publisher_policy(publisher_policy.clone())
                 .with_metadata_store(metadata_store);
             run_server(server, http_addr, quic_settings).await;
         }
@@ -219,10 +360,12 @@ async fn main() {
         "redb" => {
             let db_path = distd_core::utils::settings::cache_dir().join("server.redb");
             tracing::info!("Using redb storage at {}", db_path.display());
+            let policy_for_load = publisher_policy.clone();
             let (storage, metadata_store, metadata) = tokio::task::spawn_blocking(move || {
                 let storage = distd_core::chunk_storage::redb::RedbStorage::new(&db_path)
                     .expect("Failed to open redb database");
-                let (metadata_store, metadata) = load_metadata(metadata_paths, &storage);
+                let (metadata_store, metadata) =
+                    load_metadata(metadata_paths, &storage, &policy_for_load);
                 (storage, metadata_store, metadata)
             })
             .await
@@ -232,13 +375,15 @@ async fn main() {
             });
             let server = Server::new_ephemeral_with_metadata(storage, metadata.clone())
                 .with_enrollment_token(enrollment_token.clone())
+                .with_publisher_policy(publisher_policy.clone())
                 .with_metadata_store(metadata_store);
             run_server(server, http_addr, quic_settings).await;
         }
         "memory" => {
             tracing::info!("Using in-memory storage (ephemeral)");
             let server = Server::new_ephemeral(HashMapStorage::default())
-                .with_enrollment_token(enrollment_token.clone());
+                .with_enrollment_token(enrollment_token.clone())
+                .with_publisher_policy(publisher_policy.clone());
             run_server(server, http_addr, quic_settings).await;
         }
         other => {
@@ -253,8 +398,16 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_http_bind_policy, ALLOW_INSECURE_REMOTE_HTTP_ENV, DEFAULT_HTTP_BIND, HTTP_BIND_ENV,
+        parse_http_bind_policy, parse_publisher_policy, ALLOW_INSECURE_REMOTE_HTTP_ENV,
+        ALLOW_UNSIGNED_PUBLICATION_ENV, DEFAULT_HTTP_BIND, HTTP_BIND_ENV, MAX_PUBLISHER_KEYS,
+        PUBLISHER_PUBLIC_KEYS_ENV,
     };
+
+    fn publisher_key(index: usize) -> String {
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&(index as u64).to_le_bytes());
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
 
     #[test]
     fn http_bind_defaults_to_ipv4_loopback() {
@@ -319,5 +472,85 @@ mod tests {
             assert!(error.contains(HTTP_BIND_ENV));
             assert!(error.contains("valid IP socket address"));
         }
+    }
+
+    #[test]
+    fn publisher_policy_requires_exact_unique_lowercase_keys() {
+        let first = publisher_key(1);
+        let second = publisher_key(2);
+        let configured = format!(" \t{first},\n{second} ");
+        let parsed = parse_publisher_policy(Some(&configured), None).expect("secure policy");
+        assert!(!parsed.policy.permits_unsigned());
+        assert_eq!(parsed.fingerprints.len(), 2);
+
+        let duplicate = format!("{first},{first}");
+        let error = parse_publisher_policy(Some(&duplicate), None)
+            .err()
+            .expect("duplicate key");
+        assert!(error.contains("duplicate"));
+        assert!(!error.contains(&first));
+
+        for invalid in [
+            String::new(),
+            "00".repeat(31),
+            "00".repeat(33),
+            "GG".repeat(32),
+            "ab".repeat(32).to_uppercase(),
+            format!("{first},"),
+            format!("{first}, {second} extra"),
+        ] {
+            let error = parse_publisher_policy(Some(&invalid), None)
+                .err()
+                .expect("invalid key");
+            assert!(error.contains(PUBLISHER_PUBLIC_KEYS_ENV));
+            if !invalid.is_empty() {
+                assert!(!error.contains(&invalid));
+            }
+        }
+    }
+
+    #[test]
+    fn publisher_policy_is_fail_closed_unless_unsigned_mode_is_explicit() {
+        let missing = parse_publisher_policy(None, None)
+            .err()
+            .expect("missing secure policy");
+        assert!(missing.contains(PUBLISHER_PUBLIC_KEYS_ENV));
+        assert!(missing.contains(ALLOW_UNSIGNED_PUBLICATION_ENV));
+
+        let insecure = parse_publisher_policy(None, Some("true")).expect("explicit insecure mode");
+        assert!(insecure.policy.permits_unsigned());
+        assert!(insecure.fingerprints.is_empty());
+
+        let key = publisher_key(7);
+        assert!(parse_publisher_policy(Some(&key), Some("true")).is_err());
+        for value in ["", "TRUE", "1", "yes", " true", "false "] {
+            let error = parse_publisher_policy(None, Some(value))
+                .err()
+                .expect("invalid switch");
+            assert_eq!(
+                error,
+                format!("{ALLOW_UNSIGNED_PUBLICATION_ENV} must be exactly \"true\" or \"false\"")
+            );
+            if !value.is_empty() {
+                assert!(!error.contains(value));
+            }
+        }
+    }
+
+    #[test]
+    fn publisher_policy_enforces_the_key_count_bound() {
+        let exact = (0..MAX_PUBLISHER_KEYS)
+            .map(publisher_key)
+            .collect::<Vec<_>>()
+            .join(",");
+        let parsed = parse_publisher_policy(Some(&exact), None).expect("exact key limit");
+        assert_eq!(parsed.fingerprints.len(), MAX_PUBLISHER_KEYS);
+
+        let over = format!("{exact},{}", publisher_key(MAX_PUBLISHER_KEYS));
+        let error = parse_publisher_policy(Some(&over), None)
+            .err()
+            .expect("over key limit");
+        assert!(error.contains("at most"));
+        assert!(!error.contains(&over));
     }
 }

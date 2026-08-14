@@ -9,6 +9,9 @@ pub enum Server {
     #[error("durable server state error: {0}")]
     DurableState(#[from] distd_core::durable_state::DurableStateError),
 
+    #[error("publisher authorization failed: {0}")]
+    Publication(#[from] crate::publication::PublicationError),
+
     #[error("Cannot insert chunk in data store")]
     ChunkInsertError,
 

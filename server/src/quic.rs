@@ -14,8 +14,8 @@ use distd_core::proto::{
 };
 use distd_core::transport::TransportOp;
 use distd_core::utils::frame::{
-    read_length_delimited_async_with_limit, read_optional_uuid_async, read_transport_op_async,
-    write_length_delimited_async, MAX_FRAME_PAYLOAD_BYTES,
+    encode_length_delimited, read_length_delimited_async_with_limit, read_optional_uuid_async,
+    read_transport_op_async, write_length_delimited_async, MAX_FRAME_PAYLOAD_BYTES,
 };
 use prost::Message;
 use quinn::{Endpoint, RecvStream, SendStream};
@@ -1050,13 +1050,18 @@ where
                     settings.write_timeout,
                     QuicPhase::ResponseWrite,
                 )?;
-                write_message_bounded(
-                    send,
-                    &SyncMessage {
+                let manifest_frame = tokio::task::spawn_blocking(move || {
+                    encode_length_delimited(&SyncMessage {
                         msg: Some(Msg::ManifestResponse(manifest_response)),
-                    },
+                    })
+                })
+                .await
+                .map_err(|_| StreamFailure::internal(QuicPhase::Internal))?
+                .map_err(|_| StreamFailure::internal(QuicPhase::Internal))?;
+                write_response_at(
                     manifest_write_deadline,
                     absolute,
+                    send.write_all(&manifest_frame),
                 )
                 .await?;
                 let possession_deadline = fixed_phase_deadline(
@@ -1326,9 +1331,12 @@ mod tests {
         QUIC_STREAM_INTERNAL_CODE, QUIC_STREAM_OVERLOADED_CODE, QUIC_STREAM_PROTOCOL_CODE,
         QUIC_STREAM_TIMEOUT_CODE,
     };
+    use crate::publication::PublishedRevision;
+    use crate::publication::PublisherPolicy;
     use crate::server::InternalMetadata;
     use crate::Server;
     use distd_core::chunk_storage::hashmap_storage::HashMapStorage;
+    use distd_core::chunk_storage::ChunkStorage;
     use distd_core::chunks::{ChunkAlgorithm, ChunkInfo};
     use distd_core::hash::Hash;
     use distd_core::item::{Format as ItemFormat, Item, Manifest};
@@ -1339,6 +1347,9 @@ mod tests {
         sync_message::Msg, ClientKeepAlive, ClientRegister, ManifestRequest, PayloadCompression,
         PossessionBitfield, ServerMetadata as ProtoServerMetadata, SyncMessage,
     };
+    use distd_core::signature::{
+        PublisherPublicKey, PublisherSignature, PublisherSignatureEnvelope, PublisherStatement,
+    };
     use distd_core::transport::TransportOp;
     use distd_core::utils::frame::{
         decode_length_delimited, encode_length_delimited, read_length_delimited_async,
@@ -1348,6 +1359,7 @@ mod tests {
     use distd_core::version::Version;
     use prost::Message as _;
     use quinn::{ClientConfig, Endpoint};
+    use ring::signature::{Ed25519KeyPair, KeyPair};
     use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
     use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
     use rustls::{DigitallySignedStruct, Error as TlsError, SignatureScheme};
@@ -1496,7 +1508,20 @@ mod tests {
         QuicAdmission,
     ) {
         let server = Server::new_ephemeral_with_metadata(HashMapStorage::default(), metadata)
-            .with_enrollment_token("integration-token");
+            .with_enrollment_token("integration-token")
+            .with_publisher_policy(PublisherPolicy::explicitly_insecure_unsigned());
+        start_test_server_instance(server, settings)
+    }
+
+    fn start_test_server_instance(
+        server: Server<HashMapStorage>,
+        settings: QuicResourceSettings,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        SocketAddr,
+        Server<HashMapStorage>,
+        QuicAdmission,
+    ) {
         let endpoint = Endpoint::server(
             make_server_config().expect("server config"),
             "127.0.0.1:0".parse().unwrap(),
@@ -1521,6 +1546,15 @@ mod tests {
         });
 
         (handle, addr, server, admission)
+    }
+
+    fn signed_envelope(item: &Item, seed: [u8; 32]) -> PublisherSignatureEnvelope {
+        let pair = Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
+        let statement = PublisherStatement::from_item(item).unwrap();
+        PublisherSignatureEnvelope::from_parts(
+            PublisherPublicKey::try_from(pair.public_key().as_ref()).unwrap(),
+            PublisherSignature::try_from(pair.sign(statement.as_bytes()).as_ref()).unwrap(),
+        )
     }
 
     async fn start_test_server() -> (
@@ -1565,7 +1599,10 @@ mod tests {
         InternalMetadata {
             version: Version::from((0, 2, 0)),
             feeds: HashMap::new(),
-            items: HashMap::from([(item.manifest.artifact_id.clone(), item)]),
+            items: HashMap::from([(
+                item.manifest.artifact_id.clone(),
+                PublishedRevision::unsigned(item),
+            )]),
             versions: HashMap::new(),
         }
     }
@@ -1915,7 +1952,8 @@ mod tests {
         let server = Server::new_ephemeral_with_metadata(
             HashMapStorage::default(),
             InternalMetadata::default(),
-        );
+        )
+        .with_publisher_policy(PublisherPolicy::explicitly_insecure_unsigned());
         let context = Arc::new(super::ConnectionContext::new(server, admission));
         let stream_a = Arc::clone(&context);
         let stream_b = Arc::clone(&context);
@@ -3116,7 +3154,8 @@ mod tests {
             HashMapStorage::default(),
             InternalMetadata::default(),
         )
-        .with_enrollment_token("integration-token");
+        .with_enrollment_token("integration-token")
+        .with_publisher_policy(PublisherPolicy::explicitly_insecure_unsigned());
         let item = server
             .publish_item(
                 "ipv6-artifact".to_string(),
@@ -3278,6 +3317,110 @@ mod tests {
         }
         assert!(saw_payload, "expected at least one payload frame");
 
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn quic_sync_latest_and_exact_versions_return_their_signed_envelopes() {
+        let storage = HashMapStorage::default();
+        let algorithm = ChunkAlgorithm::Fixed256K;
+        let first_bytes = axum::body::Bytes::from_static(b"signed quic revision zero");
+        let second_bytes = axum::body::Bytes::from_static(b"signed quic revision one");
+        let prepare = |bytes: axum::body::Bytes| {
+            storage
+                .prepare_revision(
+                    "signed-quic".to_string(),
+                    "signed-quic".to_string(),
+                    "signed-quic.bin".into(),
+                    0,
+                    None,
+                    bytes,
+                    algorithm,
+                )
+                .unwrap()
+        };
+        let first_envelope = signed_envelope(&prepare(first_bytes.clone()), [71; 32]);
+        let second_envelope = signed_envelope(&prepare(second_bytes.clone()), [73; 32]);
+        let policy =
+            PublisherPolicy::required([first_envelope.public_key(), second_envelope.public_key()]);
+        let server = Server::new_ephemeral_with_metadata(storage, InternalMetadata::default())
+            .with_enrollment_token("integration-token")
+            .with_publisher_policy(policy);
+        let first = server
+            .publish_signed_item_as(
+                "signed-quic".to_string(),
+                "signed-quic".to_string(),
+                "signed-quic.bin".into(),
+                None,
+                first_bytes,
+                algorithm,
+                first_envelope,
+            )
+            .await
+            .unwrap();
+        let second = server
+            .publish_signed_item_as(
+                "signed-quic".to_string(),
+                "signed-quic".to_string(),
+                "signed-quic.bin".into(),
+                None,
+                second_bytes,
+                algorithm,
+                second_envelope,
+            )
+            .await
+            .unwrap();
+        let (server_task, addr, _, _) =
+            start_test_server_instance(server, QuicResourceSettings::default());
+        let (_endpoint, connection) = connect_client(addr).await;
+        let uuid = register_client_uuid(&connection).await;
+
+        for (version, expected_item, expected_envelope) in [
+            (None, &second, second_envelope),
+            (Some(0), &first, first_envelope),
+        ] {
+            let (mut send, mut recv) =
+                open_authed_stream(&connection, TransportOp::Sync, Some(uuid)).await;
+            write_length_delimited_async(
+                &mut send,
+                &ManifestRequest {
+                    artifact_id: "signed-quic".to_string(),
+                    version,
+                },
+            )
+            .await
+            .unwrap();
+            let response = read_length_delimited_async::<_, SyncMessage>(&mut recv)
+                .await
+                .unwrap();
+            let response = match response.msg {
+                Some(Msg::ManifestResponse(response)) => response,
+                other => panic!("unexpected signed manifest response: {other:?}"),
+            };
+            assert_eq!(response.version, expected_item.manifest.version);
+            assert_eq!(
+                response.publisher_public_key,
+                expected_envelope.public_key().as_bytes()
+            );
+            assert_eq!(
+                response.publisher_signature,
+                expected_envelope.signature().as_bytes()
+            );
+            write_length_delimited_async(
+                &mut send,
+                &PossessionBitfield {
+                    bitfield: Bitfield::full(expected_item.manifest.chunk_count).to_bytes(),
+                },
+            )
+            .await
+            .unwrap();
+            send.finish().unwrap();
+            assert!(matches!(
+                read_length_delimited_async::<_, SyncMessage>(&mut recv).await,
+                Err(distd_core::utils::frame::FrameError::IoError(error))
+                    if error.kind() == std::io::ErrorKind::UnexpectedEof
+            ));
+        }
         server_task.abort();
     }
 

@@ -17,6 +17,7 @@ use distd_core::proto::{
     self, sync_message::Msg, ClientKeepAlive, ClientRegister,
     ServerMetadata as ProtoServerMetadata, SyncMessage,
 };
+use distd_core::signature::PublisherSignatureEnvelope;
 use distd_core::transport::maybe_compress_sync_payload_owned;
 use distd_core::utils::serde::BitcodeSerializable;
 use distd_core::utils::uuid::slice_to_uuid;
@@ -27,7 +28,6 @@ use ring::{
     rand,
     signature::{self},
 };
-use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, RwLock};
 use tracing::span;
 use uuid::Uuid;
@@ -35,11 +35,14 @@ use uuid::Uuid;
 use crate::client::{Client, Name as ClientName};
 use crate::error::Server as ServerError;
 use crate::metadata_state::MetadataStateStore;
+use crate::publication::{
+    PublicationAttestation, PublicationError, PublishedRevision, PublisherPolicy,
+};
 use distd_core::feed::{Feed, Name as FeedName};
 use distd_core::version::Version;
 
 /// Data structure used internally by server, may be converted to `ServerMetadata`
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InternalMetadata {
     // TODO
     // server version
@@ -47,9 +50,8 @@ pub struct InternalMetadata {
     // Feed map
     pub feeds: HashMap<FeedName, Feed>,
     // Item map — keyed by ArtifactId
-    pub items: HashMap<ArtifactId, Item>,
-    #[serde(default)]
-    pub versions: HashMap<ArtifactId, BTreeMap<u64, Item>>,
+    pub items: HashMap<ArtifactId, PublishedRevision>,
+    pub versions: HashMap<ArtifactId, BTreeMap<u64, PublishedRevision>>,
 }
 
 impl InternalMetadata {
@@ -58,8 +60,19 @@ impl InternalMetadata {
         T: ChunkStorage,
     {
         crate::metadata_state::validate_runtime_metadata(self)?;
-        for item in self.published_revisions() {
-            storage.verify_committed_revision(&item).map_err(|error| {
+        self.verify_storage_after_metadata_validation(storage)
+    }
+
+    pub(crate) fn verify_storage_after_metadata_validation<T>(
+        &self,
+        storage: &T,
+    ) -> Result<(), ServerError>
+    where
+        T: ChunkStorage,
+    {
+        for revision in self.versions.values().flat_map(BTreeMap::values) {
+            let item = revision.item();
+            storage.verify_committed_revision(item).map_err(|error| {
                 ServerError::State(format!(
                     "artifact {} version {} is not available in selected storage: {error}",
                     item.metadata.artifact_id, item.manifest.version
@@ -83,7 +96,7 @@ impl InternalMetadata {
     pub fn published_revisions(&self) -> Vec<Item> {
         self.versions
             .values()
-            .flat_map(|versions| versions.values().cloned())
+            .flat_map(|versions| versions.values().map(|revision| revision.item().clone()))
             .collect()
     }
 }
@@ -111,6 +124,27 @@ fn same_version_relevant_metadata(left: &Item, right: &Item) -> bool {
         && left.chunks == right.chunks
 }
 
+fn validate_publisher_policy_markers(
+    metadata: &InternalMetadata,
+    policy: &PublisherPolicy,
+) -> Result<(), ServerError> {
+    if !policy.permits_unsigned() {
+        for revision in metadata.versions.values().flat_map(BTreeMap::values) {
+            match revision.attestation() {
+                PublicationAttestation::Signed(envelope)
+                    if policy.contains_exact_key(envelope.public_key()) => {}
+                PublicationAttestation::Signed(_) => {
+                    return Err(PublicationError::UntrustedPublisher.into());
+                }
+                PublicationAttestation::Unsigned => {
+                    return Err(PublicationError::UnsignedForbidden.into());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 impl From<InternalMetadata> for ServerMetadata {
     fn from(value: InternalMetadata) -> Self {
         Self {
@@ -119,7 +153,7 @@ impl From<InternalMetadata> for ServerMetadata {
             items: value
                 .items
                 .into_iter()
-                .map(|(artifact_id, item)| (artifact_id, item.metadata))
+                .map(|(artifact_id, revision)| (artifact_id, revision.into_parts().0.metadata))
                 .collect(),
         }
     }
@@ -137,6 +171,7 @@ where
     key_pair: Arc<Ed25519KeyPair>, // needs server restart to be changed
     uuid_nonce: String,            // needs server restart to be changed
     enrollment_token: Option<Arc<str>>,
+    publisher_policy: PublisherPolicy,
 
     /// global server metadata
     metadata: Arc<RwLock<InternalMetadata>>,
@@ -158,6 +193,7 @@ where
             key_pair: Arc::clone(&self.key_pair),
             uuid_nonce: self.uuid_nonce.clone(),
             enrollment_token: self.enrollment_token.clone(),
+            publisher_policy: self.publisher_policy.clone(),
             metadata: Arc::clone(&self.metadata),
             storage: Arc::clone(&self.storage),
             clients: Arc::clone(&self.clients),
@@ -208,12 +244,13 @@ where
     async fn commit_publication_metadata(
         &self,
         artifact_id: ArtifactId,
-        expected_previous: Option<&Item>,
-        item: Item,
+        expected_previous: Option<&PublishedRevision>,
+        revision: PublishedRevision,
     ) -> Result<(), ServerError> {
         let live_metadata = Arc::clone(&self.metadata);
         let persist_lock = Arc::clone(&self.metadata_persist_lock);
         let store = self.metadata_store.clone();
+        let publisher_policy = self.publisher_policy.clone();
         let expected_previous = expected_previous.cloned();
         tokio::task::spawn_blocking(move || {
             let _persist_guard = persist_lock
@@ -221,7 +258,7 @@ where
                 .map_err(|_| ServerError::State("metadata commit lock is poisoned".to_string()))?;
             let snapshot = live_metadata.blocking_read();
             let mut next = (*snapshot).clone();
-            let actual_previous = current_publication_item(&next, &artifact_id)?;
+            let actual_previous = current_publication_revision(&next, &artifact_id)?;
             if actual_previous != expected_previous {
                 return Err(ServerError::State(
                     "publication history changed before metadata commit".to_string(),
@@ -230,7 +267,7 @@ where
             let versions = next.versions.entry(artifact_id.clone()).or_default();
             if versions.is_empty() {
                 if let Some(previous) = actual_previous {
-                    match versions.entry(previous.manifest.version) {
+                    match versions.entry(previous.item().manifest.version) {
                         std::collections::btree_map::Entry::Vacant(entry) => {
                             entry.insert(previous);
                         }
@@ -238,9 +275,9 @@ where
                     }
                 }
             }
-            match versions.entry(item.manifest.version) {
+            match versions.entry(revision.item().manifest.version) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(item.clone());
+                    entry.insert(revision.clone());
                 }
                 std::collections::btree_map::Entry::Occupied(_) => {
                     return Err(ServerError::State(
@@ -248,7 +285,8 @@ where
                     ));
                 }
             }
-            next.items.insert(artifact_id, item);
+            next.items.insert(artifact_id, revision);
+            validate_publisher_policy_markers(&next, &publisher_policy)?;
             Self::persist_metadata_snapshot(store.as_deref(), &snapshot, &next)?;
             drop(snapshot);
             *live_metadata.blocking_write() = next;
@@ -262,7 +300,7 @@ where
     async fn ensure_publication_history(
         &self,
         artifact_id: &str,
-        item: &Item,
+        revision: &PublishedRevision,
     ) -> Result<(), ServerError> {
         if self
             .metadata
@@ -270,38 +308,43 @@ where
             .await
             .versions
             .get(artifact_id)
-            .is_some_and(|versions| versions.get(&item.manifest.version) == Some(item))
+            .is_some_and(|versions| {
+                versions.get(&revision.item().manifest.version) == Some(revision)
+            })
         {
             return Ok(());
         }
         let live_metadata = Arc::clone(&self.metadata);
         let persist_lock = Arc::clone(&self.metadata_persist_lock);
         let store = self.metadata_store.clone();
+        let publisher_policy = self.publisher_policy.clone();
         let artifact_id = artifact_id.to_string();
-        let item = item.clone();
+        let revision = revision.clone();
         tokio::task::spawn_blocking(move || {
             let _persist_guard = persist_lock
                 .lock()
                 .map_err(|_| ServerError::State("metadata commit lock is poisoned".to_string()))?;
             let snapshot = live_metadata.blocking_read();
             let mut next = (*snapshot).clone();
-            if next.items.get(&artifact_id) != Some(&item) {
+            if next.items.get(&artifact_id) != Some(&revision) {
                 return Err(ServerError::State(
                     "publication changed before historical backfill".to_string(),
                 ));
             }
             let versions = next.versions.entry(artifact_id).or_default();
-            match versions.entry(item.manifest.version) {
+            match versions.entry(revision.item().manifest.version) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(item);
+                    entry.insert(revision);
                 }
-                std::collections::btree_map::Entry::Occupied(entry) if entry.get() == &item => {}
+                std::collections::btree_map::Entry::Occupied(entry) if entry.get() == &revision => {
+                }
                 std::collections::btree_map::Entry::Occupied(_) => {
                     return Err(ServerError::State(
                         "publication history conflicts during backfill".to_string(),
                     ));
                 }
             }
+            validate_publisher_policy_markers(&next, &publisher_policy)?;
             Self::persist_metadata_snapshot(store.as_deref(), &snapshot, &next)?;
             drop(snapshot);
             *live_metadata.blocking_write() = next;
@@ -328,6 +371,7 @@ where
             key_pair: Arc::new(key_pair),
             uuid_nonce,
             enrollment_token: None,
+            publisher_policy: PublisherPolicy::required([]),
             metadata: Arc::new(RwLock::new(metadata)),
             storage: Arc::new(storage),
             clients: Arc::new(RwLock::new(BTreeMap::new())),
@@ -353,6 +397,7 @@ where
             key_pair: Arc::new(key_pair),
             uuid_nonce: Uuid::new_v4().to_string(),
             enrollment_token: None,
+            publisher_policy: PublisherPolicy::required([]),
             metadata: Arc::new(RwLock::new(metadata)),
             storage: Arc::new(storage),
             clients: Arc::new(RwLock::new(BTreeMap::new())),
@@ -366,6 +411,13 @@ where
     pub fn with_enrollment_token(mut self, token: impl Into<Arc<str>>) -> Self {
         let token = token.into();
         self.enrollment_token = (!token.trim().is_empty()).then_some(token);
+        self
+    }
+
+    /// Attach the immutable publisher policy used for publication and sync.
+    #[must_use]
+    pub fn with_publisher_policy(mut self, policy: PublisherPolicy) -> Self {
+        self.publisher_policy = policy;
         self
     }
 
@@ -466,26 +518,45 @@ where
         &self,
         manifest_req: proto::ManifestRequest,
     ) -> Result<(proto::ManifestResponse, Item), String> {
-        let item = {
-            let md = self.metadata.read().await;
-            match manifest_req.version {
-                Some(version) => md
-                    .versions
-                    .get(&manifest_req.artifact_id)
-                    .and_then(|versions| versions.get(&version))
-                    .cloned(),
-                None => md.items.get(&manifest_req.artifact_id).cloned(),
+        let metadata = Arc::clone(&self.metadata);
+        let publisher_policy = self.publisher_policy.clone();
+        tokio::task::spawn_blocking(move || {
+            let artifact_id = manifest_req.artifact_id;
+            let revision = {
+                let metadata = metadata.blocking_read();
+                match manifest_req.version {
+                    Some(version) => metadata
+                        .versions
+                        .get(&artifact_id)
+                        .and_then(|versions| versions.get(&version))
+                        .cloned(),
+                    None => metadata.items.get(&artifact_id).cloned(),
+                }
             }
-        }
-        .ok_or_else(|| format!("Unknown artifact: {}", manifest_req.artifact_id))?;
-
-        let root_hash = *item.root();
-
-        Ok((
-            proto::ManifestResponse {
+            .ok_or_else(|| format!("Unknown artifact: {artifact_id}"))?;
+            publisher_policy
+                .validate_metadata_compatibility(&revision)
+                .map_err(|error| error.to_string())?;
+            let (item, attestation) = revision.into_parts();
+            let (publisher_public_key, publisher_signature) = match attestation {
+                PublicationAttestation::Signed(envelope) => (
+                    envelope.public_key().as_bytes().to_vec(),
+                    envelope.signature().as_bytes().to_vec(),
+                ),
+                PublicationAttestation::Unsigned => (Vec::new(), Vec::new()),
+            };
+            let chunk_sizes = item
+                .chunks
+                .iter()
+                .map(|chunk| {
+                    u32::try_from(chunk.size)
+                        .map_err(|_| "signed manifest chunk size exceeds wire limit".to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let response = proto::ManifestResponse {
                 artifact_id: item.manifest.artifact_id.clone(),
                 version: item.manifest.version,
-                root_hash: root_hash.as_bytes().to_vec(),
+                root_hash: item.root().as_bytes().to_vec(),
                 total_size: item.manifest.total_size,
                 chunk_count: item.manifest.chunk_count,
                 chunk_size: item.manifest.chunk_size,
@@ -506,10 +577,14 @@ where
                     })
                     .collect(),
                 chunk_algorithm: Some(item.manifest.chunk_algorithm.to_proto()),
-                chunk_sizes: item.chunks.iter().map(|chunk| chunk.size as u32).collect(),
-            },
-            item,
-        ))
+                chunk_sizes,
+                publisher_public_key,
+                publisher_signature,
+            };
+            Ok::<_, String>((response, item))
+        })
+        .await
+        .map_err(|error| format!("manifest response worker failed: {error}"))?
     }
 
     pub async fn sync_chunk_response_messages(
@@ -683,6 +758,7 @@ where
         let live_metadata = Arc::clone(&self.metadata);
         let persist_lock = Arc::clone(&self.metadata_persist_lock);
         let store = self.metadata_store.clone();
+        let publisher_policy = self.publisher_policy.clone();
         let storage = Arc::clone(&self.storage);
         let name = feed.name.clone();
         let result = tokio::task::spawn_blocking(move || {
@@ -710,6 +786,7 @@ where
                 }
             }
             crate::metadata_state::validate_runtime_metadata(&next)?;
+            validate_publisher_policy_markers(&next, &publisher_policy)?;
             Self::persist_metadata_snapshot(store.as_deref(), &snapshot, &next)?;
             drop(snapshot);
             *live_metadata.blocking_write() = next;
@@ -755,6 +832,58 @@ where
     where
         T: 'static,
     {
+        self.publish_item_as_with_attestation(
+            artifact_id,
+            name,
+            path,
+            description,
+            file,
+            chunk_algorithm,
+            None,
+        )
+        .await
+    }
+
+    /// Publish a revision authorized by an exact detached publisher envelope.
+    pub async fn publish_signed_item_as(
+        &self,
+        artifact_id: ArtifactId,
+        name: ItemName,
+        path: PathBuf,
+        description: Option<String>,
+        file: Bytes,
+        chunk_algorithm: ChunkAlgorithm,
+        envelope: PublisherSignatureEnvelope,
+    ) -> Result<Item, ServerError>
+    where
+        T: 'static,
+    {
+        self.publish_item_as_with_attestation(
+            artifact_id,
+            name,
+            path,
+            description,
+            file,
+            chunk_algorithm,
+            Some(envelope),
+        )
+        .await
+    }
+
+    async fn publish_item_as_with_attestation(
+        &self,
+        artifact_id: ArtifactId,
+        name: ItemName,
+        path: PathBuf,
+        description: Option<String>,
+        file: Bytes,
+        chunk_algorithm: ChunkAlgorithm,
+        envelope: Option<PublisherSignatureEnvelope>,
+    ) -> Result<Item, ServerError>
+    where
+        T: 'static,
+    {
+        self.precheck_publication_attestation(envelope.as_ref())?;
         let coordinator = self.clone();
         tokio::spawn(async move {
             coordinator
@@ -765,6 +894,7 @@ where
                     description,
                     file,
                     chunk_algorithm,
+                    envelope,
                 )
                 .await
         })
@@ -780,6 +910,7 @@ where
         description: Option<String>,
         file: Bytes,
         chunk_algorithm: ChunkAlgorithm,
+        envelope: Option<PublisherSignatureEnvelope>,
     ) -> Result<Item, ServerError> {
         let storage = Arc::clone(&self.storage);
         let prepare_artifact_id = artifact_id.clone();
@@ -803,25 +934,51 @@ where
         })?;
         let _publish_guard = self.publication_guard(&artifact_id).await;
         self.require_publication_writable()?;
+        let policy = self.publisher_policy.clone();
+        let authorized = tokio::task::spawn_blocking(move || match envelope {
+            Some(envelope) => policy.authorize_new(envelope, prepared),
+            None => policy.authorize_unsigned_new(prepared),
+        })
+        .await
+        .map_err(|error| {
+            ServerError::State(format!("publisher verification worker failed: {error}"))
+        })??;
         let previous = {
             let metadata = self.metadata.read().await;
-            current_publication_item(&metadata, &artifact_id)?
+            current_publication_revision(&metadata, &artifact_id)?
         };
         if let Some(old) = previous.as_ref() {
-            if same_version_relevant_metadata(old, &prepared) {
+            if same_signed_statement_content(old.item(), authorized.item())
+                && old.attestation() != authorized.attestation()
+            {
+                return Err(PublicationError::AttestationConflict.into());
+            }
+            if same_version_relevant_metadata(old.item(), authorized.item())
+                && old.attestation() == authorized.attestation()
+            {
                 self.ensure_publication_history(&artifact_id, old).await?;
-                return Ok(old.clone());
+                return Ok(old.item().clone());
             }
         }
         let revision = previous.as_ref().map_or(Ok(0), |item| {
-            item.metadata
+            item.item()
+                .metadata
                 .revision
                 .checked_add(1)
                 .ok_or_else(|| ServerError::State("artifact revision is exhausted".to_string()))
         })?;
+        let (prepared, attestation) = authorized.into_parts();
         let storage = Arc::clone(&self.storage);
-        let item = tokio::task::spawn_blocking(move || {
-            storage.commit_revision(prepared.with_revision(revision), file)
+        let (published, item) = tokio::task::spawn_blocking(move || {
+            storage
+                .commit_revision(prepared.with_revision(revision), file)
+                .map(|item| {
+                    let returned = item.clone();
+                    (
+                        PublishedRevision::from_verified_parts(item, attestation),
+                        returned,
+                    )
+                })
         })
         .await
         .map_err(|error| ServerError::State(format!("revision storage worker failed: {error}")))?
@@ -831,7 +988,7 @@ where
         })?;
 
         if let Err(error) = self
-            .commit_publication_metadata(artifact_id, previous.as_ref(), item.clone())
+            .commit_publication_metadata(artifact_id, previous.as_ref(), published)
             .await
         {
             self.cleanup_failed_publication(&item).await?;
@@ -874,6 +1031,58 @@ where
     where
         T: 'static,
     {
+        self.publish_item_from_files_as_with_attestation(
+            artifact_id,
+            name,
+            path,
+            description,
+            files,
+            chunk_algorithm,
+            None,
+        )
+        .await
+    }
+
+    /// Publish a directory revision authorized by an exact publisher envelope.
+    pub async fn publish_signed_item_from_files_as(
+        &self,
+        artifact_id: ArtifactId,
+        name: ItemName,
+        path: PathBuf,
+        description: Option<String>,
+        files: Vec<(PathBuf, Bytes)>,
+        chunk_algorithm: ChunkAlgorithm,
+        envelope: PublisherSignatureEnvelope,
+    ) -> Result<Item, ServerError>
+    where
+        T: 'static,
+    {
+        self.publish_item_from_files_as_with_attestation(
+            artifact_id,
+            name,
+            path,
+            description,
+            files,
+            chunk_algorithm,
+            Some(envelope),
+        )
+        .await
+    }
+
+    async fn publish_item_from_files_as_with_attestation(
+        &self,
+        artifact_id: ArtifactId,
+        name: ItemName,
+        path: PathBuf,
+        description: Option<String>,
+        files: Vec<(PathBuf, Bytes)>,
+        chunk_algorithm: ChunkAlgorithm,
+        envelope: Option<PublisherSignatureEnvelope>,
+    ) -> Result<Item, ServerError>
+    where
+        T: 'static,
+    {
+        self.precheck_publication_attestation(envelope.as_ref())?;
         let coordinator = self.clone();
         tokio::spawn(async move {
             coordinator
@@ -884,6 +1093,7 @@ where
                     description,
                     files,
                     chunk_algorithm,
+                    envelope,
                 )
                 .await
         })
@@ -897,23 +1107,32 @@ where
         name: ItemName,
         path: PathBuf,
         description: Option<String>,
-        mut files: Vec<(PathBuf, Bytes)>,
+        files: Vec<(PathBuf, Bytes)>,
         chunk_algorithm: ChunkAlgorithm,
+        envelope: Option<PublisherSignatureEnvelope>,
     ) -> Result<Item, ServerError> {
-        files.sort_by(|left, right| left.0.cmp(&right.0));
         let storage = Arc::clone(&self.storage);
         let prepare_artifact_id = artifact_id.clone();
-        let prepare_files = files.clone();
-        let prepared = tokio::task::spawn_blocking(move || {
-            storage.prepare_revision_from_files(
-                prepare_artifact_id,
-                name,
-                path,
-                0,
-                description,
-                prepare_files,
-                chunk_algorithm,
-            )
+        let (prepared, files) = tokio::task::spawn_blocking(move || {
+            let mut files = files;
+            files.sort_by(|left, right| {
+                left.0
+                    .to_str()
+                    .unwrap_or_default()
+                    .as_bytes()
+                    .cmp(right.0.to_str().unwrap_or_default().as_bytes())
+            });
+            storage
+                .prepare_revision_from_sorted_files(
+                    prepare_artifact_id,
+                    name,
+                    path,
+                    0,
+                    description,
+                    &files,
+                    chunk_algorithm,
+                )
+                .map(|prepared| (prepared, files))
         })
         .await
         .map_err(|error| {
@@ -926,25 +1145,51 @@ where
 
         let _publish_guard = self.publication_guard(&artifact_id).await;
         self.require_publication_writable()?;
+        let policy = self.publisher_policy.clone();
+        let authorized = tokio::task::spawn_blocking(move || match envelope {
+            Some(envelope) => policy.authorize_new(envelope, prepared),
+            None => policy.authorize_unsigned_new(prepared),
+        })
+        .await
+        .map_err(|error| {
+            ServerError::State(format!("publisher verification worker failed: {error}"))
+        })??;
         let previous = {
             let metadata = self.metadata.read().await;
-            current_publication_item(&metadata, &artifact_id)?
+            current_publication_revision(&metadata, &artifact_id)?
         };
         if let Some(old) = previous.as_ref() {
-            if same_version_relevant_metadata(old, &prepared) {
+            if same_signed_statement_content(old.item(), authorized.item())
+                && old.attestation() != authorized.attestation()
+            {
+                return Err(PublicationError::AttestationConflict.into());
+            }
+            if same_version_relevant_metadata(old.item(), authorized.item())
+                && old.attestation() == authorized.attestation()
+            {
                 self.ensure_publication_history(&artifact_id, old).await?;
-                return Ok(old.clone());
+                return Ok(old.item().clone());
             }
         }
         let revision = previous.as_ref().map_or(Ok(0), |item| {
-            item.metadata
+            item.item()
+                .metadata
                 .revision
                 .checked_add(1)
                 .ok_or_else(|| ServerError::State("artifact revision is exhausted".to_string()))
         })?;
+        let (prepared, attestation) = authorized.into_parts();
         let storage = Arc::clone(&self.storage);
-        let item = tokio::task::spawn_blocking(move || {
-            storage.commit_revision_from_files(prepared.with_revision(revision), files)
+        let (published, item) = tokio::task::spawn_blocking(move || {
+            storage
+                .commit_revision_from_files(prepared.with_revision(revision), files)
+                .map(|item| {
+                    let returned = item.clone();
+                    (
+                        PublishedRevision::from_verified_parts(item, attestation),
+                        returned,
+                    )
+                })
         })
         .await
         .map_err(|error| ServerError::State(format!("revision storage worker failed: {error}")))?
@@ -954,7 +1199,7 @@ where
         })?;
 
         if let Err(error) = self
-            .commit_publication_metadata(artifact_id, previous.as_ref(), item.clone())
+            .commit_publication_metadata(artifact_id, previous.as_ref(), published)
             .await
         {
             self.cleanup_failed_publication(&item).await?;
@@ -997,6 +1242,25 @@ where
         Ok(())
     }
 
+    pub(crate) fn precheck_publication_attestation(
+        &self,
+        envelope: Option<&PublisherSignatureEnvelope>,
+    ) -> Result<(), ServerError> {
+        match envelope {
+            Some(envelope)
+                if !self.publisher_policy.permits_unsigned()
+                    && !self
+                        .publisher_policy
+                        .contains_exact_key(envelope.public_key()) =>
+            {
+                Err(PublicationError::UntrustedPublisher.into())
+            }
+            Some(_) => Ok(()),
+            None if self.publisher_policy.permits_unsigned() => Ok(()),
+            None => Err(PublicationError::UnsignedForbidden.into()),
+        }
+    }
+
     /// Get the public key of the server
     #[must_use]
     pub fn public_key(&self) -> &[u8] {
@@ -1004,18 +1268,18 @@ where
     }
 }
 
-fn current_publication_item(
+fn current_publication_revision(
     metadata: &InternalMetadata,
     artifact_id: &str,
-) -> Result<Option<Item>, ServerError> {
+) -> Result<Option<PublishedRevision>, ServerError> {
     let current = metadata.items.get(artifact_id).cloned();
     if let Some(current) = &current {
-        validate_item_identity(artifact_id, current)?;
+        validate_item_identity(artifact_id, current.item())?;
     }
     let historical = if let Some(versions) = metadata.versions.get(artifact_id) {
-        for (version, item) in versions {
-            validate_item_identity(artifact_id, item)?;
-            if *version != item.manifest.version {
+        for (version, revision) in versions {
+            validate_item_identity(artifact_id, revision.item())?;
+            if *version != revision.item().manifest.version {
                 return Err(ServerError::State(format!(
                     "artifact {artifact_id} history key disagrees with its item version"
                 )));
@@ -1023,14 +1287,14 @@ fn current_publication_item(
         }
         versions
             .last_key_value()
-            .map(|(version, item)| (*version, item.clone()))
+            .map(|(version, revision)| (*version, revision.clone()))
     } else {
         None
     };
     match (&current, &historical) {
         (None, None) => Ok(None),
         (Some(current), Some((version, historical)))
-            if current == historical && *version == current.manifest.version =>
+            if current == historical && *version == current.item().manifest.version =>
         {
             Ok(current.clone().into())
         }
@@ -1039,6 +1303,15 @@ fn current_publication_item(
             "artifact {artifact_id} current revision disagrees with immutable history"
         ))),
     }
+}
+
+fn same_signed_statement_content(left: &Item, right: &Item) -> bool {
+    left.manifest.artifact_id == right.manifest.artifact_id
+        && left.manifest.root_hash == right.manifest.root_hash
+        && left.manifest.total_size == right.manifest.total_size
+        && left.manifest.chunk_algorithm == right.manifest.chunk_algorithm
+        && left.manifest.entries == right.manifest.entries
+        && left.chunks == right.chunks
 }
 
 const BULK_TARGET_BYTES: usize = 16 * 1024 * 1024;
@@ -1149,7 +1422,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{build_sync_payload_batches, InternalMetadata, Server, ServerError};
+    use super::{
+        build_sync_payload_batches, InternalMetadata, Server as ProductionServer, ServerError,
+    };
     use axum::body::Bytes;
     use distd_core::chunk_storage::hashmap_storage::HashMapStorage;
     use distd_core::chunk_storage::ChunkStorage;
@@ -1157,10 +1432,154 @@ mod tests {
     use distd_core::durable_state::{
         replace_enveloped_state, DurableReplaceStage, DurableStateError, DurableStateKind,
     };
+    use distd_core::item::Item;
     use distd_core::proto::ManifestRequest;
     use distd_core::proto::{sync_message::Msg, PayloadCompression};
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
+
+    use crate::publication::{PublicationError, PublishedRevision, PublisherPolicy};
+    use distd_core::signature::{
+        PublisherPublicKey, PublisherSignature, PublisherSignatureEnvelope, PublisherStatement,
+    };
+    use ring::signature::{Ed25519KeyPair, KeyPair};
+
+    fn unsigned(item: Item) -> PublishedRevision {
+        PublishedRevision::unsigned(item)
+    }
+
+    fn signed_envelope(item: &Item, seed: [u8; 32]) -> PublisherSignatureEnvelope {
+        let pair = Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
+        let statement = PublisherStatement::from_item(item).unwrap();
+        PublisherSignatureEnvelope::from_parts(
+            PublisherPublicKey::try_from(pair.public_key().as_ref()).unwrap(),
+            PublisherSignature::try_from(pair.sign(statement.as_bytes()).as_ref()).unwrap(),
+        )
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct CountingStorage {
+        inner: HashMapStorage,
+        commits: Arc<AtomicUsize>,
+    }
+
+    impl
+        distd_core::hash::HashTreeCapable<
+            Arc<distd_core::chunk_storage::Node>,
+            distd_core::error::Error,
+        > for CountingStorage
+    {
+        fn func(
+            &self,
+            data: &[u8],
+        ) -> Result<Arc<distd_core::chunk_storage::Node>, distd_core::error::Error> {
+            self.inner.func(data)
+        }
+
+        fn merge(
+            &self,
+            left: &Arc<distd_core::chunk_storage::Node>,
+            right: &Arc<distd_core::chunk_storage::Node>,
+        ) -> Result<Arc<distd_core::chunk_storage::Node>, distd_core::error::Error> {
+            self.inner.merge(left, right)
+        }
+    }
+
+    impl ChunkStorage for CountingStorage {
+        fn get(
+            &self,
+            hash: &distd_core::hash::Hash,
+        ) -> Option<Arc<distd_core::chunk_storage::Node>> {
+            self.inner.get(hash)
+        }
+
+        fn store_chunk(
+            &self,
+            hash: distd_core::hash::Hash,
+            chunk: &[u8],
+        ) -> Result<Arc<distd_core::chunk_storage::Node>, distd_core::chunk_storage::StorageError>
+        {
+            self.inner.store_chunk(hash, chunk)
+        }
+
+        fn store_link(
+            &self,
+            hash: distd_core::hash::Hash,
+            left: Arc<distd_core::chunk_storage::Node>,
+            right: Arc<distd_core::chunk_storage::Node>,
+        ) -> Result<Arc<distd_core::chunk_storage::Node>, distd_core::chunk_storage::StorageError>
+        {
+            self.inner.store_link(hash, left, right)
+        }
+
+        fn chunks(&self) -> Vec<distd_core::hash::Hash> {
+            self.inner.chunks()
+        }
+
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+
+        fn commit_revision(
+            &self,
+            item: Item,
+            file: Bytes,
+        ) -> Result<Item, distd_core::error::Error> {
+            self.commits.fetch_add(1, Ordering::Relaxed);
+            self.inner.commit_revision(item, file)
+        }
+
+        fn commit_revision_from_files(
+            &self,
+            item: Item,
+            files: Vec<(std::path::PathBuf, Bytes)>,
+        ) -> Result<Item, distd_core::error::Error> {
+            self.commits.fetch_add(1, Ordering::Relaxed);
+            self.inner.commit_revision_from_files(item, files)
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct CountingMetadataReplace {
+        calls: AtomicUsize,
+    }
+
+    impl crate::metadata_state::MetadataReplace for CountingMetadataReplace {
+        fn replace(&self, path: &Path, payload: &[u8]) -> Result<(), DurableStateError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            replace_enveloped_state(
+                path,
+                DurableStateKind::ServerPublication,
+                crate::metadata_state::SERVER_PUBLICATION_SCHEMA,
+                payload,
+                crate::metadata_state::MAX_SERVER_PUBLICATION_PAYLOAD,
+            )
+        }
+    }
+
+    struct Server;
+
+    impl Server {
+        fn new_ephemeral<T>(storage: T) -> ProductionServer<T>
+        where
+            T: ChunkStorage + Sync + Send + std::fmt::Debug + 'static,
+        {
+            ProductionServer::new_ephemeral(storage)
+                .with_publisher_policy(PublisherPolicy::explicitly_insecure_unsigned())
+        }
+
+        fn new_ephemeral_with_metadata<T>(
+            storage: T,
+            metadata: InternalMetadata,
+        ) -> ProductionServer<T>
+        where
+            T: ChunkStorage + Sync + Send + std::fmt::Debug + 'static,
+        {
+            ProductionServer::new_ephemeral_with_metadata(storage, metadata)
+                .with_publisher_policy(PublisherPolicy::explicitly_insecure_unsigned())
+        }
+    }
 
     #[derive(Debug)]
     struct BlockingMetadataReplace {
@@ -1231,6 +1650,370 @@ mod tests {
             }
             other => panic!("expected bulk message, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn signed_publication_verifies_before_commit_and_is_exactly_idempotent() {
+        let storage = CountingStorage::default();
+        let storage_commits = Arc::clone(&storage.commits);
+        let bytes = Bytes::from_static(b"publisher-authenticated revision");
+        let algorithm = ChunkAlgorithm::Fixed256K;
+        let prepared = storage
+            .prepare_revision(
+                "signed-id".to_string(),
+                "display".to_string(),
+                "signed.bin".into(),
+                0,
+                None,
+                bytes.clone(),
+                algorithm,
+            )
+            .unwrap();
+        let envelope = signed_envelope(&prepared, [7; 32]);
+        let policy = PublisherPolicy::required([envelope.public_key()]);
+        let directory =
+            std::env::temp_dir().join(format!("distd-signed-idempotence-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let paths = crate::metadata_state::MetadataPaths::in_state_directory(&directory);
+        let replacer = Arc::new(CountingMetadataReplace::default());
+        let (store, metadata) = crate::metadata_state::MetadataStateStore::open_with_replacer(
+            paths.clone(),
+            replacer.clone(),
+            |_| Ok(()),
+        )
+        .unwrap();
+        let bootstrap_writes = replacer.calls.load(Ordering::Relaxed);
+        let server = ProductionServer::new_ephemeral_with_metadata(storage, metadata)
+            .with_publisher_policy(policy.clone())
+            .with_metadata_store(store);
+
+        let first = server
+            .publish_signed_item_as(
+                "signed-id".to_string(),
+                "display".to_string(),
+                "signed.bin".into(),
+                None,
+                bytes.clone(),
+                algorithm,
+                envelope,
+            )
+            .await
+            .unwrap();
+        let size_after_first = server.storage().size();
+        assert_eq!(storage_commits.load(Ordering::Relaxed), 1);
+        let metadata_writes_after_first = replacer.calls.load(Ordering::Relaxed);
+        assert_eq!(metadata_writes_after_first, bootstrap_writes + 1);
+        let duplicate = server
+            .publish_signed_item_as(
+                "signed-id".to_string(),
+                "display".to_string(),
+                "signed.bin".into(),
+                None,
+                bytes,
+                algorithm,
+                envelope,
+            )
+            .await
+            .unwrap();
+        assert_eq!(duplicate, first);
+        assert_eq!(server.storage().size(), size_after_first);
+        assert_eq!(storage_commits.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            replacer.calls.load(Ordering::Relaxed),
+            metadata_writes_after_first
+        );
+        let metadata = server.metadata_snapshot().await;
+        let history = metadata.versions.get("signed-id").unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history.get(&0).unwrap().attestation().envelope(),
+            Some(&envelope)
+        );
+
+        let (response, exact) = server
+            .sync_manifest_response(ManifestRequest {
+                artifact_id: "signed-id".to_string(),
+                version: Some(0),
+            })
+            .await
+            .unwrap();
+        assert_eq!(exact, first);
+        assert_eq!(
+            response.publisher_public_key,
+            envelope.public_key().as_bytes()
+        );
+        assert_eq!(
+            response.publisher_signature,
+            envelope.signature().as_bytes()
+        );
+        let (_, restarted) =
+            crate::metadata_state::MetadataStateStore::open_with_validator(paths, |candidate| {
+                crate::metadata_state::validate_runtime_metadata_with_policy(candidate, &policy)
+            })
+            .unwrap();
+        assert_eq!(restarted.items.get("signed-id").unwrap().item(), &first);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_or_unknown_publisher_never_mutates_storage_or_metadata() {
+        let storage = HashMapStorage::default();
+        let bytes = Bytes::from_static(b"rejected signed revision");
+        let prepared = storage
+            .prepare_revision(
+                "rejected".to_string(),
+                "rejected".to_string(),
+                "rejected.bin".into(),
+                0,
+                None,
+                bytes.clone(),
+                ChunkAlgorithm::Fixed256K,
+            )
+            .unwrap();
+        let allowed = signed_envelope(&prepared, [11; 32]);
+        let unknown = signed_envelope(&prepared, [13; 32]);
+        let directory = std::env::temp_dir().join(format!(
+            "distd-invalid-signed-publication-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let paths = crate::metadata_state::MetadataPaths::in_state_directory(&directory);
+        let (store, metadata) =
+            crate::metadata_state::MetadataStateStore::open_with_validator(paths.clone(), |_| {
+                Ok(())
+            })
+            .unwrap();
+        let durable_before = std::fs::read(&paths.current).unwrap();
+        let server = ProductionServer::new_ephemeral_with_metadata(storage, metadata)
+            .with_publisher_policy(PublisherPolicy::required([allowed.public_key()]))
+            .with_metadata_store(store);
+        let before = server.metadata_snapshot().await;
+        let size_before = server.storage().size();
+
+        let missing_error = server
+            .publish_item_as(
+                "rejected".to_string(),
+                "rejected".to_string(),
+                "rejected.bin".into(),
+                None,
+                bytes.clone(),
+                ChunkAlgorithm::Fixed256K,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            missing_error,
+            ServerError::Publication(PublicationError::UnsignedForbidden)
+        ));
+
+        let unknown_error = server
+            .publish_signed_item_as(
+                "rejected".to_string(),
+                "rejected".to_string(),
+                "rejected.bin".into(),
+                None,
+                bytes.clone(),
+                ChunkAlgorithm::Fixed256K,
+                unknown,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            unknown_error,
+            ServerError::Publication(PublicationError::UntrustedPublisher)
+        ));
+
+        let mut invalid_signature = *allowed.signature().as_bytes();
+        invalid_signature[0] ^= 1;
+        let invalid = PublisherSignatureEnvelope::from_parts(
+            allowed.public_key(),
+            PublisherSignature::from_bytes(invalid_signature),
+        );
+        let invalid_error = server
+            .publish_signed_item_as(
+                "rejected".to_string(),
+                "rejected".to_string(),
+                "rejected.bin".into(),
+                None,
+                bytes,
+                ChunkAlgorithm::Fixed256K,
+                invalid,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            invalid_error,
+            ServerError::Publication(PublicationError::InvalidSignature(_))
+        ));
+        let cross_artifact = server
+            .publish_signed_item_as(
+                "other-artifact".to_string(),
+                "rejected".to_string(),
+                "rejected.bin".into(),
+                None,
+                Bytes::from_static(b"rejected signed revision"),
+                ChunkAlgorithm::Fixed256K,
+                allowed,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            cross_artifact,
+            ServerError::Publication(PublicationError::InvalidSignature(_))
+        ));
+        assert_eq!(server.metadata_snapshot().await, before);
+        assert_eq!(server.storage().size(), size_before);
+        assert_eq!(std::fs::read(&paths.current).unwrap(), durable_before);
+        drop(server);
+        let (_, restarted) =
+            crate::metadata_state::MetadataStateStore::open_with_validator(paths, |_| Ok(()))
+                .unwrap();
+        assert_eq!(restarted, before);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn signed_history_keeps_each_exact_envelope_and_rejects_key_substitution() {
+        let storage = HashMapStorage::default();
+        let first_bytes = Bytes::from_static(b"first signed revision");
+        let second_bytes = Bytes::from_static(b"second signed revision");
+        let prepare = |bytes: Bytes| {
+            storage
+                .prepare_revision(
+                    "rotating".to_string(),
+                    "rotating".to_string(),
+                    "rotating.bin".into(),
+                    0,
+                    None,
+                    bytes,
+                    ChunkAlgorithm::Fixed256K,
+                )
+                .unwrap()
+        };
+        let first_envelope = signed_envelope(&prepare(first_bytes.clone()), [17; 32]);
+        let substituted = signed_envelope(&prepare(first_bytes.clone()), [19; 32]);
+        let second_envelope = signed_envelope(&prepare(second_bytes.clone()), [19; 32]);
+        let server = ProductionServer::new_ephemeral(storage).with_publisher_policy(
+            PublisherPolicy::required([first_envelope.public_key(), second_envelope.public_key()]),
+        );
+
+        let first = server
+            .publish_signed_item_as(
+                "rotating".to_string(),
+                "rotating".to_string(),
+                "rotating.bin".into(),
+                None,
+                first_bytes.clone(),
+                ChunkAlgorithm::Fixed256K,
+                first_envelope,
+            )
+            .await
+            .unwrap();
+        let conflict = server
+            .publish_signed_item_as(
+                "rotating".to_string(),
+                "rotating".to_string(),
+                "rotating.bin".into(),
+                None,
+                first_bytes,
+                ChunkAlgorithm::Fixed256K,
+                substituted,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            conflict,
+            ServerError::Publication(PublicationError::AttestationConflict)
+        ));
+
+        let second = server
+            .publish_signed_item_as(
+                "rotating".to_string(),
+                "rotating".to_string(),
+                "rotating.bin".into(),
+                None,
+                second_bytes,
+                ChunkAlgorithm::Fixed256K,
+                second_envelope,
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.metadata.revision, first.metadata.revision + 1);
+        for (version, envelope) in [(0, first_envelope), (1, second_envelope)] {
+            let (response, _) = server
+                .sync_manifest_response(ManifestRequest {
+                    artifact_id: "rotating".to_string(),
+                    version: Some(version),
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                response.publisher_public_key,
+                envelope.public_key().as_bytes()
+            );
+            assert_eq!(
+                response.publisher_signature,
+                envelope.signature().as_bytes()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn signed_directory_accepts_the_production_bzip2_profile() {
+        let storage = HashMapStorage::default();
+        let files = vec![
+            ("a.txt".into(), Bytes::from_static(b"alpha")),
+            ("nested/b.txt".into(), Bytes::from_static(b"beta")),
+        ];
+        let algorithm = ChunkAlgorithm::fixed_aligned(1024 * 1024, 100 * 1024);
+        let prepared = storage
+            .prepare_revision_from_files(
+                "signed-directory".to_string(),
+                "directory".to_string(),
+                "logical".into(),
+                0,
+                None,
+                files.clone(),
+                algorithm,
+            )
+            .unwrap();
+        let envelope = signed_envelope(&prepared, [23; 32]);
+        let server = ProductionServer::new_ephemeral(storage)
+            .with_publisher_policy(PublisherPolicy::required([envelope.public_key()]));
+        let published = server
+            .publish_signed_item_from_files_as(
+                "signed-directory".to_string(),
+                "directory".to_string(),
+                "logical".into(),
+                None,
+                files,
+                algorithm,
+                envelope,
+            )
+            .await
+            .unwrap();
+        assert_eq!(published.manifest.chunk_algorithm, algorithm);
+        assert_eq!(published.manifest.entries.len(), 2);
+        let (response, exact) = server
+            .sync_manifest_response(ManifestRequest {
+                artifact_id: "signed-directory".to_string(),
+                version: Some(0),
+            })
+            .await
+            .unwrap();
+        assert_eq!(exact, published);
+        assert_eq!(
+            ChunkAlgorithm::try_from_proto_exact(response.chunk_algorithm.as_ref()).unwrap(),
+            algorithm
+        );
+        assert_eq!(
+            response.publisher_public_key,
+            envelope.public_key().as_bytes()
+        );
+        assert_eq!(
+            response.publisher_signature,
+            envelope.signature().as_bytes()
+        );
     }
 
     #[tokio::test]
@@ -1390,7 +2173,7 @@ mod tests {
             .write()
             .await
             .items
-            .insert("exhausted".to_string(), exhausted);
+            .insert("exhausted".to_string(), unsigned(exhausted));
         let error = server
             .publish_item_as(
                 "exhausted".to_string(),
@@ -1433,7 +2216,9 @@ mod tests {
             .unwrap();
 
         let mut behind = server.metadata.read().await.clone();
-        behind.items.insert("stable-id".to_string(), first);
+        behind
+            .items
+            .insert("stable-id".to_string(), unsigned(first));
         let behind_error = crate::metadata_state::validate_runtime_metadata(&behind).unwrap_err();
         assert!(matches!(
             behind_error,
@@ -1443,7 +2228,7 @@ mod tests {
         let mut mismatched_key = server.metadata.read().await.clone();
         let versions = mismatched_key.versions.get_mut("stable-id").unwrap();
         versions.remove(&second.manifest.version);
-        versions.insert(second.manifest.version + 1, second);
+        versions.insert(second.manifest.version + 1, unsigned(second));
         let mismatched_error =
             crate::metadata_state::validate_runtime_metadata(&mismatched_key).unwrap_err();
         assert!(matches!(
@@ -1471,7 +2256,7 @@ mod tests {
         let mut current_only = InternalMetadata::default();
         current_only
             .items
-            .insert("stable-id".to_string(), first.clone());
+            .insert("stable-id".to_string(), unsigned(first.clone()));
         let server = Server::new_ephemeral_with_metadata(HashMapStorage::default(), current_only);
         let duplicate = server
             .publish_item_as(
@@ -1506,8 +2291,14 @@ mod tests {
             .unwrap();
         let metadata = server.metadata.read().await;
         let versions = metadata.versions.get("stable-id").unwrap();
-        assert_eq!(versions.get(&first.manifest.version), Some(&first));
-        assert_eq!(versions.get(&second.manifest.version), Some(&second));
+        assert_eq!(
+            versions.get(&first.manifest.version).unwrap().item(),
+            &first
+        );
+        assert_eq!(
+            versions.get(&second.manifest.version).unwrap().item(),
+            &second
+        );
         drop(metadata);
 
         let mut malformed = server.metadata.read().await.clone();
@@ -1587,18 +2378,35 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let server = Server::new_ephemeral_with_metadata(HashMapStorage::default(), metadata)
+        let storage = HashMapStorage::default();
+        let bytes = Bytes::from(vec![7_u8; 8 * 1024 * 1024]);
+        let prepared = storage
+            .prepare_revision(
+                "stable-id".to_string(),
+                "display".to_string(),
+                "artifact.bin".into(),
+                0,
+                None,
+                bytes.clone(),
+                ChunkAlgorithm::default(),
+            )
+            .unwrap();
+        let envelope = signed_envelope(&prepared, [31; 32]);
+        let policy = PublisherPolicy::required([envelope.public_key()]);
+        let server = ProductionServer::new_ephemeral_with_metadata(storage, metadata)
+            .with_publisher_policy(policy.clone())
             .with_metadata_store(store);
         let waiting_server = server.clone();
         let waiter = tokio::spawn(async move {
             waiting_server
-                .publish_item_as(
+                .publish_signed_item_as(
                     "stable-id".to_string(),
                     "display".to_string(),
                     "artifact.bin".into(),
                     None,
-                    Bytes::from(vec![7_u8; 8 * 1024 * 1024]),
+                    bytes,
                     ChunkAlgorithm::default(),
+                    envelope,
                 )
                 .await
         });
@@ -1618,14 +2426,16 @@ mod tests {
         let (_, exact) = server
             .sync_manifest_response(ManifestRequest {
                 artifact_id: "stable-id".to_string(),
-                version: Some(published.manifest.version),
+                version: Some(published.item().manifest.version),
             })
             .await
             .unwrap();
-        assert_eq!(exact, published);
+        assert_eq!(&exact, published.item());
         let (reopened, durable) =
-            crate::metadata_state::MetadataStateStore::open_with_validator(paths, |_| Ok(()))
-                .unwrap();
+            crate::metadata_state::MetadataStateStore::open_with_validator(paths, |candidate| {
+                crate::metadata_state::validate_runtime_metadata_with_policy(candidate, &policy)
+            })
+            .unwrap();
         drop(reopened);
         assert_eq!(durable.items.get("stable-id"), Some(&published));
         std::fs::remove_dir_all(directory).unwrap();
@@ -1661,28 +2471,62 @@ mod tests {
                 |_| Ok(()),
             )
             .unwrap();
-            let server =
-                Server::new_ephemeral_with_metadata(HashMapStorage::default(), metadata.clone())
-                    .with_metadata_store(store);
+            let storage = HashMapStorage::default();
             let expected_bytes: &[u8] = if stage_index.is_multiple_of(2) {
                 b"complete candidate"
             } else {
                 b"directory candidate"
             };
+            let algorithm = ChunkAlgorithm::default();
+            let prepared = if stage_index.is_multiple_of(2) {
+                storage
+                    .prepare_revision(
+                        "faulted".to_string(),
+                        "display".to_string(),
+                        "artifact.bin".into(),
+                        0,
+                        None,
+                        Bytes::copy_from_slice(expected_bytes),
+                        algorithm,
+                    )
+                    .unwrap()
+            } else {
+                storage
+                    .prepare_revision_from_files(
+                        "faulted".to_string(),
+                        "display".to_string(),
+                        "artifact".into(),
+                        0,
+                        None,
+                        vec![(
+                            "nested/file.bin".into(),
+                            Bytes::copy_from_slice(expected_bytes),
+                        )],
+                        algorithm,
+                    )
+                    .unwrap()
+            };
+            let envelope =
+                signed_envelope(&prepared, [u8::try_from(stage_index).unwrap() + 41; 32]);
+            let policy = PublisherPolicy::required([envelope.public_key()]);
+            let server = ProductionServer::new_ephemeral_with_metadata(storage, metadata.clone())
+                .with_publisher_policy(policy.clone())
+                .with_metadata_store(store);
             let result = if stage_index.is_multiple_of(2) {
                 server
-                    .publish_item_as(
+                    .publish_signed_item_as(
                         "faulted".to_string(),
                         "display".to_string(),
                         "artifact.bin".into(),
                         None,
                         Bytes::copy_from_slice(expected_bytes),
-                        ChunkAlgorithm::default(),
+                        algorithm,
+                        envelope,
                     )
                     .await
             } else {
                 server
-                    .publish_item_from_files_as(
+                    .publish_signed_item_from_files_as(
                         "faulted".to_string(),
                         "display".to_string(),
                         "artifact".into(),
@@ -1691,7 +2535,8 @@ mod tests {
                             "nested/file.bin".into(),
                             Bytes::copy_from_slice(expected_bytes),
                         )],
-                        ChunkAlgorithm::default(),
+                        algorithm,
+                        envelope,
                     )
                     .await
             };
@@ -1704,7 +2549,12 @@ mod tests {
             let (reopened, durable) =
                 crate::metadata_state::MetadataStateStore::open_with_validator(
                     paths,
-                    |candidate| candidate.verify_storage(server.storage()),
+                    |candidate| {
+                        candidate.verify_storage(server.storage())?;
+                        crate::metadata_state::validate_runtime_metadata_with_policy(
+                            candidate, &policy,
+                        )
+                    },
                 )
                 .unwrap();
             drop(reopened);
@@ -1721,7 +2571,7 @@ mod tests {
                     assert_eq!(
                         server
                             .storage()
-                            .get_chunk_by_index(&item.metadata.root.hash, 0),
+                            .get_chunk_by_index(&item.item().metadata.root.hash, 0),
                         Some(expected_bytes.to_vec())
                     );
                 }
@@ -1776,7 +2626,7 @@ mod tests {
             .reconcile_published_revisions(&durable.published_revisions())
             .unwrap();
         drop(reopened_store);
-        assert_eq!(durable.items.get("directory"), Some(&published));
+        assert_eq!(durable.items.get("directory").unwrap().item(), &published);
         assert_eq!(
             reopened_storage.get_chunk_by_index(&published.metadata.root.hash, 0),
             Some(b"alpha".to_vec())
@@ -1824,7 +2674,7 @@ mod tests {
             })
             .unwrap();
         drop(reopened_store);
-        assert_eq!(durable.items.get("single"), Some(&published));
+        assert_eq!(durable.items.get("single").unwrap().item(), &published);
         assert_eq!(
             reopened_storage.get_chunk_by_index(&published.metadata.root.hash, 0),
             Some(b"redb payload".to_vec())
@@ -1845,37 +2695,75 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let server = Server::new_ephemeral_with_metadata(HashMapStorage::default(), metadata)
+        let storage = HashMapStorage::default();
+        let algorithm = ChunkAlgorithm::default();
+        let left_bytes = Bytes::from_static(b"left");
+        let right_bytes = Bytes::from_static(b"right");
+        let left_envelope = signed_envelope(
+            &storage
+                .prepare_revision(
+                    "left".to_string(),
+                    "left".to_string(),
+                    "left.bin".into(),
+                    0,
+                    None,
+                    left_bytes.clone(),
+                    algorithm,
+                )
+                .unwrap(),
+            [51; 32],
+        );
+        let right_envelope = signed_envelope(
+            &storage
+                .prepare_revision(
+                    "right".to_string(),
+                    "right".to_string(),
+                    "right.bin".into(),
+                    0,
+                    None,
+                    right_bytes.clone(),
+                    algorithm,
+                )
+                .unwrap(),
+            [53; 32],
+        );
+        let policy =
+            PublisherPolicy::required([left_envelope.public_key(), right_envelope.public_key()]);
+        let server = ProductionServer::new_ephemeral_with_metadata(storage, metadata)
+            .with_publisher_policy(policy.clone())
             .with_metadata_store(store);
         let left_server = server.clone();
         let right_server = server.clone();
         let (left, right) = tokio::join!(
-            left_server.publish_item_as(
+            left_server.publish_signed_item_as(
                 "left".to_string(),
                 "left".to_string(),
                 "left.bin".into(),
                 None,
-                Bytes::from_static(b"left"),
-                ChunkAlgorithm::default(),
+                left_bytes,
+                algorithm,
+                left_envelope,
             ),
-            right_server.publish_item_as(
+            right_server.publish_signed_item_as(
                 "right".to_string(),
                 "right".to_string(),
                 "right.bin".into(),
                 None,
-                Bytes::from_static(b"right"),
-                ChunkAlgorithm::default(),
+                right_bytes,
+                algorithm,
+                right_envelope,
             )
         );
         let left = left.unwrap();
         let right = right.unwrap();
         let (_, durable) =
             crate::metadata_state::MetadataStateStore::open_with_validator(paths, |metadata| {
-                metadata.verify_storage(server.storage())
+                metadata.verify_storage(server.storage())?;
+                crate::metadata_state::validate_runtime_metadata_with_policy(metadata, &policy)
             })
             .unwrap();
-        assert_eq!(durable.items.get("left"), Some(&left));
-        assert_eq!(durable.items.get("right"), Some(&right));
+        assert_eq!(durable.items.get("left").unwrap().item(), &left);
+        assert_eq!(durable.items.get("right").unwrap().item(), &right);
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1980,43 +2868,116 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let server = Server::new_ephemeral_with_metadata(HashMapStorage::default(), metadata)
+        let storage = HashMapStorage::default();
+        let algorithm = ChunkAlgorithm::default();
+        let prepare = |artifact_id: &str, bytes: Bytes| {
+            storage
+                .prepare_revision(
+                    artifact_id.to_string(),
+                    artifact_id.to_string(),
+                    "artifact.bin".into(),
+                    0,
+                    None,
+                    bytes,
+                    algorithm,
+                )
+                .unwrap()
+        };
+        let left_bytes = Bytes::from_static(b"left revision");
+        let right_bytes = Bytes::from_static(b"right revision");
+        let left_envelope = signed_envelope(&prepare("stable", left_bytes.clone()), [61; 32]);
+        let right_envelope = signed_envelope(&prepare("stable", right_bytes.clone()), [63; 32]);
+        let mut invalid_signature = *left_envelope.signature().as_bytes();
+        invalid_signature[0] ^= 1;
+        let invalid_envelope = PublisherSignatureEnvelope::from_parts(
+            left_envelope.public_key(),
+            PublisherSignature::from_bytes(invalid_signature),
+        );
+        let duplicate_bytes = Bytes::from_static(b"duplicate revision");
+        let duplicate_envelope =
+            signed_envelope(&prepare("duplicate", duplicate_bytes.clone()), [61; 32]);
+        let policy =
+            PublisherPolicy::required([left_envelope.public_key(), right_envelope.public_key()]);
+        let server = ProductionServer::new_ephemeral_with_metadata(storage, metadata)
+            .with_publisher_policy(policy.clone())
             .with_metadata_store(store);
         let left_server = server.clone();
         let right_server = server.clone();
-        let (left, right) = tokio::join!(
-            left_server.publish_item_as(
+        let invalid_server = server.clone();
+        let (left, right, invalid) = tokio::join!(
+            left_server.publish_signed_item_as(
+                "stable".to_string(),
+                "stable".to_string(),
+                "artifact.bin".into(),
+                None,
+                left_bytes,
+                algorithm,
+                left_envelope,
+            ),
+            right_server.publish_signed_item_as(
+                "stable".to_string(),
+                "stable".to_string(),
+                "artifact.bin".into(),
+                None,
+                right_bytes,
+                algorithm,
+                right_envelope,
+            ),
+            invalid_server.publish_signed_item_as(
                 "stable".to_string(),
                 "stable".to_string(),
                 "artifact.bin".into(),
                 None,
                 Bytes::from_static(b"left revision"),
-                ChunkAlgorithm::default(),
-            ),
-            right_server.publish_item_as(
-                "stable".to_string(),
-                "stable".to_string(),
-                "artifact.bin".into(),
-                None,
-                Bytes::from_static(b"right revision"),
-                ChunkAlgorithm::default(),
+                algorithm,
+                invalid_envelope,
             )
         );
         let left = left.unwrap();
         let right = right.unwrap();
+        assert!(matches!(
+            invalid.unwrap_err(),
+            ServerError::Publication(PublicationError::InvalidSignature(_))
+        ));
         let mut versions = [left.metadata.revision, right.metadata.revision];
         versions.sort_unstable();
         assert_eq!(versions, [0, 1]);
 
+        let duplicate_left = server.clone();
+        let duplicate_right = server.clone();
+        let (first_duplicate, second_duplicate) = tokio::join!(
+            duplicate_left.publish_signed_item_as(
+                "duplicate".to_string(),
+                "duplicate".to_string(),
+                "artifact.bin".into(),
+                None,
+                duplicate_bytes.clone(),
+                algorithm,
+                duplicate_envelope,
+            ),
+            duplicate_right.publish_signed_item_as(
+                "duplicate".to_string(),
+                "duplicate".to_string(),
+                "artifact.bin".into(),
+                None,
+                duplicate_bytes,
+                algorithm,
+                duplicate_envelope,
+            )
+        );
+        assert_eq!(first_duplicate.unwrap(), second_duplicate.unwrap());
+
         let (_, durable) =
             crate::metadata_state::MetadataStateStore::open_with_validator(paths, |candidate| {
-                candidate.verify_storage(server.storage())
+                candidate.verify_storage(server.storage())?;
+                crate::metadata_state::validate_runtime_metadata_with_policy(candidate, &policy)
             })
             .unwrap();
         let history = durable.versions.get("stable").unwrap();
         assert_eq!(history.len(), 2);
-        assert_eq!(history.get(&0).unwrap().metadata.revision, 0);
-        assert_eq!(history.get(&1).unwrap().metadata.revision, 1);
+        assert_eq!(history.get(&0).unwrap().item().metadata.revision, 0);
+        assert_eq!(history.get(&1).unwrap().item().metadata.revision, 1);
+        assert_eq!(durable.versions.get("duplicate").unwrap().len(), 1);
         std::fs::remove_dir_all(directory).unwrap();
     }
 

@@ -38,6 +38,9 @@ percent-encoding = { workspace = true }
 
 distd_core = { path = "../core" }
 
+[dev-dependencies]
+tower = { version = "0.4.13", features = ["util"] }
+
 [features]
 default = ["redb"]
 redb = ["distd_core/redb"]

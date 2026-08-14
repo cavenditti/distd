@@ -619,6 +619,7 @@ dependencies = [
  "test-log",
  "thiserror 1.0.63",
  "tokio",
+ "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",

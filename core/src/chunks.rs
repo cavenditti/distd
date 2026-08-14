@@ -166,6 +166,20 @@ pub enum ChunkAlgorithm {
     },
 }
 
+/// A Protobuf chunk profile that is missing, unknown, or not the one exact
+/// canonical representation emitted by [`ChunkAlgorithm::to_proto`].
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ChunkAlgorithmProfileError {
+    #[error("chunk algorithm profile is missing")]
+    Missing,
+    #[error("chunk algorithm profile kind {0} is unsupported")]
+    UnsupportedKind(i32),
+    #[error("chunk algorithm profile is not canonical")]
+    NonCanonical,
+    #[error("chunk algorithm profile is invalid for publisher statement V1")]
+    InvalidProfile,
+}
+
 impl Default for ChunkAlgorithm {
     fn default() -> Self {
         Self::Fixed256K
@@ -337,6 +351,85 @@ impl ChunkAlgorithm {
         }
     }
 
+    /// Return whether this profile has the exact semantics accepted by the
+    /// canonical publisher-statement V1 contract.
+    #[must_use]
+    pub fn is_canonical_publisher_profile(self) -> bool {
+        match self {
+            Self::Fixed256K => true,
+            Self::FixedAligned {
+                chunk_size,
+                alignment,
+                header_size,
+                profile_version,
+            } => {
+                profile_version == 1
+                    && chunk_size > 0
+                    && alignment > 0
+                    && alignment <= chunk_size
+                    && header_size <= chunk_size
+            }
+            Self::FastCdc {
+                min_size,
+                avg_size,
+                max_size,
+                normalization_level,
+                seed: _,
+                profile_version,
+            } => {
+                profile_version == 1
+                    && min_size > 0
+                    && min_size <= avg_size
+                    && avg_size <= max_size
+                    && normalization_level <= 62
+            }
+            Self::BlockAlignedFastCdc {
+                min_size,
+                avg_size,
+                max_size,
+                alignment,
+                zero_run_cutoff,
+                normalization_level,
+                seed: _,
+                profile_version,
+            } => {
+                profile_version == 1
+                    && min_size > 0
+                    && min_size <= avg_size
+                    && avg_size <= max_size
+                    && alignment > 0
+                    && min_size.is_multiple_of(alignment)
+                    && avg_size.is_multiple_of(alignment)
+                    && max_size.is_multiple_of(alignment)
+                    && zero_run_cutoff > 0
+                    && zero_run_cutoff.is_multiple_of(alignment)
+                    && normalization_level <= 62
+            }
+            Self::ArchiveAwareFastCdc {
+                min_size,
+                avg_size,
+                max_size,
+                record_size,
+                alignment,
+                normalization_level,
+                seed: _,
+                profile_version,
+            } => {
+                profile_version == 1
+                    && min_size > 0
+                    && min_size <= avg_size
+                    && avg_size <= max_size
+                    && record_size > 0
+                    && alignment > 0
+                    && alignment.is_multiple_of(record_size)
+                    && min_size.is_multiple_of(alignment)
+                    && avg_size.is_multiple_of(alignment)
+                    && max_size.is_multiple_of(alignment)
+                    && normalization_level <= 62
+            }
+        }
+    }
+
     #[must_use]
     pub fn to_proto(self) -> proto::ChunkAlgorithmProfile {
         use proto::chunk_algorithm_profile::Kind;
@@ -496,6 +589,71 @@ impl ChunkAlgorithm {
             },
             Kind::Unspecified => Self::default(),
         }
+    }
+
+    /// Parse the one canonical Protobuf representation of a signed chunk
+    /// profile. Unlike [`Self::from_proto`], this never supplies defaults,
+    /// clamps values, ignores unused fields, or accepts an unknown kind.
+    pub fn try_from_proto_exact(
+        profile: Option<&proto::ChunkAlgorithmProfile>,
+    ) -> Result<Self, ChunkAlgorithmProfileError> {
+        use proto::chunk_algorithm_profile::Kind;
+
+        let profile = profile.ok_or(ChunkAlgorithmProfileError::Missing)?;
+        let kind = Kind::try_from(profile.kind)
+            .map_err(|_| ChunkAlgorithmProfileError::UnsupportedKind(profile.kind))?;
+        let algorithm = match kind {
+            Kind::FixedAligned
+                if profile.profile_version == 0
+                    && profile.nominal_chunk_size == CHUNK_SIZE as u32 =>
+            {
+                Self::Fixed256K
+            }
+            Kind::FixedAligned => Self::FixedAligned {
+                chunk_size: profile.nominal_chunk_size,
+                alignment: profile.alignment,
+                header_size: profile.header_size,
+                profile_version: profile.profile_version,
+            },
+            Kind::FastCdc => Self::FastCdc {
+                min_size: profile.min_size,
+                avg_size: profile.avg_size,
+                max_size: profile.max_size,
+                normalization_level: profile.normalization_level,
+                seed: profile.seed,
+                profile_version: profile.profile_version,
+            },
+            Kind::BlockAlignedFastCdc => Self::BlockAlignedFastCdc {
+                min_size: profile.min_size,
+                avg_size: profile.avg_size,
+                max_size: profile.max_size,
+                alignment: profile.alignment,
+                zero_run_cutoff: profile.zero_run_cutoff,
+                normalization_level: profile.normalization_level,
+                seed: profile.seed,
+                profile_version: profile.profile_version,
+            },
+            Kind::ArchiveAwareFastCdc => Self::ArchiveAwareFastCdc {
+                min_size: profile.min_size,
+                avg_size: profile.avg_size,
+                max_size: profile.max_size,
+                record_size: profile.record_size,
+                alignment: profile.alignment,
+                normalization_level: profile.normalization_level,
+                seed: profile.seed,
+                profile_version: profile.profile_version,
+            },
+            Kind::Unspecified => {
+                return Err(ChunkAlgorithmProfileError::UnsupportedKind(profile.kind));
+            }
+        };
+        if !algorithm.is_canonical_publisher_profile() {
+            return Err(ChunkAlgorithmProfileError::InvalidProfile);
+        }
+        if algorithm.to_proto() != *profile {
+            return Err(ChunkAlgorithmProfileError::NonCanonical);
+        }
+        Ok(algorithm)
     }
 
     #[must_use]
@@ -1111,7 +1269,9 @@ fn is_long_zero_run(data: &[u8], offset: usize, cutoff: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChunkAlgorithm, Chunker, ContentDefinedChunker, CHUNK_SIZE};
+    use super::{
+        ChunkAlgorithm, ChunkAlgorithmProfileError, Chunker, ContentDefinedChunker, CHUNK_SIZE,
+    };
     use std::collections::HashSet;
     use std::path::Path;
 
@@ -1215,6 +1375,66 @@ mod tests {
         let algorithm = super::detect_chunking_algorithm(Path::new("artifact.bin"), &sample, false);
 
         assert_eq!(algorithm, ChunkAlgorithm::fastcdc_default());
+    }
+
+    #[test]
+    fn exact_proto_profiles_round_trip_without_defaults_or_clamps() {
+        let algorithms = [
+            ChunkAlgorithm::Fixed256K,
+            ChunkAlgorithm::fixed_aligned(1024 * 1024, 100 * 1024),
+            ChunkAlgorithm::fastcdc_default(),
+            ChunkAlgorithm::image_default(),
+            ChunkAlgorithm::archive_default(),
+        ];
+        for algorithm in algorithms {
+            let profile = algorithm.to_proto();
+            assert_eq!(
+                ChunkAlgorithm::try_from_proto_exact(Some(&profile)),
+                Ok(algorithm)
+            );
+        }
+
+        assert_eq!(
+            ChunkAlgorithm::try_from_proto_exact(None),
+            Err(ChunkAlgorithmProfileError::Missing)
+        );
+        let mut unknown = ChunkAlgorithm::Fixed256K.to_proto();
+        unknown.kind = i32::MAX;
+        assert_eq!(
+            ChunkAlgorithm::try_from_proto_exact(Some(&unknown)),
+            Err(ChunkAlgorithmProfileError::UnsupportedKind(i32::MAX))
+        );
+    }
+
+    #[test]
+    fn exact_proto_profiles_reject_unused_aliases_and_invalid_values() {
+        let mut unused = ChunkAlgorithm::fastcdc_default().to_proto();
+        unused.header_size = 1;
+        assert_eq!(
+            ChunkAlgorithm::try_from_proto_exact(Some(&unused)),
+            Err(ChunkAlgorithmProfileError::NonCanonical)
+        );
+
+        let mut clamped = ChunkAlgorithm::fastcdc_default().to_proto();
+        clamped.min_size = 0;
+        assert_eq!(
+            ChunkAlgorithm::try_from_proto_exact(Some(&clamped)),
+            Err(ChunkAlgorithmProfileError::InvalidProfile)
+        );
+
+        let mut nominal_alias = ChunkAlgorithm::fastcdc_default().to_proto();
+        nominal_alias.nominal_chunk_size += 1;
+        assert_eq!(
+            ChunkAlgorithm::try_from_proto_exact(Some(&nominal_alias)),
+            Err(ChunkAlgorithmProfileError::NonCanonical)
+        );
+
+        let mut future = ChunkAlgorithm::archive_default().to_proto();
+        future.profile_version = 2;
+        assert_eq!(
+            ChunkAlgorithm::try_from_proto_exact(Some(&future)),
+            Err(ChunkAlgorithmProfileError::InvalidProfile)
+        );
     }
 
     #[test]

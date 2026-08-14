@@ -7,8 +7,9 @@ QUIC.
 
 > [!WARNING]
 > This is a security-hardened research prototype, not a production update
-> framework. It does not yet authenticate the software publisher or provide a
-> rollback policy.
+> framework. The server authenticates publisher signatures at publication,
+> but clients do not yet enforce their own publisher allowlist or rollback
+> policy.
 
 ## What v0.2 implements
 
@@ -24,7 +25,8 @@ QUIC.
 | Token-gated client enrollment and HTTP administration | Implemented |
 | Verified staging and atomic destination replacement | Implemented |
 | P2P distribution, swarms, or a distribution tree | Not implemented |
-| Publisher/build signatures and rollback policy | Not implemented |
+| Publisher signatures at the server publication boundary | Implemented |
+| Client publisher policy and rollback protection | Not implemented |
 
 The term “PPSPP-style” in the code refers only to the manifest → possession
 bitfield → missing-chunk exchange. There is currently no peer discovery,
@@ -44,6 +46,9 @@ administrative routes also remain unavailable unless their tokens are set.
 export DISTD_ENROLLMENT_TOKEN="$(openssl rand -hex 32)"
 export DISTD_PUBLISH_TOKEN="$(openssl rand -hex 32)"
 export DISTD_ADMIN_TOKEN="$(openssl rand -hex 32)"
+export DISTD_PUBLISHER_PUBLIC_KEY='<64-lowercase-hex Ed25519 public key>'
+export DISTD_PUBLISHER_PUBLIC_KEYS="$DISTD_PUBLISHER_PUBLIC_KEY"
+export DISTD_PUBLISHER_SIGNATURE='<128-lowercase-hex detached Ed25519 signature>'
 export DISTD_SERVER_STATE_DIR="$PWD/.distd-server-state"
 export DISTD_STORAGE=fs
 export DISTD_STORAGE_ROOT="$PWD/.distd-server-storage"
@@ -70,9 +75,21 @@ Publish through the authenticated HTTP endpoint:
 ```bash
 curl --fail-with-body \
   -H "Authorization: Bearer $DISTD_PUBLISH_TOKEN" \
+  -H 'X-Distd-Publisher-Statement-Version: 1' \
+  -H "X-Distd-Publisher-Public-Key: $DISTD_PUBLISHER_PUBLIC_KEY" \
+  -H "X-Distd-Publisher-Signature: $DISTD_PUBLISHER_SIGNATURE" \
   -F 'item=@./release.bin' \
   'http://127.0.0.1:3000/items?artifact_id=my-app&name=MyApp&path=server/release.bin'
 ```
+
+The detached signature covers distd's canonical publisher statement for the
+typed manifest and ordered chunks, not the multipart or Protobuf bytes. Private
+key tooling remains intentionally outside the server. Every key referenced by
+retained signed history must remain in `DISTD_PUBLISHER_PUBLIC_KEYS`; removing
+one makes secure startup and sync fail closed. For isolated research only,
+`DISTD_ALLOW_UNSIGNED_PUBLICATION=true` replaces the allowlist and permits the
+same request without publisher headers; the server logs that insecure mode
+prominently.
 
 Reusing `artifact_id` creates a new immutable version only when its content or
 relevant metadata changes. `name` and `path` may change without changing the
@@ -250,8 +267,8 @@ path around either requirement.
   still buffered in memory before chunking.
 - A client retains all missing chunks for an artifact until atomic activation;
   individual frames are bounded, but artifact-wide sync memory is not yet bounded.
-- Certificate pinning authenticates the distribution server, not the original
-  software publisher. Signed manifests are still required for that boundary.
+- Signed publication authenticates the original publisher at the server, but
+  client-side publisher allowlists and rollback selection remain future work.
 - Server metadata and chunk storage must be backed up and restored together.
 - Client UUIDs are session authorization handles; after a server restart,
   clients re-enroll using the configured enrollment secret.

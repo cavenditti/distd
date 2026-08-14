@@ -19,6 +19,7 @@ use distd_core::{
     item::{FileEntry, Manifest},
     metadata::Server as ServerMetadata,
     proto::{self},
+    signature::{PublisherPublicKey, PublisherSignature, PublisherSignatureEnvelope},
     version::VERSION,
 };
 
@@ -441,6 +442,14 @@ impl Server {
         };
         let (manifest_resp, continuation) = shared.transport.open_sync(manifest_request).await?;
 
+        let chunk_algorithm =
+            ChunkAlgorithm::try_from_proto_exact(manifest_resp.chunk_algorithm.as_ref())
+                .map_err(|_| ServerRequest::UnexpectedMessage)?;
+        let _publisher_envelope = publisher_envelope_from_transport(
+            &manifest_resp.publisher_public_key,
+            &manifest_resp.publisher_signature,
+        )?;
+
         let manifest = Manifest {
             artifact_id: manifest_resp.artifact_id,
             version: manifest_resp.version,
@@ -453,7 +462,7 @@ impl Server {
             total_size: manifest_resp.total_size,
             chunk_count: manifest_resp.chunk_count,
             chunk_size: manifest_resp.chunk_size,
-            chunk_algorithm: ChunkAlgorithm::from_proto(manifest_resp.chunk_algorithm.as_ref()),
+            chunk_algorithm,
             entries: manifest_resp
                 .entries
                 .into_iter()
@@ -603,6 +612,24 @@ fn redacted_token(token: Option<&str>) -> Option<&'static str> {
     token.map(|_| "[REDACTED]")
 }
 
+fn publisher_envelope_from_transport(
+    public_key: &[u8],
+    signature: &[u8],
+) -> Result<Option<PublisherSignatureEnvelope>, ServerRequest> {
+    match (public_key, signature) {
+        ([], []) => Ok(None),
+        (public_key, signature) if !public_key.is_empty() && !signature.is_empty() => {
+            Ok(Some(PublisherSignatureEnvelope::from_parts(
+                PublisherPublicKey::try_from(public_key)
+                    .map_err(|_| ServerRequest::UnexpectedMessage)?,
+                PublisherSignature::try_from(signature)
+                    .map_err(|_| ServerRequest::UnexpectedMessage)?,
+            )))
+        }
+        _ => Err(ServerRequest::UnexpectedMessage),
+    }
+}
+
 async fn fetch_metadata(transport: &mut TransportClient) -> Result<ServerMetadata, ServerRequest> {
     tracing::trace!("Starting `Fetch` request");
     let response = transport
@@ -615,8 +642,8 @@ async fn fetch_metadata(transport: &mut TransportClient) -> Result<ServerMetadat
 #[cfg(test)]
 mod tests {
     use super::{
-        assigned_uuid, receipt_matches_pending, redacted_token, require_same_prior_identity,
-        PendingServer,
+        assigned_uuid, publisher_envelope_from_transport, receipt_matches_pending, redacted_token,
+        require_same_prior_identity, PendingServer,
     };
     use crate::error::ServerRequest;
     use crate::{
@@ -656,6 +683,33 @@ mod tests {
         assert!(formatted.contains("[REDACTED]"));
         assert!(!formatted.contains(secret));
         assert_eq!(redacted_token(None), None);
+    }
+
+    #[test]
+    fn publisher_transport_tuple_is_exactly_all_or_none() {
+        assert!(matches!(
+            publisher_envelope_from_transport(&[], &[]),
+            Ok(None)
+        ));
+        let envelope = publisher_envelope_from_transport(&[3; 32], &[5; 64])
+            .unwrap()
+            .unwrap();
+        assert_eq!(envelope.public_key().as_bytes(), &[3; 32]);
+        assert_eq!(envelope.signature().as_bytes(), &[5; 64]);
+
+        for (key, signature) in [
+            (vec![], vec![5; 64]),
+            (vec![3; 32], vec![]),
+            (vec![3; 31], vec![5; 64]),
+            (vec![3; 33], vec![5; 64]),
+            (vec![3; 32], vec![5; 63]),
+            (vec![3; 32], vec![5; 65]),
+        ] {
+            assert!(matches!(
+                publisher_envelope_from_transport(&key, &signature),
+                Err(ServerRequest::UnexpectedMessage)
+            ));
+        }
     }
 
     #[test]
