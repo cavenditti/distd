@@ -117,10 +117,12 @@ non-goals.
   verification run outside Tokio workers in one blocking task. Event-loop drift
   and blocking-pool dispatch coordination each remain at most 1 ms p95 and 5 ms
   p99; the observed maximum is reported but not treated as a portable scheduler
-  guarantee. The CPU duration inside the complete pre-possession worker, including
-  bitfield construction but excluding the separately reported dispatch delay,
-  is at most 250 us p95 for 1/64 chunks, 2 ms for 4,096, and 20 ms p95/35 ms
-  maximum for 65,536-entry file and directory manifests.
+  guarantee. On Unix the worker budget uses the worker thread CPU clock,
+  excluding scheduler preemption as well as the separately reported dispatch
+  delay; other platforms use wall time inside the worker. The complete measured
+  worker includes bitfield construction and is at most 250 us p95 for 1/64
+  chunks, 2 ms for 4,096, and 20 ms p95/35 ms maximum for 65,536-entry file and
+  directory manifests.
   The canonical signature reference budgets remain 10
   us fingerprint p95, 100 us construction/verification for 1/64 chunks, 1 ms
    for 4,096, and 10/15 ms respectively for 65,536. Verification uses one canonical

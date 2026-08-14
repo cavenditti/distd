@@ -1,10 +1,96 @@
 use config::{Config, Environment, File};
-use serde::{de::Error as _, Deserialize, Deserializer};
+use serde::{
+    de::{Error as _, Visitor},
+    Deserialize, Deserializer,
+};
 use std::{fmt, path::PathBuf};
 
 use crate::{error::Client as ClientError, publisher::PublisherPolicy};
 
 pub use distd_core::utils::settings::{cache_dir, config_dir};
+
+const MIB: u64 = 1024 * 1024;
+pub(crate) const DEFAULT_MAX_SYNC_MEMORY_MIB: u64 = 512;
+pub(crate) const MAX_SYNC_MEMORY_MIB: u64 = 1024;
+
+/// Validated payload-retention budget for one client synchronization.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct SyncMemoryBudget {
+    bytes: u64,
+}
+
+impl SyncMemoryBudget {
+    fn from_mib(mib: u64) -> Result<Self, &'static str> {
+        if !(1..=MAX_SYNC_MEMORY_MIB).contains(&mib) {
+            return Err("client.max_sync_memory_mib must be between 1 and 1024");
+        }
+        let bytes = mib
+            .checked_mul(MIB)
+            .ok_or("client.max_sync_memory_mib overflows bytes")?;
+        Ok(Self { bytes })
+    }
+
+    #[must_use]
+    pub(crate) const fn bytes(self) -> u64 {
+        self.bytes
+    }
+
+    #[cfg(test)]
+    const fn mib(self) -> u64 {
+        self.bytes / MIB
+    }
+}
+
+impl Default for SyncMemoryBudget {
+    fn default() -> Self {
+        Self::from_mib(DEFAULT_MAX_SYNC_MEMORY_MIB).expect("default sync budget is valid")
+    }
+}
+
+impl fmt::Debug for SyncMemoryBudget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SyncMemoryBudget")
+            .field("bytes", &self.bytes)
+            .finish()
+    }
+}
+
+impl<'de> Deserialize<'de> for SyncMemoryBudget {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct BudgetVisitor;
+
+        impl Visitor<'_> for BudgetVisitor {
+            type Value = SyncMemoryBudget;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an integer from 1 through 1024")
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                SyncMemoryBudget::from_mib(value).map_err(E::custom)
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                let value = u64::try_from(value).map_err(|_| {
+                    E::custom("client.max_sync_memory_mib must be between 1 and 1024")
+                })?;
+                self.visit_u64(value)
+            }
+        }
+
+        deserializer.deserialize_any(BudgetVisitor)
+    }
+}
 
 #[allow(unused)]
 pub struct Server {
@@ -96,6 +182,8 @@ pub struct FsStorage {
 pub struct Client {
     pub name: String,
     pub sync: Vec<PathBuf>,
+    #[serde(default)]
+    pub(crate) max_sync_memory_mib: SyncMemoryBudget,
 }
 
 #[derive(Debug, Deserialize)]
@@ -172,6 +260,7 @@ mod tests {
         assert_eq!(settings.server.url, "quic://localhost:50051");
         assert_eq!(settings.server.publisher_policy.key_count(), 1);
         assert_eq!(settings.client.sync, [PathBuf::from("artifact")]);
+        assert_eq!(settings.client.max_sync_memory_mib.mib(), 512);
     }
 
     #[test]
@@ -238,5 +327,56 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(secure.server.publisher_policy.key_count(), 1);
+    }
+
+    #[test]
+    fn sync_memory_budget_defaults_and_rejects_out_of_range_or_wrong_types() {
+        let parse = |value: Option<&str>| {
+            let field = value
+                .map(|value| format!("max_sync_memory_mib = {value}"))
+                .unwrap_or_default();
+            Config::builder()
+                .add_source(File::from_str(
+                    &format!(
+                        r#"
+                            debug = true
+                            [fsstorage]
+                            enabled = true
+                            root = "client-root"
+                            [server]
+                            url = "quic://localhost:50051"
+                            allow_unsigned_publication = true
+                            [log]
+                            level = "INFO"
+                            log_path = "client.log"
+                            [client]
+                            name = "test-client"
+                            sync = []
+                            {field}
+                        "#
+                    ),
+                    FileFormat::Toml,
+                ))
+                .build()
+                .unwrap()
+                .try_deserialize::<Settings>()
+        };
+
+        assert_eq!(parse(None).unwrap().client.max_sync_memory_mib.mib(), 512);
+        assert_eq!(
+            parse(Some("1")).unwrap().client.max_sync_memory_mib.mib(),
+            1
+        );
+        assert_eq!(
+            parse(Some("1024"))
+                .unwrap()
+                .client
+                .max_sync_memory_mib
+                .mib(),
+            1024
+        );
+        for invalid in ["0", "1025", "-1", "1.5", "\"512\""] {
+            assert!(parse(Some(invalid)).is_err(), "accepted {invalid}");
+        }
     }
 }

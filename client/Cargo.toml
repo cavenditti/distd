@@ -37,5 +37,6 @@ distd_core = { path = "../core" }
 
 [dev-dependencies]
 bytes = { workspace = true }
+libc = "0.2"
 test-log = { workspace = true }
 tempfile = "3"

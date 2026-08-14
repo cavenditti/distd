@@ -8,8 +8,8 @@ QUIC.
 > [!WARNING]
 > This is a security-hardened research prototype, not a production update
 > framework. The server authenticates publisher signatures at publication,
-> and clients enforce an independent publisher allowlist before transfer.
-> Rollback policy is not yet implemented.
+> clients enforce an independent publisher allowlist before transfer, and a
+> durable per-authority release watermark rejects publisher-sequence rollback.
 
 ## What v0.2 implements
 
@@ -27,7 +27,8 @@ QUIC.
 | P2P distribution, swarms, or a distribution tree | Not implemented |
 | Publisher signatures at the server publication boundary | Implemented |
 | Client publisher allowlist and signature verification | Implemented |
-| Rollback protection | Not implemented |
+| Durable publisher-sequence rollback protection | Implemented |
+| Configured client missing-payload memory admission | Implemented |
 
 The term “PPSPP-style” in the code refers only to the manifest → possession
 bitfield → missing-chunk exchange. There is currently no peer discovery,
@@ -69,6 +70,13 @@ key as 64 lowercase hexadecimal characters; the QUIC certificate pin and
 only, `allow_unsigned_publication = true` may replace the publisher-key list.
 The two settings are mutually exclusive, and omitting both fails closed before
 the client connects or changes local artifact state.
+
+`client.max_sync_memory_mib` bounds decoded missing payload retained for one
+sync and defaults to 512 MiB (accepted range: 1 through 1,024 MiB). The client
+computes the exact missing-byte sum from the verified manifest and local
+possession basis, then rejects over-budget releases before advancing rollback
+state or sending possession. This budget excludes bounded manifest metadata and
+the one currently decoded protocol frame.
 
 Fetch an artifact by stable ID into a client-selected relative destination:
 
@@ -292,10 +300,9 @@ path around either requirement.
 
 - Multipart publication is authenticated and capped at 512 MiB, but fields are
   still buffered in memory before chunking.
-- A client retains all missing chunks for an artifact until atomic activation;
-  individual frames are bounded, but artifact-wide sync memory is not yet bounded.
-- Signed publication authenticates the original publisher at the server, but
-  client-side publisher allowlists and rollback selection remain future work.
+- A client retains all missing chunks for an admitted artifact until atomic
+  activation; `client.max_sync_memory_mib` now bounds that decoded payload, but
+  chunks are not yet streamed directly into activation staging.
 - Server metadata and chunk storage must be backed up and restored together.
 - Client UUIDs are session authorization handles; after a server restart,
   clients re-enroll using the configured enrollment secret.

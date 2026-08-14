@@ -29,8 +29,9 @@ v0.2 boundary is summarized in the [README](spec:src:README.md).
 The current project does not provide peer discovery, swarms, multi-source
 scheduling, package dependency resolution, release-channel policy, automatic
 rollback selection, transparency logs, or protection from a hostile local
-process racing filesystem operations. Publisher authenticity is the next
-bounded trust-boundary cycle; rollback policy remains separate work.
+process racing filesystem operations. Publisher authenticity and durable
+publisher-sequence rollback protection are implemented; automatic channel or
+operator-selected rollback remains separate policy work.
 
 ## Principles
 

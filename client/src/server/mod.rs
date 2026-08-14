@@ -130,7 +130,34 @@ type VerifiedManifestParts = (
     proto::PossessionBitfield,
     PublisherAuthorization,
     Vec<Hash>,
+    u64,
 );
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LocalChunkBasis {
+    hashes: Vec<Hash>,
+    available_hashes: HashSet<Hash>,
+}
+
+impl LocalChunkBasis {
+    pub(crate) fn new(hashes: Vec<Hash>) -> Self {
+        let available_hashes = hashes.iter().copied().collect();
+        Self {
+            hashes,
+            available_hashes,
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.hashes.len()
+    }
+}
+
+impl From<Vec<Hash>> for LocalChunkBasis {
+    fn from(hashes: Vec<Hash>) -> Self {
+        Self::new(hashes)
+    }
+}
 
 impl TransportClient {
     fn certificate_fingerprint(&self) -> [u8; 32] {
@@ -299,6 +326,9 @@ pub struct Server {
     /// Durable publisher-release high-water marks for this exact authority.
     rollback_state: ClientRollbackState,
 
+    /// Maximum decoded missing payload retained before activation.
+    max_sync_payload_bytes: u64,
+
     /// Client Uuid assigned to client from server
     client_uuid: Option<Uuid>,
 
@@ -322,6 +352,7 @@ impl Debug for Server {
             .field("certificate_pin", &self.certificate_pin)
             .field("publisher_policy", &self.publisher_policy)
             .field("rollback_state", &self.rollback_state)
+            .field("max_sync_payload_bytes", &self.max_sync_payload_bytes)
             .field("client_uuid", &self.client_uuid)
             .field("client_name", &self.client_name)
             .field(
@@ -349,6 +380,7 @@ struct PendingServerInner {
     certificate_fingerprint: [u8; 32],
     publisher_policy: PublisherPolicy,
     rollback_state: ClientRollbackState,
+    max_sync_payload_bytes: u64,
     client_uuid: Uuid,
     client_name: String,
     enrollment_token: Option<String>,
@@ -365,6 +397,7 @@ impl Debug for PendingServer {
                 .field("certificate_fingerprint", &inner.certificate_fingerprint)
                 .field("publisher_policy", &inner.publisher_policy)
                 .field("rollback_state", &inner.rollback_state)
+                .field("max_sync_payload_bytes", &inner.max_sync_payload_bytes)
                 .field("client_uuid", &inner.client_uuid)
                 .field("client_name", &inner.client_name)
                 .field(
@@ -439,6 +472,7 @@ impl PendingServer {
             certificate_pin: inner.certificate_fingerprint,
             publisher_policy: inner.publisher_policy,
             rollback_state: inner.rollback_state,
+            max_sync_payload_bytes: inner.max_sync_payload_bytes,
             url: inner.url,
             client_uuid: Some(inner.client_uuid),
             client_name: inner.client_name,
@@ -484,6 +518,7 @@ impl Server {
         enrollment_token: Option<&str>,
         publisher_policy: PublisherPolicy,
         rollback_state: ClientRollbackState,
+        max_sync_payload_bytes: u64,
     ) -> Result<PendingServer, ServerRequest> {
         let mut transport = Self::make_transport(&url, client_uuid, expected_certificate).await?;
         tracing::debug!("Connected to server");
@@ -497,6 +532,7 @@ impl Server {
                 certificate_fingerprint,
                 publisher_policy,
                 rollback_state,
+                max_sync_payload_bytes,
                 client_uuid: assigned_uuid,
                 client_name: client_name.to_owned(),
                 enrollment_token: enrollment_token.map(str::to_owned),
@@ -616,8 +652,9 @@ impl Server {
             .metadata_item(artifact_id)
             .await
             .ok_or(ServerRequest::UnexpectedMessage)?;
+        let local_basis = prepare_local_chunk_basis(local_hashes.to_vec()).await?;
         let (manifest, chunk_infos, received, wire_bytes, _) = self
-            .sync_artifact_expected_shared(artifact_id.to_owned(), expected, local_hashes.to_vec())
+            .sync_artifact_expected_shared(artifact_id.to_owned(), expected, local_basis)
             .await?;
         Ok((
             manifest,
@@ -637,8 +674,9 @@ impl Server {
             .metadata_item(artifact_id)
             .await
             .ok_or(ServerRequest::UnexpectedMessage)?;
+        let local_basis = prepare_local_chunk_basis(local_hashes.to_vec()).await?;
         let (manifest, chunks, received, wire_bytes, _) = self
-            .sync_artifact_expected_shared(artifact_id.to_owned(), expected, local_hashes.to_vec())
+            .sync_artifact_expected_shared(artifact_id.to_owned(), expected, local_basis)
             .await?;
         Ok((manifest, chunks, received, wire_bytes))
     }
@@ -647,7 +685,7 @@ impl Server {
         &self,
         requested_artifact_id: String,
         expected: ItemMetadata,
-        local_hashes: Vec<Hash>,
+        local_basis: LocalChunkBasis,
     ) -> Result<(Manifest, Vec<ChunkInfo>, Vec<ReceivedChunk>, u64, Vec<Hash>), ServerRequest> {
         require_requested_catalog_identity(&requested_artifact_id, &expected)?;
         let transport = self.shared.read().await.transport.clone();
@@ -659,10 +697,11 @@ impl Server {
         verify_and_transfer_pending(
             pending,
             expected,
-            local_hashes,
+            local_basis,
             self.publisher_policy.clone(),
             self.rollback_state.clone(),
             self.url.clone(),
+            self.max_sync_payload_bytes,
         )
         .await
     }
@@ -696,17 +735,31 @@ impl Server {
     }
 }
 
-async fn verify_and_transfer_pending(
+async fn verify_and_transfer_pending<Basis>(
     pending: PendingSync,
     expected: ItemMetadata,
-    local_hashes: Vec<Hash>,
+    local_basis: Basis,
     policy: PublisherPolicy,
     rollback_state: ClientRollbackState,
     authority: CanonicalServerUrl,
-) -> Result<(Manifest, Vec<ChunkInfo>, Vec<ReceivedChunk>, u64, Vec<Hash>), ServerRequest> {
+    max_sync_payload_bytes: u64,
+) -> Result<(Manifest, Vec<ChunkInfo>, Vec<ReceivedChunk>, u64, Vec<Hash>), ServerRequest>
+where
+    Basis: Into<LocalChunkBasis>,
+{
+    let local_basis = local_basis.into();
     verify_and_transfer_pending_with(pending, move |response| {
-        let parts = verify_manifest_response(response, &expected, local_hashes, &policy)?;
-        let (manifest, chunks, chunk_sizes, possession, authorization, local_hashes) = parts;
+        let parts = verify_manifest_response_with_basis(response, &expected, local_basis, &policy)?;
+        let (
+            manifest,
+            chunks,
+            chunk_sizes,
+            possession,
+            authorization,
+            local_hashes,
+            missing_payload_bytes,
+        ) = parts;
+        enforce_sync_memory_budget(missing_payload_bytes, max_sync_payload_bytes)?;
         if let Some(verified) = authorization.rollback() {
             let receipt = rollback_state.authorize(&authority, &manifest.artifact_id, verified)?;
             if !receipt.matches(
@@ -725,9 +778,29 @@ async fn verify_and_transfer_pending(
             possession,
             authorization,
             local_hashes,
+            missing_payload_bytes,
         ))
     })
     .await
+}
+
+async fn prepare_local_chunk_basis(
+    local_hashes: Vec<Hash>,
+) -> Result<LocalChunkBasis, ServerRequest> {
+    tokio::task::spawn_blocking(move || LocalChunkBasis::new(local_hashes))
+        .await
+        .map_err(|_| ServerRequest::PublisherVerificationWorker)
+}
+
+fn enforce_sync_memory_budget(required_bytes: u64, limit_bytes: u64) -> Result<(), ServerRequest> {
+    if required_bytes <= limit_bytes {
+        Ok(())
+    } else {
+        Err(ServerRequest::SyncMemoryLimit {
+            required_bytes,
+            limit_bytes,
+        })
+    }
 }
 
 async fn verify_and_transfer_pending_with<Verify, VerifyError>(
@@ -745,6 +818,7 @@ where
                 proto::PossessionBitfield,
                 PublisherAuthorization,
                 Vec<Hash>,
+                u64,
             ),
             VerifyError,
         > + Send
@@ -762,18 +836,25 @@ where
             .and_then(|response| verify(response).map_err(Into::into))
     })
     .await;
-    let (manifest, chunks, chunk_sizes, possession, publisher_authorization, local_hashes) =
-        match verified {
-            Ok(Ok(verified)) => verified,
-            Ok(Err(error)) => {
-                continuation.abort();
-                return Err(error);
-            }
-            Err(_) => {
-                continuation.abort();
-                return Err(ServerRequest::PublisherVerificationWorker);
-            }
-        };
+    let (
+        manifest,
+        chunks,
+        chunk_sizes,
+        possession,
+        publisher_authorization,
+        local_hashes,
+        _missing_payload_bytes,
+    ) = match verified {
+        Ok(Ok(verified)) => verified,
+        Ok(Err(error)) => {
+            continuation.abort();
+            return Err(error);
+        }
+        Err(_) => {
+            continuation.abort();
+            return Err(ServerRequest::PublisherVerificationWorker);
+        }
+    };
     VerifiedSync {
         manifest,
         chunks,
@@ -900,10 +981,25 @@ fn publisher_attestation_from_transport(
     }
 }
 
+#[cfg(test)]
 fn verify_manifest_response(
     response: proto::ManifestResponse,
     expected: &ItemMetadata,
     local_hashes: Vec<Hash>,
+    policy: &PublisherPolicy,
+) -> Result<VerifiedManifestParts, PublisherAuthenticityError> {
+    verify_manifest_response_with_basis(
+        response,
+        expected,
+        LocalChunkBasis::new(local_hashes),
+        policy,
+    )
+}
+
+fn verify_manifest_response_with_basis(
+    response: proto::ManifestResponse,
+    expected: &ItemMetadata,
+    local_basis: LocalChunkBasis,
     policy: &PublisherPolicy,
 ) -> Result<VerifiedManifestParts, PublisherAuthenticityError> {
     let attestation = publisher_attestation_from_transport(
@@ -968,21 +1064,26 @@ fn verify_manifest_response(
     let publisher_authorization =
         policy.authorize_transport_manifest(attestation, &manifest, &chunks)?;
 
-    let chunk_sizes = chunks
-        .iter()
-        .map(|chunk| {
-            usize::try_from(chunk.size)
-                .map_err(|_| PublisherAuthenticityError::MalformedAttestation)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let available_hashes = local_hashes.iter().copied().collect::<HashSet<_>>();
+    let LocalChunkBasis {
+        hashes: local_hashes,
+        available_hashes,
+    } = local_basis;
     let mut bitfield = distd_core::possession::Bitfield::empty(manifest.chunk_count);
+    let mut chunk_sizes = Vec::with_capacity(chunks.len());
+    let mut missing_payload_bytes = 0u64;
     for (index, chunk) in chunks.iter().enumerate() {
+        chunk_sizes.push(
+            usize::try_from(chunk.size)
+                .map_err(|_| PublisherAuthenticityError::MalformedAttestation)?,
+        );
         if available_hashes.contains(&chunk.hash) {
             let index = u32::try_from(index)
                 .map_err(|_| PublisherAuthenticityError::MalformedAttestation)?;
             bitfield.set(index);
+        } else {
+            missing_payload_bytes = missing_payload_bytes
+                .checked_add(chunk.size)
+                .ok_or(PublisherAuthenticityError::MalformedAttestation)?;
         }
     }
     Ok((
@@ -994,6 +1095,7 @@ fn verify_manifest_response(
         },
         publisher_authorization,
         local_hashes,
+        missing_payload_bytes,
     ))
 }
 
@@ -1012,9 +1114,10 @@ async fn fetch_metadata(transport: &TransportClient) -> Result<ServerMetadata, S
 #[cfg(test)]
 mod tests {
     use super::{
-        assigned_uuid, publisher_attestation_from_transport, receipt_matches_pending,
-        redacted_token, require_requested_catalog_identity, require_same_prior_identity,
-        verify_and_transfer_pending, verify_and_transfer_pending_with, verify_manifest_response,
+        assigned_uuid, enforce_sync_memory_budget, publisher_attestation_from_transport,
+        receipt_matches_pending, redacted_token, require_requested_catalog_identity,
+        require_same_prior_identity, verify_and_transfer_pending, verify_and_transfer_pending_with,
+        verify_manifest_response, verify_manifest_response_with_basis, LocalChunkBasis,
         ObservedSyncContinuation, ObservedSyncSession, PendingManifest, PendingServer, PendingSync,
         SyncContinuation,
     };
@@ -1027,8 +1130,9 @@ mod tests {
     };
     use distd_core::{
         chunk_storage::{hashmap_storage::HashMapStorage, ChunkStorage},
-        chunks::ChunkAlgorithm,
-        hash::Hash,
+        chunks::{ChunkAlgorithm, CHUNK_SIZE},
+        hash::{hash, Hash},
+        item::Item,
         proto,
         signature::{
             PublisherPublicKey, PublisherReleaseEnvelope, PublisherReleaseSequence,
@@ -1254,6 +1358,38 @@ mod tests {
         sorted[(sorted.len() * percentile).div_ceil(100) - 1]
     }
 
+    #[cfg(unix)]
+    fn measure_worker_cpu<T>(work: impl FnOnce() -> T) -> (T, std::time::Duration) {
+        fn thread_cpu_time() -> std::time::Duration {
+            let mut value = std::mem::MaybeUninit::<libc::timespec>::uninit();
+            // SAFETY: `clock_gettime` initializes the supplied `timespec` on success, and the
+            // return value is checked before the value is assumed initialized.
+            let result =
+                unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, value.as_mut_ptr()) };
+            assert_eq!(result, 0, "thread CPU clock must be available");
+            // SAFETY: the successful call above initialized the complete `timespec` value.
+            let value = unsafe { value.assume_init() };
+            std::time::Duration::new(
+                u64::try_from(value.tv_sec).expect("thread CPU seconds must be nonnegative"),
+                u32::try_from(value.tv_nsec).expect("thread CPU nanoseconds must fit u32"),
+            )
+        }
+
+        let started = thread_cpu_time();
+        let output = work();
+        let elapsed = thread_cpu_time()
+            .checked_sub(started)
+            .expect("thread CPU clock must be monotonic");
+        (output, elapsed)
+    }
+
+    #[cfg(not(unix))]
+    fn measure_worker_cpu<T>(work: impl FnOnce() -> T) -> (T, std::time::Duration) {
+        let started = std::time::Instant::now();
+        let output = work();
+        (output, started.elapsed())
+    }
+
     #[test]
     fn assigned_enrollment_identity_must_be_present_exact_and_non_nil() {
         assert!(matches!(
@@ -1343,14 +1479,22 @@ mod tests {
     fn signed_manifest_is_verified_before_possession_is_constructed() {
         let (response, expected, policy) = signed_manifest_fixture();
         let available = Hash::from_bytes(response.chunk_hashes[0].clone().try_into().unwrap());
-        let (manifest, chunks, chunk_sizes, possession, fingerprint, returned_hashes) =
-            verify_manifest_response(response, &expected, vec![available], &policy).unwrap();
+        let (
+            manifest,
+            chunks,
+            chunk_sizes,
+            possession,
+            fingerprint,
+            returned_hashes,
+            missing_payload_bytes,
+        ) = verify_manifest_response(response, &expected, vec![available], &policy).unwrap();
 
         assert_eq!(manifest.artifact_id, expected.artifact_id);
         assert_eq!(manifest.version, u64::from(expected.revision));
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunk_sizes, vec![usize::try_from(chunks[0].size).unwrap()]);
         assert_eq!(returned_hashes, vec![available]);
+        assert_eq!(missing_payload_bytes, 0);
         assert!(fingerprint.fingerprint().is_some());
         assert!(fingerprint.rollback().is_some());
         let bitfield = distd_core::possession::Bitfield::from_bytes(&possession.bitfield).unwrap();
@@ -1359,13 +1503,83 @@ mod tests {
     }
 
     #[test]
+    fn missing_payload_accounting_matches_possession_with_repeated_hashes() {
+        let mut payload = vec![1u8; CHUNK_SIZE];
+        payload.extend(vec![2u8; CHUNK_SIZE]);
+        payload.extend(vec![1u8; CHUNK_SIZE]);
+        let item = HashMapStorage::default()
+            .prepare_revision(
+                "repeated-hash-budget".to_string(),
+                "repeated-hash-budget".to_string(),
+                std::path::PathBuf::from("repeated-hash-budget.bin"),
+                0,
+                None,
+                bytes::Bytes::from(payload),
+                ChunkAlgorithm::Fixed256K,
+            )
+            .unwrap();
+        assert_eq!(item.chunks.len(), 3);
+        assert_eq!(item.chunks[0], item.chunks[2]);
+        let reused = item.chunks[0].hash;
+        let expected_missing = item.chunks[1].size;
+        let (response, expected, policy) = signed_response_for_item(item, [35; 32]);
+
+        let (_, _, _, possession, _, _, missing_payload_bytes) =
+            verify_manifest_response(response, &expected, vec![reused], &policy).unwrap();
+        let possession =
+            distd_core::possession::Bitfield::from_bytes(&possession.bitfield).unwrap();
+        assert!(possession.has(0));
+        assert!(!possession.has(1));
+        assert!(possession.has(2));
+        assert_eq!(missing_payload_bytes, expected_missing);
+        assert!(enforce_sync_memory_budget(expected_missing, expected_missing).is_ok());
+        assert!(matches!(
+            enforce_sync_memory_budget(expected_missing, expected_missing - 1),
+            Err(ServerRequest::SyncMemoryLimit {
+                required_bytes,
+                limit_bytes,
+            }) if required_bytes == expected_missing && limit_bytes == expected_missing - 1
+        ));
+    }
+
+    #[test]
+    fn default_sync_memory_budget_accepts_exact_limit_and_rejects_one_more_byte() {
+        const DEFAULT_LIMIT: u64 = 512 * 1024 * 1024;
+        for (size, accepted) in [(DEFAULT_LIMIT, true), (DEFAULT_LIMIT + 1, false)] {
+            let chunk = distd_core::chunks::ChunkInfo {
+                hash: hash(format!("virtual-{size}").as_bytes()),
+                size,
+            };
+            let item = Item::make(
+                "sync-budget-boundary".to_string(),
+                std::path::PathBuf::from("sync-budget-boundary.bin"),
+                0,
+                None,
+                chunk,
+                vec![chunk],
+                ChunkAlgorithm::Fixed256K,
+            )
+            .unwrap();
+            let (response, expected, policy) = signed_response_for_item(item, [36; 32]);
+            let (_, _, _, _, _, _, required_bytes) =
+                verify_manifest_response(response, &expected, Vec::new(), &policy).unwrap();
+            assert_eq!(required_bytes, size);
+            assert_eq!(
+                enforce_sync_memory_budget(required_bytes, DEFAULT_LIMIT).is_ok(),
+                accepted
+            );
+        }
+    }
+
+    #[test]
     fn signed_directory_entries_and_detected_bzip2_profile_use_the_same_boundary() {
         let (response, expected, policy) = signed_directory_fixture();
-        let (manifest, chunks, _, possession, fingerprint, _) =
+        let (manifest, chunks, _, possession, fingerprint, _, missing_payload_bytes) =
             verify_manifest_response(response.clone(), &expected, Vec::new(), &policy).unwrap();
         assert_eq!(manifest.entries.len(), 2);
         assert_eq!(chunks.len(), 2);
         assert!(fingerprint.fingerprint().is_some());
+        assert_eq!(missing_payload_bytes, manifest.total_size);
         assert!(
             distd_core::possession::Bitfield::from_bytes(&possession.bitfield)
                 .unwrap()
@@ -1421,7 +1635,7 @@ mod tests {
             )
             .unwrap();
         let (response, expected, policy) = signed_response_for_item(item, [31; 32]);
-        let (manifest, _, _, _, _, _) =
+        let (manifest, _, _, _, _, _, _) =
             verify_manifest_response(response, &expected, Vec::new(), &policy).unwrap();
         assert_eq!(manifest.chunk_algorithm, algorithm);
     }
@@ -1450,7 +1664,7 @@ mod tests {
                 .unwrap();
             let (response, expected, policy) =
                 signed_response_for_item(item, [u8::try_from(index + 71).unwrap(); 32]);
-            let (manifest, _, _, _, fingerprint, _) =
+            let (manifest, _, _, _, fingerprint, _, _) =
                 verify_manifest_response(response, &expected, Vec::new(), &policy).unwrap();
             assert_eq!(manifest.chunk_algorithm, algorithm);
             assert!(fingerprint.fingerprint().is_some());
@@ -1612,6 +1826,7 @@ mod tests {
             policy.clone(),
             test_rollback_state(),
             test_authority(),
+            u64::MAX,
         )
         .await;
         assert!(matches!(
@@ -1646,6 +1861,7 @@ mod tests {
             policy,
             test_rollback_state(),
             test_authority(),
+            u64::MAX,
         )
         .await
         .unwrap();
@@ -1665,6 +1881,47 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn over_budget_manifest_aborts_before_possession_and_rollback_state() {
+        let (response, expected, policy) = signed_manifest_fixture();
+        let required_bytes = response.total_size;
+        assert!(required_bytes > 0);
+        let observer = std::sync::Arc::new(ObservedSyncContinuation::default());
+        let (rollback, rollback_path) = test_rollback_state_and_path();
+
+        let result = verify_and_transfer_pending(
+            PendingSync {
+                manifest: PendingManifest::Decoded(response),
+                continuation: SyncContinuation::Observed(ObservedSyncSession::new(
+                    observer.clone(),
+                )),
+            },
+            expected,
+            Vec::new(),
+            policy,
+            rollback,
+            test_authority(),
+            required_bytes - 1,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(ServerRequest::SyncMemoryLimit {
+                required_bytes: actual,
+                limit_bytes,
+            }) if actual == required_bytes && limit_bytes == required_bytes - 1
+        ));
+        assert_eq!(
+            observer
+                .possession_sends
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(observer.aborts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!rollback_path.exists());
     }
 
     #[tokio::test]
@@ -1710,6 +1967,7 @@ mod tests {
             policy.clone(),
             rollback.clone(),
             authority.clone(),
+            u64::MAX,
         )
         .await
         .unwrap();
@@ -1745,6 +2003,7 @@ mod tests {
                 policy.clone(),
                 rollback.clone(),
                 authority.clone(),
+                u64::MAX,
             )
             .await
             .unwrap_err();
@@ -1784,6 +2043,7 @@ mod tests {
             policy,
             rollback,
             authority,
+            u64::MAX,
         )
         .await
         .unwrap();
@@ -1847,6 +2107,7 @@ mod tests {
                 policy.clone(),
                 rollback.clone(),
                 authority.clone(),
+                u64::MAX,
             )
             .await
             .unwrap();
@@ -1931,7 +2192,15 @@ mod tests {
                     vec![local_hash],
                     &worker_policy,
                 )?;
-                let (manifest, chunks, sizes, possession, authorization, hashes) = parts;
+                let (
+                    manifest,
+                    chunks,
+                    sizes,
+                    possession,
+                    authorization,
+                    hashes,
+                    missing_payload_bytes,
+                ) = parts;
                 let verified = authorization.rollback().unwrap();
                 rollback.authorize(&worker_authority, &manifest.artifact_id, verified)?;
                 durable_tx.send(()).unwrap();
@@ -1940,7 +2209,15 @@ mod tests {
                 let _released = condition
                     .wait_while(released, |released| !*released)
                     .unwrap();
-                Ok::<_, ServerRequest>((manifest, chunks, sizes, possession, authorization, hashes))
+                Ok::<_, ServerRequest>((
+                    manifest,
+                    chunks,
+                    sizes,
+                    possession,
+                    authorization,
+                    hashes,
+                    missing_payload_bytes,
+                ))
             },
         ));
         durable_rx
@@ -1963,7 +2240,7 @@ mod tests {
         assert_eq!(observer.aborts.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         let reopened = ClientRollbackState::load_from_path(rollback_path).unwrap();
-        let (_, _, _, _, authorization, _) =
+        let (_, _, _, _, authorization, _, _) =
             verify_manifest_response(response, &expected, Vec::new(), &policy).unwrap();
         assert_eq!(
             reopened
@@ -2136,19 +2413,28 @@ mod tests {
         ) {
             let item = reference_item(chunk_count, directory);
             let (response, expected, policy) = signed_response_for_item(item, [47; 32]);
-            let local_hashes = response
-                .chunk_hashes
+            let expected_missing_payload_bytes = response
+                .chunk_sizes
                 .iter()
-                .step_by(2)
-                .map(|hash| Hash::from_bytes(hash.clone().try_into().unwrap()))
-                .collect::<Vec<_>>();
+                .enumerate()
+                .filter(|(index, _)| index % 2 != 0)
+                .map(|(_, size)| u64::from(*size))
+                .sum::<u64>();
+            let local_basis = LocalChunkBasis::new(
+                response
+                    .chunk_hashes
+                    .iter()
+                    .step_by(2)
+                    .map(|hash| Hash::from_bytes(hash.clone().try_into().unwrap()))
+                    .collect::<Vec<_>>(),
+            );
             let frame = distd_core::utils::frame::encode_length_delimited(&proto::SyncMessage {
                 msg: Some(proto::sync_message::Msg::ManifestResponse(response)),
             })
             .unwrap();
             let frame = std::sync::Arc::new(frame);
             let expected = std::sync::Arc::new(expected);
-            let local_hashes = std::sync::Arc::new(local_hashes);
+            let local_basis = std::sync::Arc::new(local_basis);
 
             let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
             let heartbeat = if observe_heartbeat {
@@ -2171,30 +2457,34 @@ mod tests {
             for sample in 0..25 {
                 let frame = frame.clone();
                 let expected = expected.clone();
-                let local_hashes = local_hashes.clone();
+                // Production moves its already-computed local basis into this worker. Clone the
+                // reusable benchmark fixture before timing so the reference measures that same
+                // decode/verify/accounting boundary rather than fixture setup.
+                let local_basis = local_basis.as_ref().clone();
                 let policy = policy.clone();
                 let started = std::time::Instant::now();
                 let (verified, worker_elapsed) = tokio::task::spawn_blocking(move || {
-                    let worker_started = std::time::Instant::now();
-                    let message = distd_core::utils::frame::decode_length_delimited::<
-                        proto::SyncMessage,
-                    >(&frame)
-                    .unwrap();
-                    let response = match message.msg {
-                        Some(proto::sync_message::Msg::ManifestResponse(response)) => response,
-                        _ => panic!("reference fixture must be a manifest response"),
-                    };
-                    let verified = verify_manifest_response(
-                        response,
-                        &expected,
-                        local_hashes.as_ref().clone(),
-                        &policy,
-                    )
-                    .unwrap();
-                    (verified, worker_started.elapsed())
+                    measure_worker_cpu(|| {
+                        let message = distd_core::utils::frame::decode_length_delimited::<
+                            proto::SyncMessage,
+                        >(&frame)
+                        .unwrap();
+                        let response = match message.msg {
+                            Some(proto::sync_message::Msg::ManifestResponse(response)) => response,
+                            _ => panic!("reference fixture must be a manifest response"),
+                        };
+                        verify_manifest_response_with_basis(
+                            response,
+                            &expected,
+                            local_basis,
+                            &policy,
+                        )
+                        .unwrap()
+                    })
                 })
                 .await
                 .unwrap();
+                assert_eq!(verified.6, expected_missing_payload_bytes);
                 let total_elapsed = started.elapsed();
                 tokio::task::spawn_blocking(move || drop(verified))
                     .await

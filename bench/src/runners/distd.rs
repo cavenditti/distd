@@ -698,14 +698,15 @@ impl DistdRunner {
 
     /// Run the distd client to fetch an item.
     fn client_get(&self, item_path: &str, dest_dir: &Path) -> Result<(Child, PathBuf), String> {
-        self.client_get_with_publisher(item_path, dest_dir, &benchmark_publisher_public_key())
+        self.client_get_with_options(item_path, dest_dir, &benchmark_publisher_public_key(), None)
     }
 
-    fn client_get_with_publisher(
+    fn client_get_with_options(
         &self,
         item_path: &str,
         dest_dir: &Path,
         publisher_public_key: &str,
+        max_sync_memory_mib: Option<u64>,
     ) -> Result<(Child, PathBuf), String> {
         let bins = Self::binary_paths()?;
         if !bins.client.exists() {
@@ -723,7 +724,7 @@ impl DistdRunner {
         let certificate = std::fs::read(self.work_dir.join("server-state/quic-cert.der"))
             .map_err(|error| format!("Cannot read benchmark server certificate: {error}"))?;
         let certificate_fingerprint = blake3::hash(&certificate).to_hex().to_string();
-        let config = serde_json::json!({
+        let mut config = serde_json::json!({
             "fsstorage": {
                 "enabled": true,
                 "root": storage_dir,
@@ -744,6 +745,9 @@ impl DistdRunner {
             },
             "debug": true,
         });
+        if let Some(max_sync_memory_mib) = max_sync_memory_mib {
+            config["client"]["max_sync_memory_mib"] = serde_json::Value::from(max_sync_memory_mib);
+        }
 
         let config_path = client_dir.join("ClientSettings.json");
         std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap())
@@ -1575,7 +1579,7 @@ mod tests {
             .unwrap();
         let wrong_key = "11".repeat(32);
         let (client, _) = runner
-            .client_get_with_publisher("bench-untrusted", &destination, &wrong_key)
+            .client_get_with_options("bench-untrusted", &destination, &wrong_key, None)
             .unwrap();
         let output = client.wait_with_output().unwrap();
         assert!(
@@ -1616,6 +1620,119 @@ mod tests {
             server_output.matches("distd_sync_missing_chunks=").count(),
             1,
             "only the valid seed fetch may send possession: {server_output}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires built product binaries and exclusive loopback ports"]
+    fn over_budget_quic_manifest_preserves_active_bytes_and_rollback_watermark() {
+        let _exclusive = PRODUCT_INTEGRATION_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temporary = tempfile::tempdir().unwrap();
+        let runner = integration_runner(temporary.path());
+        runner.reset_client_cache().unwrap();
+        runner.start_server().unwrap();
+
+        let source = temporary.path().join("budget-source.bin");
+        let destination = temporary.path().join("budget-destination");
+        fs::create_dir_all(&destination).unwrap();
+        let original = vec![1u8; 512 * 1024];
+        fs::write(&source, &original).unwrap();
+        runner
+            .publish_file(&source, "bench-budget", "bench-budget", Some("fixed"))
+            .unwrap();
+        let (client, _) = runner
+            .client_get_with_options(
+                "bench-budget",
+                &destination,
+                &benchmark_publisher_public_key(),
+                Some(1),
+            )
+            .unwrap();
+        let output = client.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read(destination.join("bench-budget")).unwrap(),
+            original
+        );
+
+        let durable_before = directory_snapshot(&destination);
+        let rollback_path = runner
+            .client_cache_dir()
+            .join("distd_client_rollback.state");
+        let rollback_before = fs::read(&rollback_path).unwrap();
+
+        let oversized = vec![2u8; 1024 * 1024 + 1];
+        fs::write(&source, &oversized).unwrap();
+        runner
+            .publish_file(&source, "bench-budget", "bench-budget", Some("fixed"))
+            .unwrap();
+        let (client, _) = runner
+            .client_get_with_options(
+                "bench-budget",
+                &destination,
+                &benchmark_publisher_public_key(),
+                Some(1),
+            )
+            .unwrap();
+        let output = client.wait_with_output().unwrap();
+        assert!(
+            !output.status.success(),
+            "over-budget client unexpectedly succeeded; stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let client_error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            client_error.contains("SyncMemoryLimit"),
+            "unexpected client error: {client_error}"
+        );
+        assert_eq!(directory_snapshot(&destination), durable_before);
+        assert_eq!(fs::read(&rollback_path).unwrap(), rollback_before);
+
+        let reopened =
+            distd_core::chunk_storage::fs_storage::FsStorage::new(destination.clone()).unwrap();
+        let active = reopened
+            .open_active_revision(&destination.join("bench-budget"))
+            .unwrap()
+            .expect("previous revision remains active after budget rejection");
+        let mut restarted_bytes = Vec::new();
+        use std::io::Read as _;
+        active
+            .open_file()
+            .unwrap()
+            .read_to_end(&mut restarted_bytes)
+            .unwrap();
+        assert_eq!(restarted_bytes, original);
+        assert!(reopened.chunk_cache_stats().invariants_hold);
+        drop(active);
+        drop(reopened);
+
+        let reopened_again =
+            distd_core::chunk_storage::fs_storage::FsStorage::new(destination.clone()).unwrap();
+        let active_again = reopened_again
+            .open_active_revision(&destination.join("bench-budget"))
+            .unwrap()
+            .expect("previous revision remains active after a second budget-rejection restart");
+        let mut twice_restarted_bytes = Vec::new();
+        active_again
+            .open_file()
+            .unwrap()
+            .read_to_end(&mut twice_restarted_bytes)
+            .unwrap();
+        assert_eq!(twice_restarted_bytes, original);
+        assert!(reopened_again.chunk_cache_stats().invariants_hold);
+
+        let server_output = runner.stop_server_and_collect_output();
+        assert_eq!(
+            server_output.matches("distd_sync_missing_chunks=").count(),
+            1,
+            "only the admitted seed fetch may send possession: {server_output}"
         );
     }
 

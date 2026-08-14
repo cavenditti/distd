@@ -558,6 +558,7 @@ dependencies = [
  "dirs",
  "distd_core",
  "http",
+ "libc",
  "percent-encoding",
  "quinn",
  "ring",

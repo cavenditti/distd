@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::{
     error::Client as ClientError,
     persistence::{ClientState, DurableTrustReceipt, ServerTrustRecord},
-    server::Server,
+    server::{LocalChunkBasis, Server},
     server_url::CanonicalServerUrl,
     settings::Settings,
 };
@@ -83,6 +83,7 @@ where
             settings.server.enrollment_token.as_deref(),
             publisher_policy,
             state.rollback.clone(),
+            settings.client.max_sync_memory_mib.bytes(),
         )
         .await?;
 
@@ -218,7 +219,7 @@ impl Client<FsStorage> {
     async fn local_diff_basis(
         &self,
         path: PathBuf,
-    ) -> Result<(Option<u32>, Vec<Hash>), ClientError> {
+    ) -> Result<(Option<u32>, LocalChunkBasis), ClientError> {
         let storage = Arc::clone(&self.storage);
         tokio::task::spawn_blocking(move || {
             storage
@@ -226,7 +227,7 @@ impl Client<FsStorage> {
                 .map(|item| {
                     (
                         Some(item.metadata.revision),
-                        item.chunks.iter().map(|chunk| chunk.hash).collect(),
+                        LocalChunkBasis::new(item.chunks.iter().map(|chunk| chunk.hash).collect()),
                     )
                 })
                 .unwrap_or_default()
@@ -240,7 +241,7 @@ impl Client<FsStorage> {
         requested_artifact_id: String,
         target: ItemMetadata,
         destination: PathBuf,
-        from: Vec<Hash>,
+        from: LocalChunkBasis,
     ) -> Result<Item, ClientError> {
         let t0 = Instant::now();
         let (manifest, chunk_infos, received_chunks, wire_bytes, from) = self

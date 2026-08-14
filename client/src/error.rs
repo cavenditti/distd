@@ -85,6 +85,14 @@ pub enum ServerRequest {
     #[error("publisher rollback protection failed: {0}")]
     RollbackProtection(#[from] RollbackError),
 
+    #[error(
+        "sync requires {required_bytes} bytes of missing-payload retention, configured limit is {limit_bytes} bytes"
+    )]
+    SyncMemoryLimit {
+        required_bytes: u64,
+        limit_bytes: u64,
+    },
+
     #[error("server metadata worker failed")]
     MetadataWorker,
 }
