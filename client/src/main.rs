@@ -4,6 +4,7 @@
 pub mod client;
 pub mod error;
 pub mod persistence;
+pub mod publisher;
 pub mod server;
 pub mod server_url;
 pub mod settings;

@@ -48,6 +48,17 @@ where
         settings: Settings,
         mut state: ClientState,
     ) -> Result<Self, ClientError> {
+        let publisher_policy = settings.server.publisher_policy.clone();
+        if publisher_policy.permits_unsigned() {
+            tracing::warn!(
+                "publisher verification is explicitly disabled; unsigned artifacts may be activated"
+            );
+        } else {
+            tracing::info!(
+                publisher_key_count = publisher_policy.key_count(),
+                "publisher verification is required"
+            );
+        }
         let canonical_url = CanonicalServerUrl::parse(&settings.server.url)?;
         let configured_certificate = settings
             .server
@@ -70,6 +81,7 @@ where
             authority.client_uuid,
             authority.certificate_pin,
             settings.server.enrollment_token.as_deref(),
+            publisher_policy,
         )
         .await?;
 
@@ -85,17 +97,13 @@ where
             .await?;
         state = ClientState { pid, persistent };
 
-        let items = server.metadata().await.items;
-        let server_ids: Vec<&String> = items.keys().collect();
-        let missing: Vec<&PathBuf> = settings
-            .client
-            .sync
-            .iter()
-            .filter(|p| {
-                let aid = p.to_string_lossy().to_string();
-                !server_ids.iter().any(|s| **s == aid)
-            })
-            .collect();
+        let mut missing = Vec::new();
+        for path in &settings.client.sync {
+            let artifact_id = path.to_string_lossy();
+            if server.metadata_item(&artifact_id).await.is_none() {
+                missing.push(path);
+            }
+        }
         if !missing.is_empty() {
             tracing::error!(
                 "Some requested items could not be found on server: {}",
@@ -198,28 +206,37 @@ fn enrollment_authority(
 }
 
 impl Client<FsStorage> {
-    fn local_diff_basis(&self, path: &Path) -> (Option<u32>, Vec<Hash>) {
-        self.storage
-            .item_for_path(path)
-            .map(|item| {
-                (
-                    Some(item.metadata.revision),
-                    item.chunks.iter().map(|chunk| chunk.hash).collect(),
-                )
-            })
-            .unwrap_or_default()
+    async fn local_diff_basis(
+        &self,
+        path: PathBuf,
+    ) -> Result<(Option<u32>, Vec<Hash>), ClientError> {
+        let storage = Arc::clone(&self.storage);
+        tokio::task::spawn_blocking(move || {
+            storage
+                .item_for_path(&path)
+                .map(|item| {
+                    (
+                        Some(item.metadata.revision),
+                        item.chunks.iter().map(|chunk| chunk.hash).collect(),
+                    )
+                })
+                .unwrap_or_default()
+        })
+        .await
+        .map_err(|_| ClientError::StorageWorker)
     }
 
     async fn sync_transfer(
         &mut self,
+        requested_artifact_id: String,
         target: ItemMetadata,
         destination: PathBuf,
-        from: &[Hash],
+        from: Vec<Hash>,
     ) -> Result<Item, ClientError> {
         let t0 = Instant::now();
-        let (manifest, chunk_infos, received_chunks, wire_bytes) = self
+        let (manifest, chunk_infos, received_chunks, wire_bytes, from) = self
             .server
-            .sync_artifact_shared(&target.artifact_id, from)
+            .sync_artifact_expected_shared(requested_artifact_id, target.clone(), from)
             .await?;
         let network_elapsed = t0.elapsed();
 
@@ -238,7 +255,7 @@ impl Client<FsStorage> {
             destination,
             manifest,
             chunk_infos,
-            from.to_vec(),
+            from,
             received_chunks,
         )
         .await?;
@@ -260,14 +277,14 @@ impl Client<FsStorage> {
         tracing::debug!("sync: {target:?} {path:?}");
 
         let resolved_path = self.storage.path(path).map_err(ClientError::Core)?;
-        let (_, from) = self.local_diff_basis(&resolved_path);
+        let (_, from) = self.local_diff_basis(resolved_path).await?;
 
-        let server_metadata = self.server.metadata().await;
         // Look up by artifact_id (target path string used as artifact_id)
         let target_str = target.to_string_lossy().to_string();
-        let item_metadata = server_metadata
-            .items
-            .get(&target_str)
+        let item_metadata = self
+            .server
+            .metadata_item(&target_str)
+            .await
             .ok_or(ClientError::FileNotFound(target_str.clone()))?;
 
         tracing::info!(
@@ -279,7 +296,7 @@ impl Client<FsStorage> {
         let now = Instant::now();
 
         let item = self
-            .sync_transfer(item_metadata.clone(), path.to_path_buf(), &from)
+            .sync_transfer(target_str, item_metadata, path.to_path_buf(), from)
             .await?;
 
         tracing::info!(
@@ -295,6 +312,7 @@ impl Client<FsStorage> {
 
     async fn update(
         &mut self,
+        requested_artifact_id: &str,
         new_item_metadata: &ItemMetadata,
         destination: &Path,
     ) -> Result<Item, ClientError> {
@@ -306,7 +324,7 @@ impl Client<FsStorage> {
         let now = Instant::now();
 
         let local_path = self.storage.path(destination).map_err(ClientError::Core)?;
-        let (from_version, from) = self.local_diff_basis(&local_path);
+        let (from_version, from) = self.local_diff_basis(local_path).await?;
 
         tracing::info!(
             "Requesting revision {} from local revision {:?} with {} known chunks",
@@ -316,7 +334,12 @@ impl Client<FsStorage> {
         );
 
         let item = self
-            .sync_transfer(new_item_metadata.clone(), destination.to_path_buf(), &from)
+            .sync_transfer(
+                requested_artifact_id.to_owned(),
+                new_item_metadata.clone(),
+                destination.to_path_buf(),
+                from,
+            )
             .await?;
 
         tracing::info!(
@@ -338,16 +361,16 @@ impl Client<FsStorage> {
 
         loop {
             tokio::time::sleep(self.server.timeout).await;
-            let items = self.server.metadata().await.items;
             for path in &self.settings.client.sync.clone() {
                 let artifact_id = path.to_string_lossy().to_string();
-                if latest.get(&artifact_id) == items.get(&artifact_id).map(|i| &i.root.hash) {
+                let item = self.server.metadata_item(&artifact_id).await;
+                if latest.get(&artifact_id) == item.as_ref().map(|item| &item.root.hash) {
                     continue;
                 }
 
                 tracing::debug!("Syncing '{artifact_id}'");
-                let old_item = items.get(&artifact_id).ok_or(ClientError::Storage)?;
-                let item = self.update(old_item, path).await?;
+                let old_item = item.ok_or(ClientError::Storage)?;
+                let item = self.update(&artifact_id, &old_item, path).await?;
                 latest.insert(artifact_id, *item.root());
             }
         }

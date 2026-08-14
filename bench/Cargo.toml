@@ -19,6 +19,8 @@ serde_json = { workspace = true }
 rand = { workspace = true }
 blake3 = { workspace = true }
 ring = { workspace = true }
+bytes = { workspace = true }
+distd_core = { path = "../core" }
 clap = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

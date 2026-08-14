@@ -61,6 +61,14 @@ certificate. Copy that value into `server.certificate_fingerprint` in
 required by default. `allow_tofu = true` exists for isolated development, but
 the first connection is then vulnerable to interception.
 
+The client independently requires the exact publisher authority in
+`server.publisher_public_keys`. Copy the publisher's raw 32-byte Ed25519 public
+key as 64 lowercase hexadecimal characters; the QUIC certificate pin and
+`allow_tofu` never authorize artifact content. For isolated research servers
+only, `allow_unsigned_publication = true` may replace the publisher-key list.
+The two settings are mutually exclusive, and omitting both fails closed before
+the client connects or changes local artifact state.
+
 Fetch an artifact by stable ID into a client-selected relative destination:
 
 ```bash

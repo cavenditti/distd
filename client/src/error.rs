@@ -4,7 +4,11 @@ use config::ConfigError;
 use distd_core::{error::InvalidParameter, transport::PayloadCompressionError};
 use thiserror::Error;
 
-use crate::{persistence::PersistenceError, server_url::ServerUrlError};
+use crate::{
+    persistence::PersistenceError,
+    publisher::{PublisherAuthenticityError, PublisherConfigError},
+    server_url::ServerUrlError,
+};
 
 #[derive(Error, Debug)]
 pub enum ServerConnection {
@@ -64,6 +68,15 @@ pub enum ServerRequest {
 
     #[error("Invalid compressed sync payload")]
     Compression(#[from] PayloadCompressionError),
+
+    #[error("publisher authenticity validation failed: {0}")]
+    PublisherAuthenticity(#[from] PublisherAuthenticityError),
+
+    #[error("publisher verification worker failed")]
+    PublisherVerificationWorker,
+
+    #[error("server metadata worker failed")]
+    MetadataWorker,
 }
 
 #[derive(Error, Debug)]
@@ -83,6 +96,9 @@ pub enum Client {
     #[error("client trust persistence worker failed")]
     PersistenceWorker(#[from] tokio::task::JoinError),
 
+    #[error("client storage worker failed")]
+    StorageWorker,
+
     #[error("No command specified")]
     MissingCmd,
 
@@ -94,6 +110,9 @@ pub enum Client {
 
     #[error("Invalid config")]
     InvaldConfig(#[from] ConfigError),
+
+    #[error("invalid publisher trust configuration: {0}")]
+    PublisherConfiguration(#[from] PublisherConfigError),
 
     #[error("Cannot connect to server")]
     ServerConnection(#[from] ServerConnection),

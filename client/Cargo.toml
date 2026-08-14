@@ -30,9 +30,11 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 percent-encoding = { workspace = true }
 bitcode = { workspace = true }
+rustc-hash = { workspace = true }
 
 distd_core = { path = "../core" }
 
 [dev-dependencies]
+bytes = { workspace = true }
 test-log = { workspace = true }
 tempfile = "3"

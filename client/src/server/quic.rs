@@ -4,19 +4,19 @@ use std::sync::{Arc, Mutex};
 use distd_core::chunk_storage::ReceivedChunk;
 use distd_core::possession::Bitfield;
 use distd_core::proto::{
-    sync_message::Msg, ClientKeepAlive, ClientRegister, ManifestRequest, ManifestResponse,
-    PossessionBitfield, ServerMetadata, SyncMessage,
+    sync_message::Msg, ClientKeepAlive, ClientRegister, ManifestRequest, PossessionBitfield,
+    ServerMetadata, SyncMessage,
 };
 use distd_core::transport::{decode_sync_payload_owned, TransportOp};
 use distd_core::utils::frame::{
     read_length_delimited_async, write_length_delimited_async, write_optional_uuid_async,
-    write_transport_op_async,
+    write_transport_op_async, FrameError, MAX_FRAME_PAYLOAD_BYTES,
 };
 use quinn::{ClientConfig, Endpoint};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, Error as TlsError, SignatureScheme};
-use tokio::io::AsyncRead;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -115,7 +115,7 @@ fn resolve_quic_target(url: &CanonicalServerUrl) -> Result<(SocketAddr, String),
     Ok((addr, server_name))
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct QuicTransportClient {
     _endpoint: Endpoint,
     connection: quinn::Connection,
@@ -129,6 +129,18 @@ pub struct QuicSyncSession {
     recv: quinn::RecvStream,
     connection: quinn::Connection,
     starting_received_bytes: u64,
+    finished: bool,
+}
+
+impl Drop for QuicSyncSession {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let code = quinn::VarInt::from_u32(0x4453_5055);
+        let _ = self.send.reset(code);
+        let _ = self.recv.stop(code);
+    }
 }
 
 impl QuicTransportClient {
@@ -263,14 +275,22 @@ impl QuicTransportClient {
     pub async fn sync(
         &self,
         manifest_request: ManifestRequest,
-    ) -> Result<(ManifestResponse, QuicSyncSession), ServerRequest> {
+    ) -> Result<(Vec<u8>, QuicSyncSession), ServerRequest> {
         let starting_received_bytes = self.connection.stats().udp_rx.bytes;
         let (mut send, mut recv) = self.open_bi(TransportOp::Sync).await?;
         write_length_delimited_async(&mut send, &manifest_request)
             .await
             .map_err(|err| ServerRequest::Quic(err.to_string()))?;
 
-        let manifest = read_sync_manifest_response(&mut recv).await?;
+        let manifest = match read_sync_manifest_frame(&mut recv).await {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                let code = quinn::VarInt::from_u32(0x4453_5055);
+                let _ = send.reset(code);
+                let _ = recv.stop(code);
+                return Err(error);
+            }
+        };
 
         Ok((
             manifest,
@@ -279,27 +299,45 @@ impl QuicTransportClient {
                 recv,
                 connection: self.connection.clone(),
                 starting_received_bytes,
+                finished: false,
             },
         ))
     }
 }
 
-async fn read_sync_manifest_response<R>(reader: &mut R) -> Result<ManifestResponse, ServerRequest>
+async fn read_sync_manifest_frame<R>(reader: &mut R) -> Result<Vec<u8>, ServerRequest>
 where
     R: AsyncRead + Unpin,
 {
-    match read_length_delimited_async::<_, SyncMessage>(reader)
+    let mut length = [0u8; 4];
+    reader
+        .read_exact(&mut length)
         .await
-        .map_err(|err| ServerRequest::Quic(err.to_string()))?
-    {
-        SyncMessage {
-            msg: Some(Msg::ManifestResponse(response)),
-        } => Ok(response),
-        _ => Err(ServerRequest::UnexpectedMessage),
+        .map_err(FrameError::from)
+        .map_err(|error| ServerRequest::Quic(error.to_string()))?;
+    let payload_len = u32::from_be_bytes(length) as usize;
+    if payload_len > MAX_FRAME_PAYLOAD_BYTES {
+        return Err(ServerRequest::Quic(FrameError::FrameTooLarge.to_string()));
     }
+    let mut frame = Vec::with_capacity(4 + payload_len);
+    frame.extend_from_slice(&length);
+    frame.resize(4 + payload_len, 0);
+    reader
+        .read_exact(&mut frame[4..])
+        .await
+        .map_err(FrameError::from)
+        .map_err(|error| ServerRequest::Quic(error.to_string()))?;
+    Ok(frame)
 }
 
 impl QuicSyncSession {
+    pub fn abort(mut self) {
+        let code = quinn::VarInt::from_u32(0x4453_5055);
+        let _ = self.send.reset(code);
+        let _ = self.recv.stop(code);
+        self.finished = true;
+    }
+
     #[allow(dead_code)]
     pub async fn send_possession_and_collect_chunks(
         self,
@@ -352,6 +390,7 @@ impl QuicSyncSession {
             .udp_rx
             .bytes
             .saturating_sub(self.starting_received_bytes);
+        self.finished = true;
         Ok((received, wire_bytes))
     }
 }
@@ -475,7 +514,7 @@ impl<'a> SyncChunkDecoder<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{read_sync_manifest_response, resolve_quic_target, SyncChunkDecoder};
+    use super::{read_sync_manifest_frame, resolve_quic_target, SyncChunkDecoder};
     use crate::server_url::CanonicalServerUrl;
     use distd_core::proto::{
         sync_message::Msg, BulkData, ChunkData, ManifestResponse, PayloadCompression, SyncMessage,
@@ -530,14 +569,20 @@ mod tests {
                 .expect("write sync manifest frame");
         });
 
-        let actual = read_sync_manifest_response(&mut reader)
+        let frame = read_sync_manifest_frame(&mut reader)
             .await
-            .expect("decode manifest response");
+            .expect("read manifest response frame");
+        let actual = distd_core::utils::frame::decode_length_delimited::<SyncMessage>(&frame)
+            .expect("decode manifest response frame");
+        let actual = match actual.msg {
+            Some(Msg::ManifestResponse(actual)) => actual,
+            _ => panic!("expected manifest response"),
+        };
         assert_eq!(actual, expected);
     }
 
     #[tokio::test]
-    async fn rejects_non_manifest_sync_message_frame() {
+    async fn reads_non_manifest_frame_for_worker_rejection() {
         let (mut writer, mut reader) = duplex(4096);
 
         tokio::spawn(async move {
@@ -554,13 +599,12 @@ mod tests {
                 .expect("write non-manifest frame");
         });
 
-        let err = read_sync_manifest_response(&mut reader)
+        let frame = read_sync_manifest_frame(&mut reader)
             .await
-            .expect_err("non-manifest frame should fail");
-        assert!(matches!(
-            err,
-            crate::error::ServerRequest::UnexpectedMessage
-        ));
+            .expect("bounded read is deliberately decode-free");
+        let message = distd_core::utils::frame::decode_length_delimited::<SyncMessage>(&frame)
+            .expect("worker can decode the framed message");
+        assert!(matches!(message.msg, Some(Msg::ChunkData(_))));
     }
 
     #[test]

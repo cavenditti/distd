@@ -525,10 +525,12 @@ name = "distd_bench"
 version = "0.2.0"
 dependencies = [
  "blake3",
+ "bytes",
  "chrono",
  "clap",
  "comfy-table",
  "csv",
+ "distd_core",
  "flate2",
  "libc",
  "rand 0.8.5",
@@ -550,6 +552,7 @@ version = "0.2.0"
 dependencies = [
  "bitcode",
  "blake3",
+ "bytes",
  "clap",
  "config",
  "dirs",
@@ -558,6 +561,7 @@ dependencies = [
  "percent-encoding",
  "quinn",
  "ring",
+ "rustc-hash",
  "rustls",
  "serde",
  "serde_json",

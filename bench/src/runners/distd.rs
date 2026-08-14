@@ -8,12 +8,21 @@
 //!
 //! Both "in-memory" (current default) and "persistent" server modes are supported.
 
+use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use bytes::Bytes;
+use distd_core::{
+    chunk_storage::{hashmap_storage::HashMapStorage, ChunkStorage},
+    chunks::{ChunkAlgorithm, ChunkingPolicy},
+    signature::PublisherStatement,
+};
+use ring::signature::{Ed25519KeyPair, KeyPair};
 
 use crate::metrics::{self, ProcessMonitor, RunMetrics};
 use crate::network::{NetworkProfile, UdpShaperProxy};
@@ -30,6 +39,32 @@ const PUBLISH_RETRIES: usize = 3;
 const HTTP_SERVER_ADDR: &str = "127.0.0.1:3000";
 const SYNC_SERVER_ADDR: &str = "127.0.0.1:50051";
 const BENCH_AUTH_TOKEN: &str = "distd-isolated-benchmark-token";
+const BENCH_PUBLISHER_SEED: [u8; 32] = [0x42; 32];
+
+fn benchmark_publisher_key_pair() -> Ed25519KeyPair {
+    Ed25519KeyPair::from_seed_unchecked(&BENCH_PUBLISHER_SEED)
+        .expect("fixed benchmark publisher seed is valid")
+}
+
+fn benchmark_publisher_public_key() -> String {
+    benchmark_publisher_key_pair()
+        .public_key()
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn benchmark_publisher_signature(item: &distd_core::item::Item) -> Result<String, String> {
+    let statement = PublisherStatement::from_item(item)
+        .map_err(|error| format!("cannot build benchmark publisher statement: {error}"))?;
+    Ok(benchmark_publisher_key_pair()
+        .sign(statement.as_bytes())
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
 
 /// Paths to the compiled distd binaries.
 struct BinaryPaths {
@@ -162,22 +197,49 @@ impl DistdRunner {
         server.exists() && client.exists()
     }
 
-    fn binary_paths() -> BinaryPaths {
+    fn binary_paths() -> Result<BinaryPaths, String> {
         let workspace = workspace_root();
-        // Prefer release builds, fall back to debug
-        let release_server = workspace.join("target/release/distd_server");
-        let release_client = workspace.join("target/release/distd_client");
-        if release_server.exists() && release_client.exists() {
-            BinaryPaths {
-                server: release_server,
-                client: release_client,
-            }
-        } else {
+        let paths = if cfg!(test) {
             BinaryPaths {
                 server: workspace.join("target/debug/distd_server"),
                 client: workspace.join("target/debug/distd_client"),
             }
+        } else {
+            // Prefer release builds, fall back to debug
+            let release_server = workspace.join("target/release/distd_server");
+            let release_client = workspace.join("target/release/distd_client");
+            if release_server.exists() && release_client.exists() {
+                BinaryPaths {
+                    server: release_server,
+                    client: release_client,
+                }
+            } else {
+                BinaryPaths {
+                    server: workspace.join("target/debug/distd_server"),
+                    client: workspace.join("target/debug/distd_client"),
+                }
+            }
+        };
+        if cfg!(test) {
+            for (binary, product) in [(&paths.server, "server"), (&paths.client, "client")] {
+                let latest_source = latest_product_source_modification(&workspace, product)?;
+                let modified = fs::metadata(binary)
+                    .and_then(|metadata| metadata.modified())
+                    .map_err(|error| {
+                        format!(
+                            "product binary {} is unavailable; build current debug binaries first: {error}",
+                            binary.display()
+                        )
+                    })?;
+                if modified < latest_source {
+                    return Err(format!(
+                        "product binary {} predates client/server/core sources; rebuild current debug binaries first",
+                        binary.display()
+                    ));
+                }
+            }
         }
+        Ok(paths)
     }
 
     /// Start the distd server and wait for it to be ready.
@@ -218,7 +280,7 @@ impl DistdRunner {
             std::fs::remove_file(&metadata_path).map_err(|error| error.to_string())?;
         }
 
-        let bins = Self::binary_paths();
+        let bins = Self::binary_paths()?;
         if !bins.server.exists() {
             return Err(format!(
                 "distd_server binary not found at {}. Run `cargo build` first.",
@@ -236,6 +298,10 @@ impl DistdRunner {
             .env("DISTD_ENROLLMENT_TOKEN", BENCH_AUTH_TOKEN)
             .env("DISTD_PUBLISH_TOKEN", BENCH_AUTH_TOKEN)
             .env("DISTD_ADMIN_TOKEN", BENCH_AUTH_TOKEN)
+            .env(
+                "DISTD_PUBLISHER_PUBLIC_KEYS",
+                benchmark_publisher_public_key(),
+            )
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if let Ok(cache_mb) = std::env::var("DISTD_STORAGE_CHUNK_CACHE_MB") {
@@ -260,9 +326,9 @@ impl DistdRunner {
         let mut quic_ready = false;
         loop {
             if start.elapsed() > timeout {
-                self.stop_server();
+                let server_output = self.stop_server_and_collect_output();
                 return Err(format!(
-                    "Timed out waiting for distd_server (http_ready={http_ready}, quic_ready={quic_ready})"
+                    "Timed out waiting for distd_server (http_ready={http_ready}, quic_ready={quic_ready}): {server_output}"
                 ));
             }
             if !http_ready {
@@ -360,6 +426,90 @@ impl DistdRunner {
             .then_some(self.low_delta_chunking.as_str())
     }
 
+    fn chunk_algorithm(
+        chunking_policy: Option<&str>,
+        path: &Path,
+        sample: &[u8],
+        multi_file: bool,
+    ) -> Result<ChunkAlgorithm, String> {
+        let policy = chunking_policy
+            .unwrap_or("auto")
+            .parse::<ChunkingPolicy>()
+            .map_err(|error| format!("invalid benchmark chunking policy: {error}"))?;
+        Ok(ChunkAlgorithm::from_policy(
+            policy, path, sample, multi_file,
+        ))
+    }
+
+    fn signed_file_headers(
+        source_file: &Path,
+        item_name: &str,
+        item_path: &str,
+        chunking_policy: Option<&str>,
+    ) -> Result<(String, String), String> {
+        let data = std::fs::read(source_file)
+            .map_err(|error| format!("cannot read benchmark publication input: {error}"))?;
+        let algorithm = Self::chunk_algorithm(chunking_policy, source_file, &data, false)?;
+        let item = HashMapStorage::default()
+            .prepare_revision(
+                item_name.to_string(),
+                item_name.to_string(),
+                PathBuf::from(item_path),
+                0,
+                None,
+                Bytes::from(data),
+                algorithm,
+            )
+            .map_err(|error| format!("cannot prepare signed benchmark publication: {error}"))?;
+        Ok((
+            benchmark_publisher_public_key(),
+            benchmark_publisher_signature(&item)?,
+        ))
+    }
+
+    fn signed_directory_headers(
+        source_root: &Path,
+        source_files: &[PathBuf],
+        item_name: &str,
+        item_path: &str,
+        chunking_policy: Option<&str>,
+    ) -> Result<(String, String), String> {
+        let files = source_files
+            .iter()
+            .map(|source_file| {
+                let relative = source_file.strip_prefix(source_root).map_err(|error| {
+                    format!(
+                        "cannot derive benchmark publication path for {}: {error}",
+                        source_file.display()
+                    )
+                })?;
+                let data = std::fs::read(source_file).map_err(|error| {
+                    format!(
+                        "cannot read benchmark publication input {}: {error}",
+                        source_file.display()
+                    )
+                })?;
+                Ok((relative.to_path_buf(), Bytes::from(data)))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let algorithm = Self::chunk_algorithm(chunking_policy, Path::new(item_path), &[], true)?;
+        let item = HashMapStorage::default()
+            .prepare_revision_from_files(
+                item_name.to_string(),
+                item_name.to_string(),
+                PathBuf::from(item_path),
+                0,
+                None,
+                files,
+                algorithm,
+            )
+            .map_err(|error| format!("cannot prepare signed benchmark publication: {error}"))?;
+        Ok((
+            benchmark_publisher_public_key(),
+            benchmark_publisher_signature(&item)?,
+        ))
+    }
+
     /// Publish a file to the running server via HTTP REST API.
     fn publish_file(
         &self,
@@ -368,6 +518,8 @@ impl DistdRunner {
         item_path: &str,
         chunking_policy: Option<&str>,
     ) -> Result<(), String> {
+        let (publisher_key, publisher_signature) =
+            Self::signed_file_headers(source_file, item_name, item_path, chunking_policy)?;
         for attempt in 1..=PUBLISH_RETRIES {
             let publish_url = item_publish_url(
                 &self.publish_base_url(),
@@ -387,6 +539,12 @@ impl DistdRunner {
                     "POST",
                     "-H",
                     &format!("Authorization: Bearer {BENCH_AUTH_TOKEN}"),
+                    "-H",
+                    "X-Distd-Publisher-Statement-Version: 1",
+                    "-H",
+                    &format!("X-Distd-Publisher-Public-Key: {publisher_key}"),
+                    "-H",
+                    &format!("X-Distd-Publisher-Signature: {publisher_signature}"),
                     &publish_url,
                     "-F",
                     &format!("item=@{}", source_file.to_string_lossy()),
@@ -425,6 +583,13 @@ impl DistdRunner {
         item_path: &str,
         chunking_policy: Option<&str>,
     ) -> Result<(), String> {
+        let (publisher_key, publisher_signature) = Self::signed_directory_headers(
+            source_root,
+            source_files,
+            item_name,
+            item_path,
+            chunking_policy,
+        )?;
         for attempt in 1..=PUBLISH_RETRIES {
             let mut cmd = Command::new("curl");
             cmd.arg("-sS")
@@ -437,6 +602,14 @@ impl DistdRunner {
                 .arg("POST")
                 .arg("-H")
                 .arg(format!("Authorization: Bearer {BENCH_AUTH_TOKEN}"))
+                .arg("-H")
+                .arg("X-Distd-Publisher-Statement-Version: 1")
+                .arg("-H")
+                .arg(format!("X-Distd-Publisher-Public-Key: {publisher_key}"))
+                .arg("-H")
+                .arg(format!(
+                    "X-Distd-Publisher-Signature: {publisher_signature}"
+                ))
                 .arg(item_publish_url(
                     &self.publish_base_url(),
                     item_name,
@@ -487,7 +660,16 @@ impl DistdRunner {
 
     /// Run the distd client to fetch an item.
     fn client_get(&self, item_path: &str, dest_dir: &Path) -> Result<(Child, PathBuf), String> {
-        let bins = Self::binary_paths();
+        self.client_get_with_publisher(item_path, dest_dir, &benchmark_publisher_public_key())
+    }
+
+    fn client_get_with_publisher(
+        &self,
+        item_path: &str,
+        dest_dir: &Path,
+        publisher_public_key: &str,
+    ) -> Result<(Child, PathBuf), String> {
+        let bins = Self::binary_paths()?;
         if !bins.client.exists() {
             return Err(format!(
                 "distd_client binary not found at {}.",
@@ -513,6 +695,7 @@ impl DistdRunner {
                 "enrollment_token": BENCH_AUTH_TOKEN,
                 "certificate_fingerprint": certificate_fingerprint,
                 "allow_tofu": false,
+                "publisher_public_keys": [publisher_public_key],
             },
             "log": {
                 "level": "INFO",
@@ -1075,17 +1258,349 @@ fn workspace_root() -> PathBuf {
     PathBuf::from(".")
 }
 
+fn latest_product_source_modification(
+    workspace: &Path,
+    product: &str,
+) -> Result<SystemTime, String> {
+    fn visit(path: &Path, latest: &mut SystemTime) -> Result<(), String> {
+        let metadata = fs::symlink_metadata(path).map_err(|error| {
+            format!("cannot inspect product source {}: {error}", path.display())
+        })?;
+        if metadata.is_dir() {
+            for entry in fs::read_dir(path).map_err(|error| {
+                format!(
+                    "cannot enumerate product source {}: {error}",
+                    path.display()
+                )
+            })? {
+                visit(&entry.map_err(|error| error.to_string())?.path(), latest)?;
+            }
+        } else if metadata.is_file() {
+            let modified = metadata.modified().map_err(|error| {
+                format!(
+                    "cannot read product source time {}: {error}",
+                    path.display()
+                )
+            })?;
+            *latest = (*latest).max(modified);
+        } else {
+            return Err(format!(
+                "product source path is not a regular file or directory: {}",
+                path.display()
+            ));
+        }
+        Ok(())
+    }
+
+    let mut latest = UNIX_EPOCH;
+    for relative in ["Cargo.toml", "core/Cargo.toml", "core/src", "core/proto"] {
+        visit(&workspace.join(relative), &mut latest)?;
+    }
+    let product_paths: &[&str] = match product {
+        "client" => &["client/Cargo.toml", "client/src"],
+        "server" => &["server/Cargo.toml", "server/src"],
+        _ => return Err(format!("unknown distd product binary {product}")),
+    };
+    for relative in product_paths {
+        visit(&workspace.join(relative), &mut latest)?;
+    }
+    Ok(latest)
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::Mutex;
 
     use crate::metrics::RunMetrics;
 
     use super::{
-        apply_sync_diagnostics, item_publish_url, operation_evidence_stem,
-        parse_client_sync_diagnostics, parse_server_sync_diagnostics, record_complete_hashes,
-        write_new_evidence_file, ClientSyncDiagnostics, ServerSyncDiagnostics,
+        apply_sync_diagnostics, benchmark_publisher_public_key, item_publish_url,
+        operation_evidence_stem, parse_client_sync_diagnostics, parse_server_sync_diagnostics,
+        record_complete_hashes, write_new_evidence_file, ClientSyncDiagnostics, DistdRunner,
+        ServerSyncDiagnostics,
     };
+    use crate::runners::RunnerOptions;
+
+    static PRODUCT_INTEGRATION_LOCK: Mutex<()> = Mutex::new(());
+
+    fn decode_hex<const N: usize>(value: &str) -> [u8; N] {
+        assert_eq!(value.len(), N * 2);
+        let mut bytes = [0; N];
+        for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+            let digits = std::str::from_utf8(pair).unwrap();
+            bytes[index] = u8::from_str_radix(digits, 16).unwrap();
+        }
+        bytes
+    }
+
+    #[test]
+    fn benchmark_publications_use_the_configured_publisher_key_and_valid_signatures() {
+        use bytes::Bytes;
+        use distd_core::{
+            chunk_storage::{hashmap_storage::HashMapStorage, ChunkStorage},
+            chunks::ChunkAlgorithm,
+            signature::{PublisherPublicKey, PublisherSignature, PublisherSignatureEnvelope},
+        };
+
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("fixture.bin");
+        let payload = b"signed benchmark publication";
+        fs::write(&source, payload).unwrap();
+
+        let (key, signature) =
+            DistdRunner::signed_file_headers(&source, "bench-artifact", "bench-artifact", None)
+                .unwrap();
+        assert_eq!(key, benchmark_publisher_public_key());
+
+        let item = HashMapStorage::default()
+            .prepare_revision(
+                "bench-artifact".to_string(),
+                "bench-artifact".to_string(),
+                "bench-artifact".into(),
+                0,
+                None,
+                Bytes::copy_from_slice(payload),
+                ChunkAlgorithm::from_policy("auto".parse().unwrap(), &source, payload, false),
+            )
+            .unwrap();
+        let envelope = PublisherSignatureEnvelope::from_parts(
+            PublisherPublicKey::from_bytes(decode_hex(&key)),
+            PublisherSignature::from_bytes(decode_hex(&signature)),
+        );
+        envelope.verify(&item).unwrap();
+    }
+
+    fn integration_runner(root: &std::path::Path) -> DistdRunner {
+        DistdRunner::new(
+            root,
+            RunnerOptions {
+                network: None,
+                artifacts_dir: root.join("artifacts"),
+                distd_low_delta_chunking: "fixed".to_string(),
+                corpus_seed: Some(17),
+            },
+        )
+    }
+
+    #[test]
+    #[ignore = "requires built product binaries and exclusive loopback ports"]
+    fn signed_quic_client_activates_file_delta_and_directory_artifacts() {
+        let _exclusive = PRODUCT_INTEGRATION_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temporary = tempfile::tempdir().unwrap();
+        let runner = integration_runner(temporary.path());
+        runner.reset_client_cache().unwrap();
+        runner.start_server().unwrap();
+
+        let source = temporary.path().join("source.bin");
+        let destination = temporary.path().join("destination");
+        fs::create_dir_all(&destination).unwrap();
+        let mut initial = (0..distd_core::chunks::CHUNK_SIZE * 3)
+            .map(|index| ((index * 17) % 251) as u8)
+            .collect::<Vec<_>>();
+        fs::write(&source, &initial).unwrap();
+        runner
+            .publish_file(
+                &source,
+                "bench-signed-file",
+                "bench-signed-file",
+                Some("fixed"),
+            )
+            .unwrap();
+        let (client, _) = runner
+            .client_get("bench-signed-file", &destination)
+            .unwrap();
+        let output = client.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read(destination.join("bench-signed-file")).unwrap(),
+            initial
+        );
+
+        for byte in &mut initial[distd_core::chunks::CHUNK_SIZE..distd_core::chunks::CHUNK_SIZE * 2]
+        {
+            *byte ^= 0x5a;
+        }
+        fs::write(&source, &initial).unwrap();
+        runner
+            .publish_file(
+                &source,
+                "bench-signed-file",
+                "bench-signed-file",
+                Some("fixed"),
+            )
+            .unwrap();
+        let (client, _) = runner
+            .client_get("bench-signed-file", &destination)
+            .unwrap();
+        let output = client.wait_with_output().unwrap();
+        let update_stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{update_stderr}");
+        assert!(update_stderr.contains("distd_sync_local_basis_chunks=3"));
+        assert!(update_stderr.contains("distd_sync_received_chunks=1"));
+        assert_eq!(
+            fs::read(destination.join("bench-signed-file")).unwrap(),
+            initial
+        );
+
+        let directory_source = temporary.path().join("directory-source");
+        fs::create_dir_all(directory_source.join("nested")).unwrap();
+        fs::write(directory_source.join("a.bin"), b"signed directory a").unwrap();
+        fs::write(directory_source.join("nested/b.bin"), b"signed directory b").unwrap();
+        let source_files = crate::workload::walkdir_files(&directory_source);
+        runner
+            .publish_files(
+                &directory_source,
+                &source_files,
+                "bench-signed-directory",
+                "bench-signed-directory",
+                Some("fixed"),
+            )
+            .unwrap();
+        let (client, _) = runner
+            .client_get("bench-signed-directory", &destination)
+            .unwrap();
+        let output = client.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read(destination.join("bench-signed-directory/a.bin")).unwrap(),
+            b"signed directory a"
+        );
+        assert_eq!(
+            fs::read(destination.join("bench-signed-directory/nested/b.bin")).unwrap(),
+            b"signed directory b"
+        );
+
+        let server_output = runner.stop_server_and_collect_output();
+        assert!(!server_output.contains("publisher authorization failed"));
+        assert!(server_output.contains("distd_sync_missing_chunks=1"));
+    }
+
+    #[test]
+    #[ignore = "requires built product binaries and exclusive loopback ports"]
+    fn untrusted_quic_manifest_resets_before_possession_and_activation() {
+        let _exclusive = PRODUCT_INTEGRATION_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temporary = tempfile::tempdir().unwrap();
+        let runner = integration_runner(temporary.path());
+        runner.reset_client_cache().unwrap();
+        runner.start_server().unwrap();
+
+        let source = temporary.path().join("untrusted-source.bin");
+        let original = b"previously active signed publisher content";
+        fs::write(&source, original).unwrap();
+        runner
+            .publish_file(&source, "bench-untrusted", "bench-untrusted", Some("fixed"))
+            .unwrap();
+        let destination = temporary.path().join("untrusted-destination");
+        fs::create_dir_all(&destination).unwrap();
+        let (client, _) = runner.client_get("bench-untrusted", &destination).unwrap();
+        let output = client.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read(destination.join("bench-untrusted")).unwrap(),
+            original
+        );
+        let durable_before = directory_snapshot(&destination);
+
+        fs::write(
+            &source,
+            b"new content that must remain inactive for an untrusted client",
+        )
+        .unwrap();
+        runner
+            .publish_file(&source, "bench-untrusted", "bench-untrusted", Some("fixed"))
+            .unwrap();
+        let wrong_key = "11".repeat(32);
+        let (client, _) = runner
+            .client_get_with_publisher("bench-untrusted", &destination, &wrong_key)
+            .unwrap();
+        let output = client.wait_with_output().unwrap();
+        assert!(
+            !output.status.success(),
+            "untrusted client unexpectedly succeeded; stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let client_error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            client_error.contains("PublisherAuthenticity(UntrustedPublisher)"),
+            "unexpected client error: {client_error}"
+        );
+        assert_eq!(
+            fs::read(destination.join("bench-untrusted")).unwrap(),
+            original
+        );
+        assert_eq!(directory_snapshot(&destination), durable_before);
+
+        let reopened =
+            distd_core::chunk_storage::fs_storage::FsStorage::new(destination.clone()).unwrap();
+        let active = reopened
+            .open_active_revision(&destination.join("bench-untrusted"))
+            .unwrap()
+            .expect("previous signed revision remains active after restart");
+        let mut restarted_bytes = Vec::new();
+        use std::io::Read as _;
+        active
+            .open_file()
+            .unwrap()
+            .read_to_end(&mut restarted_bytes)
+            .unwrap();
+        assert_eq!(restarted_bytes, original);
+        assert!(reopened.chunk_cache_stats().invariants_hold);
+
+        let server_output = runner.stop_server_and_collect_output();
+        assert_eq!(
+            server_output.matches("distd_sync_missing_chunks=").count(),
+            1,
+            "only the valid seed fetch may send possession: {server_output}"
+        );
+    }
+
+    fn directory_snapshot(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        fn visit(
+            root: &std::path::Path,
+            current: &std::path::Path,
+            snapshot: &mut Vec<(std::path::PathBuf, Vec<u8>)>,
+        ) {
+            let mut entries = fs::read_dir(current)
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .collect::<Vec<_>>();
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                let path = entry.path();
+                let metadata = fs::symlink_metadata(&path).unwrap();
+                if metadata.is_dir() {
+                    visit(root, &path, snapshot);
+                } else if metadata.is_file() {
+                    snapshot.push((
+                        path.strip_prefix(root).unwrap().to_path_buf(),
+                        fs::read(path).unwrap(),
+                    ));
+                }
+            }
+        }
+
+        let mut snapshot = Vec::new();
+        visit(root, root, &mut snapshot);
+        snapshot
+    }
 
     #[test]
     fn parses_complete_client_sync_diagnostics() {

@@ -5,15 +5,10 @@ use crate::chunks::CHUNK_SIZE;
 #[must_use]
 #[inline]
 pub fn merge_hashes(left: &blake3_hash::Hash, right: &blake3_hash::Hash) -> blake3_hash::Hash {
-    blake3::hash(
-        &left
-            .as_bytes()
-            .iter()
-            .chain(right.as_bytes().iter())
-            .copied()
-            .collect::<Vec<u8>>(),
-    )
-    .into()
+    let mut input = [0_u8; 64];
+    input[..32].copy_from_slice(left.as_bytes());
+    input[32..].copy_from_slice(right.as_bytes());
+    blake3::hash(&input).into()
 }
 
 /// Trait to abstract away the structure used to compute hash-tree
