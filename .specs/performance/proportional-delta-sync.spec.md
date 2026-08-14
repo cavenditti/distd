@@ -33,6 +33,9 @@ for every repeatable measurement.
 - {#c-correctness} Every measured full transfer and update MUST validate the
   destination against the expected complete artifact hash before its metrics
   are eligible for comparison.
+- {#c-diff-iteration} Hash-tree difference iteration MUST traverse lazily and
+  without recursion. Its working allocation MUST follow actual tree depth and
+  MUST NOT be derived from an untrusted node's declared payload size.
 - {#c-target} Across five paired warm runs of the pinned 32 MiB, 5%-edit
   workload, update QUIC wire bytes MUST be at most 4 MiB in every run and the
   median full-transfer wall time MUST regress by no more than 5% from the

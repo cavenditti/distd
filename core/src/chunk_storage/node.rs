@@ -4,7 +4,7 @@ use std::{collections::HashSet, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 
-use crate::chunks::{ChunkInfo, CHUNK_SIZE_U64};
+use crate::chunks::ChunkInfo;
 use crate::hash::Hash;
 use crate::utils::serde::nodes::{deserialize_arc_node, serialize_arc_node};
 
@@ -41,72 +41,29 @@ pub enum Node {
     },
 }
 
-/// Depth-first Iterator over the references of the chunks in the tree
+/// Lazy post-order iterator over the references of the chunks in the tree.
+///
+/// Work is proportional to the actual tree depth. In particular, declared
+/// node byte sizes never influence iterator allocation.
 struct NodeIterator {
-    stack: Vec<Arc<Node>>,
+    work: Vec<NodeVisit>,
+    completed: Vec<Arc<Node>>,
+    skip: HashSet<Hash>,
+}
+
+enum NodeVisit {
+    Enter(Arc<Node>),
+    FinishParent { hash: Hash, size: u64 },
 }
 
 impl NodeIterator {
-    fn new(node: Arc<Node>) -> Self {
-        fn push_children(node: Arc<Node>, stack: &mut Vec<Arc<Node>>) {
-            match node.clone().as_ref() {
-                &Node::Stored { .. } | &Node::Skipped { .. } => {
-                    // We're at a leaf, just return it
-                    stack.push(node);
-                }
-                Node::Parent { left, right, .. } => {
-                    // in this case we keep descending, first pushed get returned last
-                    stack.push(node);
-                    push_children(right.clone(), stack);
-                    push_children(left.clone(), stack);
-                }
-            }
-        }
-
-        // TODO should be safe for any reasonable CHUNK_SIZE but needs to be restricted somehow
-        #[allow(clippy::cast_possible_truncation)]
-        let mut stack = Vec::with_capacity(((2 * node.size()) / CHUNK_SIZE_U64) as usize);
-        // The very dumb heuristic™
-
-        push_children(node, &mut stack);
-        Self { stack }
-    }
-
     /// Create a new iterator skipping some hashes
-    fn new_skipping(node: Arc<Node>, skip: &HashSet<Hash>) -> Self {
-        fn iterate_children(node: Arc<Node>, skip: &HashSet<Hash>) -> Arc<Node> {
-            if skip.contains(node.hash()) {
-                Arc::new(Node::Skipped {
-                    hash: *node.hash(),
-                    size: node.size(),
-                })
-            } else {
-                match node.clone().as_ref() {
-                    &Node::Stored { .. } | &Node::Skipped { .. } => {
-                        // We're at a leaf, just return it
-                        node
-                    }
-                    Node::Parent {
-                        left,
-                        right,
-                        hash,
-                        size,
-                    } => {
-                        // in this case we keep descending, first pushed get returned last
-                        let l = iterate_children(left.clone(), skip);
-                        let r = iterate_children(right.clone(), skip);
-                        Arc::new(Node::Parent {
-                            hash: *hash,
-                            size: *size,
-                            left: l,
-                            right: r,
-                        })
-                    }
-                }
-            }
+    fn new_skipping(node: Arc<Node>, skip: HashSet<Hash>) -> Self {
+        Self {
+            work: vec![NodeVisit::Enter(node)],
+            completed: Vec::new(),
+            skip,
         }
-
-        Self::new(iterate_children(node, skip))
     }
 }
 
@@ -114,7 +71,55 @@ impl Iterator for NodeIterator {
     type Item = Arc<Node>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.stack.pop()
+        loop {
+            match self.work.pop()? {
+                NodeVisit::Enter(node) if self.skip.contains(node.hash()) => {
+                    let node = Arc::new(Node::Skipped {
+                        hash: *node.hash(),
+                        size: node.size(),
+                    });
+                    self.completed.push(node.clone());
+                    return Some(node);
+                }
+                NodeVisit::Enter(node) => match node.as_ref() {
+                    Node::Stored { .. } | Node::Skipped { .. } => {
+                        self.completed.push(node.clone());
+                        return Some(node);
+                    }
+                    Node::Parent {
+                        hash,
+                        size,
+                        left,
+                        right,
+                    } => {
+                        self.work.push(NodeVisit::FinishParent {
+                            hash: *hash,
+                            size: *size,
+                        });
+                        self.work.push(NodeVisit::Enter(right.clone()));
+                        self.work.push(NodeVisit::Enter(left.clone()));
+                    }
+                },
+                NodeVisit::FinishParent { hash, size } => {
+                    let right = self
+                        .completed
+                        .pop()
+                        .expect("post-order parent must follow its right child");
+                    let left = self
+                        .completed
+                        .pop()
+                        .expect("post-order parent must follow its left child");
+                    let node = Arc::new(Node::Parent {
+                        hash,
+                        size,
+                        left,
+                        right,
+                    });
+                    self.completed.push(node.clone());
+                    return Some(node);
+                }
+            }
+        }
     }
 }
 
@@ -361,15 +366,22 @@ impl Node {
 
     /// From a subset of hashes, get all hashes completely dependent on those
     pub fn fill_hashes(self: &Arc<Node>, hashes: &mut HashSet<Hash>) {
-        match self.as_ref() {
-            &Node::Stored { .. } | &Node::Skipped { .. } => {}
-            Node::Parent {
+        let mut work = vec![(self.clone(), false)];
+        while let Some((node, children_visited)) = work.pop() {
+            if let Node::Parent {
                 hash, left, right, ..
-            } => {
-                left.fill_hashes(hashes);
-                right.fill_hashes(hashes);
-                if hashes.contains(left.hash()) && hashes.contains(right.hash()) {
-                    hashes.insert(*hash);
+            } = node.as_ref()
+            {
+                if children_visited {
+                    if hashes.contains(left.hash()) && hashes.contains(right.hash()) {
+                        hashes.insert(*hash);
+                    }
+                } else {
+                    let left = left.clone();
+                    let right = right.clone();
+                    work.push((node, true));
+                    work.push((right, false));
+                    work.push((left, false));
                 }
             }
         }
@@ -379,7 +391,7 @@ impl Node {
     pub fn find_diff(self: Arc<Node>, hashes: &[Hash]) -> impl Iterator<Item = Arc<Node>> {
         let mut hashes = hashes.iter().copied().collect();
         self.fill_hashes(&mut hashes);
-        NodeIterator::new_skipping(self, &hashes)
+        NodeIterator::new_skipping(self, hashes)
     }
 }
 
@@ -393,7 +405,7 @@ mod tests {
     };
     use rand::RngCore;
 
-    use super::Node;
+    use super::{Node, NodeIterator};
 
     #[test]
     fn flatten() {
@@ -447,6 +459,110 @@ mod tests {
         assert!(matches!(diff.as_ref(), &Node::Skipped { .. }));
         assert_eq!(diff.hash(), &h);
         assert_eq!(diff.size(), 12_000);
+    }
+
+    #[test]
+    fn node_diff_iterator_allocation_ignores_declared_payload_size() {
+        let hash = hash(b"size-independent-node-diff");
+        let node = Arc::new(Node::Skipped {
+            hash,
+            size: u64::MAX,
+        });
+        let mut iterator = NodeIterator::new_skipping(node, HashSet::new());
+
+        assert_eq!(iterator.work.len(), 1);
+        assert_eq!(iterator.work.capacity(), 1);
+        let yielded = iterator.next().unwrap();
+        assert_eq!(yielded.hash(), &hash);
+        assert_eq!(yielded.size(), u64::MAX);
+        assert!(iterator.next().is_none());
+    }
+
+    #[test]
+    fn node_diff_iterator_handles_deep_trees_without_recursive_traversal() {
+        const DEPTH: usize = 4_096;
+        let leaf = Arc::new(Node::Skipped {
+            hash: hash(b"deep-node-diff-leaf"),
+            size: 0,
+        });
+        let mut root = leaf.clone();
+        let mut owners = Vec::with_capacity(DEPTH + 1);
+        owners.push(root.clone());
+        for _ in 0..DEPTH {
+            root = Arc::new(Node::Parent {
+                hash: hash(b"deep-node-diff-parent"),
+                size: u64::MAX,
+                left: root,
+                right: leaf.clone(),
+            });
+            owners.push(root.clone());
+        }
+
+        let mut closure = HashSet::new();
+        root.fill_hashes(&mut closure);
+        assert!(closure.is_empty());
+
+        let mut iterator = NodeIterator::new_skipping(root.clone(), closure);
+        let mut count = 0usize;
+        let mut maximum_work = 0usize;
+        let mut maximum_completed = 0usize;
+        while iterator.next().is_some() {
+            count += 1;
+            maximum_work = maximum_work.max(iterator.work.len());
+            maximum_completed = maximum_completed.max(iterator.completed.len());
+        }
+        assert_eq!(count, DEPTH * 2 + 1);
+        assert!(maximum_work <= DEPTH * 2);
+        assert!(maximum_completed <= 2);
+
+        // Release external owners from root to leaf so test teardown itself
+        // does not recursively drop this deliberately adversarial tree.
+        drop(iterator);
+        drop(root);
+        for owner in owners.into_iter().rev() {
+            drop(owner);
+        }
+    }
+
+    #[test]
+    #[ignore = "release-only local node-diff iterator reference"]
+    fn node_diff_iterator_reference_performance() {
+        assert!(
+            !cfg!(debug_assertions),
+            "run the node-diff iterator reference in release mode"
+        );
+        const LEAF_COUNT: usize = 32_768;
+        let leaf = Arc::new(Node::Skipped {
+            hash: hash(b"node-diff-reference-leaf"),
+            size: 0,
+        });
+        let mut level = vec![leaf; LEAF_COUNT];
+        while level.len() > 1 {
+            level = level
+                .chunks_exact(2)
+                .map(|pair| {
+                    Arc::new(Node::Parent {
+                        hash: hash(b"node-diff-reference-parent"),
+                        size: u64::MAX,
+                        left: pair[0].clone(),
+                        right: pair[1].clone(),
+                    })
+                })
+                .collect();
+        }
+        let root = level.pop().unwrap();
+        let started = std::time::Instant::now();
+        let count = root.find_diff(&[]).count();
+        let elapsed = started.elapsed();
+        println!(
+            "node_diff_iterator_nodes={count} elapsed_ns={}",
+            elapsed.as_nanos()
+        );
+        assert_eq!(count, LEAF_COUNT * 2 - 1);
+        assert!(
+            elapsed <= std::time::Duration::from_millis(100),
+            "65,535-node diff iteration took {elapsed:?}"
+        );
     }
 
     #[test]
