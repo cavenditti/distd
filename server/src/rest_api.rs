@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet, fmt::Debug, net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc,
+    collections::HashMap, fmt::Debug, net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc,
     time::Duration,
 };
 
@@ -33,7 +33,8 @@ use distd_core::{
     metadata::Server as ServerMetadata,
     signature::{
         PublisherPublicKey, PublisherReleaseEnvelope, PublisherReleaseSequence, PublisherSignature,
-        PublisherSignatureEnvelope,
+        PublisherSignatureEnvelope, MAX_PUBLISHER_ENTRIES, MAX_PUBLISHER_ENTRY_PATH_BYTES,
+        MAX_PUBLISHER_STATEMENT_BYTES,
     },
     utils::path::validate_relative,
     utils::serde::empty_string_as_none,
@@ -451,11 +452,64 @@ fn sanitize_relative_upload_path(path: &str) -> Option<PathBuf> {
     validate_relative(std::path::Path::new(path)).ok()
 }
 
+struct UploadedFileAccumulator {
+    files: HashMap<PathBuf, axum::body::Bytes>,
+    path_bytes: usize,
+}
+
+impl UploadedFileAccumulator {
+    fn new() -> Self {
+        Self {
+            files: HashMap::new(),
+            path_bytes: 0,
+        }
+    }
+
+    fn prepare_next(&self, file_name: Option<&str>) -> Result<(PathBuf, usize), StatusCode> {
+        if self.files.len() >= MAX_PUBLISHER_ENTRIES {
+            return Err(StatusCode::PAYLOAD_TOO_LARGE);
+        }
+        let file_name = file_name.unwrap_or("item");
+        if file_name.len() > MAX_PUBLISHER_ENTRY_PATH_BYTES {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        let next_path_bytes = self
+            .path_bytes
+            .checked_add(file_name.len())
+            .filter(|total| *total <= MAX_PUBLISHER_STATEMENT_BYTES)
+            .ok_or(StatusCode::PAYLOAD_TOO_LARGE)?;
+        let path = sanitize_relative_upload_path(file_name).ok_or(StatusCode::BAD_REQUEST)?;
+        if self.files.contains_key(&path) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        Ok((path, next_path_bytes))
+    }
+
+    fn retain_prepared(
+        &mut self,
+        path: PathBuf,
+        next_path_bytes: usize,
+        data: axum::body::Bytes,
+    ) -> Result<(), StatusCode> {
+        match self.files.entry(path) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(data);
+                self.path_bytes = next_path_bytes;
+                Ok(())
+            }
+            std::collections::hash_map::Entry::Occupied(_) => Err(StatusCode::BAD_REQUEST),
+        }
+    }
+
+    fn into_files(self) -> Vec<(PathBuf, axum::body::Bytes)> {
+        self.files.into_iter().collect()
+    }
+}
+
 async fn collect_uploaded_files(
     mut multipart: Multipart,
 ) -> Result<Vec<(PathBuf, axum::body::Bytes)>, StatusCode> {
-    let mut uploaded_files = Vec::new();
-    let mut uploaded_paths = HashSet::new();
+    let mut uploaded_files = UploadedFileAccumulator::new();
 
     while let Some(field) = multipart
         .next_field()
@@ -465,15 +519,7 @@ async fn collect_uploaded_files(
         if field.name() != Some("item") {
             continue;
         }
-        let file_name = match field.file_name() {
-            Some(file_name) => {
-                sanitize_relative_upload_path(file_name).ok_or(StatusCode::BAD_REQUEST)?
-            }
-            None => PathBuf::from("item"),
-        };
-        if !uploaded_paths.insert(file_name.clone()) {
-            return Err(StatusCode::BAD_REQUEST);
-        }
+        let (file_name, next_path_bytes) = uploaded_files.prepare_next(field.file_name())?;
         let data = field
             .bytes()
             .await
@@ -484,10 +530,10 @@ async fn collect_uploaded_files(
                 );
             })
             .map_err(|error| error.status())?;
-        uploaded_files.push((file_name, data));
+        uploaded_files.retain_prepared(file_name, next_path_bytes, data)?;
     }
 
-    Ok(uploaded_files)
+    Ok(uploaded_files.into_files())
 }
 
 /// Publish an item
@@ -800,6 +846,72 @@ mod tests {
         body.extend_from_slice(payload);
         body.extend_from_slice(b"\r\n--distd-test--\r\n");
         body
+    }
+
+    #[test]
+    fn publication_file_structure_uses_exact_canonical_limits_and_one_path_owner() {
+        let mut files = UploadedFileAccumulator::new();
+        let mut expected_path_bytes = 0;
+        for index in 0..MAX_PUBLISHER_ENTRIES {
+            let file_name = format!("entry/{index}");
+            let (path, next_path_bytes) = files.prepare_next(Some(&file_name)).unwrap();
+            expected_path_bytes += file_name.len();
+            assert_eq!(next_path_bytes, expected_path_bytes);
+            files
+                .retain_prepared(path, next_path_bytes, Bytes::new())
+                .unwrap();
+        }
+        assert_eq!(files.files.len(), MAX_PUBLISHER_ENTRIES);
+        assert_eq!(files.path_bytes, expected_path_bytes);
+        assert_eq!(
+            files.prepare_next(Some("one-too-many")),
+            Err(StatusCode::PAYLOAD_TOO_LARGE)
+        );
+
+        let mut exact_path = UploadedFileAccumulator::new();
+        let maximum = "x".repeat(MAX_PUBLISHER_ENTRY_PATH_BYTES);
+        let (path, next_path_bytes) = exact_path.prepare_next(Some(&maximum)).unwrap();
+        exact_path
+            .retain_prepared(path, next_path_bytes, Bytes::new())
+            .unwrap();
+        assert_eq!(exact_path.path_bytes, MAX_PUBLISHER_ENTRY_PATH_BYTES);
+        assert_eq!(
+            UploadedFileAccumulator::new()
+                .prepare_next(Some(&"x".repeat(MAX_PUBLISHER_ENTRY_PATH_BYTES + 1))),
+            Err(StatusCode::BAD_REQUEST)
+        );
+
+        let mut aggregate = UploadedFileAccumulator::new();
+        aggregate.path_bytes = MAX_PUBLISHER_STATEMENT_BYTES - 1;
+        let (path, exact_total) = aggregate.prepare_next(Some("z")).unwrap();
+        assert_eq!(exact_total, MAX_PUBLISHER_STATEMENT_BYTES);
+        aggregate
+            .retain_prepared(path, exact_total, Bytes::new())
+            .unwrap();
+        assert_eq!(
+            aggregate.prepare_next(Some("y")),
+            Err(StatusCode::PAYLOAD_TOO_LARGE)
+        );
+        aggregate.path_bytes = usize::MAX;
+        assert_eq!(
+            aggregate.prepare_next(Some("overflow")),
+            Err(StatusCode::PAYLOAD_TOO_LARGE)
+        );
+
+        let mut canonical = UploadedFileAccumulator::new();
+        let (fallback, next_path_bytes) = canonical.prepare_next(None).unwrap();
+        assert_eq!(fallback, PathBuf::from("item"));
+        canonical
+            .retain_prepared(fallback, next_path_bytes, Bytes::new())
+            .unwrap();
+        let before = (canonical.files.len(), canonical.path_bytes);
+        for rejected in ["item", "/absolute", "../traversal"] {
+            assert_eq!(
+                canonical.prepare_next(Some(rejected)),
+                Err(StatusCode::BAD_REQUEST)
+            );
+            assert_eq!((canonical.files.len(), canonical.path_bytes), before);
+        }
     }
 
     fn request_with_body(
@@ -1207,6 +1319,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn overlong_multipart_path_rejects_before_stalled_field_body_is_read() {
+        let _environment = ENV_LOCK.lock().await;
+        let _token = PublishTokenGuard::install("structure-secret");
+        let allowed_key = [0x71; 32];
+        let server = RawServer::new_ephemeral(HashMapStorage::default()).with_publisher_policy(
+            crate::publication::PublisherPolicy::required([PublisherPublicKey::from_bytes(
+                allowed_key,
+            )]),
+        );
+        let storage = server.storage().clone();
+        let observed = server.clone();
+        let metadata_before = server.metadata_snapshot().await;
+        let header = format!(
+            "--distd-test\r\nContent-Disposition: form-data; name=\"item\"; filename=\"{}\"\r\nContent-Type: application/octet-stream\r\n\r\n",
+            "x".repeat(MAX_PUBLISHER_ENTRY_PATH_BYTES + 1)
+        );
+        let declared_length = header.len() + 1_024;
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        sender
+            .send(Ok::<_, std::io::Error>(Bytes::from(header)))
+            .await
+            .unwrap();
+        let request = request_with_body(
+            Body::from_stream(ReceiverStream::new(receiver)),
+            declared_length,
+            Some("structure-secret"),
+            allowed_key,
+        );
+        let admission = PublicationAdmission::new(declared_length, Duration::from_secs(5)).unwrap();
+        let router = make_router_with_admission(server, declared_length + 1, admission.clone());
+        let response = tokio::time::timeout(Duration::from_millis(500), router.oneshot(request))
+            .await
+            .expect("overlong path must reject from field headers without waiting for its body")
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(admission.available_bytes(), declared_length);
+        assert_eq!(storage.size(), 0);
+        assert_eq!(observed.metadata_snapshot().await, metadata_before);
+        drop(sender);
+    }
+
+    #[tokio::test]
     async fn dropped_publication_handler_releases_owned_admission() {
         let admission = test_admission(4_096);
         let router = Router::new()
@@ -1264,6 +1418,47 @@ mod tests {
         println!("publication_admission_p95_ns={p95}");
         assert!(p95 <= 10_000, "publication admission p95 {p95}ns");
         assert_eq!(admission.available_bytes(), MAX_PUBLICATION_BODY_BYTES);
+    }
+
+    #[test]
+    #[ignore = "release-only local publication structure reference"]
+    fn publication_structure_reference_performance() {
+        assert!(
+            !cfg!(debug_assertions),
+            "run the publication structure reference in release mode"
+        );
+        let paths = (0..MAX_PUBLISHER_ENTRIES)
+            .map(|index| format!("entry/{index}"))
+            .collect::<Vec<_>>();
+        let expected_path_bytes = paths.iter().map(String::len).sum::<usize>();
+        let campaign = || {
+            let started = std::time::Instant::now();
+            let mut files = UploadedFileAccumulator::new();
+            for path in &paths {
+                let (path, next_path_bytes) = files.prepare_next(Some(path)).unwrap();
+                files
+                    .retain_prepared(path, next_path_bytes, Bytes::new())
+                    .unwrap();
+            }
+            let elapsed = started.elapsed();
+            assert_eq!(files.files.len(), MAX_PUBLISHER_ENTRIES);
+            assert_eq!(files.path_bytes, expected_path_bytes);
+            assert_eq!(files.into_files().len(), MAX_PUBLISHER_ENTRIES);
+            elapsed
+        };
+        for _ in 0..3 {
+            let _ = campaign();
+        }
+        let samples = (0..10).map(|_| campaign()).collect::<Vec<_>>();
+        let mut sorted = samples.clone();
+        sorted.sort_unstable();
+        let p95 = sorted[(sorted.len() * 95).div_ceil(100) - 1];
+        println!("publication_structure_raw_ns={samples:?}");
+        println!("publication_structure_p95_ns={}", p95.as_nanos());
+        assert!(
+            p95 <= Duration::from_millis(100),
+            "publication structure p95 {p95:?}"
+        );
     }
 
     #[tokio::test]

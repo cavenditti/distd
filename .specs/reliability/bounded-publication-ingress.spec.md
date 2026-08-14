@@ -46,6 +46,11 @@ extraction allocates or retains any field payload.
   buffers and its reservation without starting storage preparation or durable
   publication. The network deadline MUST stop after extraction so it cannot
   cancel an already-owned publication coordinator.
+- {#c-structure} Multipart extraction MUST reject more than 65,536 retained
+  item fields, an item path above 4,096 UTF-8 bytes, or aggregate retained item
+  path bytes above the 32 MiB canonical-statement ceiling before reading the
+  rejected field body. Each accepted path MUST have one retained owner, and a
+  duplicate path MUST fail without retaining duplicate path or payload data.
 - {#c-observability} Rejections MUST use stable credential-free HTTP statuses
   and logs MUST NOT include body bytes, bearer tokens, publisher keys, or
   signatures. Test observability MUST prove exact reservation and release

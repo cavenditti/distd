@@ -28,6 +28,12 @@ const MAX_ARTIFACT_ID_BYTES: usize = 256;
 const MAX_ENTRY_PATH_BYTES: usize = 4_096;
 const MAX_CHUNKS: usize = 65_536;
 const MAX_ENTRIES: usize = 65_536;
+/// Maximum number of canonical file entries in one publisher statement.
+pub const MAX_PUBLISHER_ENTRIES: usize = MAX_ENTRIES;
+/// Maximum UTF-8 byte length of one canonical publisher entry path.
+pub const MAX_PUBLISHER_ENTRY_PATH_BYTES: usize = MAX_ENTRY_PATH_BYTES;
+/// Maximum encoded byte length of one canonical publisher statement.
+pub const MAX_PUBLISHER_STATEMENT_BYTES: usize = MAX_FRAME_PAYLOAD_BYTES;
 const PUBLIC_KEY_BYTES: usize = 32;
 const SIGNATURE_BYTES: usize = 64;
 const ENVELOPE_BYTES: usize = ENVELOPE_DOMAIN.len() + 2 + 2 + PUBLIC_KEY_BYTES + SIGNATURE_BYTES;
