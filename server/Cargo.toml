@@ -40,6 +40,7 @@ distd_core = { path = "../core" }
 
 [dev-dependencies]
 tower = { version = "0.4.13", features = ["util"] }
+tokio-stream = { workspace = true }
 
 [features]
 default = ["redb"]

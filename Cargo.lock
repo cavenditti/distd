@@ -625,6 +625,7 @@ dependencies = [
  "test-log",
  "thiserror 1.0.63",
  "tokio",
+ "tokio-stream",
  "tower",
  "tower-http",
  "tracing",

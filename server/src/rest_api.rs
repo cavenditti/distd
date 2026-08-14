@@ -1,5 +1,6 @@
 use std::{
     collections::HashSet, fmt::Debug, net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc,
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
@@ -8,8 +9,8 @@ use uuid::Uuid;
 use axum::{
     body::Body,
     extract::{
-        connect_info::IntoMakeServiceWithConnectInfo, ConnectInfo, DefaultBodyLimit, Multipart,
-        Path, Query, State,
+        connect_info::IntoMakeServiceWithConnectInfo, ConnectInfo, DefaultBodyLimit, Extension,
+        Multipart, Path, Query, State,
     },
     http::{header::CONTENT_LENGTH, HeaderMap, HeaderValue, Method, Request, StatusCode},
     middleware::{self, Next},
@@ -56,10 +57,11 @@ const MAX_PUBLICATION_BODY_BYTES: usize = 512 * 1024 * 1024;
 struct PublicationAdmission {
     permits: Arc<Semaphore>,
     max_bytes: u32,
+    body_timeout: Duration,
 }
 
 impl PublicationAdmission {
-    fn new(max_bytes: usize) -> Result<Self, &'static str> {
+    fn new(max_bytes: usize, body_timeout: Duration) -> Result<Self, &'static str> {
         let max_bytes = u32::try_from(max_bytes)
             .map_err(|_| "publication memory budget exceeds semaphore capacity")?;
         if max_bytes == 0 {
@@ -68,6 +70,7 @@ impl PublicationAdmission {
         Ok(Self {
             permits: Arc::new(Semaphore::new(max_bytes as usize)),
             max_bytes,
+            body_timeout,
         })
     }
 
@@ -91,6 +94,9 @@ impl PublicationAdmission {
         self.permits.available_permits()
     }
 }
+
+#[derive(Clone, Copy, Debug)]
+struct PublicationBodyDeadline(tokio::time::Instant);
 
 fn singleton_header<'a>(
     headers: &'a HeaderMap,
@@ -235,7 +241,7 @@ where
 
 async fn admit_publication_body(
     State(admission): State<PublicationAdmission>,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> impl IntoResponse {
     if request.method() != Method::POST || request.uri().path() != "/items" {
@@ -254,6 +260,9 @@ async fn admit_publication_body(
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
+    request.extensions_mut().insert(PublicationBodyDeadline(
+        tokio::time::Instant::now() + admission.body_timeout,
+    ));
     let response = next.run(request).await;
     drop(permit);
     response
@@ -442,25 +451,9 @@ fn sanitize_relative_upload_path(path: &str) -> Option<PathBuf> {
     validate_relative(std::path::Path::new(path)).ok()
 }
 
-/// Publish an item
-async fn publish_item<T>(
-    headers: HeaderMap,
-    Query(item_data): Query<ItemPostObj>,
-    State(server): State<Server<T>>,
+async fn collect_uploaded_files(
     mut multipart: Multipart,
-) -> Result<impl IntoResponse, StatusCode>
-where
-    T: ChunkStorage + Sync + Send + Debug + 'static,
-{
-    let envelope = publication_envelope(&headers)?;
-    let destination = validate_relative(&item_data.path).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let artifact_id = item_data
-        .artifact_id
-        .clone()
-        .unwrap_or_else(|| item_data.name.clone());
-    if artifact_id.is_empty() || artifact_id.len() > 256 || item_data.name.len() > 256 {
-        return Err(StatusCode::BAD_REQUEST);
-    }
+) -> Result<Vec<(PathBuf, axum::body::Bytes)>, StatusCode> {
     let mut uploaded_files = Vec::new();
     let mut uploaded_paths = HashSet::new();
 
@@ -484,10 +477,43 @@ where
         let data = field
             .bytes()
             .await
-            .inspect_err(|e| tracing::warn!("Cannot extract bytes from item field: {e}"))
+            .inspect_err(|_| {
+                tracing::warn!(
+                    phase = "multipart_body",
+                    "publication body extraction failed"
+                );
+            })
             .map_err(|error| error.status())?;
         uploaded_files.push((file_name, data));
     }
+
+    Ok(uploaded_files)
+}
+
+/// Publish an item
+async fn publish_item<T>(
+    headers: HeaderMap,
+    Query(item_data): Query<ItemPostObj>,
+    State(server): State<Server<T>>,
+    Extension(body_deadline): Extension<PublicationBodyDeadline>,
+    multipart: Multipart,
+) -> Result<impl IntoResponse, StatusCode>
+where
+    T: ChunkStorage + Sync + Send + Debug + 'static,
+{
+    let envelope = publication_envelope(&headers)?;
+    let destination = validate_relative(&item_data.path).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let artifact_id = item_data
+        .artifact_id
+        .clone()
+        .unwrap_or_else(|| item_data.name.clone());
+    if artifact_id.is_empty() || artifact_id.len() > 256 || item_data.name.len() > 256 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut uploaded_files =
+        tokio::time::timeout_at(body_deadline.0, collect_uploaded_files(multipart))
+            .await
+            .map_err(|_| StatusCode::REQUEST_TIMEOUT)??;
 
     if uploaded_files.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
@@ -695,6 +721,7 @@ fn make_router_with_limits<T>(
     server: RawServer<T>,
     body_limit: usize,
     publication_memory_bytes: usize,
+    publication_body_timeout: Duration,
 ) -> Router
 where
     T: ChunkStorage + Sync + Send + Debug + 'static,
@@ -702,7 +729,7 @@ where
     make_router_with_admission(
         server,
         body_limit,
-        PublicationAdmission::new(publication_memory_bytes)
+        PublicationAdmission::new(publication_memory_bytes, publication_body_timeout)
             .expect("validated publication memory budget"),
     )
 }
@@ -711,12 +738,18 @@ where
 pub fn make_app<T>(
     server: RawServer<T>,
     publication_memory_bytes: usize,
+    publication_body_timeout: Duration,
 ) -> IntoMakeServiceWithConnectInfo<Router, SocketAddr>
 where
     T: ChunkStorage + Sync + Send + Debug + 'static,
 {
-    make_router_with_limits(server, MAX_PUBLICATION_BODY_BYTES, publication_memory_bytes)
-        .into_make_service_with_connect_info::<SocketAddr>()
+    make_router_with_limits(
+        server,
+        MAX_PUBLICATION_BODY_BYTES,
+        publication_memory_bytes,
+        publication_body_timeout,
+    )
+    .into_make_service_with_connect_info::<SocketAddr>()
 }
 
 #[cfg(test)]
@@ -733,6 +766,7 @@ mod tests {
         },
     };
     use ring::signature::{Ed25519KeyPair, KeyPair};
+    use tokio_stream::wrappers::ReceiverStream;
     use tower::ServiceExt;
 
     static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -768,8 +802,12 @@ mod tests {
         body
     }
 
-    fn request(body: Vec<u8>, bearer: Option<&str>, key: [u8; 32]) -> Request<Body> {
-        let content_length = body.len();
+    fn request_with_body(
+        body: Body,
+        content_length: usize,
+        bearer: Option<&str>,
+        key: [u8; 32],
+    ) -> Request<Body> {
         let mut request = Request::builder()
             .method(Method::POST)
             .uri("/items?artifact_id=route-test&name=route-test&path=route.bin&chunking=fixed")
@@ -788,7 +826,16 @@ mod tests {
                 format!("Bearer {bearer}"),
             );
         }
-        request.body(Body::from(body)).unwrap()
+        request.body(body).unwrap()
+    }
+
+    fn request(body: Vec<u8>, bearer: Option<&str>, key: [u8; 32]) -> Request<Body> {
+        let content_length = body.len();
+        request_with_body(Body::from(body), content_length, bearer, key)
+    }
+
+    fn test_admission(max_bytes: usize) -> PublicationAdmission {
+        PublicationAdmission::new(max_bytes, Duration::from_secs(60)).unwrap()
     }
 
     fn signed_headers() -> HeaderMap {
@@ -950,7 +997,7 @@ mod tests {
         let exact_body = multipart_body(b"x");
         let over_body = multipart_body(b"xy");
         assert_eq!(over_body.len(), exact_body.len() + 1);
-        let admission = PublicationAdmission::new(MAX_PUBLICATION_BODY_BYTES).unwrap();
+        let admission = test_admission(MAX_PUBLICATION_BODY_BYTES);
         let held = Arc::clone(&admission.permits)
             .try_acquire_many_owned(MAX_PUBLICATION_BODY_BYTES as u32)
             .unwrap();
@@ -1022,7 +1069,7 @@ mod tests {
         let storage = server.storage().clone();
         let observed = server.clone();
         let body = multipart_body(b"admitted");
-        let admission = PublicationAdmission::new(body.len()).unwrap();
+        let admission = test_admission(body.len());
         let held = Arc::clone(&admission.permits)
             .try_acquire_many_owned(body.len() as u32)
             .unwrap();
@@ -1101,8 +1148,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stalled_partial_multipart_times_out_before_storage_and_releases_admission() {
+        let _environment = ENV_LOCK.lock().await;
+        let _token = PublishTokenGuard::install("deadline-secret");
+        let allowed_key = [0x61; 32];
+        let directory = std::env::temp_dir().join(format!(
+            "distd-rest-publication-deadline-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let paths = crate::metadata_state::MetadataPaths::in_state_directory(&directory);
+        let (store, metadata) =
+            crate::metadata_state::MetadataStateStore::open_with_validator(paths.clone(), |_| {
+                Ok(())
+            })
+            .unwrap();
+        let durable_before = std::fs::read(&paths.current).unwrap();
+        let server = RawServer::new_ephemeral_with_metadata(HashMapStorage::default(), metadata)
+            .with_publisher_policy(crate::publication::PublisherPolicy::required([
+                PublisherPublicKey::from_bytes(allowed_key),
+            ]))
+            .with_metadata_store(store);
+        let storage = server.storage().clone();
+        let observed = server.clone();
+        let metadata_before = server.metadata_snapshot().await;
+
+        let complete = multipart_body(b"never-completes");
+        let partial_length = complete.len() - b"\r\n--distd-test--\r\n".len();
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        sender
+            .send(Ok::<_, std::io::Error>(Bytes::copy_from_slice(
+                &complete[..partial_length],
+            )))
+            .await
+            .unwrap();
+        let request = request_with_body(
+            Body::from_stream(ReceiverStream::new(receiver)),
+            complete.len(),
+            Some("deadline-secret"),
+            allowed_key,
+        );
+        let admission =
+            PublicationAdmission::new(complete.len(), Duration::from_millis(20)).unwrap();
+        let router = make_router_with_admission(server, complete.len() + 1, admission.clone());
+        let response = tokio::time::timeout(Duration::from_secs(1), router.oneshot(request))
+            .await
+            .expect("stalled multipart must meet its configured deadline")
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(admission.available_bytes(), complete.len());
+        assert_eq!(storage.size(), 0);
+        assert_eq!(observed.metadata_snapshot().await, metadata_before);
+        assert_eq!(std::fs::read(&paths.current).unwrap(), durable_before);
+
+        drop(sender);
+        drop(observed);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
     async fn dropped_publication_handler_releases_owned_admission() {
-        let admission = PublicationAdmission::new(4_096).unwrap();
+        let admission = test_admission(4_096);
         let router = Router::new()
             .route(
                 "/items",
@@ -1134,7 +1240,7 @@ mod tests {
             !cfg!(debug_assertions),
             "run the publication admission reference in release mode"
         );
-        let admission = PublicationAdmission::new(MAX_PUBLICATION_BODY_BYTES).unwrap();
+        let admission = test_admission(MAX_PUBLICATION_BODY_BYTES);
         for _ in 0..1_000 {
             drop(
                 Arc::clone(&admission.permits)
@@ -1207,7 +1313,7 @@ mod tests {
             )
             .body(Body::from(body.clone()))
             .unwrap();
-        let admission = PublicationAdmission::new(body.len() + 1).unwrap();
+        let admission = test_admission(body.len() + 1);
         let response = make_router_with_admission(server, body.len() + 1, admission.clone())
             .oneshot(request)
             .await

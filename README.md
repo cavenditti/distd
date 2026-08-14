@@ -55,6 +55,7 @@ export DISTD_SERVER_STATE_DIR="$PWD/.distd-server-state"
 export DISTD_STORAGE=fs
 export DISTD_STORAGE_ROOT="$PWD/.distd-server-storage"
 export DISTD_PUBLICATION_MEMORY_MIB=512
+export DISTD_PUBLICATION_BODY_TIMEOUT_SECS=600
 cargo run -p distd_server
 ```
 
@@ -117,6 +118,12 @@ through 2,048 MiB). `POST /items` requires `Content-Length`; a request that
 cannot fit returns 413, while temporary aggregate exhaustion fails fast with
 429 before multipart fields are buffered. The reservation remains held through
 durable publication and is released on every completion or cancellation path.
+`DISTD_PUBLICATION_BODY_TIMEOUT_SECS` applies an absolute body-transfer
+deadline after admission (default 600 seconds; accepted range: 1 through
+86,400). A stalled or trickled multipart body returns 408 and releases its
+partial buffers and reservation before storage preparation begins; the
+deadline ends once extraction completes and never cancels an owned durable
+publication.
 
 Reusing `artifact_id` creates a new immutable version only when its content or
 relevant metadata changes. `name` and `path` may change without changing the

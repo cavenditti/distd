@@ -3,7 +3,7 @@ use distd_core::chunk_storage::hashmap_storage::HashMapStorage;
 use distd_core::chunk_storage::ChunkStorage;
 use distd_core::feed::Feed;
 use distd_core::signature::PublisherPublicKey;
-use std::{collections::HashSet, net::SocketAddr};
+use std::{collections::HashSet, net::SocketAddr, time::Duration};
 
 use crate::client::Client;
 use crate::metadata_state::{MetadataPaths, MetadataStateStore};
@@ -27,6 +27,9 @@ const ALLOW_UNSIGNED_PUBLICATION_ENV: &str = "DISTD_ALLOW_UNSIGNED_PUBLICATION";
 const PUBLICATION_MEMORY_MIB_ENV: &str = "DISTD_PUBLICATION_MEMORY_MIB";
 const DEFAULT_PUBLICATION_MEMORY_MIB: usize = 512;
 const MAX_PUBLICATION_MEMORY_MIB: usize = 2_048;
+const PUBLICATION_BODY_TIMEOUT_SECS_ENV: &str = "DISTD_PUBLICATION_BODY_TIMEOUT_SECS";
+const DEFAULT_PUBLICATION_BODY_TIMEOUT_SECS: u64 = 600;
+const MAX_PUBLICATION_BODY_TIMEOUT_SECS: u64 = 86_400;
 const MAX_PUBLISHER_KEYS: usize = 1_024;
 
 #[derive(Clone)]
@@ -168,6 +171,31 @@ fn publication_memory_bytes(mebibytes: usize) -> Result<usize, String> {
     Ok(bytes)
 }
 
+fn parse_publication_body_timeout_secs(configured: Option<&str>) -> Result<u64, String> {
+    let Some(configured) = configured else {
+        return Ok(DEFAULT_PUBLICATION_BODY_TIMEOUT_SECS);
+    };
+    if configured.is_empty()
+        || (configured.len() > 1 && configured.starts_with('0'))
+        || !configured.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(format!(
+            "{PUBLICATION_BODY_TIMEOUT_SECS_ENV} must be a canonical integer from 1 through {MAX_PUBLICATION_BODY_TIMEOUT_SECS}"
+        ));
+    }
+    let seconds = configured.parse::<u64>().map_err(|_| {
+        format!(
+            "{PUBLICATION_BODY_TIMEOUT_SECS_ENV} must be a canonical integer from 1 through {MAX_PUBLICATION_BODY_TIMEOUT_SECS}"
+        )
+    })?;
+    if !(1..=MAX_PUBLICATION_BODY_TIMEOUT_SECS).contains(&seconds) {
+        return Err(format!(
+            "{PUBLICATION_BODY_TIMEOUT_SECS_ENV} must be from 1 through {MAX_PUBLICATION_BODY_TIMEOUT_SECS}"
+        ));
+    }
+    Ok(seconds)
+}
+
 fn parse_http_bind_policy(
     configured_bind: Option<&str>,
     configured_override: Option<&str>,
@@ -258,13 +286,18 @@ async fn run_server<T>(
     http_addr: SocketAddr,
     quic_settings: QuicResourceSettings,
     publication_memory_bytes: usize,
+    publication_body_timeout: Duration,
 ) where
     T: ChunkStorage + Send + Sync + std::fmt::Debug + 'static,
 {
     let feed = Feed::new("A feed");
     let _ = server.expose_feed(feed).await;
 
-    let app = rest_api::make_app(server.clone(), publication_memory_bytes);
+    let app = rest_api::make_app(
+        server.clone(),
+        publication_memory_bytes,
+        publication_body_timeout,
+    );
 
     let addr_quic = "0.0.0.0:50051".parse().unwrap();
     tokio::spawn(async move {
@@ -333,8 +366,17 @@ async fn main() {
             eprintln!("Invalid publication memory configuration: {error}");
             std::process::exit(2);
         });
+    let publication_body_timeout_secs =
+        optional_utf8_environment(PUBLICATION_BODY_TIMEOUT_SECS_ENV)
+            .and_then(|value| parse_publication_body_timeout_secs(value.as_deref()))
+            .unwrap_or_else(|error| {
+                eprintln!("Invalid publication body timeout configuration: {error}");
+                std::process::exit(2);
+            });
+    let publication_body_timeout = Duration::from_secs(publication_body_timeout_secs);
     tracing::info!(
         publication_memory_mib,
+        publication_body_timeout_secs,
         "configured aggregate REST publication-body budget"
     );
     if publisher.policy.permits_unsigned() {
@@ -410,7 +452,14 @@ async fn main() {
                 .with_enrollment_token(enrollment_token.clone())
                 .with_publisher_policy(publisher_policy.clone())
                 .with_metadata_store(metadata_store);
-            run_server(server, http_addr, quic_settings, publication_memory_bytes).await;
+            run_server(
+                server,
+                http_addr,
+                quic_settings,
+                publication_memory_bytes,
+                publication_body_timeout,
+            )
+            .await;
         }
         #[cfg(feature = "redb")]
         "redb" => {
@@ -433,14 +482,28 @@ async fn main() {
                 .with_enrollment_token(enrollment_token.clone())
                 .with_publisher_policy(publisher_policy.clone())
                 .with_metadata_store(metadata_store);
-            run_server(server, http_addr, quic_settings, publication_memory_bytes).await;
+            run_server(
+                server,
+                http_addr,
+                quic_settings,
+                publication_memory_bytes,
+                publication_body_timeout,
+            )
+            .await;
         }
         "memory" => {
             tracing::info!("Using in-memory storage (ephemeral)");
             let server = Server::new_ephemeral(HashMapStorage::default())
                 .with_enrollment_token(enrollment_token.clone())
                 .with_publisher_policy(publisher_policy.clone());
-            run_server(server, http_addr, quic_settings, publication_memory_bytes).await;
+            run_server(
+                server,
+                http_addr,
+                quic_settings,
+                publication_memory_bytes,
+                publication_body_timeout,
+            )
+            .await;
         }
         other => {
             eprintln!(
@@ -454,11 +517,12 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_http_bind_policy, parse_publication_memory_mib, parse_publisher_policy,
-        publication_memory_bytes, ALLOW_INSECURE_REMOTE_HTTP_ENV, ALLOW_UNSIGNED_PUBLICATION_ENV,
-        DEFAULT_HTTP_BIND, DEFAULT_PUBLICATION_MEMORY_MIB, HTTP_BIND_ENV,
-        MAX_PUBLICATION_MEMORY_MIB, MAX_PUBLISHER_KEYS, PUBLICATION_MEMORY_MIB_ENV,
-        PUBLISHER_PUBLIC_KEYS_ENV,
+        parse_http_bind_policy, parse_publication_body_timeout_secs, parse_publication_memory_mib,
+        parse_publisher_policy, publication_memory_bytes, ALLOW_INSECURE_REMOTE_HTTP_ENV,
+        ALLOW_UNSIGNED_PUBLICATION_ENV, DEFAULT_HTTP_BIND, DEFAULT_PUBLICATION_BODY_TIMEOUT_SECS,
+        DEFAULT_PUBLICATION_MEMORY_MIB, HTTP_BIND_ENV, MAX_PUBLICATION_BODY_TIMEOUT_SECS,
+        MAX_PUBLICATION_MEMORY_MIB, MAX_PUBLISHER_KEYS, PUBLICATION_BODY_TIMEOUT_SECS_ENV,
+        PUBLICATION_MEMORY_MIB_ENV, PUBLISHER_PUBLIC_KEYS_ENV,
     };
 
     fn publisher_key(index: usize) -> String {
@@ -642,6 +706,35 @@ mod tests {
         ] {
             let error = parse_publication_memory_mib(Some(value)).unwrap_err();
             assert!(error.contains(PUBLICATION_MEMORY_MIB_ENV));
+        }
+    }
+
+    #[test]
+    fn publication_body_timeout_is_canonical_checked_and_bounded() {
+        assert_eq!(
+            parse_publication_body_timeout_secs(None).unwrap(),
+            DEFAULT_PUBLICATION_BODY_TIMEOUT_SECS
+        );
+        for value in [1u64, 600, MAX_PUBLICATION_BODY_TIMEOUT_SECS] {
+            assert_eq!(
+                parse_publication_body_timeout_secs(Some(&value.to_string())).unwrap(),
+                value
+            );
+        }
+        for value in [
+            "",
+            "0",
+            "01",
+            "+1",
+            "-1",
+            "1.0",
+            " 1",
+            "86401",
+            "18446744073709551616",
+            "not-a-number",
+        ] {
+            let error = parse_publication_body_timeout_secs(Some(value)).unwrap_err();
+            assert!(error.contains(PUBLICATION_BODY_TIMEOUT_SECS_ENV));
         }
     }
 }

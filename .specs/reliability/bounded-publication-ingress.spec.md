@@ -40,6 +40,12 @@ extraction allocates or retains any field payload.
   request has finished validation, storage preparation, durable publication,
   and response construction, and MUST release on success, rejection,
   cancellation, panic unwind, or connection loss.
+- {#c-progress} The server MUST apply one absolute configurable deadline from
+  successful admission through complete multipart field extraction. A stalled
+  or trickled body that misses the deadline MUST release all partial field
+  buffers and its reservation without starting storage preparation or durable
+  publication. The network deadline MUST stop after extraction so it cannot
+  cancel an already-owned publication coordinator.
 - {#c-observability} Rejections MUST use stable credential-free HTTP statuses
   and logs MUST NOT include body bytes, bearer tokens, publisher keys, or
   signatures. Test observability MUST prove exact reservation and release
