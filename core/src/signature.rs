@@ -16,8 +16,14 @@ use crate::{
 
 const STATEMENT_DOMAIN: &[u8] = b"distd publisher statement v1\0";
 const ENVELOPE_DOMAIN: &[u8] = b"distd publisher signature envelope v1\0";
+const RELEASE_STATEMENT_DOMAIN: &[u8] = b"distd publisher release statement v2\0";
+const RELEASE_ENVELOPE_DOMAIN: &[u8] = b"distd publisher release envelope v2\0";
+const RELEASE_IDENTITY_DOMAIN: &[u8] = b"distd publisher release identity v1\0";
 const FINGERPRINT_DOMAIN: &[u8] = b"distd publisher public key fingerprint v1\0";
-const FORMAT_VERSION: u16 = 1;
+/// Format version of the replayable publisher content statement.
+pub const PUBLISHER_STATEMENT_VERSION_V1: u16 = 1;
+/// Format version of the rollback-protected publisher release statement.
+pub const PUBLISHER_RELEASE_STATEMENT_VERSION_V2: u16 = 2;
 const MAX_ARTIFACT_ID_BYTES: usize = 256;
 const MAX_ENTRY_PATH_BYTES: usize = 4_096;
 const MAX_CHUNKS: usize = 65_536;
@@ -25,6 +31,8 @@ const MAX_ENTRIES: usize = 65_536;
 const PUBLIC_KEY_BYTES: usize = 32;
 const SIGNATURE_BYTES: usize = 64;
 const ENVELOPE_BYTES: usize = ENVELOPE_DOMAIN.len() + 2 + 2 + PUBLIC_KEY_BYTES + SIGNATURE_BYTES;
+const RELEASE_ENVELOPE_BYTES: usize =
+    RELEASE_ENVELOPE_DOMAIN.len() + 2 + 2 + PUBLIC_KEY_BYTES + SIGNATURE_BYTES;
 
 /// Errors produced by the canonical publisher statement and signature format.
 #[non_exhaustive]
@@ -160,6 +168,53 @@ impl FromStr for PublisherKeyFingerprint {
     }
 }
 
+/// A publisher-controlled, artifact-scoped monotonic release sequence.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PublisherReleaseSequence(u64);
+
+impl PublisherReleaseSequence {
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl From<u64> for PublisherReleaseSequence {
+    fn from(value: u64) -> Self {
+        Self::new(value)
+    }
+}
+
+/// A domain-separated identity of one exact canonical V2 release statement.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PublisherReleaseIdentity([u8; 32]);
+
+impl PublisherReleaseIdentity {
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Display for PublisherReleaseIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
 /// A fully decoded and validated canonical publisher statement.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PublisherStatement {
@@ -195,7 +250,7 @@ impl PublisherStatement {
         let mut reader = Reader::new(bytes);
         reader.expect_domain(STATEMENT_DOMAIN)?;
         let version = reader.u16()?;
-        if version != FORMAT_VERSION {
+        if version != PUBLISHER_STATEMENT_VERSION_V1 {
             return Err(SignatureEnvelopeError::UnsupportedStatementVersion(version));
         }
         let body_length = usize::try_from(reader.u32()?)
@@ -281,7 +336,7 @@ impl PublisherStatement {
     ) -> Result<Self, SignatureEnvelopeError> {
         let mut bytes = Vec::with_capacity(encoded_size);
         bytes.extend_from_slice(STATEMENT_DOMAIN);
-        push_u16(&mut bytes, FORMAT_VERSION);
+        push_u16(&mut bytes, PUBLISHER_STATEMENT_VERSION_V1);
         let body_length_offset = bytes.len();
         push_u32(&mut bytes, 0);
         let body_start = bytes.len();
@@ -325,6 +380,196 @@ impl PublisherStatement {
     }
 }
 
+/// A fully decoded and validated canonical V2 publisher release statement.
+///
+/// Unlike [`PublisherStatement`], this statement signs the publisher-controlled
+/// artifact release sequence used by rollback policy.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublisherReleaseStatement {
+    bytes: Vec<u8>,
+    sequence: PublisherReleaseSequence,
+}
+
+impl PublisherReleaseStatement {
+    /// Construct the canonical V2 release statement from a typed sync manifest
+    /// and its ordered chunk identities.
+    pub fn from_manifest(
+        manifest: &Manifest,
+        chunks: &[ChunkInfo],
+        sequence: PublisherReleaseSequence,
+    ) -> Result<Self, SignatureEnvelopeError> {
+        let v1_size = validate_manifest(manifest, chunks)?;
+        Self::encode_validated(manifest, chunks, sequence, release_statement_size(v1_size)?)
+    }
+
+    /// Construct the canonical V2 release statement from an authoritative
+    /// typed item.
+    pub fn from_item(
+        item: &Item,
+        sequence: PublisherReleaseSequence,
+    ) -> Result<Self, SignatureEnvelopeError> {
+        validate_revision_metadata(item)
+            .map_err(|_| SignatureEnvelopeError::InvalidStatement("invalid item metadata"))?;
+        let v1_size = validate_manifest_after_valid_item(&item.manifest, &item.chunks)?;
+        Self::encode_validated(
+            &item.manifest,
+            &item.chunks,
+            sequence,
+            release_statement_size(v1_size)?,
+        )
+    }
+
+    /// Decode exact canonical V2 release statement bytes for fixtures and
+    /// external signing tooling.
+    pub fn decode(bytes: &[u8]) -> Result<Self, SignatureEnvelopeError> {
+        if bytes.len() > MAX_FRAME_PAYLOAD_BYTES {
+            return Err(SignatureEnvelopeError::StatementLimit {
+                field: "statement bytes",
+                limit: MAX_FRAME_PAYLOAD_BYTES,
+            });
+        }
+        let mut reader = Reader::new(bytes);
+        reader.expect_domain(RELEASE_STATEMENT_DOMAIN)?;
+        let version = reader.u16()?;
+        if version != PUBLISHER_RELEASE_STATEMENT_VERSION_V2 {
+            return Err(SignatureEnvelopeError::UnsupportedStatementVersion(version));
+        }
+        let body_length = usize::try_from(reader.u32()?)
+            .map_err(|_| SignatureEnvelopeError::InvalidStatement("body length overflows usize"))?;
+        if body_length != reader.remaining() {
+            return Err(if body_length > reader.remaining() {
+                SignatureEnvelopeError::Truncated
+            } else {
+                SignatureEnvelopeError::TrailingBytes
+            });
+        }
+
+        let artifact_id = reader.utf8_u16("artifact ID", MAX_ARTIFACT_ID_BYTES)?;
+        let sequence = PublisherReleaseSequence::new(reader.u64()?);
+        let root_hash = Hash::from_bytes(reader.array()?);
+        let total_size = reader.u64()?;
+        let chunk_algorithm = decode_algorithm(&mut reader)?;
+        let chunk_count = reader.bounded_count("chunks", MAX_CHUNKS, 40)?;
+        if chunk_count == 0 {
+            return Err(SignatureEnvelopeError::InvalidStatement(
+                "chunk list is empty",
+            ));
+        }
+        let mut chunks = Vec::with_capacity(chunk_count);
+        for _ in 0..chunk_count {
+            chunks.push(ChunkInfo {
+                hash: Hash::from_bytes(reader.array()?),
+                size: reader.u64()?,
+            });
+        }
+        let entry_count = reader.bounded_count("entries", MAX_ENTRIES, 18)?;
+        let mut entries = Vec::with_capacity(entry_count);
+        for _ in 0..entry_count {
+            entries.push(FileEntry {
+                relative_path: reader.utf8_u16("entry path", MAX_ENTRY_PATH_BYTES)?,
+                size: reader.u64()?,
+                chunk_range: (reader.u32()?, reader.u32()?),
+            });
+        }
+        if reader.remaining() != 0 {
+            return Err(SignatureEnvelopeError::TrailingBytes);
+        }
+
+        let manifest = Manifest {
+            artifact_id,
+            version: 0,
+            root_hash,
+            total_size,
+            chunk_count: u32::try_from(chunks.len()).expect("bounded chunk count fits u32"),
+            chunk_size: chunk_algorithm.nominal_chunk_size(),
+            chunk_algorithm,
+            entries,
+        };
+        validate_manifest(&manifest, &chunks)?;
+        drop(manifest);
+        drop(chunks);
+        Ok(Self {
+            bytes: bytes.to_vec(),
+            sequence,
+        })
+    }
+
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    #[must_use]
+    pub const fn sequence(&self) -> PublisherReleaseSequence {
+        self.sequence
+    }
+
+    #[must_use]
+    pub fn identity(&self) -> PublisherReleaseIdentity {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(RELEASE_IDENTITY_DOMAIN);
+        hasher.update(&self.bytes);
+        PublisherReleaseIdentity::from_bytes(*hasher.finalize().as_bytes())
+    }
+
+    fn encode_validated(
+        manifest: &Manifest,
+        chunks: &[ChunkInfo],
+        sequence: PublisherReleaseSequence,
+        encoded_size: usize,
+    ) -> Result<Self, SignatureEnvelopeError> {
+        let mut bytes = Vec::with_capacity(encoded_size);
+        bytes.extend_from_slice(RELEASE_STATEMENT_DOMAIN);
+        push_u16(&mut bytes, PUBLISHER_RELEASE_STATEMENT_VERSION_V2);
+        let body_length_offset = bytes.len();
+        push_u32(&mut bytes, 0);
+        let body_start = bytes.len();
+        push_string_u16(&mut bytes, &manifest.artifact_id)?;
+        push_u64(&mut bytes, sequence.get());
+        bytes.extend_from_slice(manifest.root_hash.as_bytes());
+        push_u64(&mut bytes, manifest.total_size);
+        encode_algorithm(&mut bytes, manifest.chunk_algorithm);
+        push_u32(
+            &mut bytes,
+            u32::try_from(chunks.len()).expect("validated chunk count fits u32"),
+        );
+        for chunk in chunks {
+            bytes.extend_from_slice(chunk.hash.as_bytes());
+            push_u64(&mut bytes, chunk.size);
+        }
+        push_u32(
+            &mut bytes,
+            u32::try_from(manifest.entries.len()).expect("validated entry count fits u32"),
+        );
+        for entry in &manifest.entries {
+            push_string_u16(&mut bytes, &entry.relative_path)?;
+            push_u64(&mut bytes, entry.size);
+            push_u32(&mut bytes, entry.chunk_range.0);
+            push_u32(&mut bytes, entry.chunk_range.1);
+        }
+        if bytes.len() != encoded_size || bytes.len() > MAX_FRAME_PAYLOAD_BYTES {
+            return Err(SignatureEnvelopeError::StatementLimit {
+                field: "statement bytes",
+                limit: MAX_FRAME_PAYLOAD_BYTES,
+            });
+        }
+        let body_length = u32::try_from(bytes.len() - body_start).map_err(|_| {
+            SignatureEnvelopeError::StatementLimit {
+                field: "statement bytes",
+                limit: MAX_FRAME_PAYLOAD_BYTES,
+            }
+        })?;
+        bytes[body_length_offset..body_length_offset + 4]
+            .copy_from_slice(&body_length.to_le_bytes());
+        Ok(Self { bytes, sequence })
+    }
+}
+
 /// A fixed-width detached Ed25519 signature envelope.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PublisherSignatureEnvelope {
@@ -345,13 +590,13 @@ impl PublisherSignatureEnvelope {
         let mut reader = Reader::new(bytes);
         reader.expect_domain(ENVELOPE_DOMAIN)?;
         let envelope_version = reader.u16()?;
-        if envelope_version != FORMAT_VERSION {
+        if envelope_version != PUBLISHER_STATEMENT_VERSION_V1 {
             return Err(SignatureEnvelopeError::UnsupportedEnvelopeVersion(
                 envelope_version,
             ));
         }
         let statement_version = reader.u16()?;
-        if statement_version != FORMAT_VERSION {
+        if statement_version != PUBLISHER_STATEMENT_VERSION_V1 {
             return Err(SignatureEnvelopeError::UnsupportedStatementVersion(
                 statement_version,
             ));
@@ -369,8 +614,16 @@ impl PublisherSignatureEnvelope {
         let mut bytes = [0u8; ENVELOPE_BYTES];
         let mut offset = 0;
         copy_to_array(&mut bytes, &mut offset, ENVELOPE_DOMAIN);
-        copy_to_array(&mut bytes, &mut offset, &FORMAT_VERSION.to_le_bytes());
-        copy_to_array(&mut bytes, &mut offset, &FORMAT_VERSION.to_le_bytes());
+        copy_to_array(
+            &mut bytes,
+            &mut offset,
+            &PUBLISHER_STATEMENT_VERSION_V1.to_le_bytes(),
+        );
+        copy_to_array(
+            &mut bytes,
+            &mut offset,
+            &PUBLISHER_STATEMENT_VERSION_V1.to_le_bytes(),
+        );
         copy_to_array(&mut bytes, &mut offset, self.public_key.as_bytes());
         copy_to_array(&mut bytes, &mut offset, self.signature.as_bytes());
         bytes
@@ -415,6 +668,156 @@ impl PublisherSignatureEnvelope {
 }
 
 impl TryFrom<&[u8]> for PublisherSignatureEnvelope {
+    type Error = SignatureEnvelopeError;
+
+    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+        Self::decode(bytes)
+    }
+}
+
+/// Proof returned only after a V2 release statement has been reconstructed and
+/// its detached Ed25519 signature has verified.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VerifiedPublisherRelease {
+    publisher_fingerprint: PublisherKeyFingerprint,
+    sequence: PublisherReleaseSequence,
+    statement_identity: PublisherReleaseIdentity,
+}
+
+impl VerifiedPublisherRelease {
+    #[must_use]
+    pub const fn publisher_fingerprint(&self) -> PublisherKeyFingerprint {
+        self.publisher_fingerprint
+    }
+
+    #[must_use]
+    pub const fn sequence(&self) -> PublisherReleaseSequence {
+        self.sequence
+    }
+
+    #[must_use]
+    pub const fn statement_identity(&self) -> PublisherReleaseIdentity {
+        self.statement_identity
+    }
+}
+
+/// A fixed-width detached Ed25519 envelope for a V2 publisher release
+/// statement. It is intentionally type-distinct from the replayable V1
+/// [`PublisherSignatureEnvelope`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PublisherReleaseEnvelope {
+    public_key: PublisherPublicKey,
+    signature: PublisherSignature,
+}
+
+impl PublisherReleaseEnvelope {
+    /// Exact encoded byte length of a V2 publisher release envelope.
+    pub const ENCODED_LEN: usize = RELEASE_ENVELOPE_BYTES;
+
+    #[must_use]
+    pub const fn from_parts(public_key: PublisherPublicKey, signature: PublisherSignature) -> Self {
+        Self {
+            public_key,
+            signature,
+        }
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, SignatureEnvelopeError> {
+        let mut reader = Reader::new(bytes);
+        reader.expect_domain(RELEASE_ENVELOPE_DOMAIN)?;
+        let envelope_version = reader.u16()?;
+        if envelope_version != PUBLISHER_RELEASE_STATEMENT_VERSION_V2 {
+            return Err(SignatureEnvelopeError::UnsupportedEnvelopeVersion(
+                envelope_version,
+            ));
+        }
+        let statement_version = reader.u16()?;
+        if statement_version != PUBLISHER_RELEASE_STATEMENT_VERSION_V2 {
+            return Err(SignatureEnvelopeError::UnsupportedStatementVersion(
+                statement_version,
+            ));
+        }
+        let public_key = PublisherPublicKey::from_bytes(reader.array()?);
+        let signature = PublisherSignature::from_bytes(reader.array()?);
+        if reader.remaining() != 0 {
+            return Err(SignatureEnvelopeError::TrailingBytes);
+        }
+        Ok(Self::from_parts(public_key, signature))
+    }
+
+    #[must_use]
+    pub fn encode(&self) -> [u8; RELEASE_ENVELOPE_BYTES] {
+        let mut bytes = [0u8; RELEASE_ENVELOPE_BYTES];
+        let mut offset = 0;
+        copy_to_array(&mut bytes, &mut offset, RELEASE_ENVELOPE_DOMAIN);
+        copy_to_array(
+            &mut bytes,
+            &mut offset,
+            &PUBLISHER_RELEASE_STATEMENT_VERSION_V2.to_le_bytes(),
+        );
+        copy_to_array(
+            &mut bytes,
+            &mut offset,
+            &PUBLISHER_RELEASE_STATEMENT_VERSION_V2.to_le_bytes(),
+        );
+        copy_to_array(&mut bytes, &mut offset, self.public_key.as_bytes());
+        copy_to_array(&mut bytes, &mut offset, self.signature.as_bytes());
+        bytes
+    }
+
+    #[must_use]
+    pub const fn public_key(&self) -> PublisherPublicKey {
+        self.public_key
+    }
+
+    #[must_use]
+    pub const fn signature(&self) -> PublisherSignature {
+        self.signature
+    }
+
+    #[must_use]
+    pub fn publisher_fingerprint(&self) -> PublisherKeyFingerprint {
+        self.public_key.fingerprint()
+    }
+
+    /// Reconstruct and verify a V2 release statement from a fully validated
+    /// typed item and its publisher-controlled sequence.
+    pub fn verify(
+        &self,
+        item: &Item,
+        sequence: PublisherReleaseSequence,
+    ) -> Result<VerifiedPublisherRelease, SignatureEnvelopeError> {
+        let statement = PublisherReleaseStatement::from_item(item, sequence)?;
+        self.verify_statement(&statement)
+    }
+
+    /// Validate and verify a typed sync manifest before chunk negotiation.
+    pub fn verify_manifest(
+        &self,
+        manifest: &Manifest,
+        chunks: &[ChunkInfo],
+        sequence: PublisherReleaseSequence,
+    ) -> Result<VerifiedPublisherRelease, SignatureEnvelopeError> {
+        let statement = PublisherReleaseStatement::from_manifest(manifest, chunks, sequence)?;
+        self.verify_statement(&statement)
+    }
+
+    fn verify_statement(
+        &self,
+        statement: &PublisherReleaseStatement,
+    ) -> Result<VerifiedPublisherRelease, SignatureEnvelopeError> {
+        signature::UnparsedPublicKey::new(&signature::ED25519, self.public_key.as_bytes())
+            .verify(statement.as_bytes(), self.signature.as_bytes())
+            .map_err(|_| SignatureEnvelopeError::InvalidSignature)?;
+        Ok(VerifiedPublisherRelease {
+            publisher_fingerprint: self.publisher_fingerprint(),
+            sequence: statement.sequence(),
+            statement_identity: statement.identity(),
+        })
+    }
+}
+
+impl TryFrom<&[u8]> for PublisherReleaseEnvelope {
     type Error = SignatureEnvelopeError;
 
     fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
@@ -850,6 +1253,24 @@ fn estimated_statement_size(
     Ok(size)
 }
 
+fn release_statement_size(v1_size: usize) -> Result<usize, SignatureEnvelopeError> {
+    let size = v1_size
+        .checked_sub(STATEMENT_DOMAIN.len())
+        .and_then(|value| value.checked_add(RELEASE_STATEMENT_DOMAIN.len()))
+        .and_then(|value| value.checked_add(8))
+        .ok_or(SignatureEnvelopeError::StatementLimit {
+            field: "statement bytes",
+            limit: MAX_FRAME_PAYLOAD_BYTES,
+        })?;
+    if size > MAX_FRAME_PAYLOAD_BYTES {
+        return Err(SignatureEnvelopeError::StatementLimit {
+            field: "statement bytes",
+            limit: MAX_FRAME_PAYLOAD_BYTES,
+        });
+    }
+    Ok(size)
+}
+
 const fn encoded_algorithm_size(algorithm: ChunkAlgorithm) -> usize {
     match algorithm {
         ChunkAlgorithm::Fixed256K => 1,
@@ -1189,6 +1610,28 @@ mod tests {
         (envelope, key)
     }
 
+    fn signed_release(
+        item: &Item,
+        sequence: PublisherReleaseSequence,
+    ) -> (
+        PublisherReleaseStatement,
+        PublisherReleaseEnvelope,
+        ring::signature::Ed25519KeyPair,
+    ) {
+        let key = ring::signature::Ed25519KeyPair::from_pkcs8(
+            ring::signature::Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
+                .unwrap()
+                .as_ref(),
+        )
+        .unwrap();
+        let statement = PublisherReleaseStatement::from_item(item, sequence).unwrap();
+        let envelope = PublisherReleaseEnvelope::from_parts(
+            PublisherPublicKey::try_from(key.public_key().as_ref()).unwrap(),
+            PublisherSignature::try_from(key.sign(statement.as_bytes()).as_ref()).unwrap(),
+        );
+        (statement, envelope, key)
+    }
+
     fn directory_item() -> Item {
         item_for(
             &[b"alpha", b"", b"omega"],
@@ -1242,6 +1685,228 @@ mod tests {
             PublisherStatement::from_item(&changed).unwrap().as_bytes(),
             statement.as_bytes()
         );
+    }
+
+    #[test]
+    fn release_statement_signs_sequence_but_not_server_revision() {
+        let item = directory_item();
+        let sequence = PublisherReleaseSequence::new(0);
+        let statement = PublisherReleaseStatement::from_item(&item, sequence).unwrap();
+        assert_eq!(statement.sequence(), sequence);
+        assert_eq!(statement.bytes.capacity(), statement.as_bytes().len());
+        assert_eq!(
+            PublisherReleaseStatement::decode(statement.as_bytes()).unwrap(),
+            statement
+        );
+
+        let v1 = PublisherStatement::from_item(&item).unwrap();
+        assert_eq!(
+            statement.as_bytes().len(),
+            v1.as_bytes().len() - STATEMENT_DOMAIN.len() + RELEASE_STATEMENT_DOMAIN.len() + 8
+        );
+        assert!(PublisherStatement::decode(statement.as_bytes()).is_err());
+        assert!(PublisherReleaseStatement::decode(v1.as_bytes()).is_err());
+
+        let maximum =
+            PublisherReleaseStatement::from_item(&item, PublisherReleaseSequence::new(u64::MAX))
+                .unwrap();
+        assert_eq!(maximum.sequence().get(), u64::MAX);
+        assert_ne!(maximum.as_bytes(), statement.as_bytes());
+        assert_ne!(maximum.identity(), statement.identity());
+
+        let mut unsigned_changes = item;
+        unsigned_changes.metadata.revision = 99;
+        unsigned_changes.manifest.version = 99;
+        unsigned_changes.metadata.path = PathBuf::from("another/destination");
+        unsigned_changes.metadata.name = "Another name".to_string();
+        unsigned_changes.metadata.description = None;
+        unsigned_changes.metadata.created = SystemTime::now();
+        assert_eq!(
+            PublisherReleaseStatement::from_item(&unsigned_changes, sequence)
+                .unwrap()
+                .as_bytes(),
+            statement.as_bytes()
+        );
+    }
+
+    #[test]
+    fn release_envelope_is_type_distinct_and_sequence_bound() {
+        let item = directory_item();
+        let sequence = PublisherReleaseSequence::new(41);
+        let (statement, envelope, _) = signed_release(&item, sequence);
+        let verified = envelope.verify(&item, sequence).unwrap();
+        assert_eq!(
+            verified.publisher_fingerprint(),
+            envelope.publisher_fingerprint()
+        );
+        assert_eq!(verified.sequence(), sequence);
+        assert_eq!(verified.statement_identity(), statement.identity());
+        assert_eq!(
+            envelope
+                .verify_manifest(&item.manifest, &item.chunks, sequence)
+                .unwrap(),
+            verified
+        );
+        assert_eq!(
+            envelope.verify(&item, PublisherReleaseSequence::new(40)),
+            Err(SignatureEnvelopeError::InvalidSignature)
+        );
+        let (_, wrong_key, _) = signed_release(&item, sequence);
+        let substituted_key =
+            PublisherReleaseEnvelope::from_parts(wrong_key.public_key(), envelope.signature());
+        assert_eq!(
+            substituted_key.verify(&item, sequence),
+            Err(SignatureEnvelopeError::InvalidSignature)
+        );
+
+        for length in 0..statement.as_bytes().len() {
+            assert!(PublisherReleaseStatement::decode(&statement.as_bytes()[..length]).is_err());
+        }
+        let mut trailing_statement = statement.as_bytes().to_vec();
+        trailing_statement.push(0);
+        assert_eq!(
+            PublisherReleaseStatement::decode(&trailing_statement),
+            Err(SignatureEnvelopeError::TrailingBytes)
+        );
+        let mut wrong_statement_version = statement.as_bytes().to_vec();
+        wrong_statement_version[RELEASE_STATEMENT_DOMAIN.len()..RELEASE_STATEMENT_DOMAIN.len() + 2]
+            .copy_from_slice(&1u16.to_le_bytes());
+        assert_eq!(
+            PublisherReleaseStatement::decode(&wrong_statement_version),
+            Err(SignatureEnvelopeError::UnsupportedStatementVersion(1))
+        );
+        let mut wrong_body_length = statement.as_bytes().to_vec();
+        wrong_body_length[RELEASE_STATEMENT_DOMAIN.len() + 2..RELEASE_STATEMENT_DOMAIN.len() + 6]
+            .copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(
+            PublisherReleaseStatement::decode(&wrong_body_length),
+            Err(SignatureEnvelopeError::TrailingBytes)
+        );
+
+        let encoded = envelope.encode();
+        assert_eq!(encoded.len(), PublisherReleaseEnvelope::ENCODED_LEN);
+        assert_eq!(
+            PublisherReleaseEnvelope::decode(&encoded).unwrap(),
+            envelope
+        );
+        assert!(PublisherSignatureEnvelope::decode(&encoded).is_err());
+        assert!(PublisherReleaseEnvelope::decode(&signed(&item).0.encode()).is_err());
+        for length in 0..encoded.len() {
+            assert!(PublisherReleaseEnvelope::decode(&encoded[..length]).is_err());
+        }
+        let mut trailing = encoded.to_vec();
+        trailing.push(0);
+        assert_eq!(
+            PublisherReleaseEnvelope::decode(&trailing),
+            Err(SignatureEnvelopeError::TrailingBytes)
+        );
+        let mut bad_envelope_version = encoded;
+        bad_envelope_version[RELEASE_ENVELOPE_DOMAIN.len()..RELEASE_ENVELOPE_DOMAIN.len() + 2]
+            .copy_from_slice(&1u16.to_le_bytes());
+        assert_eq!(
+            PublisherReleaseEnvelope::decode(&bad_envelope_version),
+            Err(SignatureEnvelopeError::UnsupportedEnvelopeVersion(1))
+        );
+        let mut bad_statement_version = encoded;
+        bad_statement_version[RELEASE_ENVELOPE_DOMAIN.len() + 2..RELEASE_ENVELOPE_DOMAIN.len() + 4]
+            .copy_from_slice(&1u16.to_le_bytes());
+        assert_eq!(
+            PublisherReleaseEnvelope::decode(&bad_statement_version),
+            Err(SignatureEnvelopeError::UnsupportedStatementVersion(1))
+        );
+    }
+
+    #[test]
+    fn release_statement_round_trips_every_algorithm_and_empty_artifact() {
+        for (index, algorithm) in [
+            ChunkAlgorithm::Fixed256K,
+            ChunkAlgorithm::fixed_aligned_with_header(4096, 512, 512),
+            ChunkAlgorithm::fastcdc_default(),
+            ChunkAlgorithm::image_default(),
+            ChunkAlgorithm::archive_default(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let item = item_for(&[b"data"], Vec::new(), algorithm);
+            let sequence = PublisherReleaseSequence::new(index as u64);
+            let statement =
+                PublisherReleaseStatement::from_manifest(&item.manifest, &item.chunks, sequence)
+                    .unwrap();
+            let v1 = PublisherStatement::from_manifest(&item.manifest, &item.chunks).unwrap();
+            let v1_content = STATEMENT_DOMAIN.len() + 2 + 4 + 2 + item.manifest.artifact_id.len();
+            let v2_sequence =
+                RELEASE_STATEMENT_DOMAIN.len() + 2 + 4 + 2 + item.manifest.artifact_id.len();
+            assert_eq!(
+                &statement.as_bytes()[v2_sequence..v2_sequence + 8],
+                &sequence.get().to_le_bytes()
+            );
+            assert_eq!(
+                &statement.as_bytes()[v2_sequence + 8..],
+                &v1.as_bytes()[v1_content..],
+                "V2 must reuse the exact V1 canonical content body for {algorithm:?}"
+            );
+            assert_eq!(
+                PublisherReleaseStatement::decode(statement.as_bytes()).unwrap(),
+                statement
+            );
+            assert!(signed_release(&item, sequence)
+                .1
+                .verify_manifest(&item.manifest, &item.chunks, sequence)
+                .is_ok());
+        }
+
+        let empty = item_for(&[b""], Vec::new(), ChunkAlgorithm::Fixed256K);
+        let sequence = PublisherReleaseSequence::new(u64::MAX);
+        let statement =
+            PublisherReleaseStatement::from_item(&empty, sequence).expect("empty V2 release");
+        assert_eq!(
+            PublisherReleaseStatement::decode(statement.as_bytes()).unwrap(),
+            statement
+        );
+    }
+
+    #[test]
+    fn release_statement_mutations_never_verify_or_preserve_identity() {
+        let item = directory_item();
+        let sequence = PublisherReleaseSequence::new(7);
+        let (statement, envelope, _) = signed_release(&item, sequence);
+        for index in 0..statement.as_bytes().len() {
+            let mut bytes = statement.as_bytes().to_vec();
+            bytes[index] ^= 1;
+            assert!(signature::UnparsedPublicKey::new(
+                &signature::ED25519,
+                envelope.public_key().as_bytes()
+            )
+            .verify(&bytes, envelope.signature().as_bytes())
+            .is_err());
+            if let Ok(mutated) = PublisherReleaseStatement::decode(&bytes) {
+                assert_ne!(mutated.identity(), statement.identity());
+            }
+        }
+
+        for count in [1usize, 2, 3, 17, 64, 257] {
+            let bytes: Vec<Vec<u8>> = (0..count)
+                .map(|index| {
+                    (0..(index % 31 + 1))
+                        .map(|offset| ((index * 17 + offset * 13) % 251) as u8)
+                        .collect()
+                })
+                .collect();
+            let parts: Vec<&[u8]> = bytes.iter().map(Vec::as_slice).collect();
+            let item = item_for(&parts, Vec::new(), ChunkAlgorithm::Fixed256K);
+            let sequence = PublisherReleaseSequence::new(count as u64);
+            let (statement, envelope, _) = signed_release(&item, sequence);
+            assert_eq!(
+                PublisherReleaseStatement::decode(statement.as_bytes()).unwrap(),
+                statement
+            );
+            assert!(envelope.verify(&item, sequence).is_ok());
+            assert_eq!(
+                envelope.verify(&item, PublisherReleaseSequence::new(count as u64 + 1)),
+                Err(SignatureEnvelopeError::InvalidSignature)
+            );
+        }
     }
 
     #[test]
@@ -1498,6 +2163,49 @@ mod tests {
             envelope
         );
         assert!(envelope.verify(&directory_item()).is_ok());
+    }
+
+    #[test]
+    fn fixed_release_statement_and_envelope_literals_are_hash_pinned() {
+        let seed = decode_hex_array::<32>(
+            "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+        );
+        let public = decode_hex_array::<32>(
+            "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+        );
+        let key =
+            ring::signature::Ed25519KeyPair::from_seed_and_public_key(&seed, &public).unwrap();
+        let sequence = PublisherReleaseSequence::new(42);
+        let statement = PublisherReleaseStatement::from_item(&directory_item(), sequence).unwrap();
+        let envelope = PublisherReleaseEnvelope::from_parts(
+            PublisherPublicKey::from_bytes(public),
+            PublisherSignature::try_from(key.sign(statement.as_bytes()).as_ref()).unwrap(),
+        );
+        const STATEMENT_GOLDEN: &str = "6469737464207075626c69736865722072656c656173652073746174656d656e742076320002002001000014006f72672e6578616d706c652f61727469666163742a00000000000000cc6287f7e02fc50ce0c4b7ffe12d090f733e61c204b0ac1539e87299549cba7c0a00000000000000010400000001000000000000000100000003000000644a9bc57c6063e2ba4028fa73ed585170ae7db8ac7723d32be49c021a0225f50500000000000000af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f326200000000000000003c13aeea02a8b9dd4108745b06eaf3ed38e318f084ad97dc7001d82f9b8d19480500000000000000030000000500612e747874050000000000000000000000010000000900656d7074792e7478740000000000000000010000000200000005007a2e74787405000000000000000200000003000000";
+        const ENVELOPE_GOLDEN: &str = "6469737464207075626c69736865722072656c6561736520656e76656c6f70652076320002000200d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a0a731aff29e7631af70f1d061a1419cdd16d649b5d5f67713c7140237609f64152c125cb19c8485e9d8d52e13c41a2b4d07b011842390bfe930826e9f6f3b70e";
+        assert_eq!(encode_hex(statement.as_bytes()), STATEMENT_GOLDEN);
+        assert_eq!(
+            blake3::hash(statement.as_bytes()).to_hex().as_str(),
+            "e4b18d11f0940fe14018f1e6a00b9f63899d5298af1b6b44e1891a66f863d749"
+        );
+        assert_eq!(
+            statement.identity().to_string(),
+            "963ad762cc294a23c714ebb96e4e43a3072e9c1b240a1cb87296952ffe5dd945"
+        );
+        assert_eq!(
+            PublisherReleaseStatement::decode(&decode_hex(STATEMENT_GOLDEN)).unwrap(),
+            statement
+        );
+        assert_eq!(encode_hex(&envelope.encode()), ENVELOPE_GOLDEN);
+        assert_eq!(
+            blake3::hash(&envelope.encode()).to_hex().as_str(),
+            "07fe93d78bccb9e3e61e3cc1a579d44c2bfd7ef0845e017157c619101b80cced"
+        );
+        assert_eq!(
+            PublisherReleaseEnvelope::decode(&decode_hex(ENVELOPE_GOLDEN)).unwrap(),
+            envelope
+        );
+        assert!(envelope.verify(&directory_item(), sequence).is_ok());
     }
 
     #[test]
@@ -2013,6 +2721,38 @@ mod tests {
             statement
         );
 
+        let release_delta = RELEASE_STATEMENT_DOMAIN.len() + 8 - STATEMENT_DOMAIN.len();
+        let mut release_manifest = manifest.clone();
+        let shortened = release_manifest.entries[0].relative_path.len() - release_delta;
+        release_manifest.entries[0]
+            .relative_path
+            .truncate(shortened);
+        let release = PublisherReleaseStatement::from_manifest(
+            &release_manifest,
+            &chunks,
+            PublisherReleaseSequence::new(u64::MAX),
+        )
+        .unwrap();
+        assert_eq!(release.as_bytes().len(), MAX_FRAME_PAYLOAD_BYTES);
+        assert_eq!(release.bytes.capacity(), MAX_FRAME_PAYLOAD_BYTES);
+        assert_eq!(
+            PublisherReleaseStatement::decode(release.as_bytes()).unwrap(),
+            release
+        );
+        let mut oversized_release = release_manifest;
+        oversized_release.entries[0].relative_path.push('x');
+        assert!(matches!(
+            PublisherReleaseStatement::from_manifest(
+                &oversized_release,
+                &chunks,
+                PublisherReleaseSequence::new(0)
+            ),
+            Err(SignatureEnvelopeError::StatementLimit {
+                field: "statement bytes",
+                ..
+            })
+        ));
+
         let mut oversized = manifest;
         oversized.entries[0].relative_path.push('x');
         assert!(matches!(
@@ -2308,6 +3048,14 @@ mod tests {
                     publisher_key,
                     PublisherSignature::try_from(key.sign(statement.as_bytes()).as_ref()).unwrap(),
                 );
+                let release_sequence = PublisherReleaseSequence::new(42);
+                let release_statement =
+                    PublisherReleaseStatement::from_item(&item, release_sequence).unwrap();
+                let release_envelope = PublisherReleaseEnvelope::from_parts(
+                    publisher_key,
+                    PublisherSignature::try_from(key.sign(release_statement.as_bytes()).as_ref())
+                        .unwrap(),
+                );
                 for _ in 0..WARMUPS {
                     std::hint::black_box(
                         PublisherStatement::from_manifest(&item.manifest, &item.chunks).unwrap(),
@@ -2315,6 +3063,19 @@ mod tests {
                     std::hint::black_box(
                         envelope
                             .verify_manifest(&item.manifest, &item.chunks)
+                            .unwrap(),
+                    );
+                    std::hint::black_box(
+                        PublisherReleaseStatement::from_manifest(
+                            &item.manifest,
+                            &item.chunks,
+                            release_sequence,
+                        )
+                        .unwrap(),
+                    );
+                    std::hint::black_box(
+                        release_envelope
+                            .verify_manifest(&item.manifest, &item.chunks, release_sequence)
                             .unwrap(),
                     );
                 }
@@ -2339,13 +3100,45 @@ mod tests {
                         started.elapsed()
                     })
                     .collect();
+                let release_construction: Vec<Duration> = (0..SAMPLES)
+                    .map(|_| {
+                        let started = Instant::now();
+                        std::hint::black_box(
+                            PublisherReleaseStatement::from_manifest(
+                                &item.manifest,
+                                &item.chunks,
+                                release_sequence,
+                            )
+                            .unwrap(),
+                        );
+                        started.elapsed()
+                    })
+                    .collect();
+                let release_verification: Vec<Duration> = (0..SAMPLES)
+                    .map(|_| {
+                        let started = Instant::now();
+                        std::hint::black_box(
+                            release_envelope
+                                .verify_manifest(&item.manifest, &item.chunks, release_sequence)
+                                .unwrap(),
+                        );
+                        started.elapsed()
+                    })
+                    .collect();
                 println!(
-                    "workload={workload} chunks={count} construction_samples={construction:?} construction_p95={:?} verification_samples={verification:?} verification_p95={:?}",
+                    "format=v1 workload={workload} chunks={count} construction_samples={construction:?} construction_p95={:?} verification_samples={verification:?} verification_p95={:?}",
                     p95(&construction),
                     p95(&verification)
                 );
+                println!(
+                    "format=v2 workload={workload} chunks={count} construction_samples={release_construction:?} construction_p95={:?} verification_samples={release_verification:?} verification_p95={:?}",
+                    p95(&release_construction),
+                    p95(&release_verification)
+                );
                 assert!(p95(&construction) <= construction_limit);
                 assert!(p95(&verification) <= verification_limit);
+                assert!(p95(&release_construction) <= construction_limit);
+                assert!(p95(&release_verification) <= verification_limit);
             }
         }
 
