@@ -2306,6 +2306,41 @@ struct ActivationCleanupCoordinator {
     poisoned: Arc<AtomicBool>,
 }
 
+#[derive(Debug)]
+struct ActivationLockSlot {
+    lock: Arc<Mutex<()>>,
+    participants: usize,
+}
+
+#[derive(Debug)]
+struct ActivationLockLease<'a> {
+    identity: [u8; 32],
+    lock: Arc<Mutex<()>>,
+    registry: &'a Mutex<HashMap<[u8; 32], ActivationLockSlot>>,
+}
+
+impl Drop for ActivationLockLease<'_> {
+    fn drop(&mut self) {
+        let mut registry = self
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let remove = registry
+            .get_mut(&self.identity)
+            .filter(|slot| Arc::ptr_eq(&slot.lock, &self.lock))
+            .is_some_and(|slot| {
+                slot.participants = slot
+                    .participants
+                    .checked_sub(1)
+                    .expect("activation lock participant count underflow");
+                slot.participants == 0
+            });
+        if remove {
+            registry.remove(&self.identity);
+        }
+    }
+}
+
 impl std::fmt::Debug for ActivationCleanupCoordinator {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -2441,7 +2476,7 @@ impl Drop for ActivationCleanupCoordinator {
 pub struct FsStorage {
     inner: RwLock<FsStorageState>,
     persistence_lock: Mutex<()>,
-    activation_locks: Mutex<HashMap<[u8; 32], Arc<Mutex<()>>>>,
+    activation_locks: Mutex<HashMap<[u8; 32], ActivationLockSlot>>,
     activation_poisoned: Arc<AtomicBool>,
     active_refs: RwLock<HashMap<[u8; 32], Arc<FsActivationActiveV1>>>,
     activation_fault_hook: Arc<RwLock<Option<ActivationFaultHook>>>,
@@ -3412,13 +3447,29 @@ impl FsStorage {
         Ok(())
     }
 
-    fn destination_lock(&self, identity: [u8; 32]) -> Arc<Mutex<()>> {
-        self.activation_locks
-            .lock()
-            .unwrap()
-            .entry(identity)
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
+    fn destination_lock(&self, identity: [u8; 32]) -> ActivationLockLease<'_> {
+        let lock = {
+            let mut registry = self
+                .activation_locks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let slot = registry
+                .entry(identity)
+                .or_insert_with(|| ActivationLockSlot {
+                    lock: Arc::new(Mutex::new(())),
+                    participants: 0,
+                });
+            slot.participants = slot
+                .participants
+                .checked_add(1)
+                .expect("activation lock participant count overflow");
+            slot.lock.clone()
+        };
+        ActivationLockLease {
+            identity,
+            lock,
+            registry: &self.activation_locks,
+        }
     }
 
     fn artifact_entry_path(root: &Path, relative_path: &Path) -> Result<PathBuf, Error> {
@@ -5033,7 +5084,7 @@ impl FsStorage {
         let destination = self.canonical_activation_destination(destination)?;
         let destination_identity = self.activation_destination_identity(&destination)?;
         let destination_lock = self.destination_lock(destination_identity);
-        let _destination_guard = destination_lock.lock().unwrap();
+        let _destination_guard = destination_lock.lock.lock().unwrap();
         if self
             .activation_poisoned
             .load(std::sync::atomic::Ordering::Acquire)
@@ -5928,7 +5979,7 @@ impl FsStorage {
             return self.handle_from_active(active).map(Some);
         }
         let destination_lock = self.destination_lock(identity);
-        let destination_guard = destination_lock.lock().unwrap();
+        let destination_guard = destination_lock.lock.lock().unwrap();
         if self
             .activation_poisoned
             .load(std::sync::atomic::Ordering::Acquire)
@@ -9529,6 +9580,86 @@ mod tests {
             fs::read(root.join("basis.bin")).unwrap(),
             vec![7u8; CHUNK_SIZE]
         );
+    }
+
+    fn activation_lock_identity(index: u64) -> [u8; 32] {
+        let mut identity = [0u8; 32];
+        identity[..8].copy_from_slice(&index.to_le_bytes());
+        identity
+    }
+
+    #[test]
+    fn activation_lock_registry_tracks_only_live_participants() {
+        let storage = FsStorage::default();
+        let identity = activation_lock_identity(1);
+        let first = storage.destination_lock(identity);
+        let first_guard = first.lock.lock().unwrap();
+        assert_eq!(storage.activation_locks.lock().unwrap().len(), 1);
+        assert_eq!(
+            storage.activation_locks.lock().unwrap()[&identity].participants,
+            1
+        );
+
+        let abandoned_waiter = storage.destination_lock(identity);
+        let other_identity = activation_lock_identity(2);
+        let other = storage.destination_lock(other_identity);
+        {
+            let registry = storage.activation_locks.lock().unwrap();
+            assert_eq!(registry.len(), 2);
+            assert_eq!(registry[&identity].participants, 2);
+            assert_eq!(registry[&other_identity].participants, 1);
+        }
+
+        drop(abandoned_waiter);
+        {
+            let registry = storage.activation_locks.lock().unwrap();
+            assert_eq!(registry.len(), 2);
+            assert_eq!(registry[&identity].participants, 1);
+        }
+        drop(other);
+        assert_eq!(storage.activation_locks.lock().unwrap().len(), 1);
+        drop(first_guard);
+        drop(first);
+        assert!(storage.activation_locks.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn missing_active_revision_lookups_release_destination_slots() {
+        let storage = FsStorage::new(temp_path()).unwrap();
+        for index in 0..10_000 {
+            let destination = PathBuf::from(format!("missing/{index}"));
+            assert!(storage
+                .open_active_revision(&destination)
+                .unwrap()
+                .is_none());
+        }
+        assert!(storage.activation_locks.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    #[ignore = "release-only local activation-lock registry reference"]
+    fn activation_lock_registry_reference_performance() {
+        assert!(
+            !cfg!(debug_assertions),
+            "run the activation-lock registry reference in release mode"
+        );
+        let storage = FsStorage::default();
+        let mut samples = Vec::with_capacity(20_000);
+        for index in 0..20_000 {
+            let started = std::time::Instant::now();
+            let lease = storage.destination_lock(activation_lock_identity(index));
+            let guard = lease.lock.lock().unwrap();
+            drop(guard);
+            drop(lease);
+            samples.push(started.elapsed().as_nanos());
+        }
+        let mut sorted = samples.clone();
+        sorted.sort_unstable();
+        let p95 = sorted[(sorted.len() * 95).div_ceil(100) - 1];
+        println!("activation_lock_registry_raw_ns={samples:?}");
+        println!("activation_lock_registry_p95_ns={p95}");
+        assert!(p95 <= 10_000, "activation-lock registry p95 {p95}ns");
+        assert!(storage.activation_locks.lock().unwrap().is_empty());
     }
 
     #[test]
