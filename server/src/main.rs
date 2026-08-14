@@ -24,6 +24,9 @@ const HTTP_BIND_ENV: &str = "DISTD_HTTP_BIND";
 const ALLOW_INSECURE_REMOTE_HTTP_ENV: &str = "DISTD_ALLOW_INSECURE_REMOTE_HTTP";
 const PUBLISHER_PUBLIC_KEYS_ENV: &str = "DISTD_PUBLISHER_PUBLIC_KEYS";
 const ALLOW_UNSIGNED_PUBLICATION_ENV: &str = "DISTD_ALLOW_UNSIGNED_PUBLICATION";
+const PUBLICATION_MEMORY_MIB_ENV: &str = "DISTD_PUBLICATION_MEMORY_MIB";
+const DEFAULT_PUBLICATION_MEMORY_MIB: usize = 512;
+const MAX_PUBLICATION_MEMORY_MIB: usize = 2_048;
 const MAX_PUBLISHER_KEYS: usize = 1_024;
 
 #[derive(Clone)]
@@ -128,6 +131,43 @@ fn parse_publisher_policy(
     })
 }
 
+fn parse_publication_memory_mib(configured: Option<&str>) -> Result<usize, String> {
+    let Some(configured) = configured else {
+        return Ok(DEFAULT_PUBLICATION_MEMORY_MIB);
+    };
+    if configured.is_empty()
+        || (configured.len() > 1 && configured.starts_with('0'))
+        || !configured.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(format!(
+            "{PUBLICATION_MEMORY_MIB_ENV} must be a canonical integer from 1 through {MAX_PUBLICATION_MEMORY_MIB}"
+        ));
+    }
+    let mebibytes = configured.parse::<usize>().map_err(|_| {
+        format!(
+            "{PUBLICATION_MEMORY_MIB_ENV} must be a canonical integer from 1 through {MAX_PUBLICATION_MEMORY_MIB}"
+        )
+    })?;
+    if !(1..=MAX_PUBLICATION_MEMORY_MIB).contains(&mebibytes) {
+        return Err(format!(
+            "{PUBLICATION_MEMORY_MIB_ENV} must be from 1 through {MAX_PUBLICATION_MEMORY_MIB}"
+        ));
+    }
+    Ok(mebibytes)
+}
+
+fn publication_memory_bytes(mebibytes: usize) -> Result<usize, String> {
+    let bytes = mebibytes
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| format!("{PUBLICATION_MEMORY_MIB_ENV} overflows the platform byte range"))?;
+    if bytes > usize::MAX >> 3 {
+        return Err(format!(
+            "{PUBLICATION_MEMORY_MIB_ENV} exceeds the platform admission capacity"
+        ));
+    }
+    Ok(bytes)
+}
+
 fn parse_http_bind_policy(
     configured_bind: Option<&str>,
     configured_override: Option<&str>,
@@ -217,13 +257,14 @@ async fn run_server<T>(
     server: Server<T>,
     http_addr: SocketAddr,
     quic_settings: QuicResourceSettings,
+    publication_memory_bytes: usize,
 ) where
     T: ChunkStorage + Send + Sync + std::fmt::Debug + 'static,
 {
     let feed = Feed::new("A feed");
     let _ = server.expose_feed(feed).await;
 
-    let app = rest_api::make_app(server.clone());
+    let app = rest_api::make_app(server.clone(), publication_memory_bytes);
 
     let addr_quic = "0.0.0.0:50051".parse().unwrap();
     tokio::spawn(async move {
@@ -281,6 +322,21 @@ async fn main() {
             eprintln!("Invalid publisher configuration: {error}");
             std::process::exit(2);
         });
+    let publication_memory_mib = optional_utf8_environment(PUBLICATION_MEMORY_MIB_ENV)
+        .and_then(|value| parse_publication_memory_mib(value.as_deref()))
+        .unwrap_or_else(|error| {
+            eprintln!("Invalid publication memory configuration: {error}");
+            std::process::exit(2);
+        });
+    let publication_memory_bytes =
+        publication_memory_bytes(publication_memory_mib).unwrap_or_else(|error| {
+            eprintln!("Invalid publication memory configuration: {error}");
+            std::process::exit(2);
+        });
+    tracing::info!(
+        publication_memory_mib,
+        "configured aggregate REST publication-body budget"
+    );
     if publisher.policy.permits_unsigned() {
         tracing::warn!(
             "publisher authentication is explicitly disabled; unsigned publication is insecure"
@@ -354,7 +410,7 @@ async fn main() {
                 .with_enrollment_token(enrollment_token.clone())
                 .with_publisher_policy(publisher_policy.clone())
                 .with_metadata_store(metadata_store);
-            run_server(server, http_addr, quic_settings).await;
+            run_server(server, http_addr, quic_settings, publication_memory_bytes).await;
         }
         #[cfg(feature = "redb")]
         "redb" => {
@@ -377,14 +433,14 @@ async fn main() {
                 .with_enrollment_token(enrollment_token.clone())
                 .with_publisher_policy(publisher_policy.clone())
                 .with_metadata_store(metadata_store);
-            run_server(server, http_addr, quic_settings).await;
+            run_server(server, http_addr, quic_settings, publication_memory_bytes).await;
         }
         "memory" => {
             tracing::info!("Using in-memory storage (ephemeral)");
             let server = Server::new_ephemeral(HashMapStorage::default())
                 .with_enrollment_token(enrollment_token.clone())
                 .with_publisher_policy(publisher_policy.clone());
-            run_server(server, http_addr, quic_settings).await;
+            run_server(server, http_addr, quic_settings, publication_memory_bytes).await;
         }
         other => {
             eprintln!(
@@ -398,8 +454,10 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_http_bind_policy, parse_publisher_policy, ALLOW_INSECURE_REMOTE_HTTP_ENV,
-        ALLOW_UNSIGNED_PUBLICATION_ENV, DEFAULT_HTTP_BIND, HTTP_BIND_ENV, MAX_PUBLISHER_KEYS,
+        parse_http_bind_policy, parse_publication_memory_mib, parse_publisher_policy,
+        publication_memory_bytes, ALLOW_INSECURE_REMOTE_HTTP_ENV, ALLOW_UNSIGNED_PUBLICATION_ENV,
+        DEFAULT_HTTP_BIND, DEFAULT_PUBLICATION_MEMORY_MIB, HTTP_BIND_ENV,
+        MAX_PUBLICATION_MEMORY_MIB, MAX_PUBLISHER_KEYS, PUBLICATION_MEMORY_MIB_ENV,
         PUBLISHER_PUBLIC_KEYS_ENV,
     };
 
@@ -552,5 +610,38 @@ mod tests {
             .expect("over key limit");
         assert!(error.contains("at most"));
         assert!(!error.contains(&over));
+    }
+
+    #[test]
+    fn publication_memory_budget_is_canonical_checked_and_bounded() {
+        assert_eq!(
+            parse_publication_memory_mib(None).unwrap(),
+            DEFAULT_PUBLICATION_MEMORY_MIB
+        );
+        for value in [1usize, 512, MAX_PUBLICATION_MEMORY_MIB] {
+            assert_eq!(
+                parse_publication_memory_mib(Some(&value.to_string())).unwrap(),
+                value
+            );
+            assert_eq!(
+                publication_memory_bytes(value).unwrap(),
+                value * 1024 * 1024
+            );
+        }
+        for value in [
+            "",
+            "0",
+            "01",
+            "+1",
+            "-1",
+            "1.0",
+            " 1",
+            "2049",
+            "18446744073709551616",
+            "not-a-number",
+        ] {
+            let error = parse_publication_memory_mib(Some(value)).unwrap_err();
+            assert!(error.contains(PUBLICATION_MEMORY_MIB_ENV));
+        }
     }
 }

@@ -54,6 +54,7 @@ export DISTD_PUBLISHER_SIGNATURE='<128-lowercase-hex detached Ed25519 signature>
 export DISTD_SERVER_STATE_DIR="$PWD/.distd-server-state"
 export DISTD_STORAGE=fs
 export DISTD_STORAGE_ROOT="$PWD/.distd-server-storage"
+export DISTD_PUBLICATION_MEMORY_MIB=512
 cargo run -p distd_server
 ```
 
@@ -109,6 +110,13 @@ one makes secure startup and sync fail closed. For isolated research only,
 `DISTD_ALLOW_UNSIGNED_PUBLICATION=true` replaces the allowlist and permits the
 same request without publisher headers; the server logs that insecure mode
 prominently.
+
+`DISTD_PUBLICATION_MEMORY_MIB` bounds aggregate declared multipart bodies held
+by authenticated publications and defaults to 512 MiB (accepted range: 1
+through 2,048 MiB). `POST /items` requires `Content-Length`; a request that
+cannot fit returns 413, while temporary aggregate exhaustion fails fast with
+429 before multipart fields are buffered. The reservation remains held through
+durable publication and is released on every completion or cancellation path.
 
 Reusing `artifact_id` creates a new immutable version only when its content or
 relevant metadata changes. `name` and `path` may change without changing the
@@ -298,8 +306,9 @@ path around either requirement.
 
 ## Remaining v0.2 limitations
 
-- Multipart publication is authenticated and capped at 512 MiB, but fields are
-  still buffered in memory before chunking.
+- Multipart publication fields are still buffered before chunking, but each
+  request remains capped at 512 MiB and aggregate declared bodies are bounded
+  by `DISTD_PUBLICATION_MEMORY_MIB`.
 - A client retains all missing chunks for an admitted artifact until atomic
   activation; `client.max_sync_memory_mib` now bounds that decoded payload, but
   chunks are not yet streamed directly into activation staging.

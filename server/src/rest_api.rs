@@ -11,13 +11,14 @@ use axum::{
         connect_info::IntoMakeServiceWithConnectInfo, ConnectInfo, DefaultBodyLimit, Multipart,
         Path, Query, State,
     },
-    http::{HeaderMap, HeaderValue, Method, Request, StatusCode},
+    http::{header::CONTENT_LENGTH, HeaderMap, HeaderValue, Method, Request, StatusCode},
     middleware::{self, Next},
     response::IntoResponse,
     routing::get, //, post},
     Json,
     Router,
 };
+use tokio::sync::Semaphore;
 use tower_http::{
     trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer},
     LatencyUnit,
@@ -50,6 +51,46 @@ const PUBLISHER_KEY_HEADER: &str = "x-distd-publisher-public-key";
 const PUBLISHER_SIGNATURE_HEADER: &str = "x-distd-publisher-signature";
 const PUBLISHER_SEQUENCE_HEADER: &str = "x-distd-publisher-release-sequence";
 const MAX_PUBLICATION_BODY_BYTES: usize = 512 * 1024 * 1024;
+
+#[derive(Clone, Debug)]
+struct PublicationAdmission {
+    permits: Arc<Semaphore>,
+    max_bytes: u32,
+}
+
+impl PublicationAdmission {
+    fn new(max_bytes: usize) -> Result<Self, &'static str> {
+        let max_bytes = u32::try_from(max_bytes)
+            .map_err(|_| "publication memory budget exceeds semaphore capacity")?;
+        if max_bytes == 0 {
+            return Err("publication memory budget must be nonzero");
+        }
+        Ok(Self {
+            permits: Arc::new(Semaphore::new(max_bytes as usize)),
+            max_bytes,
+        })
+    }
+
+    fn declared_bytes(&self, headers: &HeaderMap) -> Result<u32, StatusCode> {
+        let value = singleton_header(headers, CONTENT_LENGTH.as_str())?
+            .ok_or(StatusCode::LENGTH_REQUIRED)?
+            .to_str()
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        let declared = value.parse::<u64>().map_err(|_| StatusCode::BAD_REQUEST)?;
+        if declared > u64::from(self.max_bytes) {
+            return Err(StatusCode::PAYLOAD_TOO_LARGE);
+        }
+        u32::try_from(declared).map_err(|_| StatusCode::PAYLOAD_TOO_LARGE)
+    }
+
+    #[cfg(test)]
+    fn available_bytes(&self) -> usize {
+        self.permits.available_permits()
+    }
+}
 
 fn singleton_header<'a>(
     headers: &'a HeaderMap,
@@ -190,6 +231,32 @@ where
         }
     }
     next.run(request).await
+}
+
+async fn admit_publication_body(
+    State(admission): State<PublicationAdmission>,
+    request: Request<Body>,
+    next: Next,
+) -> impl IntoResponse {
+    if request.method() != Method::POST || request.uri().path() != "/items" {
+        return next.run(request).await;
+    }
+    let declared = match admission.declared_bytes(request.headers()) {
+        Ok(declared) => declared,
+        Err(status) => return status.into_response(),
+    };
+    let permit = match Arc::clone(&admission.permits).try_acquire_many_owned(declared) {
+        Ok(permit) => permit,
+        Err(tokio::sync::TryAcquireError::NoPermits) => {
+            return StatusCode::TOO_MANY_REQUESTS.into_response();
+        }
+        Err(tokio::sync::TryAcquireError::Closed) => {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+    let response = next.run(request).await;
+    drop(permit);
+    response
 }
 
 #[derive(Deserialize, Serialize)]
@@ -579,7 +646,11 @@ where
 }
 
 /// Create a new `axum::Router` with all the routes
-fn make_router_with_body_limit<T>(server: RawServer<T>, body_limit: usize) -> Router
+fn make_router_with_admission<T>(
+    server: RawServer<T>,
+    body_limit: usize,
+    admission: PublicationAdmission,
+) -> Router
 where
     T: ChunkStorage + Sync + Send + Debug + 'static,
 {
@@ -599,6 +670,10 @@ where
         .route("/metadata", get(get_metadata))
         .with_state(Arc::clone(&server))
         .layer(middleware::from_fn_with_state(
+            admission,
+            admit_publication_body,
+        ))
+        .layer(middleware::from_fn_with_state(
             server,
             authorize_publisher_headers::<T>,
         ))
@@ -616,12 +691,31 @@ where
         )
 }
 
-/// Create a new `axum::Router` with all the routes
-pub fn make_app<T>(server: RawServer<T>) -> IntoMakeServiceWithConnectInfo<Router, SocketAddr>
+fn make_router_with_limits<T>(
+    server: RawServer<T>,
+    body_limit: usize,
+    publication_memory_bytes: usize,
+) -> Router
 where
     T: ChunkStorage + Sync + Send + Debug + 'static,
 {
-    make_router_with_body_limit(server, MAX_PUBLICATION_BODY_BYTES)
+    make_router_with_admission(
+        server,
+        body_limit,
+        PublicationAdmission::new(publication_memory_bytes)
+            .expect("validated publication memory budget"),
+    )
+}
+
+/// Create a new `axum::Router` with all the routes
+pub fn make_app<T>(
+    server: RawServer<T>,
+    publication_memory_bytes: usize,
+) -> IntoMakeServiceWithConnectInfo<Router, SocketAddr>
+where
+    T: ChunkStorage + Sync + Send + Debug + 'static,
+{
+    make_router_with_limits(server, MAX_PUBLICATION_BODY_BYTES, publication_memory_bytes)
         .into_make_service_with_connect_info::<SocketAddr>()
 }
 
@@ -675,6 +769,7 @@ mod tests {
     }
 
     fn request(body: Vec<u8>, bearer: Option<&str>, key: [u8; 32]) -> Request<Body> {
+        let content_length = body.len();
         let mut request = Request::builder()
             .method(Method::POST)
             .uri("/items?artifact_id=route-test&name=route-test&path=route.bin&chunking=fixed")
@@ -682,6 +777,7 @@ mod tests {
                 axum::http::header::CONTENT_TYPE,
                 "multipart/form-data; boundary=distd-test",
             )
+            .header(CONTENT_LENGTH, content_length.to_string())
             .header(PUBLISHER_VERSION_HEADER, "2")
             .header(PUBLISHER_SEQUENCE_HEADER, "1")
             .header(PUBLISHER_KEY_HEADER, hex(&key))
@@ -854,7 +950,11 @@ mod tests {
         let exact_body = multipart_body(b"x");
         let over_body = multipart_body(b"xy");
         assert_eq!(over_body.len(), exact_body.len() + 1);
-        let router = make_router_with_body_limit(server, exact_body.len());
+        let admission = PublicationAdmission::new(MAX_PUBLICATION_BODY_BYTES).unwrap();
+        let held = Arc::clone(&admission.permits)
+            .try_acquire_many_owned(MAX_PUBLICATION_BODY_BYTES as u32)
+            .unwrap();
+        let router = make_router_with_admission(server, exact_body.len(), admission.clone());
 
         let status = router
             .clone()
@@ -871,6 +971,23 @@ mod tests {
             .unwrap()
             .status();
         assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let status = router
+            .clone()
+            .oneshot(request(
+                exact_body.clone(),
+                Some("route-secret"),
+                allowed_key,
+            ))
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(storage.size(), 0);
+        assert_eq!(observed_server.metadata_snapshot().await, metadata_before);
+        assert_eq!(std::fs::read(&paths.current).unwrap(), durable_before);
+        drop(held);
+        assert_eq!(admission.available_bytes(), MAX_PUBLICATION_BODY_BYTES);
 
         let exact = router
             .clone()
@@ -890,6 +1007,157 @@ mod tests {
         assert_eq!(metadata_before, InternalMetadata::default());
         assert_eq!(std::fs::read(&paths.current).unwrap(), durable_before);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn publication_admission_is_after_auth_fail_fast_and_exactly_released() {
+        let _environment = ENV_LOCK.lock().await;
+        let _token = PublishTokenGuard::install("admission-secret");
+        let allowed_key = [0x51; 32];
+        let server = RawServer::new_ephemeral(HashMapStorage::default()).with_publisher_policy(
+            crate::publication::PublisherPolicy::required([PublisherPublicKey::from_bytes(
+                allowed_key,
+            )]),
+        );
+        let storage = server.storage().clone();
+        let observed = server.clone();
+        let body = multipart_body(b"admitted");
+        let admission = PublicationAdmission::new(body.len()).unwrap();
+        let held = Arc::clone(&admission.permits)
+            .try_acquire_many_owned(body.len() as u32)
+            .unwrap();
+        assert_eq!(admission.available_bytes(), 0);
+        let router = make_router_with_admission(server, body.len() + 1, admission.clone());
+
+        let unauthorized = router
+            .clone()
+            .oneshot(request(body.clone(), None, allowed_key))
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(admission.available_bytes(), 0);
+
+        let untrusted = router
+            .clone()
+            .oneshot(request(body.clone(), Some("admission-secret"), [0x52; 32]))
+            .await
+            .unwrap();
+        assert_eq!(untrusted.status(), StatusCode::FORBIDDEN);
+        assert_eq!(admission.available_bytes(), 0);
+
+        let exhausted = router
+            .clone()
+            .oneshot(request(body.clone(), Some("admission-secret"), allowed_key))
+            .await
+            .unwrap();
+        assert_eq!(exhausted.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(admission.available_bytes(), 0);
+
+        let mut undeclared = request(body.clone(), Some("admission-secret"), allowed_key);
+        undeclared.headers_mut().remove(CONTENT_LENGTH);
+        let undeclared = router.clone().oneshot(undeclared).await.unwrap();
+        assert_eq!(undeclared.status(), StatusCode::LENGTH_REQUIRED);
+
+        for value in ["not-a-length", "18446744073709551616"] {
+            let mut malformed = request(body.clone(), Some("admission-secret"), allowed_key);
+            malformed
+                .headers_mut()
+                .insert(CONTENT_LENGTH, HeaderValue::from_str(value).unwrap());
+            let malformed = router.clone().oneshot(malformed).await.unwrap();
+            assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+        }
+        let mut duplicate_length = request(body.clone(), Some("admission-secret"), allowed_key);
+        duplicate_length
+            .headers_mut()
+            .append(CONTENT_LENGTH, HeaderValue::from_static("1"));
+        let duplicate_length = router.clone().oneshot(duplicate_length).await.unwrap();
+        assert_eq!(duplicate_length.status(), StatusCode::BAD_REQUEST);
+
+        let too_large_body = multipart_body(b"admitted-over-budget");
+        let too_large = router
+            .clone()
+            .oneshot(request(
+                too_large_body,
+                Some("admission-secret"),
+                allowed_key,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(too_large.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        drop(held);
+        assert_eq!(admission.available_bytes(), body.len());
+        let ordinary_rejection = router
+            .oneshot(request(body.clone(), Some("admission-secret"), allowed_key))
+            .await
+            .unwrap();
+        assert_eq!(ordinary_rejection.status(), StatusCode::FORBIDDEN);
+        assert_eq!(admission.available_bytes(), body.len());
+        assert_eq!(storage.size(), 0);
+        assert_eq!(
+            observed.metadata_snapshot().await,
+            InternalMetadata::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_publication_handler_releases_owned_admission() {
+        let admission = PublicationAdmission::new(4_096).unwrap();
+        let router = Router::new()
+            .route(
+                "/items",
+                axum::routing::post(|| async { std::future::pending::<StatusCode>().await }),
+            )
+            .layer(middleware::from_fn_with_state(
+                admission.clone(),
+                admit_publication_body,
+            ));
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/items")
+            .header(CONTENT_LENGTH, "4096")
+            .body(Body::empty())
+            .unwrap();
+        let task = tokio::spawn(router.oneshot(request));
+        while admission.available_bytes() != 0 {
+            tokio::task::yield_now().await;
+        }
+        task.abort();
+        let _ = task.await;
+        assert_eq!(admission.available_bytes(), 4_096);
+    }
+
+    #[test]
+    #[ignore = "release-only local publication admission reference"]
+    fn publication_admission_reference_performance() {
+        assert!(
+            !cfg!(debug_assertions),
+            "run the publication admission reference in release mode"
+        );
+        let admission = PublicationAdmission::new(MAX_PUBLICATION_BODY_BYTES).unwrap();
+        for _ in 0..1_000 {
+            drop(
+                Arc::clone(&admission.permits)
+                    .try_acquire_many_owned(256 * 1024)
+                    .unwrap(),
+            );
+        }
+        let mut samples = Vec::with_capacity(10_000);
+        for _ in 0..10_000 {
+            let started = std::time::Instant::now();
+            let permit = Arc::clone(&admission.permits)
+                .try_acquire_many_owned(256 * 1024)
+                .unwrap();
+            drop(permit);
+            samples.push(started.elapsed().as_nanos());
+        }
+        let mut sorted = samples.clone();
+        sorted.sort_unstable();
+        let p95 = sorted[(sorted.len() * 95).div_ceil(100) - 1];
+        println!("publication_admission_raw_ns={samples:?}");
+        println!("publication_admission_p95_ns={p95}");
+        assert!(p95 <= 10_000, "publication admission p95 {p95}ns");
+        assert_eq!(admission.available_bytes(), MAX_PUBLICATION_BODY_BYTES);
     }
 
     #[tokio::test]
@@ -928,6 +1196,7 @@ mod tests {
                 axum::http::header::CONTENT_TYPE,
                 "multipart/form-data; boundary=distd-test",
             )
+            .header(CONTENT_LENGTH, body.len().to_string())
             .header(axum::http::header::AUTHORIZATION, "Bearer release-secret")
             .header(PUBLISHER_VERSION_HEADER, "2")
             .header(PUBLISHER_SEQUENCE_HEADER, sequence.get().to_string())
@@ -938,11 +1207,13 @@ mod tests {
             )
             .body(Body::from(body.clone()))
             .unwrap();
-        let response = make_router_with_body_limit(server, body.len() + 1)
+        let admission = PublicationAdmission::new(body.len() + 1).unwrap();
+        let response = make_router_with_admission(server, body.len() + 1, admission.clone())
             .oneshot(request)
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(admission.available_bytes(), body.len() + 1);
         let metadata = observed.metadata_snapshot().await;
         let published = &metadata.versions["route-test"][&0];
         assert_eq!(published.item().manifest.root_hash, item.manifest.root_hash);

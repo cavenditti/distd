@@ -32,6 +32,9 @@ distribution refinements must preserve. See the [manifest model](spec:src:core/s
 - {#c-admin-exposure} Plaintext publication and administration endpoints MUST
   bind only to loopback by default and MUST require an explicit insecure
   override before binding to a non-loopback address.
+- {#c-publication-ingress} Authenticated multipart publication MUST bound both
+  individual request size and aggregate retained request payload before field
+  buffering or storage preparation begins.
 - {#c-destination} Server-controlled metadata MUST NOT select an absolute,
   parent-traversing, or symbolic-link-mediated client destination.
 - {#c-activation} A failed authentication, validation, transfer, staging, or
