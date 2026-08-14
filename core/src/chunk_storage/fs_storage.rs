@@ -326,11 +326,19 @@ struct HotChunkCache {
     shared_backings: HashMap<u64, SharedBackingUsage>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
+struct HotNodeEntry {
+    node: Arc<Node>,
+    older: Option<Hash>,
+    newer: Option<Hash>,
+}
+
+#[derive(Debug)]
 struct HotNodeCache {
     max_entries: usize,
-    order: VecDeque<Hash>,
-    entries: HashMap<Hash, Arc<Node>>,
+    oldest: Option<Hash>,
+    newest: Option<Hash>,
+    entries: HashMap<Hash, HotNodeEntry>,
 }
 
 #[derive(Debug)]
@@ -384,14 +392,15 @@ impl HotNodeCache {
     fn new(max_entries: usize) -> Self {
         Self {
             max_entries,
-            order: VecDeque::new(),
+            oldest: None,
+            newest: None,
             entries: HashMap::default(),
         }
     }
 
     fn get(&mut self, hash: &Hash) -> Option<Arc<Node>> {
-        let node = self.entries.get(hash)?.clone();
-        self.order.push_back(*hash);
+        let node = self.entries.get(hash)?.node.clone();
+        self.touch(*hash);
         Some(node)
     }
 
@@ -400,22 +409,119 @@ impl HotNodeCache {
             return;
         }
 
-        self.entries.insert(hash, node);
-        self.order.push_back(hash);
+        self.remove(hash);
+        let older = self.newest;
+        self.entries.insert(
+            hash,
+            HotNodeEntry {
+                node,
+                older,
+                newer: None,
+            },
+        );
+        if let Some(previous) = older {
+            self.entries
+                .get_mut(&previous)
+                .expect("hot node cache newest entry must exist")
+                .newer = Some(hash);
+        } else {
+            self.oldest = Some(hash);
+        }
+        self.newest = Some(hash);
 
         while self.entries.len() > self.max_entries {
-            let Some(oldest_hash) = self.order.pop_front() else {
+            let Some(oldest) = self.oldest else {
                 break;
             };
-            let remove = self
-                .entries
-                .get(&oldest_hash)
-                .map(|current| Arc::strong_count(current) == 1)
-                .unwrap_or(false);
-            if remove {
-                self.entries.remove(&oldest_hash);
-            }
+            self.remove(oldest);
         }
+    }
+
+    fn touch(&mut self, hash: Hash) {
+        if self.newest == Some(hash) {
+            return;
+        }
+        let (older, newer) = {
+            let entry = self
+                .entries
+                .get(&hash)
+                .expect("hot node cache touched entry must exist");
+            (entry.older, entry.newer)
+        };
+        if let Some(older) = older {
+            self.entries
+                .get_mut(&older)
+                .expect("hot node cache older entry must exist")
+                .newer = newer;
+        } else {
+            self.oldest = newer;
+        }
+        if let Some(newer) = newer {
+            self.entries
+                .get_mut(&newer)
+                .expect("hot node cache newer entry must exist")
+                .older = older;
+        }
+
+        let previous_newest = self.newest;
+        let entry = self
+            .entries
+            .get_mut(&hash)
+            .expect("hot node cache touched entry must exist");
+        entry.older = previous_newest;
+        entry.newer = None;
+        if let Some(previous_newest) = previous_newest {
+            self.entries
+                .get_mut(&previous_newest)
+                .expect("hot node cache newest entry must exist")
+                .newer = Some(hash);
+        } else {
+            self.oldest = Some(hash);
+        }
+        self.newest = Some(hash);
+    }
+
+    fn remove(&mut self, hash: Hash) -> Option<Arc<Node>> {
+        let (older, newer) = self
+            .entries
+            .get(&hash)
+            .map(|entry| (entry.older, entry.newer))?;
+        if let Some(older) = older {
+            self.entries
+                .get_mut(&older)
+                .expect("hot node cache older entry must exist")
+                .newer = newer;
+        } else {
+            self.oldest = newer;
+        }
+        if let Some(newer) = newer {
+            self.entries
+                .get_mut(&newer)
+                .expect("hot node cache newer entry must exist")
+                .older = older;
+        } else {
+            self.newest = older;
+        }
+        Some(
+            self.entries
+                .remove(&hash)
+                .expect("hot node cache removed entry must exist")
+                .node,
+        )
+    }
+
+    #[cfg(test)]
+    fn recency_hashes(&self) -> Vec<Hash> {
+        let mut hashes = Vec::with_capacity(self.entries.len());
+        let mut current = self.oldest;
+        while let Some(hash) = current {
+            if hashes.len() == self.entries.len() {
+                break;
+            }
+            hashes.push(hash);
+            current = self.entries.get(&hash).and_then(|entry| entry.newer);
+        }
+        hashes
     }
 }
 
@@ -8316,6 +8422,74 @@ mod tests {
         assert!(median <= Duration::from_micros(10));
         assert!(p95 <= Duration::from_micros(100));
         assert!(cache.stats().invariants_hold);
+    }
+
+    fn hot_node_fixture(value: u8) -> (Hash, Arc<Node>) {
+        let data = Arc::new(vec![value]);
+        let hash = do_hash(data.as_ref());
+        (hash, Arc::new(Node::Stored { hash, data }))
+    }
+
+    #[test]
+    fn hot_node_cache_has_exact_lru_and_external_owners_never_block_eviction() {
+        let (a_hash, a) = hot_node_fixture(1);
+        let (b_hash, b) = hot_node_fixture(2);
+        let (c_hash, c) = hot_node_fixture(3);
+        let (d_hash, d) = hot_node_fixture(4);
+        let mut cache = HotNodeCache::new(3);
+        cache.insert(a_hash, a);
+        cache.insert(b_hash, b);
+        cache.insert(c_hash, c);
+        let held_b = cache.entries.get(&b_hash).unwrap().node.clone();
+
+        for _ in 0..1_000_000 {
+            assert!(cache.get(&a_hash).is_some());
+        }
+        assert_eq!(cache.entries.len(), 3);
+        assert_eq!(cache.recency_hashes(), vec![b_hash, c_hash, a_hash]);
+
+        cache.insert(d_hash, d);
+        assert!(!cache.entries.contains_key(&b_hash));
+        assert_eq!(held_b.hash(), &b_hash);
+        assert_eq!(cache.recency_hashes(), vec![c_hash, a_hash, d_hash]);
+    }
+
+    #[test]
+    #[ignore = "release-only local hot-node cache reference"]
+    fn hot_node_cache_reference_performance() {
+        use std::time::{Duration, Instant};
+
+        assert!(
+            !cfg!(debug_assertions),
+            "run the hot-node cache performance reference in release mode"
+        );
+        let (hash, node) = hot_node_fixture(1);
+        let mut cache = HotNodeCache::new(DEFAULT_TREE_CACHE_ENTRIES);
+        cache.insert(hash, node.clone());
+
+        let hits_started = Instant::now();
+        for _ in 0..1_000_000 {
+            std::hint::black_box(cache.get(&hash).unwrap());
+        }
+        let hits_elapsed = hits_started.elapsed();
+
+        let mut replacement_samples = Vec::with_capacity(10_000);
+        for _ in 0..10_000 {
+            let started = Instant::now();
+            cache.insert(hash, node.clone());
+            replacement_samples.push(started.elapsed());
+        }
+        replacement_samples.sort_unstable();
+        let replacement_p95 = replacement_samples[(10_000usize * 95).div_ceil(100) - 1];
+        println!(
+            "hot_node_cache_reference_performance hits_elapsed={hits_elapsed:?} replacement_p95={replacement_p95:?} entries={} recency={}",
+            cache.entries.len(),
+            cache.recency_hashes().len()
+        );
+        assert!(hits_elapsed <= Duration::from_millis(100));
+        assert!(replacement_p95 <= Duration::from_micros(100));
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.recency_hashes(), vec![hash]);
     }
 
     #[test]

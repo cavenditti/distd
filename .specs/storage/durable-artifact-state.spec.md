@@ -53,6 +53,10 @@ and [server publication](spec:src:server/src/server.rs).
   most one recency record per cached path. A successful hit MUST make that path
   most-recently used, eviction MUST remove the true least-recently used path,
   and repeated reads MUST NOT grow cache metadata.
+- {#c-tree-node-cache} Reconstructed tree-node caching MUST retain exactly one
+  recency relation per live hash and MUST update or evict it in constant time.
+  Caller-owned node references MUST NOT prevent the cache from releasing its
+  own entry at the configured ceiling.
 - {#c-publication-commit} A server revision MUST NOT become visible through
   latest lookup, exact-version lookup, or metadata fetch until all referenced
   storage and metadata are durably committed; a failed commit MUST preserve the
