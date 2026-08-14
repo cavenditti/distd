@@ -32,6 +32,11 @@ closes that boundary without attempting rollback policy.
 - {#c-publication} A publisher-enforcing server MUST reject a missing,
   malformed, untrusted, or invalid signature before advancing or persisting the
   artifact's visible version metadata.
+- {#c-publication-locks} Publication serialization MUST retain one lock slot
+  only while an active or waiting coordinator references its artifact ID.
+  Success, rejection, failure, and cancellation MUST release the participant,
+  and the last participant MUST remove the slot without weakening same-artifact
+  serialization or different-artifact independence.
 - {#c-propagation} The accepted publisher key identity and detached signature
   MUST be persisted with the immutable revision and returned with its sync
   manifest without server-side substitution.

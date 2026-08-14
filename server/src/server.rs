@@ -48,6 +48,47 @@ pub(crate) const DEFAULT_MAX_REGISTERED_CLIENTS: usize = 4_096;
 pub(crate) const HARD_MAX_REGISTERED_CLIENTS: usize = 65_536;
 pub(crate) const MAX_CLIENT_NAME_BYTES: usize = 256;
 
+#[derive(Debug)]
+struct PublicationLockSlot {
+    lock: Arc<AsyncMutex<()>>,
+    participants: usize,
+}
+
+struct PublicationLockLease {
+    artifact_id: ArtifactId,
+    lock: Arc<AsyncMutex<()>>,
+    registry: Arc<StdMutex<HashMap<ArtifactId, PublicationLockSlot>>>,
+}
+
+impl Drop for PublicationLockLease {
+    fn drop(&mut self) {
+        let mut registry = self
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let remove = registry
+            .get_mut(&self.artifact_id)
+            .filter(|slot| Arc::ptr_eq(&slot.lock, &self.lock))
+            .is_some_and(|slot| {
+                slot.participants = slot
+                    .participants
+                    .checked_sub(1)
+                    .expect("publication lock participant count underflow");
+                slot.participants == 0
+            });
+        if remove {
+            registry.remove(&self.artifact_id);
+        }
+    }
+}
+
+struct PublicationGuard {
+    // Declaration order is part of the lifecycle: unlock before the lease may
+    // remove the last registry slot.
+    _guard: OwnedMutexGuard<()>,
+    _lease: PublicationLockLease,
+}
+
 /// Data structure used internally by server, may be converted to `ServerMetadata`
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InternalMetadata {
@@ -190,7 +231,7 @@ where
     /// Client map
     pub clients: Arc<RwLock<BTreeMap<Uuid, Client>>>,
     max_registered_clients: usize,
-    publish_locks: Arc<AsyncMutex<HashMap<ArtifactId, Arc<AsyncMutex<()>>>>>,
+    publish_locks: Arc<StdMutex<HashMap<ArtifactId, PublicationLockSlot>>>,
     metadata_persist_lock: Arc<StdMutex<()>>,
     metadata_store: Option<Arc<MetadataStateStore>>,
 }
@@ -226,6 +267,18 @@ where
 
     pub(crate) fn storage(&self) -> &T {
         &self.storage
+    }
+
+    #[cfg(test)]
+    fn publication_lock_stats_for_test(&self) -> (usize, usize) {
+        let registry = self
+            .publish_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            registry.len(),
+            registry.values().map(|slot| slot.participants).sum(),
+        )
     }
 
     #[cfg(test)]
@@ -388,7 +441,7 @@ where
             storage: Arc::new(storage),
             clients: Arc::new(RwLock::new(BTreeMap::new())),
             max_registered_clients: DEFAULT_MAX_REGISTERED_CLIENTS,
-            publish_locks: Arc::new(AsyncMutex::new(HashMap::new())),
+            publish_locks: Arc::new(StdMutex::new(HashMap::new())),
             metadata_persist_lock: Arc::new(StdMutex::new(())),
             metadata_store: None,
         })
@@ -415,7 +468,7 @@ where
             storage: Arc::new(storage),
             clients: Arc::new(RwLock::new(BTreeMap::new())),
             max_registered_clients: DEFAULT_MAX_REGISTERED_CLIENTS,
-            publish_locks: Arc::new(AsyncMutex::new(HashMap::new())),
+            publish_locks: Arc::new(StdMutex::new(HashMap::new())),
             metadata_persist_lock: Arc::new(StdMutex::new(())),
             metadata_store: None,
         }
@@ -454,16 +507,32 @@ where
         self
     }
 
-    async fn publication_guard(&self, artifact_id: &str) -> OwnedMutexGuard<()> {
-        let lock = {
-            let mut locks = self.publish_locks.lock().await;
-            Arc::clone(
-                locks
+    async fn publication_guard(&self, artifact_id: &str) -> Result<PublicationGuard, ServerError> {
+        let lease = {
+            let mut registry = self.publish_locks.lock().map_err(|_| {
+                ServerError::State("publication lock registry is poisoned".to_string())
+            })?;
+            let slot =
+                registry
                     .entry(artifact_id.to_string())
-                    .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
-            )
+                    .or_insert_with(|| PublicationLockSlot {
+                        lock: Arc::new(AsyncMutex::new(())),
+                        participants: 0,
+                    });
+            slot.participants = slot.participants.checked_add(1).ok_or_else(|| {
+                ServerError::State("publication lock participant count is exhausted".to_string())
+            })?;
+            PublicationLockLease {
+                artifact_id: artifact_id.to_string(),
+                lock: Arc::clone(&slot.lock),
+                registry: Arc::clone(&self.publish_locks),
+            }
         };
-        lock.lock_owned().await
+        let guard = Arc::clone(&lease.lock).lock_owned().await;
+        Ok(PublicationGuard {
+            _guard: guard,
+            _lease: lease,
+        })
     }
 }
 
@@ -984,7 +1053,7 @@ where
             tracing::error!("Cannot prepare revision: {error}");
             ServerError::ChunkInsertError
         })?;
-        let _publish_guard = self.publication_guard(&artifact_id).await;
+        let _publish_guard = self.publication_guard(&artifact_id).await?;
         self.require_publication_writable()?;
         let policy = self.publisher_policy.clone();
         let authorized =
@@ -1220,7 +1289,7 @@ where
             ServerError::ChunkInsertError
         })?;
 
-        let _publish_guard = self.publication_guard(&artifact_id).await;
+        let _publish_guard = self.publication_guard(&artifact_id).await?;
         self.require_publication_writable()?;
         let policy = self.publisher_policy.clone();
         let authorized =
@@ -1594,6 +1663,77 @@ mod tests {
         );
         assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
         assert_eq!(server.clients.read().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn publication_lock_registry_releases_distinct_success_and_rejection_slots() {
+        let server = ProductionServer::new_ephemeral(HashMapStorage::default());
+        for index in 0..10_000 {
+            let artifact_id = format!("ephemeral-{index}");
+            let guard = server.publication_guard(&artifact_id).await.unwrap();
+            assert_eq!(server.publication_lock_stats_for_test(), (1, 1));
+            if index % 2 == 0 {
+                drop(guard);
+            } else {
+                let rejected: Result<(), PublicationError> = {
+                    let _guard = guard;
+                    Err(PublicationError::UntrustedPublisher)
+                };
+                assert_eq!(rejected, Err(PublicationError::UntrustedPublisher));
+            }
+            assert_eq!(server.publication_lock_stats_for_test(), (0, 0));
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_publication_waiter_releases_only_its_participation() {
+        let server = ProductionServer::new_ephemeral(HashMapStorage::default());
+        let active = server.publication_guard("shared").await.unwrap();
+        assert_eq!(server.publication_lock_stats_for_test(), (1, 1));
+
+        let waiter_server = server.clone();
+        let waiter = tokio::spawn(async move { waiter_server.publication_guard("shared").await });
+        for _ in 0..100 {
+            if server.publication_lock_stats_for_test() == (1, 2) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(server.publication_lock_stats_for_test(), (1, 2));
+
+        waiter.abort();
+        let cancellation = waiter.await;
+        assert!(cancellation
+            .as_ref()
+            .is_err_and(tokio::task::JoinError::is_cancelled));
+        assert_eq!(server.publication_lock_stats_for_test(), (1, 1));
+        drop(active);
+        assert_eq!(server.publication_lock_stats_for_test(), (0, 0));
+    }
+
+    #[tokio::test]
+    #[ignore = "release-only local publication-lock registry reference"]
+    async fn publication_lock_registry_reference_performance() {
+        assert!(
+            !cfg!(debug_assertions),
+            "run the publication-lock registry reference in release mode"
+        );
+        let server = ProductionServer::new_ephemeral(HashMapStorage::default());
+        let mut samples = Vec::with_capacity(20_000);
+        for index in 0..20_000 {
+            let artifact_id = format!("reference-{index}");
+            let started = std::time::Instant::now();
+            let guard = server.publication_guard(&artifact_id).await.unwrap();
+            drop(guard);
+            samples.push(started.elapsed().as_nanos());
+        }
+        let mut sorted = samples.clone();
+        sorted.sort_unstable();
+        let p95 = sorted[(sorted.len() * 95).div_ceil(100) - 1];
+        println!("publication_lock_registry_raw_ns={samples:?}");
+        println!("publication_lock_registry_p95_ns={p95}");
+        assert!(p95 <= 10_000, "publication-lock registry p95 {p95}ns");
+        assert_eq!(server.publication_lock_stats_for_test(), (0, 0));
     }
 
     #[tokio::test]
