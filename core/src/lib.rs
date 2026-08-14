@@ -11,6 +11,7 @@ pub mod hash;
 pub mod item;
 pub mod metadata;
 pub mod possession;
+pub mod signature;
 pub mod transport;
 pub mod unique_name;
 pub mod utils;

@@ -33,6 +33,7 @@ uuid = { workspace = true }
 multimap = "0.10.0"
 futures = "0.3"
 zstd = { workspace = true }
+unicode-normalization = { workspace = true }
 
 redb = { workspace = true, optional = true }
 
