@@ -1,6 +1,13 @@
 syntax = "proto3";
 package distd;
 
+// Protobuf contract V1 is declared by the fixed DSWP operation preface.
+// Field numbers, oneof tags, and enum values are never reused. A removed
+// identifier must be reserved here by both number and name. Enum zero values
+// remain unspecified/error sentinels. Additive fields are V1-compatible only
+// when an older reader may safely ignore their complete semantics; otherwise
+// the protobuf-contract version in the operation preface must be incremented.
+
 service Distd {
   rpc Register(ClientRegister) returns (ServerMetadata);
   rpc Fetch(ClientKeepAlive) returns (ServerMetadata);

@@ -1,7 +1,10 @@
 use std::str::Utf8Error;
 
 use config::ConfigError;
-use distd_core::{error::InvalidParameter, transport::PayloadCompressionError};
+use distd_core::{
+    error::InvalidParameter,
+    transport::{PayloadCompressionError, WireCompatibilityError},
+};
 use thiserror::Error;
 
 use crate::{
@@ -65,6 +68,9 @@ pub enum ServerRequest {
 
     #[error("QUIC transport error: {0}")]
     Quic(String),
+
+    #[error("server wire contract is incompatible: {0}")]
+    WireCompatibility(#[from] WireCompatibilityError),
 
     #[error("Invalid compressed sync payload")]
     Compression(#[from] PayloadCompressionError),

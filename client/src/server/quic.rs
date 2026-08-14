@@ -9,8 +9,10 @@ use distd_core::proto::{
 };
 use distd_core::transport::{decode_sync_payload_owned, TransportOp};
 use distd_core::utils::frame::{
-    read_length_delimited_async, write_length_delimited_async, write_optional_uuid_async,
-    write_transport_op_async, FrameError, MAX_FRAME_PAYLOAD_BYTES,
+    read_length_delimited_async, read_length_delimited_or_wire_rejection_async,
+    read_response_frame_length_async, write_current_wire_preface_async,
+    write_length_delimited_async, write_optional_uuid_async, write_transport_op_async, FrameError,
+    MAX_FRAME_PAYLOAD_BYTES,
 };
 use quinn::{ClientConfig, Endpoint};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -24,6 +26,13 @@ use crate::{
     error::{ServerConnection, ServerRequest},
     server_url::CanonicalServerUrl,
 };
+
+fn response_frame_error(error: FrameError) -> ServerRequest {
+    match error {
+        FrameError::WireCompatibility(source) => ServerRequest::WireCompatibility(source),
+        other => ServerRequest::Quic(other.to_string()),
+    }
+}
 
 #[derive(Debug)]
 struct PinnedServerCertVerifier {
@@ -238,6 +247,9 @@ impl QuicTransportClient {
             .open_bi()
             .await
             .map_err(|err| ServerRequest::Quic(err.to_string()))?;
+        write_current_wire_preface_async(&mut send)
+            .await
+            .map_err(|err| ServerRequest::Quic(err.to_string()))?;
         write_transport_op_async(&mut send, op)
             .await
             .map_err(|err| ServerRequest::Quic(err.to_string()))?;
@@ -255,9 +267,9 @@ impl QuicTransportClient {
             .map_err(|err| ServerRequest::Quic(err.to_string()))?;
         send.finish()
             .map_err(|err| ServerRequest::Quic(err.to_string()))?;
-        read_length_delimited_async(&mut recv)
+        read_length_delimited_or_wire_rejection_async(&mut recv)
             .await
-            .map_err(|err| ServerRequest::Quic(err.to_string()))
+            .map_err(response_frame_error)
     }
 
     pub async fn fetch(&self, request: ClientKeepAlive) -> Result<ServerMetadata, ServerRequest> {
@@ -267,9 +279,9 @@ impl QuicTransportClient {
             .map_err(|err| ServerRequest::Quic(err.to_string()))?;
         send.finish()
             .map_err(|err| ServerRequest::Quic(err.to_string()))?;
-        read_length_delimited_async(&mut recv)
+        read_length_delimited_or_wire_rejection_async(&mut recv)
             .await
-            .map_err(|err| ServerRequest::Quic(err.to_string()))
+            .map_err(response_frame_error)
     }
 
     pub async fn sync(
@@ -309,18 +321,11 @@ async fn read_sync_manifest_frame<R>(reader: &mut R) -> Result<Vec<u8>, ServerRe
 where
     R: AsyncRead + Unpin,
 {
-    let mut length = [0u8; 4];
-    reader
-        .read_exact(&mut length)
+    let payload_len = read_response_frame_length_async(reader, MAX_FRAME_PAYLOAD_BYTES)
         .await
-        .map_err(FrameError::from)
-        .map_err(|error| ServerRequest::Quic(error.to_string()))?;
-    let payload_len = u32::from_be_bytes(length) as usize;
-    if payload_len > MAX_FRAME_PAYLOAD_BYTES {
-        return Err(ServerRequest::Quic(FrameError::FrameTooLarge.to_string()));
-    }
+        .map_err(response_frame_error)?;
     let mut frame = Vec::with_capacity(4 + payload_len);
-    frame.extend_from_slice(&length);
+    frame.extend_from_slice(&(payload_len as u32).to_be_bytes());
     frame.resize(4 + payload_len, 0);
     reader
         .read_exact(&mut frame[4..])
@@ -519,8 +524,11 @@ mod tests {
     use distd_core::proto::{
         sync_message::Msg, BulkData, ChunkData, ManifestResponse, PayloadCompression, SyncMessage,
     };
-    use distd_core::transport::maybe_compress_sync_payload_owned;
-    use distd_core::utils::frame::write_length_delimited_async;
+    use distd_core::transport::{
+        maybe_compress_sync_payload_owned, WireCompatibilityError, WireRejection,
+        WireRejectionStatus,
+    };
+    use distd_core::utils::frame::{write_length_delimited_async, write_wire_rejection_async};
     use tokio::io::duplex;
 
     #[test]
@@ -605,6 +613,29 @@ mod tests {
         let message = distd_core::utils::frame::decode_length_delimited::<SyncMessage>(&frame)
             .expect("worker can decode the framed message");
         assert!(matches!(message.msg, Some(Msg::ChunkData(_))));
+    }
+
+    #[tokio::test]
+    async fn sync_manifest_reader_surfaces_typed_wire_rejection() {
+        let (mut writer, mut reader) = duplex(64);
+        tokio::spawn(async move {
+            write_wire_rejection_async(
+                &mut writer,
+                WireRejection::current(WireRejectionStatus::UnsupportedProtobufVersion),
+            )
+            .await
+            .expect("write compatibility rejection");
+        });
+
+        let error = read_sync_manifest_frame(&mut reader)
+            .await
+            .expect_err("wire rejection must not be parsed as a protobuf frame");
+        assert!(matches!(
+            error,
+            crate::error::ServerRequest::WireCompatibility(WireCompatibilityError::Rejected(
+                WireRejectionStatus::UnsupportedProtobufVersion
+            ))
+        ));
     }
 
     #[test]

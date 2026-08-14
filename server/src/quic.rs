@@ -12,10 +12,11 @@ use distd_core::proto::sync_message::Msg;
 use distd_core::proto::{
     ClientKeepAlive, ClientRegister, ManifestRequest, PossessionBitfield, SyncMessage,
 };
-use distd_core::transport::TransportOp;
+use distd_core::transport::{TransportOp, WireRejection, WireRejectionStatus};
 use distd_core::utils::frame::{
     encode_length_delimited, read_length_delimited_async_with_limit, read_optional_uuid_async,
-    read_transport_op_async, write_length_delimited_async, MAX_FRAME_PAYLOAD_BYTES,
+    read_transport_op_async, read_wire_preface_async, write_length_delimited_async,
+    write_wire_rejection_async, FrameError, MAX_FRAME_PAYLOAD_BYTES,
 };
 use prost::Message;
 use quinn::{Endpoint, RecvStream, SendStream};
@@ -622,28 +623,6 @@ impl StreamFailure {
     }
 }
 
-async fn phase_result<F, T, E>(
-    absolute: Instant,
-    phase_timeout: Duration,
-    phase: QuicPhase,
-    future: F,
-) -> Result<T, StreamFailure>
-where
-    F: Future<Output = Result<T, E>>,
-{
-    let now = Instant::now();
-    if now >= absolute {
-        return Err(StreamFailure::timeout(QuicPhase::Lifetime));
-    }
-    let deadline = absolute.min(now + phase_timeout);
-    match timeout_at(deadline, future).await {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(_)) => Err(StreamFailure::protocol(phase)),
-        Err(_) if deadline == absolute => Err(StreamFailure::timeout(QuicPhase::Lifetime)),
-        Err(_) => Err(StreamFailure::timeout(phase)),
-    }
-}
-
 async fn result_at<F, T, E>(
     deadline: Instant,
     absolute: Instant,
@@ -734,21 +713,55 @@ where
     .await
 }
 
-async fn read_prelude<R>(
-    reader: &mut R,
+async fn read_prelude(
+    send: &mut SendStream,
+    recv: &mut RecvStream,
     absolute: Instant,
     settings: &QuicResourceSettings,
-) -> Result<TransportOp, StreamFailure>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    phase_result(
+) -> Result<Option<TransportOp>, StreamFailure> {
+    let deadline = fixed_phase_deadline(absolute, settings.prelude_timeout, QuicPhase::Prelude)?;
+    let declaration = match timeout_at(deadline, read_wire_preface_async(recv)).await {
+        Ok(Ok(declaration)) => declaration,
+        Ok(Err(error)) => {
+            let status = match error {
+                FrameError::WireCompatibility(source) => source.rejection_status(),
+                FrameError::IoError(source)
+                    if source.kind() == std::io::ErrorKind::UnexpectedEof =>
+                {
+                    WireRejectionStatus::MalformedPreface
+                }
+                _ => return Err(StreamFailure::protocol(QuicPhase::Prelude)),
+            };
+            result_at(
+                deadline,
+                absolute,
+                QuicPhase::Prelude,
+                write_wire_rejection_async(send, WireRejection::current(status)),
+            )
+            .await?;
+            finish_send(send)
+                .await
+                .map_err(|_| StreamFailure::internal(QuicPhase::Prelude))?;
+            let _ = recv.stop(quinn::VarInt::from_u32(QUIC_STREAM_PROTOCOL_CODE));
+            return Ok(None);
+        }
+        Err(_) if deadline == absolute => {
+            return Err(StreamFailure::timeout(QuicPhase::Lifetime));
+        }
+        Err(_) => return Err(StreamFailure::timeout(QuicPhase::Prelude)),
+    };
+    debug_assert_eq!(
+        declaration,
+        distd_core::transport::WireVersionDeclaration::CURRENT
+    );
+    let op = result_at(
+        deadline,
         absolute,
-        settings.prelude_timeout,
         QuicPhase::Prelude,
-        read_transport_op_async(reader),
+        read_transport_op_async(recv),
     )
-    .await
+    .await?;
+    Ok(Some(op))
 }
 
 async fn write_message_bounded<W, M>(
@@ -914,7 +927,11 @@ where
         absolute: Instant,
     ) -> Result<(), StreamFailure> {
         let settings = &admission.settings;
-        let op = read_prelude(recv, absolute, settings).await?;
+        let Some(op) = read_prelude(send, recv, absolute, settings).await? else {
+            drop(pending);
+            report_failure(admission, StreamFailure::protocol(QuicPhase::Prelude));
+            return Ok(());
+        };
         let uuid_deadline = fixed_phase_deadline(absolute, settings.uuid_timeout, QuicPhase::Uuid)?;
         let client_uuid = result_at(
             uuid_deadline,
@@ -1350,10 +1367,14 @@ mod tests {
     use distd_core::signature::{
         PublisherPublicKey, PublisherSignature, PublisherSignatureEnvelope, PublisherStatement,
     };
-    use distd_core::transport::TransportOp;
+    use distd_core::transport::{
+        decode_wire_rejection, encode_wire_preface, TransportOp, WireRejection,
+        WireRejectionStatus, WireVersionDeclaration,
+    };
     use distd_core::utils::frame::{
         decode_length_delimited, encode_length_delimited, read_length_delimited_async,
-        write_length_delimited_async, write_optional_uuid_async, write_transport_op_async,
+        write_current_wire_preface_async, write_length_delimited_async, write_optional_uuid_async,
+        write_transport_op_async,
     };
     use distd_core::utils::serde::BitcodeSerializable;
     use distd_core::version::Version;
@@ -1476,6 +1497,9 @@ mod tests {
         uuid: Option<Uuid>,
     ) -> (quinn::SendStream, quinn::RecvStream) {
         let (mut send, recv) = connection.open_bi().await.expect("open bi");
+        write_current_wire_preface_async(&mut send)
+            .await
+            .expect("write wire preface");
         write_transport_op_async(&mut send, op)
             .await
             .expect("write transport op");
@@ -2302,6 +2326,9 @@ mod tests {
 
         let (mut hold_a_send, mut hold_a_recv) =
             connection_a.open_bi().await.expect("open first pending");
+        write_current_wire_preface_async(&mut hold_a_send)
+            .await
+            .expect("write first pending preface");
         write_transport_op_async(&mut hold_a_send, TransportOp::Register)
             .await
             .expect("start first pending");
@@ -2311,6 +2338,9 @@ mod tests {
             .open_bi()
             .await
             .expect("open per-connection excess");
+        write_current_wire_preface_async(&mut same_connection_send)
+            .await
+            .expect("write per-connection preface");
         write_transport_op_async(&mut same_connection_send, TransportOp::Register)
             .await
             .expect("start per-connection excess");
@@ -2323,6 +2353,9 @@ mod tests {
 
         let (mut hold_b_send, mut hold_b_recv) =
             connection_b.open_bi().await.expect("open second pending");
+        write_current_wire_preface_async(&mut hold_b_send)
+            .await
+            .expect("write second pending preface");
         write_transport_op_async(&mut hold_b_send, TransportOp::Register)
             .await
             .expect("start second pending");
@@ -2330,6 +2363,9 @@ mod tests {
 
         let (mut global_excess_send, mut global_excess_recv) =
             connection_c.open_bi().await.expect("open global excess");
+        write_current_wire_preface_async(&mut global_excess_send)
+            .await
+            .expect("write global excess preface");
         write_transport_op_async(&mut global_excess_send, TransportOp::Register)
             .await
             .expect("start global excess");
@@ -2382,6 +2418,9 @@ mod tests {
         {
             for _ in 0..MAX_PENDING_PER_CONNECTION {
                 let (mut send, recv) = connection.open_bi().await.expect("open pending stream");
+                write_current_wire_preface_async(&mut send)
+                    .await
+                    .expect("write pending preface");
                 write_transport_op_async(&mut send, TransportOp::Register)
                     .await
                     .expect("start pending Register");
@@ -2401,6 +2440,9 @@ mod tests {
             .open_bi()
             .await
             .expect("open per-connection excess");
+        write_current_wire_preface_async(&mut per_connection_send)
+            .await
+            .expect("write per-connection preface");
         write_transport_op_async(&mut per_connection_send, TransportOp::Register)
             .await
             .expect("start per-connection excess");
@@ -2416,6 +2458,9 @@ mod tests {
             .open_bi()
             .await
             .expect("open global excess");
+        write_current_wire_preface_async(&mut global_send)
+            .await
+            .expect("write global preface");
         write_transport_op_async(&mut global_send, TransportOp::Register)
             .await
             .expect("start global excess");
@@ -2586,6 +2631,9 @@ mod tests {
                 .await;
         let (_endpoint, connection) = connect_client(addr).await;
         let (mut send, _recv) = connection.open_bi().await.expect("open stream");
+        write_current_wire_preface_async(&mut send)
+            .await
+            .expect("write stream preface");
         write_transport_op_async(&mut send, TransportOp::Register)
             .await
             .expect("write operation");
@@ -2627,6 +2675,9 @@ mod tests {
         let (_endpoint, connection) = connect_client(addr).await;
 
         let (mut uuid_send, mut uuid_recv) = connection.open_bi().await.expect("open UUID stall");
+        write_current_wire_preface_async(&mut uuid_send)
+            .await
+            .expect("write UUID-stall preface");
         write_transport_op_async(&mut uuid_send, TransportOp::Register)
             .await
             .expect("write op before UUID stall");
@@ -2657,18 +2708,140 @@ mod tests {
             stream_lifetime: Duration::from_millis(500),
             ..QuicResourceSettings::default()
         };
-        let admission = QuicAdmission::new(settings.clone()).expect("valid admission");
-        let (_writer, mut reader) = tokio::io::duplex(1);
-        let absolute = tokio::time::Instant::now() + settings.stream_lifetime;
-        let failure = super::read_prelude(&mut reader, absolute, &settings)
-            .await
-            .expect_err("prelude with no byte must time out");
-        super::report_failure(&admission, failure);
+        let (server_task, addr, _server, admission) =
+            start_test_server_with_metadata_and_settings(InternalMetadata::default(), settings)
+                .await;
+        let (_endpoint, connection) = connect_client(addr).await;
+        let (mut send, mut recv) = connection.open_bi().await.expect("open prelude stall");
+        send.write_all(b"D").await.expect("start partial prelude");
+        assert_stream_reset(&mut send, &mut recv, QUIC_STREAM_TIMEOUT_CODE).await;
+        wait_for_admission(&admission, |snapshot| snapshot.pending == 0).await;
         assert_eq!(
             admission.failure_events(),
             vec![(super::QuicPhase::Prelude, super::StreamFailureKind::Timeout)],
             "failure telemetry retains only the credential-free phase/reason pair"
         );
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn incompatible_prefaces_are_bounded_before_operation_or_durable_state_access() {
+        let directory =
+            std::env::temp_dir().join(format!("distd-wire-compatibility-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let paths = crate::metadata_state::MetadataPaths::in_state_directory(&directory);
+        let (store, metadata) =
+            crate::metadata_state::MetadataStateStore::open_with_validator(paths.clone(), |_| {
+                Ok(())
+            })
+            .unwrap();
+        let server = Server::new_ephemeral_with_metadata(HashMapStorage::default(), metadata)
+            .with_enrollment_token("integration-token")
+            .with_publisher_policy(PublisherPolicy::explicitly_insecure_unsigned())
+            .with_metadata_store(store);
+        let before_metadata = server.metadata_snapshot().await;
+        let before_durable = std::fs::read(&paths.current).unwrap();
+        let settings = QuicResourceSettings {
+            post_auth_prefix_probe: true,
+            ..QuicResourceSettings::default()
+        };
+        let (server_task, addr, server, admission) = start_test_server_instance(server, settings);
+        let (_endpoint, connection) = connect_client(addr).await;
+
+        let cases = [
+            (
+                encode_wire_preface(WireVersionDeclaration {
+                    preface_format: 2,
+                    ..WireVersionDeclaration::CURRENT
+                })
+                .to_vec(),
+                WireRejectionStatus::UnsupportedPrefaceVersion,
+            ),
+            (
+                encode_wire_preface(WireVersionDeclaration {
+                    operation_version: 2,
+                    ..WireVersionDeclaration::CURRENT
+                })
+                .to_vec(),
+                WireRejectionStatus::UnsupportedOperationVersion,
+            ),
+            (
+                encode_wire_preface(WireVersionDeclaration {
+                    protobuf_version: 2,
+                    ..WireVersionDeclaration::CURRENT
+                })
+                .to_vec(),
+                WireRejectionStatus::UnsupportedProtobufVersion,
+            ),
+            (
+                encode_wire_preface(WireVersionDeclaration {
+                    operation_version: 2,
+                    protobuf_version: 2,
+                    ..WireVersionDeclaration::CURRENT
+                })
+                .to_vec(),
+                WireRejectionStatus::UnsupportedVersionPair,
+            ),
+            (
+                {
+                    let mut malformed =
+                        encode_wire_preface(WireVersionDeclaration::CURRENT).to_vec();
+                    malformed[0] ^= 1;
+                    malformed
+                },
+                WireRejectionStatus::MalformedPreface,
+            ),
+        ];
+
+        for (preface, expected_status) in cases {
+            let (mut send, mut recv) = connection
+                .open_bi()
+                .await
+                .expect("open incompatible stream");
+            let mut request = preface;
+            request.extend_from_slice(&[u8::from(TransportOp::Register), 0, 0, 0, 0, 0]);
+            send.write_all(&request)
+                .await
+                .expect("write incompatible request");
+            let _ = send.finish();
+            let response = recv
+                .read_to_end(64)
+                .await
+                .expect("read bounded compatibility rejection");
+            assert_eq!(response.len(), distd_core::transport::WIRE_REJECTION_BYTES);
+            let encoded: [u8; distd_core::transport::WIRE_REJECTION_BYTES] =
+                response.try_into().unwrap();
+            assert_eq!(
+                decode_wire_rejection(&encoded).unwrap(),
+                WireRejection::current(expected_status)
+            );
+        }
+
+        let (mut send, mut recv) = connection.open_bi().await.expect("open truncated stream");
+        send.write_all(&encode_wire_preface(WireVersionDeclaration::CURRENT)[..7])
+            .await
+            .expect("write truncated preface");
+        send.finish().expect("finish truncated preface");
+        let response = recv
+            .read_to_end(64)
+            .await
+            .expect("read truncated-preface rejection");
+        let encoded: [u8; distd_core::transport::WIRE_REJECTION_BYTES] =
+            response.try_into().unwrap();
+        assert_eq!(
+            decode_wire_rejection(&encoded).unwrap(),
+            WireRejection::current(WireRejectionStatus::MalformedPreface)
+        );
+
+        wait_for_admission(&admission, |snapshot| snapshot.pending == 0).await;
+        let snapshot = admission.snapshot();
+        assert_eq!(snapshot.active, 0);
+        assert_eq!(snapshot.post_auth_prefix_reads, 0);
+        assert_eq!(server.storage().size(), 0);
+        assert_eq!(server.metadata_snapshot().await, before_metadata);
+        assert_eq!(std::fs::read(&paths.current).unwrap(), before_durable);
+        server_task.abort();
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]
@@ -2925,6 +3098,9 @@ mod tests {
             .open_bi()
             .await
             .expect("open pending stream");
+        write_current_wire_preface_async(&mut pending_send)
+            .await
+            .expect("write pending preface");
         write_transport_op_async(&mut pending_send, TransportOp::Register)
             .await
             .expect("start pending stream");

@@ -8,8 +8,8 @@ QUIC.
 > [!WARNING]
 > This is a security-hardened research prototype, not a production update
 > framework. The server authenticates publisher signatures at publication,
-> but clients do not yet enforce their own publisher allowlist or rollback
-> policy.
+> and clients enforce an independent publisher allowlist before transfer.
+> Rollback policy is not yet implemented.
 
 ## What v0.2 implements
 
@@ -26,7 +26,8 @@ QUIC.
 | Verified staging and atomic destination replacement | Implemented |
 | P2P distribution, swarms, or a distribution tree | Not implemented |
 | Publisher signatures at the server publication boundary | Implemented |
-| Client publisher policy and rollback protection | Not implemented |
+| Client publisher allowlist and signature verification | Implemented |
+| Rollback protection | Not implemented |
 
 The term “PPSPP-style” in the code refers only to the manifest → possession
 bitfield → missing-chunk exchange. There is currently no peer discovery,
@@ -116,6 +117,22 @@ Clients verify every received chunk and the complete manifest root before
 materializing a staging tree. Activation replaces the previous file or directory
 with a same-filesystem rename, so shorter files and removed directory entries do
 not survive an update.
+
+### QUIC wire contract
+
+Every operation stream begins with the fixed 12-byte V1 preface
+`DSWP 0001 0001 0001 0000` before the operation byte. The fields are the
+preface format, operation-layer version, Protobuf-contract version, and a
+reserved zero, encoded as big-endian `u16` values. V1 operation identifiers are
+`1=Register`, `2=Fetch`, and `3=Sync`; all other byte values are reserved.
+
+The only supported compatibility row is operation V1 with Protobuf V1, in both
+directions. A complete malformed or unsupported declaration receives a fixed
+12-byte `DSWR` rejection before the server reads UUID or operation payload. The
+successful response frames remain byte-identical to the pre-preface V1
+messages. Protobuf field numbers, oneof tags, and enum values are never reused;
+removed identifiers must be reserved, and semantic changes that an older reader
+cannot safely ignore require a Protobuf-contract version bump.
 
 ## Validation
 

@@ -3,7 +3,11 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
 
-use crate::transport::{TransportOp, TransportOpError};
+use crate::transport::{
+    decode_wire_preface, decode_wire_rejection, encode_wire_preface, encode_wire_rejection,
+    TransportOp, TransportOpError, WireCompatibilityError, WireRejection, WireVersionDeclaration,
+    WIRE_PREFACE_BYTES, WIRE_REJECTION_BYTES, WIRE_REJECTION_DOMAIN,
+};
 
 /// Hard protocol ceiling. It bounds allocations before any protobuf message is
 /// decoded and is intentionally above the 16 MiB sync batch target.
@@ -31,6 +35,9 @@ pub enum FrameError {
 
     #[error("transport op error")]
     TransportOp(#[from] TransportOpError),
+
+    #[error("wire compatibility error")]
+    WireCompatibility(#[from] WireCompatibilityError),
 }
 
 pub fn encode_length_delimited<M>(message: &M) -> Result<Vec<u8>, FrameError>
@@ -117,6 +124,49 @@ where
     read_length_delimited_async_with_limit(reader, MAX_FRAME_PAYLOAD_BYTES).await
 }
 
+/// Read the first response frame while recognizing a bounded wire-version rejection.
+pub async fn read_length_delimited_or_wire_rejection_async<R, M>(
+    reader: &mut R,
+) -> Result<M, FrameError>
+where
+    R: AsyncRead + Unpin,
+    M: Message + Default,
+{
+    let frame_len = read_response_frame_length_async(reader, MAX_FRAME_PAYLOAD_BYTES).await?;
+    let mut payload = vec![0u8; frame_len];
+    reader.read_exact(&mut payload).await?;
+    Ok(M::decode(payload.as_slice())?)
+}
+
+/// Read a response frame length or return a typed fixed-size compatibility rejection.
+pub async fn read_response_frame_length_async<R>(
+    reader: &mut R,
+    max_payload_bytes: usize,
+) -> Result<usize, FrameError>
+where
+    R: AsyncRead + Unpin,
+{
+    if max_payload_bytes > MAX_FRAME_PAYLOAD_BYTES {
+        return Err(FrameError::InvalidPayloadLimit);
+    }
+
+    let mut prefix = [0u8; 4];
+    reader.read_exact(&mut prefix).await?;
+    if prefix == WIRE_REJECTION_DOMAIN {
+        let mut encoded = [0u8; WIRE_REJECTION_BYTES];
+        encoded[..4].copy_from_slice(&prefix);
+        reader.read_exact(&mut encoded[4..]).await?;
+        let rejection = decode_wire_rejection(&encoded)?;
+        return Err(WireCompatibilityError::Rejected(rejection.status).into());
+    }
+
+    let frame_len = u32::from_be_bytes(prefix) as usize;
+    if frame_len > max_payload_bytes {
+        return Err(FrameError::FrameTooLarge);
+    }
+    Ok(frame_len)
+}
+
 /// Read and decode one frame while enforcing a caller-specific payload limit.
 ///
 /// The caller limit cannot exceed [`MAX_FRAME_PAYLOAD_BYTES`]. The declared frame length is
@@ -149,6 +199,38 @@ where
     W: AsyncWrite + Unpin,
 {
     writer.write_u8(op.into()).await?;
+    Ok(())
+}
+
+pub async fn write_current_wire_preface_async<W>(writer: &mut W) -> Result<(), FrameError>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer
+        .write_all(&encode_wire_preface(WireVersionDeclaration::CURRENT))
+        .await?;
+    Ok(())
+}
+
+pub async fn read_wire_preface_async<R>(
+    reader: &mut R,
+) -> Result<WireVersionDeclaration, FrameError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut encoded = [0u8; WIRE_PREFACE_BYTES];
+    reader.read_exact(&mut encoded).await?;
+    Ok(decode_wire_preface(&encoded)?)
+}
+
+pub async fn write_wire_rejection_async<W>(
+    writer: &mut W,
+    rejection: WireRejection,
+) -> Result<(), FrameError>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer.write_all(&encode_wire_rejection(rejection)).await?;
     Ok(())
 }
 
@@ -196,11 +278,13 @@ where
 #[cfg(test)]
 mod tests {
     use crate::proto::{sync_message::Msg, ManifestRequest, SyncMessage};
+    use crate::transport::{WireCompatibilityError, WireRejection, WireRejectionStatus};
 
     use super::{
         decode_length_delimited, encode_length_delimited, read_length_delimited_async,
-        read_length_delimited_async_with_limit, try_decode_length_delimited, FrameError,
-        MAX_FRAME_PAYLOAD_BYTES,
+        read_length_delimited_async_with_limit, read_length_delimited_or_wire_rejection_async,
+        read_wire_preface_async, try_decode_length_delimited, write_current_wire_preface_async,
+        write_wire_rejection_async, FrameError, MAX_FRAME_PAYLOAD_BYTES,
     };
 
     fn message(artifact_id: &str) -> SyncMessage {
@@ -218,6 +302,41 @@ mod tests {
         let decoded = decode_length_delimited::<SyncMessage>(&encoded).unwrap();
 
         assert_eq!(decoded, message("artifact-a"));
+    }
+
+    #[tokio::test]
+    async fn current_wire_preface_round_trips_without_allocation() {
+        let (mut writer, mut reader) = tokio::io::duplex(12);
+        write_current_wire_preface_async(&mut writer).await.unwrap();
+        assert_eq!(
+            read_wire_preface_async(&mut reader).await.unwrap(),
+            crate::transport::WireVersionDeclaration::CURRENT
+        );
+    }
+
+    #[tokio::test]
+    async fn response_reader_recognizes_every_bounded_wire_rejection() {
+        for status in [
+            WireRejectionStatus::UnsupportedPrefaceVersion,
+            WireRejectionStatus::UnsupportedOperationVersion,
+            WireRejectionStatus::UnsupportedProtobufVersion,
+            WireRejectionStatus::UnsupportedVersionPair,
+            WireRejectionStatus::MalformedPreface,
+        ] {
+            let (mut writer, mut reader) = tokio::io::duplex(12);
+            write_wire_rejection_async(&mut writer, WireRejection::current(status))
+                .await
+                .unwrap();
+            let error =
+                read_length_delimited_or_wire_rejection_async::<_, SyncMessage>(&mut reader)
+                    .await
+                    .unwrap_err();
+            assert!(matches!(
+                error,
+                FrameError::WireCompatibility(WireCompatibilityError::Rejected(actual))
+                    if actual == status
+            ));
+        }
     }
 
     #[tokio::test]
