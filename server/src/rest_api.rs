@@ -29,14 +29,17 @@ use distd_core::{
     feed::{Feed, Name as FeedName},
     hash::Hash,
     metadata::Server as ServerMetadata,
-    signature::{PublisherPublicKey, PublisherSignature, PublisherSignatureEnvelope},
+    signature::{
+        PublisherPublicKey, PublisherReleaseEnvelope, PublisherReleaseSequence, PublisherSignature,
+        PublisherSignatureEnvelope,
+    },
     utils::path::validate_relative,
     utils::serde::empty_string_as_none,
     version::Version,
 };
 
 use crate::error::Server as ServerError;
-use crate::publication::PublicationError;
+use crate::publication::{PublicationError, PublicationRequestAttestation};
 use crate::Client;
 use crate::Server as RawServer;
 
@@ -45,6 +48,7 @@ type Server<T> = Arc<RawServer<T>>;
 const PUBLISHER_VERSION_HEADER: &str = "x-distd-publisher-statement-version";
 const PUBLISHER_KEY_HEADER: &str = "x-distd-publisher-public-key";
 const PUBLISHER_SIGNATURE_HEADER: &str = "x-distd-publisher-signature";
+const PUBLISHER_SEQUENCE_HEADER: &str = "x-distd-publisher-release-sequence";
 const MAX_PUBLICATION_BODY_BYTES: usize = 512 * 1024 * 1024;
 
 fn singleton_header<'a>(
@@ -80,19 +84,38 @@ fn decode_lower_hex<const N: usize>(value: &HeaderValue) -> Result<[u8; N], Stat
     Ok(decoded)
 }
 
-fn publication_envelope(
-    headers: &HeaderMap,
-) -> Result<Option<PublisherSignatureEnvelope>, StatusCode> {
+fn publication_envelope(headers: &HeaderMap) -> Result<PublicationRequestAttestation, StatusCode> {
     let version = singleton_header(headers, PUBLISHER_VERSION_HEADER)?;
     let key = singleton_header(headers, PUBLISHER_KEY_HEADER)?;
     let signature = singleton_header(headers, PUBLISHER_SIGNATURE_HEADER)?;
-    match (version, key, signature) {
-        (None, None, None) => Ok(None),
-        (Some(version), Some(key), Some(signature)) if version.as_bytes() == b"1" => {
-            Ok(Some(PublisherSignatureEnvelope::from_parts(
+    let sequence = singleton_header(headers, PUBLISHER_SEQUENCE_HEADER)?;
+    match (version, key, signature, sequence) {
+        (None, None, None, None) => Ok(PublicationRequestAttestation::Unsigned),
+        (Some(version), Some(key), Some(signature), None) if version.as_bytes() == b"1" => Ok(
+            PublicationRequestAttestation::ReplayableV1(PublisherSignatureEnvelope::from_parts(
                 PublisherPublicKey::from_bytes(decode_lower_hex(key)?),
                 PublisherSignature::from_bytes(decode_lower_hex(signature)?),
-            )))
+            )),
+        ),
+        (Some(version), Some(key), Some(signature), Some(sequence))
+            if version.as_bytes() == b"2" =>
+        {
+            let sequence = sequence.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
+            if sequence.is_empty()
+                || (sequence.len() > 1 && sequence.starts_with('0'))
+                || !sequence.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+            Ok(PublicationRequestAttestation::ReleaseV2 {
+                sequence: PublisherReleaseSequence::new(
+                    sequence.parse().map_err(|_| StatusCode::BAD_REQUEST)?,
+                ),
+                envelope: PublisherReleaseEnvelope::from_parts(
+                    PublisherPublicKey::from_bytes(decode_lower_hex(key)?),
+                    PublisherSignature::from_bytes(decode_lower_hex(signature)?),
+                ),
+            })
         }
         _ => Err(StatusCode::BAD_REQUEST),
     }
@@ -103,7 +126,9 @@ fn publication_error_status(error: &ServerError) -> StatusCode {
         ServerError::Publication(PublicationError::UntrustedPublisher)
         | ServerError::Publication(PublicationError::InvalidSignature(_)) => StatusCode::FORBIDDEN,
         ServerError::Publication(PublicationError::AttestationConflict) => StatusCode::CONFLICT,
-        ServerError::Publication(PublicationError::UnsignedForbidden) => StatusCode::BAD_REQUEST,
+        ServerError::Publication(
+            PublicationError::UnsignedForbidden | PublicationError::ReplayableForbidden,
+        ) => StatusCode::BAD_REQUEST,
         ServerError::State(message) if message.contains("read-only until restart") => {
             StatusCode::SERVICE_UNAVAILABLE
         }
@@ -160,7 +185,7 @@ where
             Ok(envelope) => envelope,
             Err(status) => return status.into_response(),
         };
-        if let Err(error) = server.precheck_publication_attestation(envelope.as_ref()) {
+        if let Err(error) = server.precheck_publication_attestation(&envelope) {
             return publication_error_status(&error).into_response();
         }
     }
@@ -422,7 +447,21 @@ where
     let result = if uploaded_files.len() == 1 {
         let (_, file) = uploaded_files.pop().unwrap();
         match envelope {
-            Some(envelope) => {
+            PublicationRequestAttestation::ReleaseV2 { sequence, envelope } => {
+                server
+                    .publish_release_item_as(
+                        artifact_id,
+                        item_data.name,
+                        destination,
+                        item_data.description,
+                        file,
+                        chunk_algorithm,
+                        sequence,
+                        envelope,
+                    )
+                    .await
+            }
+            PublicationRequestAttestation::ReplayableV1(envelope) => {
                 server
                     .publish_signed_item_as(
                         artifact_id,
@@ -435,7 +474,7 @@ where
                     )
                     .await
             }
-            None => {
+            PublicationRequestAttestation::Unsigned => {
                 server
                     .publish_item_as(
                         artifact_id,
@@ -450,7 +489,21 @@ where
         }
     } else {
         match envelope {
-            Some(envelope) => {
+            PublicationRequestAttestation::ReleaseV2 { sequence, envelope } => {
+                server
+                    .publish_release_item_from_files_as(
+                        artifact_id,
+                        item_data.name,
+                        destination,
+                        item_data.description,
+                        uploaded_files,
+                        chunk_algorithm,
+                        sequence,
+                        envelope,
+                    )
+                    .await
+            }
+            PublicationRequestAttestation::ReplayableV1(envelope) => {
                 server
                     .publish_signed_item_from_files_as(
                         artifact_id,
@@ -463,7 +516,7 @@ where
                     )
                     .await
             }
-            None => {
+            PublicationRequestAttestation::Unsigned => {
                 server
                     .publish_item_from_files_as(
                         artifact_id,
@@ -576,7 +629,16 @@ where
 mod tests {
     use super::*;
     use crate::InternalMetadata;
-    use distd_core::chunk_storage::hashmap_storage::HashMapStorage;
+    use axum::body::Bytes;
+    use distd_core::{
+        chunk_storage::{hashmap_storage::HashMapStorage, ChunkStorage},
+        chunks::ChunkAlgorithm,
+        signature::{
+            PublisherPublicKey, PublisherReleaseEnvelope, PublisherReleaseSequence,
+            PublisherReleaseStatement, PublisherSignature,
+        },
+    };
+    use ring::signature::{Ed25519KeyPair, KeyPair};
     use tower::ServiceExt;
 
     static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -620,7 +682,8 @@ mod tests {
                 axum::http::header::CONTENT_TYPE,
                 "multipart/form-data; boundary=distd-test",
             )
-            .header(PUBLISHER_VERSION_HEADER, "1")
+            .header(PUBLISHER_VERSION_HEADER, "2")
+            .header(PUBLISHER_SEQUENCE_HEADER, "1")
             .header(PUBLISHER_KEY_HEADER, hex(&key))
             .header(PUBLISHER_SIGNATURE_HEADER, "00".repeat(64));
         if let Some(bearer) = bearer {
@@ -646,15 +709,38 @@ mod tests {
         headers
     }
 
+    fn release_headers(sequence: &str) -> HeaderMap {
+        let mut headers = signed_headers();
+        headers.insert(PUBLISHER_VERSION_HEADER, HeaderValue::from_static("2"));
+        headers.insert(
+            PUBLISHER_SEQUENCE_HEADER,
+            HeaderValue::from_str(sequence).unwrap(),
+        );
+        headers
+    }
+
     #[test]
     fn publication_headers_are_exact_singletons() {
         let headers = signed_headers();
-        let envelope = publication_envelope(&headers)
-            .expect("valid headers")
-            .expect("signed envelope");
+        let PublicationRequestAttestation::ReplayableV1(envelope) =
+            publication_envelope(&headers).expect("valid headers")
+        else {
+            panic!("expected a V1 compatibility envelope");
+        };
         assert_eq!(envelope.public_key().as_bytes(), &[0x12; 32]);
         assert_eq!(envelope.signature().as_bytes(), &[0x34; 64]);
-        assert_eq!(publication_envelope(&HeaderMap::new()), Ok(None));
+        assert_eq!(
+            publication_envelope(&HeaderMap::new()),
+            Ok(PublicationRequestAttestation::Unsigned)
+        );
+        let PublicationRequestAttestation::ReleaseV2 { sequence, envelope } =
+            publication_envelope(&release_headers("18446744073709551615"))
+                .expect("valid V2 release headers")
+        else {
+            panic!("expected a V2 release envelope");
+        };
+        assert_eq!(sequence.get(), u64::MAX);
+        assert_eq!(envelope.public_key().as_bytes(), &[0x12; 32]);
 
         for name in [
             PUBLISHER_VERSION_HEADER,
@@ -698,6 +784,24 @@ mod tests {
             );
             assert_eq!(publication_envelope(&headers), Err(StatusCode::BAD_REQUEST));
         }
+        for sequence in ["", "00", "01", "+1", " 1", "18446744073709551616"] {
+            let mut headers = release_headers("1");
+            if sequence.is_empty() {
+                headers.remove(PUBLISHER_SEQUENCE_HEADER);
+            } else {
+                headers.insert(
+                    PUBLISHER_SEQUENCE_HEADER,
+                    HeaderValue::from_str(sequence).unwrap(),
+                );
+            }
+            assert_eq!(publication_envelope(&headers), Err(StatusCode::BAD_REQUEST));
+        }
+        let mut duplicate_sequence = release_headers("1");
+        duplicate_sequence.append(PUBLISHER_SEQUENCE_HEADER, HeaderValue::from_static("2"));
+        assert_eq!(
+            publication_envelope(&duplicate_sequence),
+            Err(StatusCode::BAD_REQUEST)
+        );
     }
 
     #[test]
@@ -786,5 +890,65 @@ mod tests {
         assert_eq!(metadata_before, InternalMetadata::default());
         assert_eq!(std::fs::read(&paths.current).unwrap(), durable_before);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn valid_v2_rest_release_persists_exact_sequence_and_envelope() {
+        let _environment = ENV_LOCK.lock().await;
+        let _token = PublishTokenGuard::install("release-secret");
+        let payload = b"rollback-protected REST release";
+        let sequence = PublisherReleaseSequence::new(42);
+        let storage = HashMapStorage::default();
+        let item = storage
+            .prepare_revision(
+                "route-test".to_string(),
+                "route-test".to_string(),
+                "route.bin".into(),
+                0,
+                None,
+                Bytes::from_static(payload),
+                ChunkAlgorithm::Fixed256K,
+            )
+            .unwrap();
+        let pair = Ed25519KeyPair::from_seed_unchecked(&[0x55; 32]).unwrap();
+        let statement = PublisherReleaseStatement::from_item(&item, sequence).unwrap();
+        let envelope = PublisherReleaseEnvelope::from_parts(
+            PublisherPublicKey::try_from(pair.public_key().as_ref()).unwrap(),
+            PublisherSignature::try_from(pair.sign(statement.as_bytes()).as_ref()).unwrap(),
+        );
+        let server = RawServer::new_ephemeral(storage).with_publisher_policy(
+            crate::publication::PublisherPolicy::required([envelope.public_key()]),
+        );
+        let observed = server.clone();
+        let body = multipart_body(payload);
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/items?artifact_id=route-test&name=route-test&path=route.bin&chunking=fixed")
+            .header(
+                axum::http::header::CONTENT_TYPE,
+                "multipart/form-data; boundary=distd-test",
+            )
+            .header(axum::http::header::AUTHORIZATION, "Bearer release-secret")
+            .header(PUBLISHER_VERSION_HEADER, "2")
+            .header(PUBLISHER_SEQUENCE_HEADER, sequence.get().to_string())
+            .header(PUBLISHER_KEY_HEADER, hex(envelope.public_key().as_bytes()))
+            .header(
+                PUBLISHER_SIGNATURE_HEADER,
+                hex(envelope.signature().as_bytes()),
+            )
+            .body(Body::from(body.clone()))
+            .unwrap();
+        let response = make_router_with_body_limit(server, body.len() + 1)
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let metadata = observed.metadata_snapshot().await;
+        let published = &metadata.versions["route-test"][&0];
+        assert_eq!(published.item().manifest.root_hash, item.manifest.root_hash);
+        assert_eq!(
+            published.attestation().release(),
+            Some((sequence, &envelope))
+        );
     }
 }

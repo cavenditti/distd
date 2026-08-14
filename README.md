@@ -84,15 +84,17 @@ Publish through the authenticated HTTP endpoint:
 ```bash
 curl --fail-with-body \
   -H "Authorization: Bearer $DISTD_PUBLISH_TOKEN" \
-  -H 'X-Distd-Publisher-Statement-Version: 1' \
+  -H 'X-Distd-Publisher-Statement-Version: 2' \
+  -H "X-Distd-Publisher-Release-Sequence: $DISTD_PUBLISHER_RELEASE_SEQUENCE" \
   -H "X-Distd-Publisher-Public-Key: $DISTD_PUBLISHER_PUBLIC_KEY" \
   -H "X-Distd-Publisher-Signature: $DISTD_PUBLISHER_SIGNATURE" \
   -F 'item=@./release.bin' \
   'http://127.0.0.1:3000/items?artifact_id=my-app&name=MyApp&path=server/release.bin'
 ```
 
-The detached signature covers distd's canonical publisher statement for the
-typed manifest and ordered chunks, not the multipart or Protobuf bytes. Private
+The detached signature covers distd's canonical V2 publisher release statement
+for the publisher-controlled sequence, typed manifest, and ordered chunks—not
+the multipart or Protobuf bytes. Sequences are monotonic per artifact. Private
 key tooling remains intentionally outside the server. Every key referenced by
 retained signed history must remain in `DISTD_PUBLISHER_PUBLIC_KEYS`; removing
 one makes secure startup and sync fail closed. For isolated research only,

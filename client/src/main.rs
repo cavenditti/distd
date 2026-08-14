@@ -5,6 +5,7 @@ pub mod client;
 pub mod error;
 pub mod persistence;
 pub mod publisher;
+pub mod rollback;
 pub mod server;
 pub mod server_url;
 pub mod settings;

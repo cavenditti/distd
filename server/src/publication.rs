@@ -5,8 +5,8 @@ use std::{collections::HashSet, fmt, sync::Arc};
 use distd_core::{
     item::Item,
     signature::{
-        PublisherKeyFingerprint, PublisherPublicKey, PublisherSignatureEnvelope,
-        SignatureEnvelopeError,
+        PublisherKeyFingerprint, PublisherPublicKey, PublisherReleaseEnvelope,
+        PublisherReleaseSequence, PublisherSignatureEnvelope, SignatureEnvelopeError,
     },
 };
 use thiserror::Error;
@@ -14,33 +14,68 @@ use thiserror::Error;
 /// A publisher attestation retained with one immutable artifact revision.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PublicationAttestation {
-    /// A cryptographically valid V1 publisher signature envelope.
-    Signed(PublisherSignatureEnvelope),
+    /// A rollback-protected V2 publisher release.
+    ReleaseV2 {
+        sequence: PublisherReleaseSequence,
+        envelope: PublisherReleaseEnvelope,
+    },
+    /// A cryptographically valid but replayable V1 compatibility envelope.
+    ReplayableV1(PublisherSignatureEnvelope),
     /// An explicitly insecure unsigned compatibility record.
+    UnsignedLegacy,
+}
+
+/// Attestation supplied with one publication request before content
+/// reconstruction makes it a verified immutable [`PublicationAttestation`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PublicationRequestAttestation {
+    ReleaseV2 {
+        sequence: PublisherReleaseSequence,
+        envelope: PublisherReleaseEnvelope,
+    },
+    ReplayableV1(PublisherSignatureEnvelope),
     Unsigned,
 }
 
 impl PublicationAttestation {
-    /// Return the signed V1 envelope, if this is an authenticated record.
+    /// Return the rollback-protected V2 sequence and envelope, when present.
     #[must_use]
-    pub const fn envelope(&self) -> Option<&PublisherSignatureEnvelope> {
+    pub const fn release(&self) -> Option<(PublisherReleaseSequence, &PublisherReleaseEnvelope)> {
         match self {
-            Self::Signed(envelope) => Some(envelope),
-            Self::Unsigned => None,
+            Self::ReleaseV2 { sequence, envelope } => Some((*sequence, envelope)),
+            Self::ReplayableV1(_) | Self::UnsignedLegacy => None,
+        }
+    }
+
+    /// Return the replayable V1 envelope, when present.
+    #[must_use]
+    pub const fn replayable_envelope(&self) -> Option<&PublisherSignatureEnvelope> {
+        match self {
+            Self::ReplayableV1(envelope) => Some(envelope),
+            Self::ReleaseV2 { .. } | Self::UnsignedLegacy => None,
         }
     }
 
     /// Return the stable publisher fingerprint when this record is signed.
     #[must_use]
     pub fn publisher_fingerprint(&self) -> Option<PublisherKeyFingerprint> {
-        self.envelope()
-            .map(PublisherSignatureEnvelope::publisher_fingerprint)
+        match self {
+            Self::ReleaseV2 { envelope, .. } => Some(envelope.publisher_fingerprint()),
+            Self::ReplayableV1(envelope) => Some(envelope.publisher_fingerprint()),
+            Self::UnsignedLegacy => None,
+        }
+    }
+
+    /// Whether this record carries rollback-protected publisher authority.
+    #[must_use]
+    pub const fn is_rollback_protected(&self) -> bool {
+        matches!(self, Self::ReleaseV2 { .. })
     }
 
     /// Whether this is the explicit unsigned compatibility variant.
     #[must_use]
     pub const fn is_unsigned(&self) -> bool {
-        matches!(self, Self::Unsigned)
+        matches!(self, Self::UnsignedLegacy)
     }
 }
 
@@ -55,8 +90,14 @@ impl PublishedRevision {
     /// Construct a record while verifying any signed attestation against the
     /// complete typed Item. Unsigned construction remains explicit.
     pub fn new(item: Item, attestation: PublicationAttestation) -> Result<Self, PublicationError> {
-        if let PublicationAttestation::Signed(envelope) = attestation {
-            envelope.verify(&item)?;
+        match attestation {
+            PublicationAttestation::ReleaseV2 { sequence, envelope } => {
+                envelope.verify(&item, sequence)?;
+            }
+            PublicationAttestation::ReplayableV1(envelope) => {
+                envelope.verify(&item)?;
+            }
+            PublicationAttestation::UnsignedLegacy => {}
         }
         Ok(Self { item, attestation })
     }
@@ -66,7 +107,7 @@ impl PublishedRevision {
     pub const fn unsigned(item: Item) -> Self {
         Self {
             item,
-            attestation: PublicationAttestation::Unsigned,
+            attestation: PublicationAttestation::UnsignedLegacy,
         }
     }
 
@@ -112,10 +153,13 @@ pub enum PublicationError {
     /// Secure policy does not admit unsigned publication or metadata.
     #[error("unsigned publication is forbidden by publisher policy")]
     UnsignedForbidden,
+    /// Secure rollback policy does not admit replayable V1 publication.
+    #[error("replayable V1 publication is forbidden by publisher policy")]
+    ReplayableForbidden,
     /// Immutable signed content already exists under a different envelope.
     #[error("publication attestation conflicts with the existing immutable revision")]
     AttestationConflict,
-    /// The typed Item or signature does not form a valid V1 attestation.
+    /// The typed Item or signature does not form a valid publisher attestation.
     #[error("publisher signature is invalid: {0}")]
     InvalidSignature(#[from] SignatureEnvelopeError),
 }
@@ -158,11 +202,12 @@ impl PublisherPolicy {
         Self::ExplicitlyInsecureUnsigned
     }
 
-    /// Verify and bind a signed new publication. Required mode checks exact
-    /// raw-key membership before performing cryptographic verification.
-    pub fn authorize_new(
+    /// Verify and bind a rollback-protected V2 release. Required mode checks
+    /// exact raw-key membership before cryptographic verification.
+    pub fn authorize_release_new(
         &self,
-        envelope: PublisherSignatureEnvelope,
+        sequence: PublisherReleaseSequence,
+        envelope: PublisherReleaseEnvelope,
         item: Item,
     ) -> Result<PublishedRevision, PublicationError> {
         if let Self::Required { keys } = self {
@@ -170,7 +215,23 @@ impl PublisherPolicy {
                 return Err(PublicationError::UntrustedPublisher);
             }
         }
-        PublishedRevision::new(item, PublicationAttestation::Signed(envelope))
+        PublishedRevision::new(
+            item,
+            PublicationAttestation::ReleaseV2 { sequence, envelope },
+        )
+    }
+
+    /// Verify and bind a replayable V1 publication. Required policy rejects
+    /// this compatibility form.
+    pub fn authorize_new(
+        &self,
+        envelope: PublisherSignatureEnvelope,
+        item: Item,
+    ) -> Result<PublishedRevision, PublicationError> {
+        if matches!(self, Self::Required { .. }) {
+            return Err(PublicationError::ReplayableForbidden);
+        }
+        PublishedRevision::new(item, PublicationAttestation::ReplayableV1(envelope))
     }
 
     /// Bind an unsigned new publication only in explicitly insecure mode.
@@ -192,19 +253,69 @@ impl PublisherPolicy {
         revision: &PublishedRevision,
     ) -> Result<(), PublicationError> {
         match revision.attestation() {
-            PublicationAttestation::Signed(envelope) => {
+            PublicationAttestation::ReleaseV2 { sequence, envelope } => {
                 if let Self::Required { keys } = self {
                     if !keys.contains(&envelope.public_key()) {
                         return Err(PublicationError::UntrustedPublisher);
                     }
                 }
-                envelope.verify(revision.item())?;
+                envelope.verify(revision.item(), *sequence)?;
                 Ok(())
             }
-            PublicationAttestation::Unsigned => match self {
+            PublicationAttestation::ReplayableV1(envelope) => match self {
+                Self::Required { .. } => Err(PublicationError::ReplayableForbidden),
+                Self::ExplicitlyInsecureUnsigned => {
+                    envelope.verify(revision.item())?;
+                    Ok(())
+                }
+            },
+            PublicationAttestation::UnsignedLegacy => match self {
                 Self::Required { .. } => Err(PublicationError::UnsignedForbidden),
                 Self::ExplicitlyInsecureUnsigned => Ok(()),
             },
+        }
+    }
+
+    /// Fail fast on request authority before reading or preparing a body.
+    pub fn precheck_request(
+        &self,
+        attestation: &PublicationRequestAttestation,
+    ) -> Result<(), PublicationError> {
+        match (self, attestation) {
+            (
+                Self::Required { keys },
+                PublicationRequestAttestation::ReleaseV2 { envelope, .. },
+            ) => {
+                if keys.contains(&envelope.public_key()) {
+                    Ok(())
+                } else {
+                    Err(PublicationError::UntrustedPublisher)
+                }
+            }
+            (Self::Required { .. }, PublicationRequestAttestation::ReplayableV1(_)) => {
+                Err(PublicationError::ReplayableForbidden)
+            }
+            (Self::Required { .. }, PublicationRequestAttestation::Unsigned) => {
+                Err(PublicationError::UnsignedForbidden)
+            }
+            (Self::ExplicitlyInsecureUnsigned, _) => Ok(()),
+        }
+    }
+
+    /// Verify one request against its reconstructed typed Item.
+    pub fn authorize_request(
+        &self,
+        attestation: PublicationRequestAttestation,
+        item: Item,
+    ) -> Result<PublishedRevision, PublicationError> {
+        match attestation {
+            PublicationRequestAttestation::ReleaseV2 { sequence, envelope } => {
+                self.authorize_release_new(sequence, envelope, item)
+            }
+            PublicationRequestAttestation::ReplayableV1(envelope) => {
+                self.authorize_new(envelope, item)
+            }
+            PublicationRequestAttestation::Unsigned => self.authorize_unsigned_new(item),
         }
     }
 
@@ -231,7 +342,7 @@ mod tests {
     use distd_core::{
         chunk_storage::{hashmap_storage::HashMapStorage, ChunkStorage},
         chunks::ChunkAlgorithm,
-        signature::{PublisherSignature, PublisherStatement},
+        signature::{PublisherReleaseStatement, PublisherSignature, PublisherStatement},
     };
     use ring::signature::{Ed25519KeyPair, KeyPair};
     use std::path::PathBuf;
@@ -259,17 +370,36 @@ mod tests {
         )
     }
 
+    fn release_envelope(
+        item: &Item,
+        seed: [u8; 32],
+        sequence: PublisherReleaseSequence,
+    ) -> PublisherReleaseEnvelope {
+        let pair = Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
+        let statement = PublisherReleaseStatement::from_item(item, sequence).unwrap();
+        PublisherReleaseEnvelope::from_parts(
+            PublisherPublicKey::try_from(pair.public_key().as_ref()).unwrap(),
+            PublisherSignature::try_from(pair.sign(statement.as_bytes()).as_ref()).unwrap(),
+        )
+    }
+
     #[test]
     fn required_policy_uses_exact_keys_for_new_and_historical_revisions() {
         let item = item();
-        let allowed = envelope(&item, [7; 32]);
-        let other = envelope(&item, [9; 32]);
+        let sequence = PublisherReleaseSequence::new(7);
+        let allowed = release_envelope(&item, [7; 32], sequence);
+        let other = release_envelope(&item, [9; 32], sequence);
         let policy = PublisherPolicy::required([allowed.public_key()]);
-        let published = policy.authorize_new(allowed, item.clone()).unwrap();
+        let published = policy
+            .authorize_release_new(sequence, allowed, item.clone())
+            .unwrap();
         assert_eq!(published.item(), &item);
-        assert_eq!(published.attestation().envelope(), Some(&allowed));
         assert_eq!(
-            policy.authorize_new(other, item.clone()),
+            published.attestation().release(),
+            Some((sequence, &allowed))
+        );
+        assert_eq!(
+            policy.authorize_release_new(sequence, other, item.clone()),
             Err(PublicationError::UntrustedPublisher)
         );
 
@@ -279,6 +409,11 @@ mod tests {
             Err(PublicationError::UntrustedPublisher)
         );
         policy.validate_metadata_compatibility(&published).unwrap();
+
+        assert_eq!(
+            policy.authorize_new(envelope(&item, [7; 32]), item),
+            Err(PublicationError::ReplayableForbidden)
+        );
     }
 
     #[test]

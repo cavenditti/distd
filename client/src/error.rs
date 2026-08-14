@@ -10,6 +10,7 @@ use thiserror::Error;
 use crate::{
     persistence::PersistenceError,
     publisher::{PublisherAuthenticityError, PublisherConfigError},
+    rollback::RollbackError,
     server_url::ServerUrlError,
 };
 
@@ -80,6 +81,9 @@ pub enum ServerRequest {
 
     #[error("publisher verification worker failed")]
     PublisherVerificationWorker,
+
+    #[error("publisher rollback protection failed: {0}")]
+    RollbackProtection(#[from] RollbackError),
 
     #[error("server metadata worker failed")]
     MetadataWorker,

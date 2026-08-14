@@ -565,6 +565,8 @@ mod tests {
             chunk_sizes: vec![42],
             publisher_public_key: Vec::new(),
             publisher_signature: Vec::new(),
+            publisher_statement_version: None,
+            publisher_release_sequence: None,
         };
         let expected_for_writer = expected.clone();
 

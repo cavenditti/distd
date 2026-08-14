@@ -1365,7 +1365,8 @@ mod tests {
         PossessionBitfield, ServerMetadata as ProtoServerMetadata, SyncMessage,
     };
     use distd_core::signature::{
-        PublisherPublicKey, PublisherSignature, PublisherSignatureEnvelope, PublisherStatement,
+        PublisherPublicKey, PublisherReleaseEnvelope, PublisherReleaseSequence,
+        PublisherReleaseStatement, PublisherSignature,
     };
     use distd_core::transport::{
         decode_wire_rejection, encode_wire_preface, TransportOp, WireRejection,
@@ -1572,13 +1573,19 @@ mod tests {
         (handle, addr, server, admission)
     }
 
-    fn signed_envelope(item: &Item, seed: [u8; 32]) -> PublisherSignatureEnvelope {
+    fn signed_release(
+        item: &Item,
+        seed: [u8; 32],
+        sequence: u64,
+    ) -> (PublisherReleaseSequence, PublisherReleaseEnvelope) {
         let pair = Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
-        let statement = PublisherStatement::from_item(item).unwrap();
-        PublisherSignatureEnvelope::from_parts(
+        let sequence = PublisherReleaseSequence::new(sequence);
+        let statement = PublisherReleaseStatement::from_item(item, sequence).unwrap();
+        let envelope = PublisherReleaseEnvelope::from_parts(
             PublisherPublicKey::try_from(pair.public_key().as_ref()).unwrap(),
             PublisherSignature::try_from(pair.sign(statement.as_bytes()).as_ref()).unwrap(),
-        )
+        );
+        (sequence, envelope)
     }
 
     async fn start_test_server() -> (
@@ -3515,33 +3522,37 @@ mod tests {
                 )
                 .unwrap()
         };
-        let first_envelope = signed_envelope(&prepare(first_bytes.clone()), [71; 32]);
-        let second_envelope = signed_envelope(&prepare(second_bytes.clone()), [73; 32]);
+        let (first_sequence, first_envelope) =
+            signed_release(&prepare(first_bytes.clone()), [71; 32], 1);
+        let (second_sequence, second_envelope) =
+            signed_release(&prepare(second_bytes.clone()), [73; 32], 2);
         let policy =
             PublisherPolicy::required([first_envelope.public_key(), second_envelope.public_key()]);
         let server = Server::new_ephemeral_with_metadata(storage, InternalMetadata::default())
             .with_enrollment_token("integration-token")
             .with_publisher_policy(policy);
         let first = server
-            .publish_signed_item_as(
+            .publish_release_item_as(
                 "signed-quic".to_string(),
                 "signed-quic".to_string(),
                 "signed-quic.bin".into(),
                 None,
                 first_bytes,
                 algorithm,
+                first_sequence,
                 first_envelope,
             )
             .await
             .unwrap();
         let second = server
-            .publish_signed_item_as(
+            .publish_release_item_as(
                 "signed-quic".to_string(),
                 "signed-quic".to_string(),
                 "signed-quic.bin".into(),
                 None,
                 second_bytes,
                 algorithm,
+                second_sequence,
                 second_envelope,
             )
             .await
@@ -3551,9 +3562,9 @@ mod tests {
         let (_endpoint, connection) = connect_client(addr).await;
         let uuid = register_client_uuid(&connection).await;
 
-        for (version, expected_item, expected_envelope) in [
-            (None, &second, second_envelope),
-            (Some(0), &first, first_envelope),
+        for (version, expected_item, expected_sequence, expected_envelope) in [
+            (None, &second, second_sequence, second_envelope),
+            (Some(0), &first, first_sequence, first_envelope),
         ] {
             let (mut send, mut recv) =
                 open_authed_stream(&connection, TransportOp::Sync, Some(uuid)).await;
@@ -3581,6 +3592,11 @@ mod tests {
             assert_eq!(
                 response.publisher_signature,
                 expected_envelope.signature().as_bytes()
+            );
+            assert_eq!(response.publisher_statement_version, Some(2));
+            assert_eq!(
+                response.publisher_release_sequence,
+                Some(expected_sequence.get())
             );
             write_length_delimited_async(
                 &mut send,

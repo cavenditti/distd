@@ -8,6 +8,7 @@
 //!
 //! Both "in-memory" (current default) and "persistent" server modes are supported.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -20,7 +21,7 @@ use bytes::Bytes;
 use distd_core::{
     chunk_storage::{hashmap_storage::HashMapStorage, ChunkStorage},
     chunks::{ChunkAlgorithm, ChunkingPolicy},
-    signature::PublisherStatement,
+    signature::{PublisherReleaseSequence, PublisherReleaseStatement},
 };
 use ring::signature::{Ed25519KeyPair, KeyPair};
 
@@ -55,8 +56,11 @@ fn benchmark_publisher_public_key() -> String {
         .collect()
 }
 
-fn benchmark_publisher_signature(item: &distd_core::item::Item) -> Result<String, String> {
-    let statement = PublisherStatement::from_item(item)
+fn benchmark_publisher_signature(
+    item: &distd_core::item::Item,
+    sequence: PublisherReleaseSequence,
+) -> Result<String, String> {
+    let statement = PublisherReleaseStatement::from_item(item, sequence)
         .map_err(|error| format!("cannot build benchmark publisher statement: {error}"))?;
     Ok(benchmark_publisher_key_pair()
         .sign(statement.as_bytes())
@@ -133,6 +137,7 @@ pub struct DistdRunner {
     corpus_seed: Option<u64>,
     server_guard: Mutex<Option<ServerGuard>>,
     sync_udp_proxy: Mutex<Option<UdpShaperProxy>>,
+    publisher_sequences: Mutex<HashMap<String, u64>>,
 }
 
 impl DistdRunner {
@@ -182,7 +187,23 @@ impl DistdRunner {
             corpus_seed: options.corpus_seed,
             server_guard: Mutex::new(None),
             sync_udp_proxy: Mutex::new(None),
+            publisher_sequences: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn next_publisher_sequence(
+        &self,
+        artifact_id: &str,
+    ) -> Result<PublisherReleaseSequence, String> {
+        let mut sequences = self.publisher_sequences.lock().unwrap();
+        let next = sequences
+            .get(artifact_id)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| "benchmark publisher release sequence exhausted".to_string())?;
+        sequences.insert(artifact_id.to_owned(), next);
+        Ok(PublisherReleaseSequence::new(next))
     }
 
     fn quic_port_ready() -> bool {
@@ -446,6 +467,7 @@ impl DistdRunner {
         item_name: &str,
         item_path: &str,
         chunking_policy: Option<&str>,
+        sequence: PublisherReleaseSequence,
     ) -> Result<(String, String), String> {
         let data = std::fs::read(source_file)
             .map_err(|error| format!("cannot read benchmark publication input: {error}"))?;
@@ -463,7 +485,7 @@ impl DistdRunner {
             .map_err(|error| format!("cannot prepare signed benchmark publication: {error}"))?;
         Ok((
             benchmark_publisher_public_key(),
-            benchmark_publisher_signature(&item)?,
+            benchmark_publisher_signature(&item, sequence)?,
         ))
     }
 
@@ -473,6 +495,7 @@ impl DistdRunner {
         item_name: &str,
         item_path: &str,
         chunking_policy: Option<&str>,
+        sequence: PublisherReleaseSequence,
     ) -> Result<(String, String), String> {
         let files = source_files
             .iter()
@@ -506,7 +529,7 @@ impl DistdRunner {
             .map_err(|error| format!("cannot prepare signed benchmark publication: {error}"))?;
         Ok((
             benchmark_publisher_public_key(),
-            benchmark_publisher_signature(&item)?,
+            benchmark_publisher_signature(&item, sequence)?,
         ))
     }
 
@@ -518,8 +541,14 @@ impl DistdRunner {
         item_path: &str,
         chunking_policy: Option<&str>,
     ) -> Result<(), String> {
-        let (publisher_key, publisher_signature) =
-            Self::signed_file_headers(source_file, item_name, item_path, chunking_policy)?;
+        let sequence = self.next_publisher_sequence(item_name)?;
+        let (publisher_key, publisher_signature) = Self::signed_file_headers(
+            source_file,
+            item_name,
+            item_path,
+            chunking_policy,
+            sequence,
+        )?;
         for attempt in 1..=PUBLISH_RETRIES {
             let publish_url = item_publish_url(
                 &self.publish_base_url(),
@@ -540,7 +569,9 @@ impl DistdRunner {
                     "-H",
                     &format!("Authorization: Bearer {BENCH_AUTH_TOKEN}"),
                     "-H",
-                    "X-Distd-Publisher-Statement-Version: 1",
+                    "X-Distd-Publisher-Statement-Version: 2",
+                    "-H",
+                    &format!("X-Distd-Publisher-Release-Sequence: {}", sequence.get()),
                     "-H",
                     &format!("X-Distd-Publisher-Public-Key: {publisher_key}"),
                     "-H",
@@ -583,12 +614,14 @@ impl DistdRunner {
         item_path: &str,
         chunking_policy: Option<&str>,
     ) -> Result<(), String> {
+        let sequence = self.next_publisher_sequence(item_name)?;
         let (publisher_key, publisher_signature) = Self::signed_directory_headers(
             source_root,
             source_files,
             item_name,
             item_path,
             chunking_policy,
+            sequence,
         )?;
         for attempt in 1..=PUBLISH_RETRIES {
             let mut cmd = Command::new("curl");
@@ -603,7 +636,12 @@ impl DistdRunner {
                 .arg("-H")
                 .arg(format!("Authorization: Bearer {BENCH_AUTH_TOKEN}"))
                 .arg("-H")
-                .arg("X-Distd-Publisher-Statement-Version: 1")
+                .arg("X-Distd-Publisher-Statement-Version: 2")
+                .arg("-H")
+                .arg(format!(
+                    "X-Distd-Publisher-Release-Sequence: {}",
+                    sequence.get()
+                ))
                 .arg("-H")
                 .arg(format!("X-Distd-Publisher-Public-Key: {publisher_key}"))
                 .arg("-H")
@@ -1340,7 +1378,10 @@ mod tests {
         use distd_core::{
             chunk_storage::{hashmap_storage::HashMapStorage, ChunkStorage},
             chunks::ChunkAlgorithm,
-            signature::{PublisherPublicKey, PublisherSignature, PublisherSignatureEnvelope},
+            signature::{
+                PublisherPublicKey, PublisherReleaseEnvelope, PublisherReleaseSequence,
+                PublisherSignature,
+            },
         };
 
         let temporary = tempfile::tempdir().unwrap();
@@ -1348,9 +1389,15 @@ mod tests {
         let payload = b"signed benchmark publication";
         fs::write(&source, payload).unwrap();
 
-        let (key, signature) =
-            DistdRunner::signed_file_headers(&source, "bench-artifact", "bench-artifact", None)
-                .unwrap();
+        let sequence = PublisherReleaseSequence::new(1);
+        let (key, signature) = DistdRunner::signed_file_headers(
+            &source,
+            "bench-artifact",
+            "bench-artifact",
+            None,
+            sequence,
+        )
+        .unwrap();
         assert_eq!(key, benchmark_publisher_public_key());
 
         let item = HashMapStorage::default()
@@ -1364,11 +1411,11 @@ mod tests {
                 ChunkAlgorithm::from_policy("auto".parse().unwrap(), &source, payload, false),
             )
             .unwrap();
-        let envelope = PublisherSignatureEnvelope::from_parts(
+        let envelope = PublisherReleaseEnvelope::from_parts(
             PublisherPublicKey::from_bytes(decode_hex(&key)),
             PublisherSignature::from_bytes(decode_hex(&signature)),
         );
-        envelope.verify(&item).unwrap();
+        envelope.verify(&item, sequence).unwrap();
     }
 
     fn integration_runner(root: &std::path::Path) -> DistdRunner {

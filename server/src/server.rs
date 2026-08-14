@@ -17,7 +17,9 @@ use distd_core::proto::{
     self, sync_message::Msg, ClientKeepAlive, ClientRegister,
     ServerMetadata as ProtoServerMetadata, SyncMessage,
 };
-use distd_core::signature::PublisherSignatureEnvelope;
+use distd_core::signature::{
+    PublisherReleaseEnvelope, PublisherReleaseSequence, PublisherSignatureEnvelope,
+};
 use distd_core::transport::maybe_compress_sync_payload_owned;
 use distd_core::utils::serde::BitcodeSerializable;
 use distd_core::utils::uuid::slice_to_uuid;
@@ -36,7 +38,8 @@ use crate::client::{Client, Name as ClientName};
 use crate::error::Server as ServerError;
 use crate::metadata_state::MetadataStateStore;
 use crate::publication::{
-    PublicationAttestation, PublicationError, PublishedRevision, PublisherPolicy,
+    PublicationAttestation, PublicationError, PublicationRequestAttestation, PublishedRevision,
+    PublisherPolicy,
 };
 use distd_core::feed::{Feed, Name as FeedName};
 use distd_core::version::Version;
@@ -131,12 +134,15 @@ fn validate_publisher_policy_markers(
     if !policy.permits_unsigned() {
         for revision in metadata.versions.values().flat_map(BTreeMap::values) {
             match revision.attestation() {
-                PublicationAttestation::Signed(envelope)
+                PublicationAttestation::ReleaseV2 { envelope, .. }
                     if policy.contains_exact_key(envelope.public_key()) => {}
-                PublicationAttestation::Signed(_) => {
+                PublicationAttestation::ReleaseV2 { .. } => {
                     return Err(PublicationError::UntrustedPublisher.into());
                 }
-                PublicationAttestation::Unsigned => {
+                PublicationAttestation::ReplayableV1(_) => {
+                    return Err(PublicationError::ReplayableForbidden.into());
+                }
+                PublicationAttestation::UnsignedLegacy => {
                     return Err(PublicationError::UnsignedForbidden.into());
                 }
             }
@@ -538,12 +544,25 @@ where
                 .validate_metadata_compatibility(&revision)
                 .map_err(|error| error.to_string())?;
             let (item, attestation) = revision.into_parts();
-            let (publisher_public_key, publisher_signature) = match attestation {
-                PublicationAttestation::Signed(envelope) => (
+            let (
+                publisher_public_key,
+                publisher_signature,
+                publisher_statement_version,
+                publisher_release_sequence,
+            ) = match attestation {
+                PublicationAttestation::ReleaseV2 { sequence, envelope } => (
                     envelope.public_key().as_bytes().to_vec(),
                     envelope.signature().as_bytes().to_vec(),
+                    Some(2),
+                    Some(sequence.get()),
                 ),
-                PublicationAttestation::Unsigned => (Vec::new(), Vec::new()),
+                PublicationAttestation::ReplayableV1(envelope) => (
+                    envelope.public_key().as_bytes().to_vec(),
+                    envelope.signature().as_bytes().to_vec(),
+                    Some(1),
+                    None,
+                ),
+                PublicationAttestation::UnsignedLegacy => (Vec::new(), Vec::new(), None, None),
             };
             let chunk_sizes = item
                 .chunks
@@ -580,6 +599,8 @@ where
                 chunk_sizes,
                 publisher_public_key,
                 publisher_signature,
+                publisher_statement_version,
+                publisher_release_sequence,
             };
             Ok::<_, String>((response, item))
         })
@@ -839,12 +860,12 @@ where
             description,
             file,
             chunk_algorithm,
-            None,
+            PublicationRequestAttestation::Unsigned,
         )
         .await
     }
 
-    /// Publish a revision authorized by an exact detached publisher envelope.
+    /// Publish a replayable V1 revision in explicit compatibility mode.
     pub async fn publish_signed_item_as(
         &self,
         artifact_id: ArtifactId,
@@ -865,7 +886,34 @@ where
             description,
             file,
             chunk_algorithm,
-            Some(envelope),
+            PublicationRequestAttestation::ReplayableV1(envelope),
+        )
+        .await
+    }
+
+    /// Publish a rollback-protected V2 publisher release.
+    pub async fn publish_release_item_as(
+        &self,
+        artifact_id: ArtifactId,
+        name: ItemName,
+        path: PathBuf,
+        description: Option<String>,
+        file: Bytes,
+        chunk_algorithm: ChunkAlgorithm,
+        sequence: PublisherReleaseSequence,
+        envelope: PublisherReleaseEnvelope,
+    ) -> Result<Item, ServerError>
+    where
+        T: 'static,
+    {
+        self.publish_item_as_with_attestation(
+            artifact_id,
+            name,
+            path,
+            description,
+            file,
+            chunk_algorithm,
+            PublicationRequestAttestation::ReleaseV2 { sequence, envelope },
         )
         .await
     }
@@ -878,12 +926,12 @@ where
         description: Option<String>,
         file: Bytes,
         chunk_algorithm: ChunkAlgorithm,
-        envelope: Option<PublisherSignatureEnvelope>,
+        attestation: PublicationRequestAttestation,
     ) -> Result<Item, ServerError>
     where
         T: 'static,
     {
-        self.precheck_publication_attestation(envelope.as_ref())?;
+        self.precheck_publication_attestation(&attestation)?;
         let coordinator = self.clone();
         tokio::spawn(async move {
             coordinator
@@ -894,7 +942,7 @@ where
                     description,
                     file,
                     chunk_algorithm,
-                    envelope,
+                    attestation,
                 )
                 .await
         })
@@ -910,7 +958,7 @@ where
         description: Option<String>,
         file: Bytes,
         chunk_algorithm: ChunkAlgorithm,
-        envelope: Option<PublisherSignatureEnvelope>,
+        attestation: PublicationRequestAttestation,
     ) -> Result<Item, ServerError> {
         let storage = Arc::clone(&self.storage);
         let prepare_artifact_id = artifact_id.clone();
@@ -935,14 +983,12 @@ where
         let _publish_guard = self.publication_guard(&artifact_id).await;
         self.require_publication_writable()?;
         let policy = self.publisher_policy.clone();
-        let authorized = tokio::task::spawn_blocking(move || match envelope {
-            Some(envelope) => policy.authorize_new(envelope, prepared),
-            None => policy.authorize_unsigned_new(prepared),
-        })
-        .await
-        .map_err(|error| {
-            ServerError::State(format!("publisher verification worker failed: {error}"))
-        })??;
+        let authorized =
+            tokio::task::spawn_blocking(move || policy.authorize_request(attestation, prepared))
+                .await
+                .map_err(|error| {
+                    ServerError::State(format!("publisher verification worker failed: {error}"))
+                })??;
         let previous = {
             let metadata = self.metadata.read().await;
             current_publication_revision(&metadata, &artifact_id)?
@@ -1038,12 +1084,12 @@ where
             description,
             files,
             chunk_algorithm,
-            None,
+            PublicationRequestAttestation::Unsigned,
         )
         .await
     }
 
-    /// Publish a directory revision authorized by an exact publisher envelope.
+    /// Publish a replayable V1 directory revision in compatibility mode.
     pub async fn publish_signed_item_from_files_as(
         &self,
         artifact_id: ArtifactId,
@@ -1064,7 +1110,34 @@ where
             description,
             files,
             chunk_algorithm,
-            Some(envelope),
+            PublicationRequestAttestation::ReplayableV1(envelope),
+        )
+        .await
+    }
+
+    /// Publish a rollback-protected V2 directory release.
+    pub async fn publish_release_item_from_files_as(
+        &self,
+        artifact_id: ArtifactId,
+        name: ItemName,
+        path: PathBuf,
+        description: Option<String>,
+        files: Vec<(PathBuf, Bytes)>,
+        chunk_algorithm: ChunkAlgorithm,
+        sequence: PublisherReleaseSequence,
+        envelope: PublisherReleaseEnvelope,
+    ) -> Result<Item, ServerError>
+    where
+        T: 'static,
+    {
+        self.publish_item_from_files_as_with_attestation(
+            artifact_id,
+            name,
+            path,
+            description,
+            files,
+            chunk_algorithm,
+            PublicationRequestAttestation::ReleaseV2 { sequence, envelope },
         )
         .await
     }
@@ -1077,12 +1150,12 @@ where
         description: Option<String>,
         files: Vec<(PathBuf, Bytes)>,
         chunk_algorithm: ChunkAlgorithm,
-        envelope: Option<PublisherSignatureEnvelope>,
+        attestation: PublicationRequestAttestation,
     ) -> Result<Item, ServerError>
     where
         T: 'static,
     {
-        self.precheck_publication_attestation(envelope.as_ref())?;
+        self.precheck_publication_attestation(&attestation)?;
         let coordinator = self.clone();
         tokio::spawn(async move {
             coordinator
@@ -1093,7 +1166,7 @@ where
                     description,
                     files,
                     chunk_algorithm,
-                    envelope,
+                    attestation,
                 )
                 .await
         })
@@ -1109,7 +1182,7 @@ where
         description: Option<String>,
         files: Vec<(PathBuf, Bytes)>,
         chunk_algorithm: ChunkAlgorithm,
-        envelope: Option<PublisherSignatureEnvelope>,
+        attestation: PublicationRequestAttestation,
     ) -> Result<Item, ServerError> {
         let storage = Arc::clone(&self.storage);
         let prepare_artifact_id = artifact_id.clone();
@@ -1146,14 +1219,12 @@ where
         let _publish_guard = self.publication_guard(&artifact_id).await;
         self.require_publication_writable()?;
         let policy = self.publisher_policy.clone();
-        let authorized = tokio::task::spawn_blocking(move || match envelope {
-            Some(envelope) => policy.authorize_new(envelope, prepared),
-            None => policy.authorize_unsigned_new(prepared),
-        })
-        .await
-        .map_err(|error| {
-            ServerError::State(format!("publisher verification worker failed: {error}"))
-        })??;
+        let authorized =
+            tokio::task::spawn_blocking(move || policy.authorize_request(attestation, prepared))
+                .await
+                .map_err(|error| {
+                    ServerError::State(format!("publisher verification worker failed: {error}"))
+                })??;
         let previous = {
             let metadata = self.metadata.read().await;
             current_publication_revision(&metadata, &artifact_id)?
@@ -1244,21 +1315,11 @@ where
 
     pub(crate) fn precheck_publication_attestation(
         &self,
-        envelope: Option<&PublisherSignatureEnvelope>,
+        attestation: &PublicationRequestAttestation,
     ) -> Result<(), ServerError> {
-        match envelope {
-            Some(envelope)
-                if !self.publisher_policy.permits_unsigned()
-                    && !self
-                        .publisher_policy
-                        .contains_exact_key(envelope.public_key()) =>
-            {
-                Err(PublicationError::UntrustedPublisher.into())
-            }
-            Some(_) => Ok(()),
-            None if self.publisher_policy.permits_unsigned() => Ok(()),
-            None => Err(PublicationError::UnsignedForbidden.into()),
-        }
+        self.publisher_policy
+            .precheck_request(attestation)
+            .map_err(Into::into)
     }
 
     /// Get the public key of the server
@@ -1435,13 +1496,15 @@ mod tests {
     use distd_core::item::Item;
     use distd_core::proto::ManifestRequest;
     use distd_core::proto::{sync_message::Msg, PayloadCompression};
+    use prost::Message as _;
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
 
     use crate::publication::{PublicationError, PublishedRevision, PublisherPolicy};
     use distd_core::signature::{
-        PublisherPublicKey, PublisherSignature, PublisherSignatureEnvelope, PublisherStatement,
+        PublisherPublicKey, PublisherReleaseEnvelope, PublisherReleaseSequence,
+        PublisherReleaseStatement, PublisherSignature,
     };
     use ring::signature::{Ed25519KeyPair, KeyPair};
 
@@ -1449,13 +1512,51 @@ mod tests {
         PublishedRevision::unsigned(item)
     }
 
-    fn signed_envelope(item: &Item, seed: [u8; 32]) -> PublisherSignatureEnvelope {
+    fn signed_release(
+        item: &Item,
+        seed: [u8; 32],
+        sequence: u64,
+    ) -> (PublisherReleaseSequence, PublisherReleaseEnvelope) {
         let pair = Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
-        let statement = PublisherStatement::from_item(item).unwrap();
-        PublisherSignatureEnvelope::from_parts(
+        let sequence = PublisherReleaseSequence::new(sequence);
+        let statement = PublisherReleaseStatement::from_item(item, sequence).unwrap();
+        let envelope = PublisherReleaseEnvelope::from_parts(
             PublisherPublicKey::try_from(pair.public_key().as_ref()).unwrap(),
             PublisherSignature::try_from(pair.sign(statement.as_bytes()).as_ref()).unwrap(),
-        )
+        );
+        (sequence, envelope)
+    }
+
+    #[test]
+    fn publisher_release_wire_tuple_has_exact_bounded_delta() {
+        let mut key_and_signature = distd_core::proto::ManifestResponse::default();
+        assert!(key_and_signature.encode_to_vec().is_empty());
+
+        key_and_signature.publisher_public_key = vec![0x11; 32];
+        key_and_signature.publisher_signature = vec![0x22; 64];
+        let key_and_signature_bytes = key_and_signature.encode_to_vec();
+        assert_eq!(key_and_signature_bytes.len(), 100);
+
+        let mut v1 = key_and_signature.clone();
+        v1.publisher_statement_version = Some(1);
+        assert_eq!(v1.encode_to_vec().len(), 102);
+
+        let mut v2 = key_and_signature;
+        v2.publisher_statement_version = Some(2);
+        v2.publisher_release_sequence = Some(1);
+        let v2_bytes = v2.encode_to_vec();
+        assert_eq!(v2_bytes.len(), 104);
+        assert_eq!(&v2_bytes[..100], key_and_signature_bytes.as_slice());
+        assert_eq!(&v2_bytes[100..], &[0x68, 0x02, 0x70, 0x01]);
+
+        v2.publisher_release_sequence = Some(u64::MAX);
+        let maximum_bytes = v2.encode_to_vec();
+        assert_eq!(maximum_bytes.len(), 113);
+        assert_eq!(&maximum_bytes[100..103], &[0x68, 0x02, 0x70]);
+        assert_eq!(
+            &maximum_bytes[103..],
+            &[0xff; 9].into_iter().chain([0x01]).collect::<Vec<_>>()
+        );
     }
 
     #[derive(Clone, Debug, Default)]
@@ -1669,7 +1770,7 @@ mod tests {
                 algorithm,
             )
             .unwrap();
-        let envelope = signed_envelope(&prepared, [7; 32]);
+        let (sequence, envelope) = signed_release(&prepared, [7; 32], 1);
         let policy = PublisherPolicy::required([envelope.public_key()]);
         let directory =
             std::env::temp_dir().join(format!("distd-signed-idempotence-{}", uuid::Uuid::new_v4()));
@@ -1688,13 +1789,14 @@ mod tests {
             .with_metadata_store(store);
 
         let first = server
-            .publish_signed_item_as(
+            .publish_release_item_as(
                 "signed-id".to_string(),
                 "display".to_string(),
                 "signed.bin".into(),
                 None,
                 bytes.clone(),
                 algorithm,
+                sequence,
                 envelope,
             )
             .await
@@ -1704,13 +1806,14 @@ mod tests {
         let metadata_writes_after_first = replacer.calls.load(Ordering::Relaxed);
         assert_eq!(metadata_writes_after_first, bootstrap_writes + 1);
         let duplicate = server
-            .publish_signed_item_as(
+            .publish_release_item_as(
                 "signed-id".to_string(),
                 "display".to_string(),
                 "signed.bin".into(),
                 None,
                 bytes,
                 algorithm,
+                sequence,
                 envelope,
             )
             .await
@@ -1726,8 +1829,8 @@ mod tests {
         let history = metadata.versions.get("signed-id").unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(
-            history.get(&0).unwrap().attestation().envelope(),
-            Some(&envelope)
+            history.get(&0).unwrap().attestation().release(),
+            Some((sequence, &envelope))
         );
 
         let (response, exact) = server
@@ -1746,6 +1849,8 @@ mod tests {
             response.publisher_signature,
             envelope.signature().as_bytes()
         );
+        assert_eq!(response.publisher_statement_version, Some(2));
+        assert_eq!(response.publisher_release_sequence, Some(sequence.get()));
         let (_, restarted) =
             crate::metadata_state::MetadataStateStore::open_with_validator(paths, |candidate| {
                 crate::metadata_state::validate_runtime_metadata_with_policy(candidate, &policy)
@@ -1770,8 +1875,8 @@ mod tests {
                 ChunkAlgorithm::Fixed256K,
             )
             .unwrap();
-        let allowed = signed_envelope(&prepared, [11; 32]);
-        let unknown = signed_envelope(&prepared, [13; 32]);
+        let (sequence, allowed) = signed_release(&prepared, [11; 32], 1);
+        let (_, unknown) = signed_release(&prepared, [13; 32], 1);
         let directory = std::env::temp_dir().join(format!(
             "distd-invalid-signed-publication-{}",
             uuid::Uuid::new_v4()
@@ -1807,13 +1912,14 @@ mod tests {
         ));
 
         let unknown_error = server
-            .publish_signed_item_as(
+            .publish_release_item_as(
                 "rejected".to_string(),
                 "rejected".to_string(),
                 "rejected.bin".into(),
                 None,
                 bytes.clone(),
                 ChunkAlgorithm::Fixed256K,
+                sequence,
                 unknown,
             )
             .await
@@ -1825,18 +1931,19 @@ mod tests {
 
         let mut invalid_signature = *allowed.signature().as_bytes();
         invalid_signature[0] ^= 1;
-        let invalid = PublisherSignatureEnvelope::from_parts(
+        let invalid = PublisherReleaseEnvelope::from_parts(
             allowed.public_key(),
             PublisherSignature::from_bytes(invalid_signature),
         );
         let invalid_error = server
-            .publish_signed_item_as(
+            .publish_release_item_as(
                 "rejected".to_string(),
                 "rejected".to_string(),
                 "rejected.bin".into(),
                 None,
                 bytes,
                 ChunkAlgorithm::Fixed256K,
+                sequence,
                 invalid,
             )
             .await
@@ -1846,13 +1953,14 @@ mod tests {
             ServerError::Publication(PublicationError::InvalidSignature(_))
         ));
         let cross_artifact = server
-            .publish_signed_item_as(
+            .publish_release_item_as(
                 "other-artifact".to_string(),
                 "rejected".to_string(),
                 "rejected.bin".into(),
                 None,
                 Bytes::from_static(b"rejected signed revision"),
                 ChunkAlgorithm::Fixed256K,
+                sequence,
                 allowed,
             )
             .await
@@ -1890,33 +1998,37 @@ mod tests {
                 )
                 .unwrap()
         };
-        let first_envelope = signed_envelope(&prepare(first_bytes.clone()), [17; 32]);
-        let substituted = signed_envelope(&prepare(first_bytes.clone()), [19; 32]);
-        let second_envelope = signed_envelope(&prepare(second_bytes.clone()), [19; 32]);
+        let (first_sequence, first_envelope) =
+            signed_release(&prepare(first_bytes.clone()), [17; 32], 1);
+        let (_, substituted) = signed_release(&prepare(first_bytes.clone()), [19; 32], 1);
+        let (second_sequence, second_envelope) =
+            signed_release(&prepare(second_bytes.clone()), [19; 32], 2);
         let server = ProductionServer::new_ephemeral(storage).with_publisher_policy(
             PublisherPolicy::required([first_envelope.public_key(), second_envelope.public_key()]),
         );
 
         let first = server
-            .publish_signed_item_as(
+            .publish_release_item_as(
                 "rotating".to_string(),
                 "rotating".to_string(),
                 "rotating.bin".into(),
                 None,
                 first_bytes.clone(),
                 ChunkAlgorithm::Fixed256K,
+                first_sequence,
                 first_envelope,
             )
             .await
             .unwrap();
         let conflict = server
-            .publish_signed_item_as(
+            .publish_release_item_as(
                 "rotating".to_string(),
                 "rotating".to_string(),
                 "rotating.bin".into(),
                 None,
                 first_bytes,
                 ChunkAlgorithm::Fixed256K,
+                first_sequence,
                 substituted,
             )
             .await
@@ -1927,19 +2039,23 @@ mod tests {
         ));
 
         let second = server
-            .publish_signed_item_as(
+            .publish_release_item_as(
                 "rotating".to_string(),
                 "rotating".to_string(),
                 "rotating.bin".into(),
                 None,
                 second_bytes,
                 ChunkAlgorithm::Fixed256K,
+                second_sequence,
                 second_envelope,
             )
             .await
             .unwrap();
         assert_eq!(second.metadata.revision, first.metadata.revision + 1);
-        for (version, envelope) in [(0, first_envelope), (1, second_envelope)] {
+        for (version, sequence, envelope) in [
+            (0, first_sequence, first_envelope),
+            (1, second_sequence, second_envelope),
+        ] {
             let (response, _) = server
                 .sync_manifest_response(ManifestRequest {
                     artifact_id: "rotating".to_string(),
@@ -1955,6 +2071,8 @@ mod tests {
                 response.publisher_signature,
                 envelope.signature().as_bytes()
             );
+            assert_eq!(response.publisher_statement_version, Some(2));
+            assert_eq!(response.publisher_release_sequence, Some(sequence.get()));
         }
     }
 
@@ -1977,17 +2095,18 @@ mod tests {
                 algorithm,
             )
             .unwrap();
-        let envelope = signed_envelope(&prepared, [23; 32]);
+        let (sequence, envelope) = signed_release(&prepared, [23; 32], 1);
         let server = ProductionServer::new_ephemeral(storage)
             .with_publisher_policy(PublisherPolicy::required([envelope.public_key()]));
         let published = server
-            .publish_signed_item_from_files_as(
+            .publish_release_item_from_files_as(
                 "signed-directory".to_string(),
                 "directory".to_string(),
                 "logical".into(),
                 None,
                 files,
                 algorithm,
+                sequence,
                 envelope,
             )
             .await
@@ -2391,7 +2510,7 @@ mod tests {
                 ChunkAlgorithm::default(),
             )
             .unwrap();
-        let envelope = signed_envelope(&prepared, [31; 32]);
+        let (sequence, envelope) = signed_release(&prepared, [31; 32], 1);
         let policy = PublisherPolicy::required([envelope.public_key()]);
         let server = ProductionServer::new_ephemeral_with_metadata(storage, metadata)
             .with_publisher_policy(policy.clone())
@@ -2399,13 +2518,14 @@ mod tests {
         let waiting_server = server.clone();
         let waiter = tokio::spawn(async move {
             waiting_server
-                .publish_signed_item_as(
+                .publish_release_item_as(
                     "stable-id".to_string(),
                     "display".to_string(),
                     "artifact.bin".into(),
                     None,
                     bytes,
                     ChunkAlgorithm::default(),
+                    sequence,
                     envelope,
                 )
                 .await
@@ -2506,27 +2626,28 @@ mod tests {
                     )
                     .unwrap()
             };
-            let envelope =
-                signed_envelope(&prepared, [u8::try_from(stage_index).unwrap() + 41; 32]);
+            let (sequence, envelope) =
+                signed_release(&prepared, [u8::try_from(stage_index).unwrap() + 41; 32], 1);
             let policy = PublisherPolicy::required([envelope.public_key()]);
             let server = ProductionServer::new_ephemeral_with_metadata(storage, metadata.clone())
                 .with_publisher_policy(policy.clone())
                 .with_metadata_store(store);
             let result = if stage_index.is_multiple_of(2) {
                 server
-                    .publish_signed_item_as(
+                    .publish_release_item_as(
                         "faulted".to_string(),
                         "display".to_string(),
                         "artifact.bin".into(),
                         None,
                         Bytes::copy_from_slice(expected_bytes),
                         algorithm,
+                        sequence,
                         envelope,
                     )
                     .await
             } else {
                 server
-                    .publish_signed_item_from_files_as(
+                    .publish_release_item_from_files_as(
                         "faulted".to_string(),
                         "display".to_string(),
                         "artifact".into(),
@@ -2536,6 +2657,7 @@ mod tests {
                             Bytes::copy_from_slice(expected_bytes),
                         )],
                         algorithm,
+                        sequence,
                         envelope,
                     )
                     .await
@@ -2699,7 +2821,7 @@ mod tests {
         let algorithm = ChunkAlgorithm::default();
         let left_bytes = Bytes::from_static(b"left");
         let right_bytes = Bytes::from_static(b"right");
-        let left_envelope = signed_envelope(
+        let (left_sequence, left_envelope) = signed_release(
             &storage
                 .prepare_revision(
                     "left".to_string(),
@@ -2712,8 +2834,9 @@ mod tests {
                 )
                 .unwrap(),
             [51; 32],
+            1,
         );
-        let right_envelope = signed_envelope(
+        let (right_sequence, right_envelope) = signed_release(
             &storage
                 .prepare_revision(
                     "right".to_string(),
@@ -2726,6 +2849,7 @@ mod tests {
                 )
                 .unwrap(),
             [53; 32],
+            1,
         );
         let policy =
             PublisherPolicy::required([left_envelope.public_key(), right_envelope.public_key()]);
@@ -2735,22 +2859,24 @@ mod tests {
         let left_server = server.clone();
         let right_server = server.clone();
         let (left, right) = tokio::join!(
-            left_server.publish_signed_item_as(
+            left_server.publish_release_item_as(
                 "left".to_string(),
                 "left".to_string(),
                 "left.bin".into(),
                 None,
                 left_bytes,
                 algorithm,
+                left_sequence,
                 left_envelope,
             ),
-            right_server.publish_signed_item_as(
+            right_server.publish_release_item_as(
                 "right".to_string(),
                 "right".to_string(),
                 "right.bin".into(),
                 None,
                 right_bytes,
                 algorithm,
+                right_sequence,
                 right_envelope,
             )
         );
@@ -2885,17 +3011,19 @@ mod tests {
         };
         let left_bytes = Bytes::from_static(b"left revision");
         let right_bytes = Bytes::from_static(b"right revision");
-        let left_envelope = signed_envelope(&prepare("stable", left_bytes.clone()), [61; 32]);
-        let right_envelope = signed_envelope(&prepare("stable", right_bytes.clone()), [63; 32]);
+        let (left_sequence, left_envelope) =
+            signed_release(&prepare("stable", left_bytes.clone()), [61; 32], 1);
+        let (right_sequence, right_envelope) =
+            signed_release(&prepare("stable", right_bytes.clone()), [63; 32], 2);
         let mut invalid_signature = *left_envelope.signature().as_bytes();
         invalid_signature[0] ^= 1;
-        let invalid_envelope = PublisherSignatureEnvelope::from_parts(
+        let invalid_envelope = PublisherReleaseEnvelope::from_parts(
             left_envelope.public_key(),
             PublisherSignature::from_bytes(invalid_signature),
         );
         let duplicate_bytes = Bytes::from_static(b"duplicate revision");
-        let duplicate_envelope =
-            signed_envelope(&prepare("duplicate", duplicate_bytes.clone()), [61; 32]);
+        let (duplicate_sequence, duplicate_envelope) =
+            signed_release(&prepare("duplicate", duplicate_bytes.clone()), [61; 32], 1);
         let policy =
             PublisherPolicy::required([left_envelope.public_key(), right_envelope.public_key()]);
         let server = ProductionServer::new_ephemeral_with_metadata(storage, metadata)
@@ -2905,31 +3033,34 @@ mod tests {
         let right_server = server.clone();
         let invalid_server = server.clone();
         let (left, right, invalid) = tokio::join!(
-            left_server.publish_signed_item_as(
+            left_server.publish_release_item_as(
                 "stable".to_string(),
                 "stable".to_string(),
                 "artifact.bin".into(),
                 None,
                 left_bytes,
                 algorithm,
+                left_sequence,
                 left_envelope,
             ),
-            right_server.publish_signed_item_as(
+            right_server.publish_release_item_as(
                 "stable".to_string(),
                 "stable".to_string(),
                 "artifact.bin".into(),
                 None,
                 right_bytes,
                 algorithm,
+                right_sequence,
                 right_envelope,
             ),
-            invalid_server.publish_signed_item_as(
+            invalid_server.publish_release_item_as(
                 "stable".to_string(),
                 "stable".to_string(),
                 "artifact.bin".into(),
                 None,
                 Bytes::from_static(b"left revision"),
                 algorithm,
+                left_sequence,
                 invalid_envelope,
             )
         );
@@ -2946,22 +3077,24 @@ mod tests {
         let duplicate_left = server.clone();
         let duplicate_right = server.clone();
         let (first_duplicate, second_duplicate) = tokio::join!(
-            duplicate_left.publish_signed_item_as(
+            duplicate_left.publish_release_item_as(
                 "duplicate".to_string(),
                 "duplicate".to_string(),
                 "artifact.bin".into(),
                 None,
                 duplicate_bytes.clone(),
                 algorithm,
+                duplicate_sequence,
                 duplicate_envelope,
             ),
-            duplicate_right.publish_signed_item_as(
+            duplicate_right.publish_release_item_as(
                 "duplicate".to_string(),
                 "duplicate".to_string(),
                 "artifact.bin".into(),
                 None,
                 duplicate_bytes,
                 algorithm,
+                duplicate_sequence,
                 duplicate_envelope,
             )
         );

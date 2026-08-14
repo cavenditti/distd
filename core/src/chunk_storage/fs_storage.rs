@@ -11825,14 +11825,15 @@ mod tests {
                 &activation_staged_data(b"version1", &first),
             )
             .unwrap();
-        for _ in 0..100 {
+        let poison_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while std::time::Instant::now() < poison_deadline {
             if storage
                 .activation_poisoned
                 .load(std::sync::atomic::Ordering::Acquire)
             {
                 break;
             }
-            std::thread::yield_now();
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
         assert!(storage
             .activation_poisoned

@@ -50,10 +50,15 @@ message ManifestResponse {
   repeated FileEntry entries = 8;
   ChunkAlgorithmProfile chunk_algorithm = 9;
   repeated uint32 chunk_sizes = 10;
-  // V1 publisher-attestation tuple. Both fields are populated together for a
-  // signed revision and both are empty only in explicit insecure mode.
+  // Publisher-attestation key/signature pair. Both fields are populated
+  // together for a signed revision and both are empty only in explicit
+  // insecure mode.
   bytes publisher_public_key = 11;
   bytes publisher_signature = 12;
+  // Present for every signed attestation. Version 2 additionally requires the
+  // publisher-controlled release sequence; V1 compatibility omits it.
+  optional uint32 publisher_statement_version = 13;
+  optional uint64 publisher_release_sequence = 14;
 }
 
 message ChunkAlgorithmProfile {

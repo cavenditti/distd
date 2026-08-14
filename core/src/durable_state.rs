@@ -36,6 +36,7 @@ pub enum DurableStateKind {
     ClientTrust = 2,
     ServerPublication = 3,
     FsActivation = 4,
+    ClientRollback = 5,
 }
 
 impl DurableStateKind {

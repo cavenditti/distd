@@ -31,6 +31,7 @@ uuid = { workspace = true }
 percent-encoding = { workspace = true }
 bitcode = { workspace = true }
 rustc-hash = { workspace = true }
+unicode-normalization = { workspace = true }
 
 distd_core = { path = "../core" }
 

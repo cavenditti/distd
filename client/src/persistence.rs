@@ -91,6 +91,8 @@ pub enum PersistenceError {
     Conflict,
     #[error("client trust JSON migration failed: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("client rollback state error: {0}")]
+    Rollback(#[from] crate::rollback::RollbackError),
 }
 
 struct LegacyClientPersistentState {
@@ -587,6 +589,7 @@ impl Drop for ClientPid {
 pub struct ClientState {
     pub pid: ClientPid,
     pub persistent: ClientPersistentState,
+    pub rollback: crate::rollback::ClientRollbackState,
 }
 
 impl ClientState {
@@ -594,6 +597,7 @@ impl ClientState {
         Ok(Self {
             pid: ClientPid::default(),
             persistent: ClientPersistentState::load()?,
+            rollback: crate::rollback::ClientRollbackState::load()?,
         })
     }
 }

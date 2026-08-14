@@ -589,7 +589,7 @@ mod tests {
     fn protobuf_v1_schema_source_is_hash_pinned() {
         assert_eq!(
             crate::hash::hash(include_bytes!("../proto/distd.proto")).to_string(),
-            "37d41ff6e6d2e44fef23de715a5a2ff2db5a9447e9f0ff5d72a65cc14d4ab36b"
+            "cb8bf604924e013182f2072daaa688c69d3ab0c55f66affbf5122f0055f8106d"
         );
     }
 

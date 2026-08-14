@@ -82,6 +82,7 @@ where
             authority.certificate_pin,
             settings.server.enrollment_token.as_deref(),
             publisher_policy,
+            state.rollback.clone(),
         )
         .await?;
 
@@ -89,13 +90,21 @@ where
             certificate_pin: pending.observed_pin(),
             client_uuid: pending.client_uuid(),
         };
-        let ClientState { pid, persistent } = state;
+        let ClientState {
+            pid,
+            persistent,
+            rollback,
+        } = state;
         let (persistent, server) =
             install_before_activation(persistent, canonical_url, candidate, |receipt| async move {
                 pending.activate(receipt).await.map_err(ClientError::from)
             })
             .await?;
-        state = ClientState { pid, persistent };
+        state = ClientState {
+            pid,
+            persistent,
+            rollback,
+        };
 
         let mut missing = Vec::new();
         for path in &settings.client.sync {

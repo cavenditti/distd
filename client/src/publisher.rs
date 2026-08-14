@@ -6,7 +6,9 @@ use distd_core::{
     chunks::ChunkInfo,
     item::Manifest,
     signature::{
-        PublisherKeyFingerprint, PublisherPublicKey, PublisherSignatureEnvelope, PublisherStatement,
+        PublisherKeyFingerprint, PublisherPublicKey, PublisherReleaseEnvelope,
+        PublisherReleaseSequence, PublisherSignatureEnvelope, PublisherStatement,
+        VerifiedPublisherRelease,
     },
 };
 use thiserror::Error;
@@ -46,6 +48,36 @@ pub enum PublisherAuthenticityError {
     InvalidSignature,
 }
 
+/// Strictly parsed publisher tuple carried by one sync manifest.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PublisherTransportAttestation {
+    ReleaseV2 {
+        sequence: PublisherReleaseSequence,
+        envelope: PublisherReleaseEnvelope,
+    },
+    ReplayableV1(PublisherSignatureEnvelope),
+    Unsigned,
+}
+
+/// Result of client policy and cryptographic authorization.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PublisherAuthorization {
+    fingerprint: Option<PublisherKeyFingerprint>,
+    rollback: Option<VerifiedPublisherRelease>,
+}
+
+impl PublisherAuthorization {
+    #[must_use]
+    pub const fn fingerprint(self) -> Option<PublisherKeyFingerprint> {
+        self.fingerprint
+    }
+
+    #[must_use]
+    pub const fn rollback(self) -> Option<VerifiedPublisherRelease> {
+        self.rollback
+    }
+}
+
 #[derive(Clone)]
 enum PublisherPolicyMode {
     Required(Arc<HashSet<PublisherPublicKey>>),
@@ -59,6 +91,71 @@ pub struct PublisherPolicy {
 }
 
 impl PublisherPolicy {
+    /// Authorize one strict transport attestation. Required policy accepts
+    /// only V2 under an exact configured key; explicit insecure mode still
+    /// validates every supplied signature but creates no rollback authority.
+    pub fn authorize_transport_manifest(
+        &self,
+        attestation: PublisherTransportAttestation,
+        manifest: &Manifest,
+        chunks: &[ChunkInfo],
+    ) -> Result<PublisherAuthorization, PublisherAuthenticityError> {
+        match (&self.mode, attestation) {
+            (
+                PublisherPolicyMode::Required(keys),
+                PublisherTransportAttestation::ReleaseV2 { sequence, envelope },
+            ) => {
+                if !keys.contains(&envelope.public_key()) {
+                    return Err(PublisherAuthenticityError::UntrustedPublisher);
+                }
+                let verified = envelope
+                    .verify_manifest(manifest, chunks, sequence)
+                    .map_err(|_| PublisherAuthenticityError::InvalidSignature)?;
+                Ok(PublisherAuthorization {
+                    fingerprint: Some(verified.publisher_fingerprint()),
+                    rollback: Some(verified),
+                })
+            }
+            (PublisherPolicyMode::Required(_), PublisherTransportAttestation::ReplayableV1(_))
+            | (PublisherPolicyMode::Required(_), PublisherTransportAttestation::Unsigned) => {
+                Err(PublisherAuthenticityError::MissingAttestation)
+            }
+            (
+                PublisherPolicyMode::ExplicitlyInsecureUnsigned,
+                PublisherTransportAttestation::ReleaseV2 { sequence, envelope },
+            ) => {
+                let verified = envelope
+                    .verify_manifest(manifest, chunks, sequence)
+                    .map_err(|_| PublisherAuthenticityError::InvalidSignature)?;
+                Ok(PublisherAuthorization {
+                    fingerprint: Some(verified.publisher_fingerprint()),
+                    rollback: None,
+                })
+            }
+            (
+                PublisherPolicyMode::ExplicitlyInsecureUnsigned,
+                PublisherTransportAttestation::ReplayableV1(envelope),
+            ) => envelope
+                .verify_manifest(manifest, chunks)
+                .map(|fingerprint| PublisherAuthorization {
+                    fingerprint: Some(fingerprint),
+                    rollback: None,
+                })
+                .map_err(|_| PublisherAuthenticityError::InvalidSignature),
+            (
+                PublisherPolicyMode::ExplicitlyInsecureUnsigned,
+                PublisherTransportAttestation::Unsigned,
+            ) => {
+                PublisherStatement::from_manifest(manifest, chunks)
+                    .map_err(|_| PublisherAuthenticityError::InvalidSignature)?;
+                Ok(PublisherAuthorization {
+                    fingerprint: None,
+                    rollback: None,
+                })
+            }
+        }
+    }
+
     /// Parse one exact policy from the raw client configuration fields.
     pub fn from_config(
         configured_keys: &[String],
@@ -95,11 +192,9 @@ impl PublisherPolicy {
         })
     }
 
-    /// Authorize and verify a complete typed manifest before possession.
-    ///
-    /// Required mode rejects an unknown exact key before performing signature
-    /// verification. Explicit unsigned mode accepts an absent envelope, but a
-    /// supplied envelope is still required to be cryptographically valid.
+    /// Compatibility-only V1 manifest verification. Rollback-enforcing mode
+    /// rejects every V1 envelope; explicit insecure mode still validates a
+    /// supplied signature and canonicalizes unsigned manifests.
     pub fn authorize_manifest(
         &self,
         envelope: Option<&PublisherSignatureEnvelope>,
@@ -107,17 +202,8 @@ impl PublisherPolicy {
         chunks: &[ChunkInfo],
     ) -> Result<Option<PublisherKeyFingerprint>, PublisherAuthenticityError> {
         match (&self.mode, envelope) {
-            (PublisherPolicyMode::Required(_), None) => {
+            (PublisherPolicyMode::Required(_), None | Some(_)) => {
                 Err(PublisherAuthenticityError::MissingAttestation)
-            }
-            (PublisherPolicyMode::Required(keys), Some(envelope)) => {
-                if !keys.contains(&envelope.public_key()) {
-                    return Err(PublisherAuthenticityError::UntrustedPublisher);
-                }
-                envelope
-                    .verify_manifest(manifest, chunks)
-                    .map(Some)
-                    .map_err(|_| PublisherAuthenticityError::InvalidSignature)
             }
             (PublisherPolicyMode::ExplicitlyInsecureUnsigned, None) => {
                 PublisherStatement::from_manifest(manifest, chunks)
@@ -209,7 +295,11 @@ fn decode_nibble(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use distd_core::{chunks::ChunkAlgorithm, hash::hash, signature::PublisherSignature};
+    use distd_core::{
+        chunks::ChunkAlgorithm,
+        hash::hash,
+        signature::{PublisherReleaseStatement, PublisherSignature},
+    };
     use ring::signature::{Ed25519KeyPair, KeyPair};
 
     fn key_text(index: usize) -> String {
@@ -245,6 +335,21 @@ mod tests {
         let pair = Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
         let statement = PublisherStatement::from_manifest(manifest, chunks).unwrap();
         PublisherSignatureEnvelope::from_parts(
+            PublisherPublicKey::try_from(pair.public_key().as_ref()).unwrap(),
+            PublisherSignature::try_from(pair.sign(statement.as_bytes()).as_ref()).unwrap(),
+        )
+    }
+
+    fn release_envelope(
+        manifest: &Manifest,
+        chunks: &[ChunkInfo],
+        seed: [u8; 32],
+        sequence: PublisherReleaseSequence,
+    ) -> PublisherReleaseEnvelope {
+        let pair = Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
+        let statement =
+            PublisherReleaseStatement::from_manifest(manifest, chunks, sequence).unwrap();
+        PublisherReleaseEnvelope::from_parts(
             PublisherPublicKey::try_from(pair.public_key().as_ref()).unwrap(),
             PublisherSignature::try_from(pair.sign(statement.as_bytes()).as_ref()).unwrap(),
         )
@@ -301,37 +406,65 @@ mod tests {
     }
 
     #[test]
-    fn required_policy_checks_exact_key_before_signature_and_verifies_manifest() {
+    fn required_policy_accepts_only_v2_and_checks_exact_key_before_signature() {
         let (manifest, chunks) = manifest();
-        let allowed = envelope(&manifest, &chunks, [7; 32]);
-        let other = envelope(&manifest, &chunks, [9; 32]);
+        let sequence = PublisherReleaseSequence::new(7);
+        let allowed = release_envelope(&manifest, &chunks, [7; 32], sequence);
+        let other = release_envelope(&manifest, &chunks, [9; 32], sequence);
         let policy =
             PublisherPolicy::from_config(&[encode_key(allowed.public_key())], false).unwrap();
+        let authorization = policy
+            .authorize_transport_manifest(
+                PublisherTransportAttestation::ReleaseV2 {
+                    sequence,
+                    envelope: allowed,
+                },
+                &manifest,
+                &chunks,
+            )
+            .unwrap();
         assert_eq!(
-            policy
-                .authorize_manifest(Some(&allowed), &manifest, &chunks)
-                .unwrap(),
+            authorization.fingerprint(),
             Some(allowed.publisher_fingerprint())
         );
+        assert_eq!(authorization.rollback().unwrap().sequence(), sequence);
         assert_eq!(
-            policy.authorize_manifest(None, &manifest, &chunks),
+            policy.authorize_manifest(
+                Some(&envelope(&manifest, &chunks, [7; 32])),
+                &manifest,
+                &chunks
+            ),
             Err(PublisherAuthenticityError::MissingAttestation)
         );
 
-        let unknown_with_invalid_signature = PublisherSignatureEnvelope::from_parts(
+        let unknown_with_invalid_signature = PublisherReleaseEnvelope::from_parts(
             other.public_key(),
             PublisherSignature::from_bytes([0; 64]),
         );
         assert_eq!(
-            policy.authorize_manifest(Some(&unknown_with_invalid_signature), &manifest, &chunks),
+            policy.authorize_transport_manifest(
+                PublisherTransportAttestation::ReleaseV2 {
+                    sequence,
+                    envelope: unknown_with_invalid_signature,
+                },
+                &manifest,
+                &chunks,
+            ),
             Err(PublisherAuthenticityError::UntrustedPublisher)
         );
-        let invalid_allowed = PublisherSignatureEnvelope::from_parts(
+        let invalid_allowed = PublisherReleaseEnvelope::from_parts(
             allowed.public_key(),
             PublisherSignature::from_bytes([0; 64]),
         );
         assert_eq!(
-            policy.authorize_manifest(Some(&invalid_allowed), &manifest, &chunks),
+            policy.authorize_transport_manifest(
+                PublisherTransportAttestation::ReleaseV2 {
+                    sequence,
+                    envelope: invalid_allowed,
+                },
+                &manifest,
+                &chunks,
+            ),
             Err(PublisherAuthenticityError::InvalidSignature)
         );
     }

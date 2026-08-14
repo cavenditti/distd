@@ -21,7 +21,10 @@ use distd_core::{
     hash::Hash,
     item::{ArtifactId, FileEntry, Format as ItemFormat, Item, Manifest},
     metadata::Item as ItemMetadata,
-    signature::{PublisherPublicKey, PublisherSignature, PublisherSignatureEnvelope},
+    signature::{
+        PublisherPublicKey, PublisherReleaseEnvelope, PublisherReleaseSequence, PublisherSignature,
+        PublisherSignatureEnvelope,
+    },
     version::Version,
 };
 use serde::{Deserialize, Serialize};
@@ -32,7 +35,8 @@ use crate::{
     server::InternalMetadata,
 };
 
-pub const SERVER_PUBLICATION_SCHEMA: u16 = 2;
+pub const SERVER_PUBLICATION_SCHEMA: u16 = 3;
+const SIGNED_SERVER_PUBLICATION_SCHEMA: u16 = 2;
 const LEGACY_SERVER_PUBLICATION_SCHEMA: u16 = 1;
 pub const MAX_SERVER_PUBLICATION_PAYLOAD: u64 = 64 * 1024 * 1024;
 const MAX_FEEDS: usize = 65_536;
@@ -42,6 +46,7 @@ const MAX_REVISIONS: usize = 1_048_576;
 #[derive(Clone, Debug)]
 pub struct MetadataPaths {
     pub current: PathBuf,
+    pub schema2: PathBuf,
     pub schema1: PathBuf,
     pub legacy: PathBuf,
 }
@@ -50,7 +55,8 @@ impl MetadataPaths {
     #[must_use]
     pub fn in_state_directory(directory: &Path) -> Self {
         Self {
-            current: directory.join("metadata.signed.state"),
+            current: directory.join("metadata.release.state"),
+            schema2: directory.join("metadata.signed.state"),
             schema1: directory.join("metadata.state"),
             legacy: directory.join("metadata.bitcode"),
         }
@@ -160,6 +166,8 @@ impl MetadataStateStore {
         });
         let (metadata, needs_current_write) = if path_entry_present(&store.paths.current)? {
             (read_current(&store.paths.current)?, false)
+        } else if path_entry_present(&store.paths.schema2)? {
+            (read_schema2(&store.paths.schema2)?, true)
         } else if path_entry_present(&store.paths.schema1)? {
             (read_schema1(&store.paths.schema1)?, true)
         } else if path_entry_present(&store.paths.legacy)? {
@@ -182,6 +190,7 @@ impl MetadataStateStore {
         let parent = path.parent().unwrap_or_else(|| Path::new(""));
         Arc::new(Self {
             paths: MetadataPaths {
+                schema2: parent.join("metadata.signed.state"),
                 schema1: parent.join("metadata.state"),
                 legacy: parent.join("metadata.bitcode"),
                 current: path,
@@ -272,7 +281,8 @@ impl MetadataStateStore {
     }
 }
 
-const CURRENT_PAYLOAD_MAGIC: &[u8; 8] = b"DSPUBV2\0";
+const CURRENT_PAYLOAD_MAGIC: &[u8; 8] = b"DSPUBV3\0";
+const SCHEMA2_PAYLOAD_MAGIC: &[u8; 8] = b"DSPUBV2\0";
 const SCHEMA1_PAYLOAD_MAGIC: &[u8; 8] = b"DSPUBV1\0";
 const MAX_STRING_BYTES: usize = 16 * 1024 * 1024;
 
@@ -293,6 +303,14 @@ struct LegacyMetadataV1 {
 }
 
 fn canonical_payload(metadata: &InternalMetadata) -> Result<Vec<u8>, ServerError> {
+    canonical_payload_with_magic(metadata, CURRENT_PAYLOAD_MAGIC, true)
+}
+
+fn canonical_payload_with_magic(
+    metadata: &InternalMetadata,
+    magic: &[u8; 8],
+    allow_release_v2: bool,
+) -> Result<Vec<u8>, ServerError> {
     // `PublishedRevision` is a verified type: its public signed constructor
     // verifies the Item, and the only crate-private no-reverify constructor is
     // reserved for binding the same verified statement after changing solely
@@ -300,8 +318,24 @@ fn canonical_payload(metadata: &InternalMetadata) -> Result<Vec<u8>, ServerError
     // signature here would make each publication O(all signatures). The
     // durable reread below cryptographically revalidates every record.
     validate_runtime_metadata_structure(metadata)?;
+    if !allow_release_v2
+        && metadata
+            .versions
+            .values()
+            .flat_map(BTreeMap::values)
+            .any(|revision| {
+                matches!(
+                    revision.attestation(),
+                    PublicationAttestation::ReleaseV2 { .. }
+                )
+            })
+    {
+        return Err(ServerError::State(
+            "schema 2 cannot encode V2 publisher releases".to_string(),
+        ));
+    }
     let mut writer = WireWriterV1::new();
-    writer.bytes(CURRENT_PAYLOAD_MAGIC)?;
+    writer.bytes(magic)?;
     writer.version(metadata.version)?;
 
     let mut feeds = metadata.feeds.iter().collect::<Vec<_>>();
@@ -554,9 +588,15 @@ impl WireWriterV1 {
     fn published_revision(&mut self, revision: &PublishedRevision) -> Result<(), ServerError> {
         self.item(revision.item())?;
         match revision.attestation() {
-            PublicationAttestation::Unsigned => self.u8(0),
-            PublicationAttestation::Signed(envelope) => {
+            PublicationAttestation::UnsignedLegacy => self.u8(0),
+            PublicationAttestation::ReplayableV1(envelope) => {
                 self.u8(1)?;
+                self.bytes(envelope.public_key().as_bytes())?;
+                self.bytes(envelope.signature().as_bytes())
+            }
+            PublicationAttestation::ReleaseV2 { sequence, envelope } => {
+                self.u8(2)?;
+                self.u64(sequence.get())?;
                 self.bytes(envelope.public_key().as_bytes())?;
                 self.bytes(envelope.signature().as_bytes())
             }
@@ -809,14 +849,24 @@ impl<'a> WireReaderV1<'a> {
         })
     }
 
-    fn published_revision(&mut self) -> Result<PublishedRevision, ServerError> {
+    fn published_revision(
+        &mut self,
+        schema: PublicationPayloadSchema,
+    ) -> Result<PublishedRevision, ServerError> {
         let item = self.item()?;
         let attestation = match self.u8()? {
-            0 => PublicationAttestation::Unsigned,
-            1 => PublicationAttestation::Signed(PublisherSignatureEnvelope::from_parts(
+            0 => PublicationAttestation::UnsignedLegacy,
+            1 => PublicationAttestation::ReplayableV1(PublisherSignatureEnvelope::from_parts(
                 PublisherPublicKey::from_bytes(self.array()?),
                 PublisherSignature::from_bytes(self.array()?),
             )),
+            2 if schema == PublicationPayloadSchema::V3 => PublicationAttestation::ReleaseV2 {
+                sequence: PublisherReleaseSequence::new(self.u64()?),
+                envelope: PublisherReleaseEnvelope::from_parts(
+                    PublisherPublicKey::from_bytes(self.array()?),
+                    PublisherSignature::from_bytes(self.array()?),
+                ),
+            },
             _ => {
                 return Err(ServerError::State(
                     "server publication attestation tag is invalid".to_string(),
@@ -868,6 +918,16 @@ fn read_current(path: &Path) -> Result<InternalMetadata, ServerError> {
         MAX_SERVER_PUBLICATION_PAYLOAD,
     )?;
     decode_current_payload(&payload)
+}
+
+fn read_schema2(path: &Path) -> Result<InternalMetadata, ServerError> {
+    let payload = read_enveloped_state(
+        path,
+        DurableStateKind::ServerPublication,
+        SIGNED_SERVER_PUBLICATION_SCHEMA,
+        MAX_SERVER_PUBLICATION_PAYLOAD,
+    )?;
+    decode_schema2_payload(&payload)
 }
 
 fn read_schema1(path: &Path) -> Result<InternalMetadata, ServerError> {
@@ -961,17 +1021,28 @@ fn normalize_legacy_runtime(
 }
 
 fn decode_current_payload(payload: &[u8]) -> Result<InternalMetadata, ServerError> {
-    decode_payload(payload, CURRENT_PAYLOAD_MAGIC, true)
+    decode_payload(payload, CURRENT_PAYLOAD_MAGIC, PublicationPayloadSchema::V3)
+}
+
+fn decode_schema2_payload(payload: &[u8]) -> Result<InternalMetadata, ServerError> {
+    decode_payload(payload, SCHEMA2_PAYLOAD_MAGIC, PublicationPayloadSchema::V2)
 }
 
 fn decode_schema1_payload(payload: &[u8]) -> Result<InternalMetadata, ServerError> {
-    decode_payload(payload, SCHEMA1_PAYLOAD_MAGIC, false)
+    decode_payload(payload, SCHEMA1_PAYLOAD_MAGIC, PublicationPayloadSchema::V1)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublicationPayloadSchema {
+    V1,
+    V2,
+    V3,
 }
 
 fn decode_payload(
     payload: &[u8],
     magic: &[u8; 8],
-    signed_schema: bool,
+    schema: PublicationPayloadSchema,
 ) -> Result<InternalMetadata, ServerError> {
     let mut reader = WireReaderV1::new(payload);
     reader.expect_bytes(magic)?;
@@ -1020,8 +1091,8 @@ fn decode_payload(
                     "revision records are not strictly increasing".to_string(),
                 ));
             }
-            let published = if signed_schema {
-                reader.published_revision()?
+            let published = if schema != PublicationPayloadSchema::V1 {
+                reader.published_revision(schema)?
             } else {
                 PublishedRevision::unsigned(reader.item()?)
             };
@@ -1082,14 +1153,14 @@ fn verify_runtime_attestations(metadata: &InternalMetadata) -> Result<(), Server
         .map(|(_, history)| {
             history
                 .values()
-                .filter(|revision| revision.attestation().envelope().is_some())
+                .filter(|revision| !revision.attestation().is_unsigned())
                 .count()
         })
         .sum::<usize>();
     let maximum_statement = histories
         .iter()
         .flat_map(|(_, history)| history.values())
-        .filter(|revision| revision.attestation().envelope().is_some())
+        .filter(|revision| !revision.attestation().is_unsigned())
         .map(|revision| estimated_statement_bytes(revision.item()))
         .max()
         .unwrap_or(0);
@@ -1120,10 +1191,7 @@ fn verify_runtime_attestations(metadata: &InternalMetadata) -> Result<(), Server
                         break;
                     };
                     for (version, revision) in history {
-                        let Some(envelope) = revision.attestation().envelope() else {
-                            continue;
-                        };
-                        if let Err(error) = envelope.verify(revision.item()) {
+                        if let Err(error) = verify_revision_attestation(revision) {
                             if !failed.swap(true, Ordering::AcqRel) {
                                 *failure.lock().expect("attestation failure lock") = Some(format!(
                                     "artifact {artifact_id} version {version} publisher signature is invalid: {error}"
@@ -1147,8 +1215,8 @@ fn verify_attestation_histories(
 ) -> Result<(), ServerError> {
     for (artifact_id, history) in histories {
         for (version, revision) in *history {
-            if let Some(envelope) = revision.attestation().envelope() {
-                envelope.verify(revision.item()).map_err(|error| {
+            if !revision.attestation().is_unsigned() {
+                verify_revision_attestation(revision).map_err(|error| {
                     ServerError::State(format!(
                         "artifact {artifact_id} version {version} publisher signature is invalid: {error}"
                     ))
@@ -1157,6 +1225,20 @@ fn verify_attestation_histories(
         }
     }
     Ok(())
+}
+
+fn verify_revision_attestation(
+    revision: &PublishedRevision,
+) -> Result<(), distd_core::signature::SignatureEnvelopeError> {
+    match revision.attestation() {
+        PublicationAttestation::ReleaseV2 { sequence, envelope } => {
+            envelope.verify(revision.item(), *sequence).map(|_| ())
+        }
+        PublicationAttestation::ReplayableV1(envelope) => {
+            envelope.verify(revision.item()).map(|_| ())
+        }
+        PublicationAttestation::UnsignedLegacy => Ok(()),
+    }
 }
 
 fn estimated_statement_bytes(item: &Item) -> usize {
@@ -1266,13 +1348,16 @@ pub(crate) fn validate_runtime_metadata_with_policy(
     for (artifact_id, history) in &metadata.versions {
         for (version, revision) in history {
             let incompatible = match revision.attestation() {
-                PublicationAttestation::Signed(envelope)
+                PublicationAttestation::ReleaseV2 { envelope, .. }
                     if !policy.permits_unsigned()
                         && !policy.contains_exact_key(envelope.public_key()) =>
                 {
                     Some(crate::publication::PublicationError::UntrustedPublisher)
                 }
-                PublicationAttestation::Unsigned if !policy.permits_unsigned() => {
+                PublicationAttestation::ReplayableV1(_) if !policy.permits_unsigned() => {
+                    Some(crate::publication::PublicationError::ReplayableForbidden)
+                }
+                PublicationAttestation::UnsignedLegacy if !policy.permits_unsigned() => {
                     Some(crate::publication::PublicationError::UnsignedForbidden)
                 }
                 _ => None,
@@ -1314,7 +1399,10 @@ mod tests {
     use distd_core::{
         chunk_storage::{hashmap_storage::HashMapStorage, ChunkStorage},
         chunks::ChunkAlgorithm,
-        signature::{PublisherSignature, PublisherStatement},
+        signature::{
+            PublisherReleaseEnvelope, PublisherReleaseSequence, PublisherReleaseStatement,
+            PublisherSignature, PublisherStatement,
+        },
     };
     use ring::signature::{Ed25519KeyPair, KeyPair};
     use std::sync::atomic::{AtomicU64, AtomicUsize};
@@ -1398,7 +1486,49 @@ mod tests {
         )
     }
 
+    fn release_envelope(
+        item: &Item,
+        seed: [u8; 32],
+        sequence: PublisherReleaseSequence,
+    ) -> PublisherReleaseEnvelope {
+        let pair = Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
+        let statement = PublisherReleaseStatement::from_item(item, sequence).unwrap();
+        PublisherReleaseEnvelope::from_parts(
+            PublisherPublicKey::try_from(pair.public_key().as_ref()).unwrap(),
+            PublisherSignature::try_from(pair.sign(statement.as_bytes()).as_ref()).unwrap(),
+        )
+    }
+
     fn signed_metadata_with(
+        artifact_id: &str,
+        payload: &'static [u8],
+        seed: [u8; 32],
+    ) -> InternalMetadata {
+        let mut metadata = metadata_with(artifact_id, payload);
+        let mut item = metadata.items[artifact_id].item().clone();
+        let fixed_time = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        item.metadata.created = fixed_time;
+        item.metadata.updated = fixed_time;
+        let sequence = PublisherReleaseSequence::new(1);
+        let published = PublishedRevision::new(
+            item.clone(),
+            PublicationAttestation::ReleaseV2 {
+                sequence,
+                envelope: release_envelope(&item, seed, sequence),
+            },
+        )
+        .unwrap();
+        metadata
+            .items
+            .insert(artifact_id.to_string(), published.clone());
+        metadata.versions.insert(
+            artifact_id.to_string(),
+            BTreeMap::from([(item.manifest.version, published)]),
+        );
+        metadata
+    }
+
+    fn replayable_metadata_with(
         artifact_id: &str,
         payload: &'static [u8],
         seed: [u8; 32],
@@ -1410,7 +1540,7 @@ mod tests {
         item.metadata.updated = fixed_time;
         let published = PublishedRevision::new(
             item.clone(),
-            PublicationAttestation::Signed(envelope(&item, seed)),
+            PublicationAttestation::ReplayableV1(envelope(&item, seed)),
         )
         .unwrap();
         metadata
@@ -1421,6 +1551,10 @@ mod tests {
             BTreeMap::from([(item.manifest.version, published)]),
         );
         metadata
+    }
+
+    fn canonical_schema2_payload(metadata: &InternalMetadata) -> Vec<u8> {
+        canonical_payload_with_magic(metadata, SCHEMA2_PAYLOAD_MAGIC, false).unwrap()
     }
 
     fn schema2_golden_metadata() -> InternalMetadata {
@@ -1518,17 +1652,17 @@ mod tests {
         let empty = canonical_payload(&InternalMetadata::default()).unwrap();
         assert_eq!(
             empty,
-            b"DSPUBV2\0\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+            b"DSPUBV3\0\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
         );
     }
 
     #[test]
-    fn signed_schema2_roundtrips_exact_envelopes_and_adds_ninety_seven_bytes() {
+    fn release_schema3_roundtrips_exact_envelopes_and_adds_one_hundred_four_bytes() {
         let unsigned = metadata_with("signed", b"signed payload");
         let signed = signed_metadata_with("signed", b"signed payload", [11; 32]);
         let unsigned_payload = canonical_payload(&unsigned).unwrap();
         let signed_payload = canonical_payload(&signed).unwrap();
-        assert_eq!(signed_payload.len(), unsigned_payload.len() + 96);
+        assert_eq!(signed_payload.len(), unsigned_payload.len() + 104);
         assert_eq!(decode_current_payload(&signed_payload).unwrap(), signed);
         assert_eq!(canonical_payload(&signed).unwrap(), signed_payload);
 
@@ -1537,20 +1671,20 @@ mod tests {
         assert!(decode_current_payload(&invalid_signature).is_err());
 
         let mut invalid_tag = signed_payload;
-        let tag = invalid_tag.len() - 97;
-        invalid_tag[tag] = 2;
+        let tag = invalid_tag.len() - 105;
+        invalid_tag[tag] = 3;
         assert!(decode_current_payload(&invalid_tag).is_err());
     }
 
     #[test]
-    fn schema2_multi_artifact_multi_revision_golden_is_stable() {
+    fn schema3_multi_artifact_multi_revision_golden_is_stable() {
         let metadata = schema2_golden_metadata();
         let payload = canonical_payload(&metadata).unwrap();
         assert_eq!(&payload[..8], CURRENT_PAYLOAD_MAGIC);
-        assert_eq!(payload.len(), 1056);
+        assert_eq!(payload.len(), 1080);
         assert_eq!(
             blake3::hash(&payload).to_hex().as_str(),
-            "9593bf33ffcaee6381b6dda8af7eedee84c27a3b549b63bb20c47a6f717d3641"
+            "98d69202ad93a1edecae7366947e11ad3ab8d02cfa50f84fac8ba4a0c9adf6a1"
         );
         assert_eq!(decode_current_payload(&payload).unwrap(), metadata);
         assert_eq!(canonical_payload(&metadata).unwrap(), payload);
@@ -1656,7 +1790,7 @@ mod tests {
         };
 
         let payload = canonical_payload(&metadata).unwrap();
-        assert_eq!(&payload[..8], b"DSPUBV2\0");
+        assert_eq!(&payload[..8], b"DSPUBV3\0");
         assert_eq!(decode_current_payload(&payload).unwrap(), metadata);
         assert_eq!(
             canonical_payload(&decode_current_payload(&payload).unwrap()).unwrap(),
@@ -1677,9 +1811,13 @@ mod tests {
         for index in 0..10_000 {
             let artifact_id = format!("artifact-{index:05}");
             let item = template.clone().with_artifact_id(artifact_id.clone());
+            let sequence = PublisherReleaseSequence::new(1);
             let published = PublishedRevision::new(
                 item.clone(),
-                PublicationAttestation::Signed(envelope(&item, [41; 32])),
+                PublicationAttestation::ReleaseV2 {
+                    sequence,
+                    envelope: release_envelope(&item, [41; 32], sequence),
+                },
             )
             .unwrap();
             metadata
@@ -1705,16 +1843,24 @@ mod tests {
         }
         encode_samples.sort_unstable();
         decode_samples.sort_unstable();
+        let encode_p95 = encode_samples[18];
+        let encode_max = encode_samples[19];
+        let decode_p95 = decode_samples[18];
+        let decode_max = decode_samples[19];
         eprintln!(
-            "schema2 current codec 10k: payload={payload_size} available_parallelism={:?} encode_median={:?} encode_p95={:?} encode_max={:?} decode_median={:?} decode_p95={:?} decode_max={:?}",
+            "schema3 release codec 10k: payload={payload_size} available_parallelism={:?} encode_median={:?} encode_p95={:?} encode_max={:?} decode_median={:?} decode_p95={:?} decode_max={:?}",
             std::thread::available_parallelism(),
             encode_samples[10],
-            encode_samples[18],
-            encode_samples[19],
+            encode_p95,
+            encode_max,
             decode_samples[10],
-            decode_samples[18],
-            decode_samples[19]
+            decode_p95,
+            decode_max
         );
+        assert_eq!(payload_size, 3_840_022);
+        assert!(encode_p95 <= std::time::Duration::from_millis(10));
+        assert!(decode_p95 <= std::time::Duration::from_millis(70));
+        assert!(decode_max <= std::time::Duration::from_millis(100));
     }
 
     #[test]
@@ -1820,7 +1966,7 @@ mod tests {
     }
 
     #[test]
-    fn secure_policy_rejects_unallowlisted_schema2_key_without_rewriting_current() {
+    fn secure_policy_rejects_unallowlisted_schema3_key_without_rewriting_current() {
         let directory = directory();
         let paths = MetadataPaths::in_state_directory(&directory);
         let metadata = signed_metadata_with("signed", b"signed payload", [41; 32]);
@@ -1846,6 +1992,66 @@ mod tests {
         assert_eq!(std::fs::read(&paths.current).unwrap(), current_before);
         assert_eq!(read_current(&paths.current).unwrap(), metadata);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn schema2_v1_is_retained_and_migrates_only_in_explicit_insecure_mode() {
+        let metadata = replayable_metadata_with("signed", b"schema two", [51; 32]);
+        let payload = canonical_schema2_payload(&metadata);
+
+        let secure_directory = directory();
+        let secure_paths = MetadataPaths::in_state_directory(&secure_directory);
+        replace_enveloped_state(
+            &secure_paths.schema2,
+            DurableStateKind::ServerPublication,
+            SIGNED_SERVER_PUBLICATION_SCHEMA,
+            &payload,
+            MAX_SERVER_PUBLICATION_PAYLOAD,
+        )
+        .unwrap();
+        let source_before = std::fs::read(&secure_paths.schema2).unwrap();
+        let item = metadata.items["signed"].item();
+        let secure = PublisherPolicy::required([envelope(item, [51; 32]).public_key()]);
+        assert!(
+            MetadataStateStore::open_with_validator(secure_paths.clone(), |value| {
+                validate_runtime_metadata_with_policy(value, &secure)
+            })
+            .is_err()
+        );
+        assert!(!secure_paths.current.exists());
+        assert_eq!(std::fs::read(&secure_paths.schema2).unwrap(), source_before);
+        std::fs::remove_dir_all(secure_directory).unwrap();
+
+        let insecure_directory = directory();
+        let insecure_paths = MetadataPaths::in_state_directory(&insecure_directory);
+        replace_enveloped_state(
+            &insecure_paths.schema2,
+            DurableStateKind::ServerPublication,
+            SIGNED_SERVER_PUBLICATION_SCHEMA,
+            &payload,
+            MAX_SERVER_PUBLICATION_PAYLOAD,
+        )
+        .unwrap();
+        let source_before = std::fs::read(&insecure_paths.schema2).unwrap();
+        let insecure = PublisherPolicy::explicitly_insecure_unsigned();
+        let (_, migrated) =
+            MetadataStateStore::open_with_validator(insecure_paths.clone(), |value| {
+                validate_runtime_metadata_with_policy(value, &insecure)
+            })
+            .unwrap();
+        assert_eq!(migrated, metadata);
+        assert_eq!(
+            std::fs::read(&insecure_paths.schema2).unwrap(),
+            source_before
+        );
+        assert_eq!(read_current(&insecure_paths.current).unwrap(), metadata);
+        let (_, restarted) =
+            MetadataStateStore::open_with_validator(insecure_paths.clone(), |value| {
+                validate_runtime_metadata_with_policy(value, &insecure)
+            })
+            .unwrap();
+        assert_eq!(restarted, metadata);
+        std::fs::remove_dir_all(insecure_directory).unwrap();
     }
 
     #[test]

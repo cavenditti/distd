@@ -1,7 +1,11 @@
 use crate::{
     error::ServerRequest,
     persistence::{DurableTrustReceipt, ServerTrustRecord},
-    publisher::{PublisherAuthenticityError, PublisherPolicy},
+    publisher::{
+        PublisherAuthenticityError, PublisherAuthorization, PublisherPolicy,
+        PublisherTransportAttestation,
+    },
+    rollback::ClientRollbackState,
     server_url::CanonicalServerUrl,
 };
 
@@ -21,7 +25,8 @@ use distd_core::{
     metadata::{Item as ItemMetadata, Server as ServerMetadata},
     proto::{self},
     signature::{
-        PublisherKeyFingerprint, PublisherPublicKey, PublisherSignature, PublisherSignatureEnvelope,
+        PublisherKeyFingerprint, PublisherPublicKey, PublisherReleaseEnvelope,
+        PublisherReleaseSequence, PublisherSignature, PublisherSignatureEnvelope,
     },
     version::VERSION,
 };
@@ -123,7 +128,7 @@ type VerifiedManifestParts = (
     Vec<ChunkInfo>,
     Vec<usize>,
     proto::PossessionBitfield,
-    Option<PublisherKeyFingerprint>,
+    PublisherAuthorization,
     Vec<Hash>,
 );
 
@@ -291,6 +296,9 @@ pub struct Server {
     /// Publisher authority configured independently from the TLS trust root.
     publisher_policy: PublisherPolicy,
 
+    /// Durable publisher-release high-water marks for this exact authority.
+    rollback_state: ClientRollbackState,
+
     /// Client Uuid assigned to client from server
     client_uuid: Option<Uuid>,
 
@@ -313,6 +321,7 @@ impl Debug for Server {
             .field("url", &self.url)
             .field("certificate_pin", &self.certificate_pin)
             .field("publisher_policy", &self.publisher_policy)
+            .field("rollback_state", &self.rollback_state)
             .field("client_uuid", &self.client_uuid)
             .field("client_name", &self.client_name)
             .field(
@@ -339,6 +348,7 @@ struct PendingServerInner {
     url: CanonicalServerUrl,
     certificate_fingerprint: [u8; 32],
     publisher_policy: PublisherPolicy,
+    rollback_state: ClientRollbackState,
     client_uuid: Uuid,
     client_name: String,
     enrollment_token: Option<String>,
@@ -354,6 +364,7 @@ impl Debug for PendingServer {
                 .field("url", &inner.url)
                 .field("certificate_fingerprint", &inner.certificate_fingerprint)
                 .field("publisher_policy", &inner.publisher_policy)
+                .field("rollback_state", &inner.rollback_state)
                 .field("client_uuid", &inner.client_uuid)
                 .field("client_name", &inner.client_name)
                 .field(
@@ -427,6 +438,7 @@ impl PendingServer {
         Ok(Server {
             certificate_pin: inner.certificate_fingerprint,
             publisher_policy: inner.publisher_policy,
+            rollback_state: inner.rollback_state,
             url: inner.url,
             client_uuid: Some(inner.client_uuid),
             client_name: inner.client_name,
@@ -471,6 +483,7 @@ impl Server {
         expected_certificate: Option<[u8; 32]>,
         enrollment_token: Option<&str>,
         publisher_policy: PublisherPolicy,
+        rollback_state: ClientRollbackState,
     ) -> Result<PendingServer, ServerRequest> {
         let mut transport = Self::make_transport(&url, client_uuid, expected_certificate).await?;
         tracing::debug!("Connected to server");
@@ -483,6 +496,7 @@ impl Server {
                 url,
                 certificate_fingerprint,
                 publisher_policy,
+                rollback_state,
                 client_uuid: assigned_uuid,
                 client_name: client_name.to_owned(),
                 enrollment_token: enrollment_token.map(str::to_owned),
@@ -647,6 +661,8 @@ impl Server {
             expected,
             local_hashes,
             self.publisher_policy.clone(),
+            self.rollback_state.clone(),
+            self.url.clone(),
         )
         .await
     }
@@ -685,33 +701,73 @@ async fn verify_and_transfer_pending(
     expected: ItemMetadata,
     local_hashes: Vec<Hash>,
     policy: PublisherPolicy,
+    rollback_state: ClientRollbackState,
+    authority: CanonicalServerUrl,
 ) -> Result<(Manifest, Vec<ChunkInfo>, Vec<ReceivedChunk>, u64, Vec<Hash>), ServerRequest> {
     verify_and_transfer_pending_with(pending, move |response| {
-        verify_manifest_response(response, &expected, local_hashes, &policy)
+        let parts = verify_manifest_response(response, &expected, local_hashes, &policy)?;
+        let (manifest, chunks, chunk_sizes, possession, authorization, local_hashes) = parts;
+        if let Some(verified) = authorization.rollback() {
+            let receipt = rollback_state.authorize(&authority, &manifest.artifact_id, verified)?;
+            if !receipt.matches(
+                &authority,
+                &manifest.artifact_id,
+                verified.sequence(),
+                verified.statement_identity(),
+            ) {
+                return Err(ServerRequest::PublisherVerificationWorker);
+            }
+        }
+        Ok((
+            manifest,
+            chunks,
+            chunk_sizes,
+            possession,
+            authorization,
+            local_hashes,
+        ))
     })
     .await
 }
 
-async fn verify_and_transfer_pending_with<Verify>(
+async fn verify_and_transfer_pending_with<Verify, VerifyError>(
     pending: PendingSync,
     verify: Verify,
 ) -> Result<(Manifest, Vec<ChunkInfo>, Vec<ReceivedChunk>, u64, Vec<Hash>), ServerRequest>
 where
-    Verify: FnOnce(proto::ManifestResponse) -> Result<VerifiedManifestParts, PublisherAuthenticityError>
-        + Send
+    Verify: FnOnce(
+            proto::ManifestResponse,
+        ) -> Result<
+            (
+                Manifest,
+                Vec<ChunkInfo>,
+                Vec<usize>,
+                proto::PossessionBitfield,
+                PublisherAuthorization,
+                Vec<Hash>,
+            ),
+            VerifyError,
+        > + Send
         + 'static,
+    VerifyError: Into<ServerRequest> + Send + 'static,
 {
     let PendingSync {
         manifest,
         continuation,
     } = pending;
-    let verified = tokio::task::spawn_blocking(move || manifest.decode().and_then(verify)).await;
-    let (manifest, chunks, chunk_sizes, possession, publisher_fingerprint, local_hashes) =
+    let verified = tokio::task::spawn_blocking(move || {
+        manifest
+            .decode()
+            .map_err(ServerRequest::from)
+            .and_then(|response| verify(response).map_err(Into::into))
+    })
+    .await;
+    let (manifest, chunks, chunk_sizes, possession, publisher_authorization, local_hashes) =
         match verified {
             Ok(Ok(verified)) => verified,
             Ok(Err(error)) => {
                 continuation.abort();
-                return Err(error.into());
+                return Err(error);
             }
             Err(_) => {
                 continuation.abort();
@@ -723,7 +779,7 @@ where
         chunks,
         chunk_sizes,
         possession,
-        publisher_fingerprint,
+        publisher_fingerprint: publisher_authorization.fingerprint(),
         local_hashes,
         continuation,
     }
@@ -807,19 +863,38 @@ fn redacted_token(token: Option<&str>) -> Option<&'static str> {
     token.map(|_| "[REDACTED]")
 }
 
-fn publisher_envelope_from_transport(
+fn publisher_attestation_from_transport(
+    statement_version: Option<u32>,
+    release_sequence: Option<u64>,
     public_key: &[u8],
     signature: &[u8],
-) -> Result<Option<PublisherSignatureEnvelope>, PublisherAuthenticityError> {
-    match (public_key, signature) {
-        ([], []) => Ok(None),
-        (public_key, signature) if !public_key.is_empty() && !signature.is_empty() => {
-            Ok(Some(PublisherSignatureEnvelope::from_parts(
-                PublisherPublicKey::try_from(public_key)
-                    .map_err(|_| PublisherAuthenticityError::MalformedAttestation)?,
-                PublisherSignature::try_from(signature)
-                    .map_err(|_| PublisherAuthenticityError::MalformedAttestation)?,
-            )))
+) -> Result<PublisherTransportAttestation, PublisherAuthenticityError> {
+    match (statement_version, release_sequence, public_key, signature) {
+        (None, None, [], []) => Ok(PublisherTransportAttestation::Unsigned),
+        (Some(1), None, public_key, signature)
+            if !public_key.is_empty() && !signature.is_empty() =>
+        {
+            Ok(PublisherTransportAttestation::ReplayableV1(
+                PublisherSignatureEnvelope::from_parts(
+                    PublisherPublicKey::try_from(public_key)
+                        .map_err(|_| PublisherAuthenticityError::MalformedAttestation)?,
+                    PublisherSignature::try_from(signature)
+                        .map_err(|_| PublisherAuthenticityError::MalformedAttestation)?,
+                ),
+            ))
+        }
+        (Some(2), Some(sequence), public_key, signature)
+            if !public_key.is_empty() && !signature.is_empty() =>
+        {
+            Ok(PublisherTransportAttestation::ReleaseV2 {
+                sequence: PublisherReleaseSequence::new(sequence),
+                envelope: PublisherReleaseEnvelope::from_parts(
+                    PublisherPublicKey::try_from(public_key)
+                        .map_err(|_| PublisherAuthenticityError::MalformedAttestation)?,
+                    PublisherSignature::try_from(signature)
+                        .map_err(|_| PublisherAuthenticityError::MalformedAttestation)?,
+                ),
+            })
         }
         _ => Err(PublisherAuthenticityError::MalformedAttestation),
     }
@@ -831,21 +906,12 @@ fn verify_manifest_response(
     local_hashes: Vec<Hash>,
     policy: &PublisherPolicy,
 ) -> Result<VerifiedManifestParts, PublisherAuthenticityError> {
-    let envelope = publisher_envelope_from_transport(
+    let attestation = publisher_attestation_from_transport(
+        response.publisher_statement_version,
+        response.publisher_release_sequence,
         &response.publisher_public_key,
         &response.publisher_signature,
     )?;
-    match envelope.as_ref() {
-        None if !policy.permits_unsigned() => {
-            return Err(PublisherAuthenticityError::MissingAttestation)
-        }
-        Some(envelope)
-            if !policy.permits_unsigned() && !policy.contains_exact_key(envelope.public_key()) =>
-        {
-            return Err(PublisherAuthenticityError::UntrustedPublisher)
-        }
-        _ => {}
-    }
 
     let root_hash = Hash::from_bytes(
         response
@@ -899,7 +965,8 @@ fn verify_manifest_response(
             })
             .collect(),
     };
-    let publisher_fingerprint = policy.authorize_manifest(envelope.as_ref(), &manifest, &chunks)?;
+    let publisher_authorization =
+        policy.authorize_transport_manifest(attestation, &manifest, &chunks)?;
 
     let chunk_sizes = chunks
         .iter()
@@ -925,7 +992,7 @@ fn verify_manifest_response(
         proto::PossessionBitfield {
             bitfield: bitfield.to_bytes(),
         },
-        publisher_fingerprint,
+        publisher_authorization,
         local_hashes,
     ))
 }
@@ -945,8 +1012,8 @@ async fn fetch_metadata(transport: &TransportClient) -> Result<ServerMetadata, S
 #[cfg(test)]
 mod tests {
     use super::{
-        assigned_uuid, publisher_envelope_from_transport, receipt_matches_pending, redacted_token,
-        require_requested_catalog_identity, require_same_prior_identity,
+        assigned_uuid, publisher_attestation_from_transport, receipt_matches_pending,
+        redacted_token, require_requested_catalog_identity, require_same_prior_identity,
         verify_and_transfer_pending, verify_and_transfer_pending_with, verify_manifest_response,
         ObservedSyncContinuation, ObservedSyncSession, PendingManifest, PendingServer, PendingSync,
         SyncContinuation,
@@ -954,7 +1021,8 @@ mod tests {
     use crate::error::ServerRequest;
     use crate::{
         persistence::{ClientPersistentState, ServerTrustRecord},
-        publisher::{PublisherAuthenticityError, PublisherPolicy},
+        publisher::{PublisherAuthenticityError, PublisherPolicy, PublisherTransportAttestation},
+        rollback::ClientRollbackState,
         server_url::CanonicalServerUrl,
     };
     use distd_core::{
@@ -963,7 +1031,9 @@ mod tests {
         hash::Hash,
         proto,
         signature::{
-            PublisherPublicKey, PublisherSignature, PublisherSignatureEnvelope, PublisherStatement,
+            PublisherPublicKey, PublisherReleaseEnvelope, PublisherReleaseSequence,
+            PublisherReleaseStatement, PublisherSignature, PublisherSignatureEnvelope,
+            PublisherStatement,
         },
     };
     use ring::signature::{Ed25519KeyPair, KeyPair};
@@ -1024,9 +1094,24 @@ mod tests {
         distd_core::metadata::Item,
         PublisherPolicy,
     ) {
+        signed_response_for_item_at_sequence(item, seed, 1)
+    }
+
+    fn signed_response_for_item_at_sequence(
+        item: distd_core::item::Item,
+        seed: [u8; 32],
+        release_sequence: u64,
+    ) -> (
+        proto::ManifestResponse,
+        distd_core::metadata::Item,
+        PublisherPolicy,
+    ) {
         let pair = Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
-        let statement = PublisherStatement::from_manifest(&item.manifest, &item.chunks).unwrap();
-        let envelope = PublisherSignatureEnvelope::from_parts(
+        let sequence = PublisherReleaseSequence::new(release_sequence);
+        let statement =
+            PublisherReleaseStatement::from_manifest(&item.manifest, &item.chunks, sequence)
+                .unwrap();
+        let envelope = PublisherReleaseEnvelope::from_parts(
             PublisherPublicKey::try_from(pair.public_key().as_ref()).unwrap(),
             PublisherSignature::try_from(pair.sign(statement.as_bytes()).as_ref()).unwrap(),
         );
@@ -1071,8 +1156,33 @@ mod tests {
                 .collect(),
             publisher_public_key: envelope.public_key().as_bytes().to_vec(),
             publisher_signature: envelope.signature().as_bytes().to_vec(),
+            publisher_statement_version: Some(2),
+            publisher_release_sequence: Some(sequence.get()),
         };
         (response, item.metadata, policy)
+    }
+
+    fn test_rollback_state() -> ClientRollbackState {
+        test_rollback_state_and_path().0
+    }
+
+    fn test_rollback_state_and_path() -> (ClientRollbackState, std::path::PathBuf) {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "distd-client-rollback-test-{}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("rollback.state");
+        (
+            ClientRollbackState::load_from_path(path.clone()).unwrap(),
+            path,
+        )
+    }
+
+    fn test_authority() -> CanonicalServerUrl {
+        CanonicalServerUrl::parse("quic://localhost:50051").unwrap()
     }
 
     fn reference_item(chunk_count: usize, directory: bool) -> distd_core::item::Item {
@@ -1181,12 +1291,15 @@ mod tests {
     #[test]
     fn publisher_transport_tuple_is_exactly_all_or_none() {
         assert!(matches!(
-            publisher_envelope_from_transport(&[], &[]),
-            Ok(None)
+            publisher_attestation_from_transport(None, None, &[], &[]),
+            Ok(PublisherTransportAttestation::Unsigned)
         ));
-        let envelope = publisher_envelope_from_transport(&[3; 32], &[5; 64])
-            .unwrap()
-            .unwrap();
+        let attestation =
+            publisher_attestation_from_transport(Some(2), Some(7), &[3; 32], &[5; 64]).unwrap();
+        let PublisherTransportAttestation::ReleaseV2 { sequence, envelope } = attestation else {
+            panic!("expected a V2 release attestation");
+        };
+        assert_eq!(sequence.get(), 7);
         assert_eq!(envelope.public_key().as_bytes(), &[3; 32]);
         assert_eq!(envelope.signature().as_bytes(), &[5; 64]);
 
@@ -1199,7 +1312,28 @@ mod tests {
             (vec![3; 32], vec![5; 65]),
         ] {
             assert!(matches!(
-                publisher_envelope_from_transport(&key, &signature),
+                publisher_attestation_from_transport(Some(2), Some(7), &key, &signature),
+                Err(PublisherAuthenticityError::MalformedAttestation)
+            ));
+        }
+
+        assert!(matches!(
+            publisher_attestation_from_transport(Some(1), None, &[3; 32], &[5; 64]),
+            Ok(PublisherTransportAttestation::ReplayableV1(_))
+        ));
+        assert!(matches!(
+            publisher_attestation_from_transport(Some(2), None, &[3; 32], &[5; 64]),
+            Err(PublisherAuthenticityError::MalformedAttestation)
+        ));
+        for (version, sequence) in [
+            (None, None),
+            (None, Some(7)),
+            (Some(0), Some(7)),
+            (Some(1), Some(7)),
+            (Some(3), Some(7)),
+        ] {
+            assert!(matches!(
+                publisher_attestation_from_transport(version, sequence, &[3; 32], &[5; 64]),
                 Err(PublisherAuthenticityError::MalformedAttestation)
             ));
         }
@@ -1217,7 +1351,8 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunk_sizes, vec![usize::try_from(chunks[0].size).unwrap()]);
         assert_eq!(returned_hashes, vec![available]);
-        assert!(fingerprint.is_some());
+        assert!(fingerprint.fingerprint().is_some());
+        assert!(fingerprint.rollback().is_some());
         let bitfield = distd_core::possession::Bitfield::from_bytes(&possession.bitfield).unwrap();
         assert_eq!(bitfield.chunk_count(), 1);
         assert!(bitfield.has(0));
@@ -1230,7 +1365,7 @@ mod tests {
             verify_manifest_response(response.clone(), &expected, Vec::new(), &policy).unwrap();
         assert_eq!(manifest.entries.len(), 2);
         assert_eq!(chunks.len(), 2);
-        assert!(fingerprint.is_some());
+        assert!(fingerprint.fingerprint().is_some());
         assert!(
             distd_core::possession::Bitfield::from_bytes(&possession.bitfield)
                 .unwrap()
@@ -1318,7 +1453,7 @@ mod tests {
             let (manifest, _, _, _, fingerprint, _) =
                 verify_manifest_response(response, &expected, Vec::new(), &policy).unwrap();
             assert_eq!(manifest.chunk_algorithm, algorithm);
-            assert!(fingerprint.is_some());
+            assert!(fingerprint.fingerprint().is_some());
         }
     }
 
@@ -1339,6 +1474,8 @@ mod tests {
         let mut missing = response.clone();
         missing.publisher_public_key.clear();
         missing.publisher_signature.clear();
+        missing.publisher_statement_version = None;
+        missing.publisher_release_sequence = None;
         assert_eq!(
             verify_manifest_response(missing, &expected, Vec::new(), &policy),
             Err(PublisherAuthenticityError::MissingAttestation)
@@ -1441,6 +1578,8 @@ mod tests {
         let (mut response, expected, _) = signed_manifest_fixture();
         response.publisher_public_key.clear();
         response.publisher_signature.clear();
+        response.publisher_statement_version = None;
+        response.publisher_release_sequence = None;
         let policy = PublisherPolicy::from_config(&[], true).unwrap();
         assert!(
             verify_manifest_response(response.clone(), &expected, Vec::new(), &policy,).is_ok()
@@ -1471,6 +1610,8 @@ mod tests {
             expected.clone(),
             vec![local_hash],
             policy.clone(),
+            test_rollback_state(),
+            test_authority(),
         )
         .await;
         assert!(matches!(
@@ -1503,6 +1644,8 @@ mod tests {
             expected,
             vec![local_hash],
             policy,
+            test_rollback_state(),
+            test_authority(),
         )
         .await
         .unwrap();
@@ -1522,6 +1665,193 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn rollback_and_same_sequence_conflict_abort_before_possession() {
+        let storage = HashMapStorage::default();
+        let prepare = |payload: &'static [u8]| {
+            storage
+                .prepare_revision(
+                    "rollback-artifact".to_string(),
+                    "rollback-artifact".to_string(),
+                    std::path::PathBuf::from("rollback-artifact.bin"),
+                    0,
+                    None,
+                    bytes::Bytes::from_static(payload),
+                    ChunkAlgorithm::Fixed256K,
+                )
+                .unwrap()
+        };
+        let (high_response, high_expected, policy) =
+            signed_response_for_item_at_sequence(prepare(b"release nine"), [47; 32], 9);
+        let (lower_response, lower_expected, _) =
+            signed_response_for_item_at_sequence(prepare(b"release eight"), [47; 32], 8);
+        let (conflict_response, conflict_expected, _) =
+            signed_response_for_item_at_sequence(prepare(b"conflicting nine"), [47; 32], 9);
+        let high_hashes = high_response
+            .chunk_hashes
+            .iter()
+            .map(|hash| Hash::from_bytes(hash.clone().try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let rollback = test_rollback_state();
+        let authority = test_authority();
+
+        let accepted_observer = std::sync::Arc::new(ObservedSyncContinuation::default());
+        verify_and_transfer_pending(
+            PendingSync {
+                manifest: PendingManifest::Decoded(high_response.clone()),
+                continuation: SyncContinuation::Observed(ObservedSyncSession::new(
+                    accepted_observer.clone(),
+                )),
+            },
+            high_expected.clone(),
+            high_hashes.clone(),
+            policy.clone(),
+            rollback.clone(),
+            authority.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            accepted_observer
+                .possession_sends
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        for (response, expected, expected_error) in [
+            (
+                lower_response,
+                lower_expected,
+                crate::rollback::RollbackError::RollbackDetected,
+            ),
+            (
+                conflict_response,
+                conflict_expected,
+                crate::rollback::RollbackError::SequenceConflict,
+            ),
+        ] {
+            let observer = std::sync::Arc::new(ObservedSyncContinuation::default());
+            let error = verify_and_transfer_pending(
+                PendingSync {
+                    manifest: PendingManifest::Decoded(response),
+                    continuation: SyncContinuation::Observed(ObservedSyncSession::new(
+                        observer.clone(),
+                    )),
+                },
+                expected,
+                Vec::new(),
+                policy.clone(),
+                rollback.clone(),
+                authority.clone(),
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(
+                (error, expected_error),
+                (
+                    ServerRequest::RollbackProtection(
+                        crate::rollback::RollbackError::RollbackDetected
+                    ),
+                    crate::rollback::RollbackError::RollbackDetected
+                ) | (
+                    ServerRequest::RollbackProtection(
+                        crate::rollback::RollbackError::SequenceConflict
+                    ),
+                    crate::rollback::RollbackError::SequenceConflict
+                )
+            ));
+            assert_eq!(
+                observer
+                    .possession_sends
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                0
+            );
+            assert_eq!(observer.aborts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+
+        let replay_observer = std::sync::Arc::new(ObservedSyncContinuation::default());
+        verify_and_transfer_pending(
+            PendingSync {
+                manifest: PendingManifest::Decoded(high_response),
+                continuation: SyncContinuation::Observed(ObservedSyncSession::new(
+                    replay_observer.clone(),
+                )),
+            },
+            high_expected,
+            high_hashes,
+            policy,
+            rollback,
+            authority,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            replay_observer
+                .possession_sends
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_insecure_v1_and_unsigned_syncs_never_create_a_watermark() {
+        let item = HashMapStorage::default()
+            .prepare_revision(
+                "replayable-artifact".to_string(),
+                "replayable-artifact".to_string(),
+                std::path::PathBuf::from("replayable.bin"),
+                0,
+                None,
+                bytes::Bytes::from_static(b"replayable payload"),
+                ChunkAlgorithm::Fixed256K,
+            )
+            .unwrap();
+        let (mut response, expected, _) =
+            signed_response_for_item_at_sequence(item.clone(), [57; 32], 1);
+        let pair = Ed25519KeyPair::from_seed_unchecked(&[57; 32]).unwrap();
+        let statement = PublisherStatement::from_item(&item).unwrap();
+        let envelope = PublisherSignatureEnvelope::from_parts(
+            PublisherPublicKey::try_from(pair.public_key().as_ref()).unwrap(),
+            PublisherSignature::try_from(pair.sign(statement.as_bytes()).as_ref()).unwrap(),
+        );
+        response.publisher_statement_version = Some(1);
+        response.publisher_release_sequence = None;
+        response.publisher_public_key = envelope.public_key().as_bytes().to_vec();
+        response.publisher_signature = envelope.signature().as_bytes().to_vec();
+        let hashes = response
+            .chunk_hashes
+            .iter()
+            .map(|hash| Hash::from_bytes(hash.clone().try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let policy = PublisherPolicy::from_config(&[], true).unwrap();
+        let (rollback, rollback_path) = test_rollback_state_and_path();
+        let authority = test_authority();
+
+        for response in [response.clone(), {
+            let mut unsigned = response;
+            unsigned.publisher_statement_version = None;
+            unsigned.publisher_public_key.clear();
+            unsigned.publisher_signature.clear();
+            unsigned
+        }] {
+            let observer = std::sync::Arc::new(ObservedSyncContinuation::default());
+            verify_and_transfer_pending(
+                PendingSync {
+                    manifest: PendingManifest::Decoded(response),
+                    continuation: SyncContinuation::Observed(ObservedSyncSession::new(observer)),
+                },
+                expected.clone(),
+                hashes.clone(),
+                policy.clone(),
+                rollback.clone(),
+                authority.clone(),
+            )
+            .await
+            .unwrap();
+            assert!(!rollback_path.exists());
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1570,6 +1900,82 @@ mod tests {
             0
         );
         assert_eq!(observer.aborts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_after_durable_watermark_keeps_state_and_sends_no_possession() {
+        let (response, expected, policy) = signed_manifest_fixture();
+        let local_hash = Hash::from_bytes(response.chunk_hashes[0].clone().try_into().unwrap());
+        let observer = std::sync::Arc::new(ObservedSyncContinuation::default());
+        let (rollback, rollback_path) = test_rollback_state_and_path();
+        let authority = test_authority();
+        let worker_authority = authority.clone();
+        let worker_expected = expected.clone();
+        let worker_policy = policy.clone();
+        let release =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let release_worker = release.clone();
+        let (durable_tx, durable_rx) = std::sync::mpsc::sync_channel(1);
+
+        let task = tokio::spawn(verify_and_transfer_pending_with(
+            PendingSync {
+                manifest: PendingManifest::Decoded(response.clone()),
+                continuation: SyncContinuation::Observed(ObservedSyncSession::new(
+                    observer.clone(),
+                )),
+            },
+            move |response| {
+                let parts = verify_manifest_response(
+                    response,
+                    &worker_expected,
+                    vec![local_hash],
+                    &worker_policy,
+                )?;
+                let (manifest, chunks, sizes, possession, authorization, hashes) = parts;
+                let verified = authorization.rollback().unwrap();
+                rollback.authorize(&worker_authority, &manifest.artifact_id, verified)?;
+                durable_tx.send(()).unwrap();
+                let (lock, condition) = &*release_worker;
+                let released = lock.lock().unwrap();
+                let _released = condition
+                    .wait_while(released, |released| !*released)
+                    .unwrap();
+                Ok::<_, ServerRequest>((manifest, chunks, sizes, possession, authorization, hashes))
+            },
+        ));
+        durable_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        {
+            let (lock, condition) = &*release;
+            *lock.lock().unwrap() = true;
+            condition.notify_all();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(
+            observer
+                .possession_sends
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(observer.aborts.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let reopened = ClientRollbackState::load_from_path(rollback_path).unwrap();
+        let (_, _, _, _, authorization, _) =
+            verify_manifest_response(response, &expected, Vec::new(), &policy).unwrap();
+        assert_eq!(
+            reopened
+                .authorize(
+                    &authority,
+                    "signed-client-artifact",
+                    authorization.rollback().unwrap(),
+                )
+                .unwrap()
+                .outcome(),
+            crate::rollback::RollbackOutcome::Unchanged
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
