@@ -44,8 +44,7 @@ distribution refinements must preserve. See the [manifest model](spec:src:core/s
 
 This requirement does not require P2P distribution, a swarm protocol, release
 eligibility rules, downgrade/rollback decisions, key transparency, or bounded
-artifact-wide memory. Those concerns require separate refinements and evidence.
-In a measured 32 MiB artifact update with a 5% edit, v0.2 sent 34.32 MB and
-peaked at 253 MiB RSS; that establishes a concrete reconciliation/memory risk
-for a later performance cycle, but does not displace the remotely exposed
-plaintext control-plane boundary or publisher-authenticity work in this cycle.
+process RSS. Missing-payload retention is bounded by the
+[client sync memory requirement](spec:req:REQ:reliability/bounded-client-sync-memory);
+transport metadata, one currently decoded frame, operating-system page cache,
+and unrelated process allocations remain outside that configured boundary.

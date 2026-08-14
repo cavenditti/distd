@@ -243,10 +243,11 @@ impl Client<FsStorage> {
         destination: PathBuf,
         from: LocalChunkBasis,
     ) -> Result<Item, ClientError> {
+        let activation = LocalActivationMetadata::from(&target);
         let t0 = Instant::now();
         let (manifest, chunk_infos, received_chunks, wire_bytes, from) = self
             .server
-            .sync_artifact_expected_shared(requested_artifact_id, target.clone(), from)
+            .sync_artifact_expected_shared(requested_artifact_id, target, from)
             .await?;
         let network_elapsed = t0.elapsed();
 
@@ -261,7 +262,7 @@ impl Client<FsStorage> {
         let local_basis_count = from.len();
         let item = commit_sync_storage(
             Arc::clone(&self.storage),
-            target,
+            activation,
             destination,
             manifest,
             chunk_infos,
@@ -387,9 +388,25 @@ impl Client<FsStorage> {
     }
 }
 
+struct LocalActivationMetadata {
+    name: String,
+    revision: u32,
+    description: Option<String>,
+}
+
+impl From<&ItemMetadata> for LocalActivationMetadata {
+    fn from(remote: &ItemMetadata) -> Self {
+        Self {
+            name: remote.name.clone(),
+            revision: remote.revision,
+            description: remote.description.clone(),
+        }
+    }
+}
+
 async fn commit_sync_storage(
     storage: Arc<FsStorage>,
-    target: ItemMetadata,
+    activation: LocalActivationMetadata,
     destination: PathBuf,
     manifest: Manifest,
     chunk_infos: Vec<ChunkInfo>,
@@ -398,10 +415,10 @@ async fn commit_sync_storage(
 ) -> Result<Item, ClientError> {
     tokio::task::spawn_blocking(move || {
         storage.receive_sync_item_shared(
-            target.name,
+            activation.name,
             destination,
-            target.revision,
-            target.description,
+            activation.revision,
+            activation.description,
             &manifest,
             &chunk_infos,
             &from,
@@ -687,7 +704,11 @@ mod trust_tests {
 
 #[cfg(test)]
 mod chunk_cache_tests {
-    use std::{io::Read, path::Path, sync::Arc};
+    use std::{
+        io::Read,
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
 
     use distd_core::{
         chunk_storage::{
@@ -700,7 +721,7 @@ mod chunk_cache_tests {
         item::Item,
     };
 
-    use super::commit_sync_storage;
+    use super::{commit_sync_storage, LocalActivationMetadata};
 
     fn prepared_revision(
         source: &HashMapStorage,
@@ -766,7 +787,7 @@ mod chunk_cache_tests {
         ];
         let first = commit_sync_storage(
             Arc::clone(&storage),
-            initial.metadata.clone(),
+            LocalActivationMetadata::from(&initial.metadata),
             destination.clone(),
             initial.manifest.clone(),
             initial.chunks.clone(),
@@ -793,7 +814,7 @@ mod chunk_cache_tests {
             .collect::<Vec<Hash>>();
         let second = commit_sync_storage(
             Arc::clone(&storage),
-            changed.metadata.clone(),
+            LocalActivationMetadata::from(&changed.metadata),
             destination.clone(),
             changed.manifest.clone(),
             changed.chunks.clone(),
@@ -829,5 +850,39 @@ mod chunk_cache_tests {
         assert_eq!(active.item().metadata.root, changed.metadata.root);
         assert_eq!(read_all(active.open_file().unwrap()), changed_bytes);
         assert_empty_bounded_cache(&reopened);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_deployment_hint_cannot_select_activation_destination() {
+        let temporary = tempfile::tempdir().unwrap();
+        let storage = Arc::new(FsStorage::new(temporary.path().to_path_buf()).unwrap());
+        let source = HashMapStorage::default();
+        let payload = vec![41u8; CHUNK_SIZE];
+        let mut remote = prepared_revision(&source, Path::new("server-hint.bin"), 1, &payload);
+        let escaped = temporary
+            .path()
+            .parent()
+            .unwrap()
+            .join(format!("distd-remote-destination-{}", uuid::Uuid::new_v4()));
+        remote.metadata.path = escaped.clone();
+
+        let item = commit_sync_storage(
+            Arc::clone(&storage),
+            LocalActivationMetadata::from(&remote.metadata),
+            PathBuf::from("managed.bin"),
+            remote.manifest.clone(),
+            remote.chunks.clone(),
+            Vec::new(),
+            vec![ReceivedChunk::from_vec(payload.clone())],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(item.metadata.path, PathBuf::from("managed.bin"));
+        assert_eq!(
+            std::fs::read(temporary.path().join("managed.bin")).unwrap(),
+            payload
+        );
+        assert!(!escaped.exists());
     }
 }

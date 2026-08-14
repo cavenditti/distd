@@ -9478,6 +9478,60 @@ mod tests {
     }
 
     #[test]
+    fn sync_rejects_corrupt_reused_backing_before_destination_mutation() {
+        use crate::chunk_storage::hashmap_storage::HashMapStorage;
+
+        let root = temp_path();
+        let storage = FsStorage::new(root.clone()).unwrap();
+        let expected = vec![9u8; CHUNK_SIZE];
+        let basis = storage
+            .create_item(
+                "basis".to_string(),
+                PathBuf::from("basis.bin"),
+                0,
+                None,
+                bytes::Bytes::from(expected.clone()),
+                ChunkAlgorithm::default(),
+            )
+            .unwrap();
+        fs::write(root.join("basis.bin"), vec![7u8; CHUNK_SIZE]).unwrap();
+
+        let source = HashMapStorage::default();
+        let (candidate_root, chunks) = source
+            .chunk_tree(&expected, ChunkAlgorithm::default())
+            .unwrap();
+        let manifest = Manifest::from_tree(
+            "artifact".to_string(),
+            1,
+            &candidate_root,
+            &chunks,
+            ChunkAlgorithm::default(),
+        );
+
+        let result = storage.receive_sync_item_shared(
+            "artifact".to_string(),
+            PathBuf::from("artifact.bin"),
+            1,
+            None,
+            &manifest,
+            &chunks,
+            &[basis.chunks[0].hash],
+            Vec::new(),
+        );
+
+        assert!(result.is_err());
+        assert!(!root.join("artifact.bin").exists());
+        assert!(storage
+            .open_active_revision(Path::new("artifact.bin"))
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            fs::read(root.join("basis.bin")).unwrap(),
+            vec![7u8; CHUNK_SIZE]
+        );
+    }
+
+    #[test]
     fn active_revision_handle_survives_replacement_and_restart() {
         let root = temp_path();
         let storage = FsStorage::new(root.clone()).unwrap();
