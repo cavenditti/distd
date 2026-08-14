@@ -57,6 +57,10 @@ and [server publication](spec:src:server/src/server.rs).
   recency relation per live hash and MUST update or evict it in constant time.
   Caller-owned node references MUST NOT prevent the cache from releasing its
   own entry at the configured ceiling.
+- {#c-write-handle-cache} Mutable ordinary-file handles MUST be opened lazily,
+  retained under a fixed count and aggregate buffer ceiling, and flushed before
+  cache eviction. Completed paths and restart reconstruction MUST retain no
+  unnecessary write handle.
 - {#c-publication-commit} A server revision MUST NOT become visible through
   latest lookup, exact-version lookup, or metadata fetch until all referenced
   storage and metadata are durably committed; a failed commit MUST preserve the

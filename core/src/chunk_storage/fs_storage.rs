@@ -36,6 +36,8 @@ use super::{ChunkStorage, Node, ReceivedChunk};
 const DEFAULT_CHUNK_CACHE_BYTES: usize = 512 * 1024 * 1024;
 const DEFAULT_TREE_CACHE_ENTRIES: usize = 65_536;
 const DEFAULT_IMMUTABLE_READER_ENTRIES: usize = 32;
+const DEFAULT_WRITE_HANDLE_ENTRIES: usize = 32;
+const WRITE_HANDLE_BUFFER_BYTES: usize = CHUNK_SIZE;
 const FS_STORAGE_PAYLOAD_SCHEMA: u16 = 1;
 const FS_STORAGE_ROOT_DOMAIN: &[u8] = b"distd fs storage root identity v1\0";
 const FS_STORAGE_REVISION_NAMESPACE: &str = ".distd-revisions-v1";
@@ -346,6 +348,102 @@ struct ImmutableReaderCache {
     max_entries: usize,
     order: VecDeque<PathBuf>,
     entries: HashMap<PathBuf, Arc<File>>,
+}
+
+#[derive(Debug)]
+struct WriteHandleCache {
+    max_entries: usize,
+    order: VecDeque<PathBuf>,
+    entries: HashMap<PathBuf, Arc<Mutex<Handle>>>,
+}
+
+impl WriteHandleCache {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            max_entries,
+            order: VecDeque::new(),
+            entries: HashMap::default(),
+        }
+    }
+
+    fn get(&mut self, path: &Path) -> Option<Arc<Mutex<Handle>>> {
+        let handle = self.entries.get(path)?.clone();
+        self.order.retain(|queued| queued != path);
+        self.order.push_back(path.to_path_buf());
+        Some(handle)
+    }
+
+    fn ensure(&mut self, path: &Path) -> Result<(), Error> {
+        if self.get(path).is_some() {
+            return Ok(());
+        }
+        if self.max_entries == 0 {
+            Handle::new(path)?;
+            return Ok(());
+        }
+        while self.entries.len() >= self.max_entries {
+            let oldest = self
+                .order
+                .front()
+                .cloned()
+                .ok_or_else(|| invalid_state("write-handle recency is empty under pressure"))?;
+            self.entries
+                .get(&oldest)
+                .ok_or_else(|| invalid_state("write-handle recency references a missing path"))?
+                .lock()
+                .unwrap()
+                .flush()?;
+            self.order.pop_front();
+            self.entries.remove(&oldest);
+        }
+        let handle = Arc::new(Mutex::new(Handle::new(path)?));
+        self.entries.insert(path.to_path_buf(), handle);
+        self.order.push_back(path.to_path_buf());
+        debug_assert_eq!(self.order.len(), self.entries.len());
+        Ok(())
+    }
+
+    fn remove(&mut self, path: &Path) -> Result<(), Error> {
+        if let Some(handle) = self.entries.get(path) {
+            handle.lock().unwrap().flush()?;
+        }
+        self.entries.remove(path);
+        self.order.retain(|queued| queued != path);
+        debug_assert_eq!(self.order.len(), self.entries.len());
+        Ok(())
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&Path) -> bool) -> Result<(), Error> {
+        let removed = self
+            .entries
+            .keys()
+            .filter(|path| !keep(path))
+            .cloned()
+            .collect::<Vec<_>>();
+        for path in &removed {
+            self.entries
+                .get(path)
+                .expect("write-handle removal candidate must exist")
+                .lock()
+                .unwrap()
+                .flush()?;
+        }
+        for path in removed {
+            self.entries.remove(&path);
+        }
+        self.order.retain(|path| self.entries.contains_key(path));
+        debug_assert_eq!(self.order.len(), self.entries.len());
+        Ok(())
+    }
+
+    fn flush_all(&self) -> Result<(), Error> {
+        for (path, handle) in &self.entries {
+            handle.lock().unwrap().flush().inspect_err(|error| {
+                tracing::error!("Cannot flush handle {}: {error}", path.to_string_lossy());
+            })?;
+        }
+        Ok(())
+    }
 }
 
 impl ImmutableReaderCache {
@@ -881,17 +979,6 @@ pub fn open_file(path: &Path) -> Result<File, Error> {
         .map_err(Error::IoError)
 }
 
-fn open_existing_file(path: &Path) -> Result<File, Error> {
-    File::options()
-        .read(true)
-        .write(true)
-        .append(false)
-        .truncate(false)
-        .open(path)
-        .inspect_err(|e| tracing::error!("Cannot open existing file at {:?}: {}", path, e))
-        .map_err(Error::IoError)
-}
-
 #[derive(Debug)]
 struct Handle {
     pub buf_writer: BufWriter<File>,
@@ -901,14 +988,7 @@ struct Handle {
 impl Handle {
     pub fn new(path: &Path) -> Result<Self, Error> {
         Ok(Self {
-            buf_writer: BufWriter::with_capacity(CHUNK_SIZE * 8, open_file(path)?),
-            position: 0,
-        })
-    }
-
-    fn existing(path: &Path) -> Result<Self, Error> {
-        Ok(Self {
-            buf_writer: BufWriter::with_capacity(CHUNK_SIZE * 8, open_existing_file(path)?),
+            buf_writer: BufWriter::with_capacity(WRITE_HANDLE_BUFFER_BYTES, open_file(path)?),
             position: 0,
         })
     }
@@ -2620,7 +2700,7 @@ pub struct FsStorage {
     next_activation_transaction_id: Mutex<Option<[u8; 16]>>,
     #[cfg(test)]
     simulated_crash: AtomicBool,
-    handles: RwLock<HashMap<PathBuf, Arc<Mutex<Handle>>>>,
+    handles: Mutex<WriteHandleCache>,
     immutable_readers: Mutex<ImmutableReaderCache>,
     chunk_cache: Mutex<HotChunkCache>,
     tree_cache: Mutex<HotNodeCache>,
@@ -2646,7 +2726,7 @@ impl Default for FsStorage {
             next_activation_transaction_id: Mutex::new(None),
             #[cfg(test)]
             simulated_crash: AtomicBool::new(false),
-            handles: RwLock::new(HashMap::default()),
+            handles: Mutex::new(WriteHandleCache::new(DEFAULT_WRITE_HANDLE_ENTRIES)),
             immutable_readers: Mutex::new(ImmutableReaderCache::new(
                 DEFAULT_IMMUTABLE_READER_ENTRIES,
             )),
@@ -5554,13 +5634,13 @@ impl FsStorage {
         if persist_checkpoint {
             self.persist()?;
         }
-        self.handles.write().unwrap().retain(|path, _| {
+        self.handles.lock().unwrap().retain(|path| {
             !path.starts_with(&destination_path)
                 && !path.starts_with(&revision_root)
                 && !previous_revision_root
                     .as_ref()
                     .is_some_and(|previous| path.starts_with(previous))
-        });
+        })?;
         Ok(())
     }
 
@@ -5743,7 +5823,7 @@ impl FsStorage {
     }
 
     fn handle_for_path(&self, path: &Path) -> Option<Arc<Mutex<Handle>>> {
-        self.handles.read().unwrap().get(path).cloned()
+        self.handles.lock().unwrap().get(path)
     }
 
     fn is_path_fully_populated(&self, path: &Path) -> bool {
@@ -5759,39 +5839,17 @@ impl FsStorage {
 
     fn flush_if_path_complete(&self, path: &Path) -> Result<(), Error> {
         if self.is_path_fully_populated(path) {
-            if let Some(handle) = self.handle_for_path(path) {
-                handle.lock().unwrap().flush()?;
-            }
+            self.handles.lock().unwrap().remove(path)?;
         }
         Ok(())
     }
 
     fn ensure_handle(&self, path: &Path) -> Result<(), Error> {
-        if self.handle_for_path(path).is_some() {
-            return Ok(());
-        }
-
-        let mut handles = self.handles.write().unwrap();
-        if !handles.contains_key(path) {
-            handles.insert(path.to_owned(), Arc::new(Mutex::new(Handle::new(path)?)));
-        }
-        Ok(())
+        self.handles.lock().unwrap().ensure(path)
     }
 
     fn flush_handles(&self) -> Result<(), Error> {
-        let handles = self
-            .handles
-            .read()
-            .unwrap()
-            .iter()
-            .map(|(path, handle)| (path.clone(), handle.clone()))
-            .collect::<Vec<_>>();
-        for (path, handle) in handles {
-            handle.lock().unwrap().flush().inspect_err(|e| {
-                tracing::error!("Cannot flush handle {}: {e}", path.to_string_lossy())
-            })?;
-        }
-        Ok(())
+        self.handles.lock().unwrap().flush_all()
     }
 
     pub fn receive_sync_item(
@@ -5999,7 +6057,7 @@ impl FsStorage {
             next_activation_transaction_id: Mutex::new(None),
             #[cfg(test)]
             simulated_crash: AtomicBool::new(false),
-            handles: RwLock::new(HashMap::default()),
+            handles: Mutex::new(WriteHandleCache::new(DEFAULT_WRITE_HANDLE_ENTRIES)),
             immutable_readers: Mutex::new(ImmutableReaderCache::new(
                 DEFAULT_IMMUTABLE_READER_ENTRIES,
             )),
@@ -6086,19 +6144,6 @@ impl FsStorage {
         if storage.migrate_referenced_chunks_to_cas()? {
             storage.persist()?;
         }
-        let mut handles = HashMap::default();
-        let activation_root = storage.activation_root();
-        for entries in storage.inner.read().unwrap().data.values() {
-            for entry in entries {
-                if !entry.path.starts_with(&activation_root) && !handles.contains_key(&entry.path) {
-                    handles.insert(
-                        entry.path.clone(),
-                        Arc::new(Mutex::new(Handle::existing(&entry.path)?)),
-                    );
-                }
-            }
-        }
-        *storage.handles.write().unwrap() = handles;
         Ok(storage)
     }
 
@@ -6222,10 +6267,14 @@ impl FsStorage {
     pub fn remove(&self, item: Item) -> Result<(), Error> {
         let mut inner = self.inner.write().unwrap();
         let path = inner.item_path(&item)?;
+        if !inner.items.contains(&item) {
+            return Err(Error::MissingData);
+        }
+        self.handles.lock().unwrap().remove(&path)?;
         let item = inner
             .remove_item(&item)
             .then_some(item)
-            .ok_or(Error::MissingData)?;
+            .expect("checked filesystem-storage item must remain present under the write lock");
         for chunk in &item.chunks {
             let remove_key = if let Some(infile_chunks) = inner.data.get_mut(&chunk.hash) {
                 infile_chunks.retain(|infile_chunk| infile_chunk.path != path);
@@ -6239,7 +6288,6 @@ impl FsStorage {
             }
         }
         drop(inner);
-        self.handles.write().unwrap().remove(&path);
         self.persist()
     }
 
@@ -10741,6 +10789,101 @@ mod tests {
     }
 
     #[test]
+    fn write_handle_cache_flushes_true_lru_and_ignores_external_owners() {
+        let root = temp_path();
+        fs::create_dir_all(&root).unwrap();
+        let paths = [root.join("a.bin"), root.join("b.bin"), root.join("c.bin")];
+        let mut cache = WriteHandleCache::new(2);
+        cache.ensure(&paths[0]).unwrap();
+        cache
+            .get(&paths[0])
+            .unwrap()
+            .lock()
+            .unwrap()
+            .write(b"a", 0)
+            .unwrap();
+        cache.ensure(&paths[1]).unwrap();
+        cache
+            .get(&paths[1])
+            .unwrap()
+            .lock()
+            .unwrap()
+            .write(b"b", 0)
+            .unwrap();
+        let held_b = cache.entries.get(&paths[1]).unwrap().clone();
+        cache.get(&paths[0]).unwrap();
+
+        cache.ensure(&paths[2]).unwrap();
+        assert_eq!(fs::read(&paths[1]).unwrap(), b"b");
+        assert!(!cache.entries.contains_key(&paths[1]));
+        assert_eq!(
+            cache.order,
+            VecDeque::from([paths[0].clone(), paths[2].clone()])
+        );
+        held_b.lock().unwrap().write(b"!", 1).unwrap();
+        held_b.lock().unwrap().flush().unwrap();
+        assert_eq!(fs::read(&paths[1]).unwrap(), b"b!");
+    }
+
+    #[test]
+    fn fs_storage_restart_keeps_write_handles_lazy_and_completed_paths_released() {
+        let root = temp_path();
+        let storage = FsStorage::new(root.clone()).unwrap();
+        let bytes = bytes::Bytes::from_static(b"restart-handle-fixture");
+        let item = storage
+            .create_item(
+                "fixture".to_string(),
+                PathBuf::from("fixture.bin"),
+                1,
+                None,
+                bytes.clone(),
+                ChunkAlgorithm::Fixed256K,
+            )
+            .unwrap();
+        assert!(storage.handles.lock().unwrap().entries.is_empty());
+        drop(storage);
+
+        let restarted = FsStorage::new(root).unwrap();
+        assert!(restarted.handles.lock().unwrap().entries.is_empty());
+        assert_eq!(
+            restarted
+                .get_chunk_by_index(&item.metadata.root.hash, 0)
+                .unwrap(),
+            bytes
+        );
+        assert!(restarted.handles.lock().unwrap().entries.is_empty());
+    }
+
+    #[test]
+    #[ignore = "release-only local write-handle cache reference"]
+    fn write_handle_cache_reference_performance() {
+        assert!(
+            !cfg!(debug_assertions),
+            "run the write-handle cache reference in release mode"
+        );
+        let root = temp_path();
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("hot.bin");
+        let mut cache = WriteHandleCache::new(DEFAULT_WRITE_HANDLE_ENTRIES);
+        cache.ensure(&path).unwrap();
+        let mut samples = Vec::with_capacity(20_000);
+        for _ in 0..20_000 {
+            let started = std::time::Instant::now();
+            std::hint::black_box(cache.get(&path).unwrap());
+            samples.push(started.elapsed().as_nanos());
+        }
+        let mut sorted = samples.clone();
+        sorted.sort_unstable();
+        let p95 = sorted[(sorted.len() * 95).div_ceil(100) - 1];
+        println!("write_handle_cache_raw_ns={samples:?}");
+        println!("write_handle_cache_p95_ns={p95}");
+        assert!(p95 <= 10_000, "write-handle cache p95 {p95}ns");
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.order, VecDeque::from([path]));
+        assert!(cache.entries.len() * WRITE_HANDLE_BUFFER_BYTES <= 8 * 1024 * 1024);
+    }
+
+    #[test]
     fn preexisting_mirror_transaction_paths_fail_before_intent_and_survive_restarts() {
         for use_backup in [false, true] {
             for collision_is_directory in [false, true] {
@@ -12986,7 +13129,11 @@ mod tests {
                     .is_some());
                 handle_samples.push(started.elapsed());
             }
-            assert!(storage.handles.read().unwrap().len() * CHUNK_SIZE * 8 <= 8 * 1024 * 1024);
+            let handles = storage.handles.lock().unwrap();
+            assert!(handles.entries.len() <= DEFAULT_WRITE_HANDLE_ENTRIES);
+            assert_eq!(handles.order.len(), handles.entries.len());
+            assert!(handles.entries.len() * WRITE_HANDLE_BUFFER_BYTES <= 8 * 1024 * 1024);
+            drop(handles);
             assert!(
                 storage.immutable_readers.lock().unwrap().entries.len()
                     <= DEFAULT_IMMUTABLE_READER_ENTRIES
