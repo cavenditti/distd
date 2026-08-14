@@ -60,6 +60,12 @@ and [length-delimited reader](spec:src:core/src/utils/frame.rs).
   overflowed, or inconsistent settings MUST fail startup before secrets or
   storage are loaded, using diagnostics that contain no credentials or
   payloads. Rejection and timeout events MUST identify only phase and reason.
+- {#c-registry} Client enrollment MUST retain only names of 1..=256
+  UTF-8 bytes and MUST enforce one atomic process-wide registered-client count
+  with a 4,096 default and strict 1..=65,536 configuration range. Reusing an
+  exact existing UUID MUST remain idempotent at capacity, while a distinct new
+  identity MUST fail before insertion. Concurrent registrations MUST never
+  publish more entries than the configured limit.
 :::
 
 ## Non-goals
@@ -72,4 +78,6 @@ immediate return of freed pages to the operating system. Deadlines are enforced
 at asynchronous operations and between bounded batch-building steps; hard
 preemption of synchronous filesystem reads or compression requires a separate
 cancel-aware storage/worker design.
+Registered-client expiry and persistence remain separate lifecycle policy; the
+hard registry ceiling bounds retained process state even without either.
 :::

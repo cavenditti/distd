@@ -44,6 +44,10 @@ use crate::publication::{
 use distd_core::feed::{Feed, Name as FeedName};
 use distd_core::version::Version;
 
+pub(crate) const DEFAULT_MAX_REGISTERED_CLIENTS: usize = 4_096;
+pub(crate) const HARD_MAX_REGISTERED_CLIENTS: usize = 65_536;
+pub(crate) const MAX_CLIENT_NAME_BYTES: usize = 256;
+
 /// Data structure used internally by server, may be converted to `ServerMetadata`
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InternalMetadata {
@@ -185,6 +189,7 @@ where
     storage: Arc<T>,
     /// Client map
     pub clients: Arc<RwLock<BTreeMap<Uuid, Client>>>,
+    max_registered_clients: usize,
     publish_locks: Arc<AsyncMutex<HashMap<ArtifactId, Arc<AsyncMutex<()>>>>>,
     metadata_persist_lock: Arc<StdMutex<()>>,
     metadata_store: Option<Arc<MetadataStateStore>>,
@@ -203,6 +208,7 @@ where
             metadata: Arc::clone(&self.metadata),
             storage: Arc::clone(&self.storage),
             clients: Arc::clone(&self.clients),
+            max_registered_clients: self.max_registered_clients,
             publish_locks: Arc::clone(&self.publish_locks),
             metadata_persist_lock: Arc::clone(&self.metadata_persist_lock),
             metadata_store: self.metadata_store.clone(),
@@ -381,6 +387,7 @@ where
             metadata: Arc::new(RwLock::new(metadata)),
             storage: Arc::new(storage),
             clients: Arc::new(RwLock::new(BTreeMap::new())),
+            max_registered_clients: DEFAULT_MAX_REGISTERED_CLIENTS,
             publish_locks: Arc::new(AsyncMutex::new(HashMap::new())),
             metadata_persist_lock: Arc::new(StdMutex::new(())),
             metadata_store: None,
@@ -407,6 +414,7 @@ where
             metadata: Arc::new(RwLock::new(metadata)),
             storage: Arc::new(storage),
             clients: Arc::new(RwLock::new(BTreeMap::new())),
+            max_registered_clients: DEFAULT_MAX_REGISTERED_CLIENTS,
             publish_locks: Arc::new(AsyncMutex::new(HashMap::new())),
             metadata_persist_lock: Arc::new(StdMutex::new(())),
             metadata_store: None,
@@ -424,6 +432,13 @@ where
     #[must_use]
     pub fn with_publisher_policy(mut self, policy: PublisherPolicy) -> Self {
         self.publisher_policy = policy;
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_client_registry_limit(mut self, max_registered_clients: usize) -> Self {
+        assert!((1..=HARD_MAX_REGISTERED_CLIENTS).contains(&max_registered_clients));
+        self.max_registered_clients = max_registered_clients;
         self
     }
 
@@ -703,46 +718,27 @@ where
         version: Option<Version>,
         uuid: Option<Uuid>,
     ) -> Result<Uuid, RegisterError> {
-        // tracing span
+        if name.is_empty() || name.len() > MAX_CLIENT_NAME_BYTES {
+            tracing::warn!(reason = "invalid_name", "client registration rejected");
+            return Err(RegisterError);
+        }
+
         let span = span!(tracing::Level::INFO, "register_client");
         let _entered = span.enter();
 
-        tracing::info!(
-            "Got new client: \"{}\" ver:{:?}, @{}, {:?}",
-            name,
-            version,
-            addr,
-            uuid
-        );
-        let nonced_name = name.clone() + &self.uuid_nonce + &addr.to_string();
-        tracing::debug!("Client nonced name: '{}'", nonced_name);
-
         if let Some(u) = uuid {
-            if self.clients.read().await.contains_key(&u) {
-                tracing::info!(
-                    "Got existing uuid '{}' from \"{}\"@{}",
-                    u.to_string(),
-                    name,
-                    addr
-                );
+            let mut clients = self.clients.write().await;
+            if let Some(existing) = clients.get_mut(&u) {
+                existing.last_heartbeat = SystemTime::now();
+                tracing::info!("existing client registration refreshed");
                 Ok(u)
             } else {
-                tracing::warn!(
-                    "Client reported invalid uuid '{}' from \"{}\"@{}",
-                    u.to_string(),
-                    name,
-                    addr
-                );
+                tracing::warn!(reason = "unknown_uuid", "client registration rejected");
                 Err(RegisterError)
             }
         } else {
+            let nonced_name = name.clone() + &self.uuid_nonce + &addr.to_string();
             let uuid = Uuid::new_v5(&Uuid::NAMESPACE_URL, nonced_name.as_bytes());
-            tracing::info!(
-                "Assigned new client uuid '{}' to \"{}\"@{}",
-                uuid.to_string(),
-                name,
-                addr
-            );
             let client = Client {
                 addr,
                 name,
@@ -751,17 +747,25 @@ where
                 last_heartbeat: SystemTime::now(),
             };
             let mut clients = self.clients.write().await;
-            let uuid = client.uuid;
-            match clients.entry(uuid) {
-                std::collections::btree_map::Entry::Vacant(e) => {
-                    e.insert(client);
-                    Ok(uuid)
+            if let Some(existing) = clients.get_mut(&uuid) {
+                if existing.name != client.name || existing.addr != client.addr {
+                    tracing::warn!(
+                        reason = "identity_collision",
+                        "client registration rejected"
+                    );
+                    return Err(RegisterError);
                 }
-                std::collections::btree_map::Entry::Occupied(e) => {
-                    tracing::warn!("Client {} already registered", e.key());
-                    Err(RegisterError)
-                }
+                existing.last_heartbeat = SystemTime::now();
+                tracing::info!("derived client registration refreshed");
+                return Ok(uuid);
             }
+            if clients.len() >= self.max_registered_clients {
+                tracing::warn!(reason = "registry_full", "client registration rejected");
+                return Err(RegisterError);
+            }
+            clients.insert(uuid, client);
+            tracing::info!("new client registration accepted");
+            Ok(uuid)
         }
     }
 
@@ -1485,6 +1489,7 @@ where
 mod tests {
     use super::{
         build_sync_payload_batches, InternalMetadata, Server as ProductionServer, ServerError,
+        DEFAULT_MAX_REGISTERED_CLIENTS, MAX_CLIENT_NAME_BYTES,
     };
     use axum::body::Bytes;
     use distd_core::chunk_storage::hashmap_storage::HashMapStorage;
@@ -1525,6 +1530,133 @@ mod tests {
             PublisherSignature::try_from(pair.sign(statement.as_bytes()).as_ref()).unwrap(),
         );
         (sequence, envelope)
+    }
+
+    #[tokio::test]
+    async fn client_registry_bounds_names_and_keeps_exact_reuse_at_capacity() {
+        let server = ProductionServer::new_ephemeral(HashMapStorage::default())
+            .with_client_registry_limit(2);
+        let address = "127.0.0.1:41001".parse().unwrap();
+
+        assert!(server
+            .register_client(String::new(), address, None, None)
+            .await
+            .is_err());
+        assert!(server
+            .register_client("x".repeat(MAX_CLIENT_NAME_BYTES + 1), address, None, None)
+            .await
+            .is_err());
+        assert!(server.clients.read().await.is_empty());
+
+        let first = server
+            .register_client("a".to_string(), address, None, None)
+            .await
+            .unwrap();
+        let second = server
+            .register_client("b".repeat(MAX_CLIENT_NAME_BYTES), address, None, None)
+            .await
+            .unwrap();
+        assert_ne!(first, second);
+        assert_eq!(server.clients.read().await.len(), 2);
+
+        assert!(server
+            .register_client("c".to_string(), address, None, None)
+            .await
+            .is_err());
+        assert_eq!(server.clients.read().await.len(), 2);
+        assert_eq!(
+            server
+                .register_client("a".to_string(), address, None, Some(first))
+                .await
+                .unwrap(),
+            first
+        );
+        assert_eq!(
+            server
+                .register_client("a".to_string(), address, None, None)
+                .await
+                .unwrap(),
+            first
+        );
+        assert_eq!(server.clients.read().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn competing_registrations_never_exceed_the_final_registry_slot() {
+        let server = ProductionServer::new_ephemeral(HashMapStorage::default())
+            .with_client_registry_limit(1);
+        let address = "127.0.0.1:41002".parse().unwrap();
+        let left = server.clone();
+        let right = server.clone();
+        let (left, right) = tokio::join!(
+            left.register_client("left".to_string(), address, None, None),
+            right.register_client("right".to_string(), address, None, None)
+        );
+        assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
+        assert_eq!(server.clients.read().await.len(), 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "release-only local client-registry reference"]
+    async fn client_registry_reference_performance() {
+        assert!(
+            !cfg!(debug_assertions),
+            "run the client registry reference in release mode"
+        );
+        let server = ProductionServer::new_ephemeral(HashMapStorage::default())
+            .with_client_registry_limit(DEFAULT_MAX_REGISTERED_CLIENTS);
+        let address = "127.0.0.1:41003".parse().unwrap();
+        let mut first = None;
+        for index in 0..DEFAULT_MAX_REGISTERED_CLIENTS {
+            let uuid = server
+                .register_client(format!("client-{index}"), address, None, None)
+                .await
+                .unwrap();
+            first.get_or_insert(uuid);
+        }
+        let first = first.unwrap();
+
+        let mut reuse_samples = Vec::with_capacity(10_000);
+        let mut reject_samples = Vec::with_capacity(10_000);
+        for _ in 0..10_000 {
+            let started = std::time::Instant::now();
+            assert_eq!(
+                server
+                    .register_client("client-0".to_string(), address, None, Some(first))
+                    .await
+                    .unwrap(),
+                first
+            );
+            reuse_samples.push(started.elapsed().as_nanos());
+
+            let started = std::time::Instant::now();
+            assert!(server
+                .register_client("registry-full".to_string(), address, None, None)
+                .await
+                .is_err());
+            reject_samples.push(started.elapsed().as_nanos());
+        }
+        let percentile = |samples: &[u128]| {
+            let mut sorted = samples.to_vec();
+            sorted.sort_unstable();
+            sorted[(sorted.len() * 95).div_ceil(100) - 1]
+        };
+        let reuse_p95 = percentile(&reuse_samples);
+        let reject_p95 = percentile(&reject_samples);
+        println!("client_registry_reuse_raw_ns={reuse_samples:?}");
+        println!("client_registry_reject_raw_ns={reject_samples:?}");
+        println!(
+            "client_registry_reuse_p95_ns={reuse_p95} client_registry_reject_p95_ns={reject_p95}"
+        );
+        assert!(reuse_p95 <= 100_000, "registry reuse p95 {reuse_p95}ns");
+        assert!(
+            reject_p95 <= 100_000,
+            "registry rejection p95 {reject_p95}ns"
+        );
+        assert_eq!(
+            server.clients.read().await.len(),
+            DEFAULT_MAX_REGISTERED_CLIENTS
+        );
     }
 
     #[test]

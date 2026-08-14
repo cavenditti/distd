@@ -9,7 +9,9 @@ use crate::client::Client;
 use crate::metadata_state::{MetadataPaths, MetadataStateStore};
 use crate::publication::PublisherPolicy;
 use crate::quic::QuicResourceSettings;
-use crate::server::{InternalMetadata, Server};
+use crate::server::{
+    InternalMetadata, Server, DEFAULT_MAX_REGISTERED_CLIENTS, HARD_MAX_REGISTERED_CLIENTS,
+};
 
 pub mod client;
 pub mod error;
@@ -30,6 +32,7 @@ const MAX_PUBLICATION_MEMORY_MIB: usize = 2_048;
 const PUBLICATION_BODY_TIMEOUT_SECS_ENV: &str = "DISTD_PUBLICATION_BODY_TIMEOUT_SECS";
 const DEFAULT_PUBLICATION_BODY_TIMEOUT_SECS: u64 = 600;
 const MAX_PUBLICATION_BODY_TIMEOUT_SECS: u64 = 86_400;
+const MAX_REGISTERED_CLIENTS_ENV: &str = "DISTD_MAX_REGISTERED_CLIENTS";
 const MAX_PUBLISHER_KEYS: usize = 1_024;
 
 #[derive(Clone)]
@@ -196,6 +199,31 @@ fn parse_publication_body_timeout_secs(configured: Option<&str>) -> Result<u64, 
     Ok(seconds)
 }
 
+fn parse_max_registered_clients(configured: Option<&str>) -> Result<usize, String> {
+    let Some(configured) = configured else {
+        return Ok(DEFAULT_MAX_REGISTERED_CLIENTS);
+    };
+    if configured.is_empty()
+        || (configured.len() > 1 && configured.starts_with('0'))
+        || !configured.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(format!(
+            "{MAX_REGISTERED_CLIENTS_ENV} must be a canonical integer from 1 through {HARD_MAX_REGISTERED_CLIENTS}"
+        ));
+    }
+    let limit = configured.parse::<usize>().map_err(|_| {
+        format!(
+            "{MAX_REGISTERED_CLIENTS_ENV} must be a canonical integer from 1 through {HARD_MAX_REGISTERED_CLIENTS}"
+        )
+    })?;
+    if !(1..=HARD_MAX_REGISTERED_CLIENTS).contains(&limit) {
+        return Err(format!(
+            "{MAX_REGISTERED_CLIENTS_ENV} must be from 1 through {HARD_MAX_REGISTERED_CLIENTS}"
+        ));
+    }
+    Ok(limit)
+}
+
 fn parse_http_bind_policy(
     configured_bind: Option<&str>,
     configured_override: Option<&str>,
@@ -340,6 +368,13 @@ async fn main() {
         eprintln!("Invalid QUIC resource configuration: {error}");
         std::process::exit(2);
     });
+    let max_registered_clients = optional_utf8_environment(MAX_REGISTERED_CLIENTS_ENV)
+        .and_then(|value| parse_max_registered_clients(value.as_deref()))
+        .unwrap_or_else(|error| {
+            eprintln!("Invalid client registry configuration: {error}");
+            std::process::exit(2);
+        });
+    tracing::info!(max_registered_clients, "configured client registry limit");
     let publisher_keys =
         optional_utf8_environment(PUBLISHER_PUBLIC_KEYS_ENV).unwrap_or_else(|error| {
             eprintln!("Invalid publisher configuration: {error}");
@@ -450,6 +485,7 @@ async fn main() {
             });
             let server = Server::new_ephemeral_with_metadata(storage, metadata.clone())
                 .with_enrollment_token(enrollment_token.clone())
+                .with_client_registry_limit(max_registered_clients)
                 .with_publisher_policy(publisher_policy.clone())
                 .with_metadata_store(metadata_store);
             run_server(
@@ -480,6 +516,7 @@ async fn main() {
             });
             let server = Server::new_ephemeral_with_metadata(storage, metadata.clone())
                 .with_enrollment_token(enrollment_token.clone())
+                .with_client_registry_limit(max_registered_clients)
                 .with_publisher_policy(publisher_policy.clone())
                 .with_metadata_store(metadata_store);
             run_server(
@@ -495,6 +532,7 @@ async fn main() {
             tracing::info!("Using in-memory storage (ephemeral)");
             let server = Server::new_ephemeral(HashMapStorage::default())
                 .with_enrollment_token(enrollment_token.clone())
+                .with_client_registry_limit(max_registered_clients)
                 .with_publisher_policy(publisher_policy.clone());
             run_server(
                 server,
@@ -517,13 +555,15 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_http_bind_policy, parse_publication_body_timeout_secs, parse_publication_memory_mib,
-        parse_publisher_policy, publication_memory_bytes, ALLOW_INSECURE_REMOTE_HTTP_ENV,
-        ALLOW_UNSIGNED_PUBLICATION_ENV, DEFAULT_HTTP_BIND, DEFAULT_PUBLICATION_BODY_TIMEOUT_SECS,
-        DEFAULT_PUBLICATION_MEMORY_MIB, HTTP_BIND_ENV, MAX_PUBLICATION_BODY_TIMEOUT_SECS,
-        MAX_PUBLICATION_MEMORY_MIB, MAX_PUBLISHER_KEYS, PUBLICATION_BODY_TIMEOUT_SECS_ENV,
-        PUBLICATION_MEMORY_MIB_ENV, PUBLISHER_PUBLIC_KEYS_ENV,
+        parse_http_bind_policy, parse_max_registered_clients, parse_publication_body_timeout_secs,
+        parse_publication_memory_mib, parse_publisher_policy, publication_memory_bytes,
+        ALLOW_INSECURE_REMOTE_HTTP_ENV, ALLOW_UNSIGNED_PUBLICATION_ENV, DEFAULT_HTTP_BIND,
+        DEFAULT_PUBLICATION_BODY_TIMEOUT_SECS, DEFAULT_PUBLICATION_MEMORY_MIB, HTTP_BIND_ENV,
+        MAX_PUBLICATION_BODY_TIMEOUT_SECS, MAX_PUBLICATION_MEMORY_MIB, MAX_PUBLISHER_KEYS,
+        MAX_REGISTERED_CLIENTS_ENV, PUBLICATION_BODY_TIMEOUT_SECS_ENV, PUBLICATION_MEMORY_MIB_ENV,
+        PUBLISHER_PUBLIC_KEYS_ENV,
     };
+    use crate::server::{DEFAULT_MAX_REGISTERED_CLIENTS, HARD_MAX_REGISTERED_CLIENTS};
 
     fn publisher_key(index: usize) -> String {
         let mut bytes = [0u8; 32];
@@ -735,6 +775,35 @@ mod tests {
         ] {
             let error = parse_publication_body_timeout_secs(Some(value)).unwrap_err();
             assert!(error.contains(PUBLICATION_BODY_TIMEOUT_SECS_ENV));
+        }
+    }
+
+    #[test]
+    fn registered_client_limit_is_canonical_checked_and_bounded() {
+        assert_eq!(
+            parse_max_registered_clients(None).unwrap(),
+            DEFAULT_MAX_REGISTERED_CLIENTS
+        );
+        for value in [1usize, 4_096, HARD_MAX_REGISTERED_CLIENTS] {
+            assert_eq!(
+                parse_max_registered_clients(Some(&value.to_string())).unwrap(),
+                value
+            );
+        }
+        for value in [
+            "",
+            "0",
+            "01",
+            "+1",
+            "-1",
+            "1.0",
+            " 1",
+            "65537",
+            "18446744073709551616",
+            "not-a-number",
+        ] {
+            let error = parse_max_registered_clients(Some(value)).unwrap_err();
+            assert!(error.contains(MAX_REGISTERED_CLIENTS_ENV));
         }
     }
 }

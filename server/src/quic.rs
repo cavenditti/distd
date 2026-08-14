@@ -2205,10 +2205,10 @@ mod tests {
 
         let request = (0..64)
             .find_map(|overhead| {
-                let name_len = super::REGISTER_FRAME_MAX_BYTES.checked_sub(overhead)?;
+                let version_len = super::REGISTER_FRAME_MAX_BYTES.checked_sub(overhead)?;
                 let request = ClientRegister {
-                    name: "x".repeat(name_len),
-                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    name: "boundary-client".to_string(),
+                    version: "x".repeat(version_len),
                     uuid: None,
                     enrollment_token: Some("integration-token".to_string()),
                 };

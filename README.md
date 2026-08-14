@@ -56,6 +56,7 @@ export DISTD_STORAGE=fs
 export DISTD_STORAGE_ROOT="$PWD/.distd-server-storage"
 export DISTD_PUBLICATION_MEMORY_MIB=512
 export DISTD_PUBLICATION_BODY_TIMEOUT_SECS=600
+export DISTD_MAX_REGISTERED_CLIENTS=4096
 cargo run -p distd_server
 ```
 
@@ -124,6 +125,11 @@ deadline after admission (default 600 seconds; accepted range: 1 through
 partial buffers and reservation before storage preparation begins; the
 deadline ends once extraction completes and never cancels an owned durable
 publication.
+
+`DISTD_MAX_REGISTERED_CLIENTS` bounds process-lifetime client enrollment state
+and defaults to 4,096 entries (accepted range: 1 through 65,536). Client names
+must contain 1 through 256 UTF-8 bytes. Exact UUID reuse remains available at
+capacity, while a distinct registration fails before insertion.
 
 Reusing `artifact_id` creates a new immutable version only when its content or
 relevant metadata changes. `name` and `path` may change without changing the
