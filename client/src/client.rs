@@ -5,24 +5,26 @@ use std::{
     sync::Arc,
 };
 
-use tokio::time::Instant;
+use tokio::{sync::mpsc, time::Instant};
 use uuid::Uuid;
 
 use crate::{
     error::Client as ClientError,
     persistence::{ClientState, DurableTrustReceipt, ServerTrustRecord},
-    server::{LocalChunkBasis, Server},
+    server::{LocalChunkBasis, ReceivedChunkBatch, Server},
     server_url::CanonicalServerUrl,
     settings::Settings,
 };
 
 use distd_core::{
-    chunk_storage::{fs_storage::FsStorage, ChunkStorage, ReceivedChunk},
-    chunks::ChunkInfo,
+    chunk_storage::{fs_storage::FsStorage, ChunkStorage},
     hash::Hash,
-    item::{Item, Manifest},
+    item::Item,
     metadata::Item as ItemMetadata,
 };
+
+#[cfg(test)]
+use distd_core::{chunk_storage::ReceivedChunk, chunks::ChunkInfo, item::Manifest};
 
 #[derive(Debug)]
 pub struct RegisterError;
@@ -245,32 +247,65 @@ impl Client<FsStorage> {
     ) -> Result<Item, ClientError> {
         let activation = LocalActivationMetadata::from(&target);
         let t0 = Instant::now();
-        let (manifest, chunk_infos, received_chunks, wire_bytes, from) = self
+        let prepared = self
             .server
-            .sync_artifact_expected_shared(requested_artifact_id, target, from)
+            .prepare_sync_artifact_expected(requested_artifact_id, target, from)
             .await?;
+        let manifest_chunk_count = prepared.chunks().len();
+        let local_basis_count = prepared.local_hashes().len();
+        let manifest = prepared.manifest().clone();
+        let chunk_infos = prepared.chunks().to_vec();
+        let local_hashes = prepared.local_hashes().to_vec();
+        let storage = Arc::clone(&self.storage);
+        // One decoded batch may wait while one is written. Combined with the
+        // transport batch limit this keeps handoff memory bounded without
+        // forcing disk I/O onto the async network task.
+        let (sender, mut receiver) = mpsc::channel::<ReceivedChunkBatch>(1);
+        let ingest_worker = tokio::task::spawn_blocking(move || {
+            let mut ingest = storage.begin_sync_ingest(
+                activation.name,
+                destination,
+                activation.revision,
+                activation.description,
+                manifest,
+                chunk_infos,
+                local_hashes,
+            )?;
+            while let Some(batch) = receiver.blocking_recv() {
+                for (index, chunk) in batch.into_chunks() {
+                    ingest.push_chunk(index, &chunk)?;
+                }
+            }
+            let received_chunk_count = ingest.received_chunks();
+            let payload_bytes = ingest.received_bytes();
+            let activation_started = Instant::now();
+            let item = ingest.finish()?;
+            Ok::<_, distd_core::error::Error>((
+                item,
+                received_chunk_count,
+                payload_bytes,
+                activation_started.elapsed(),
+            ))
+        });
+
+        let transfer_result = prepared.transfer_into(sender).await;
         let network_elapsed = t0.elapsed();
-
-        let received_chunk_count = received_chunks.len();
-        let manifest_chunk_count = chunk_infos.len();
-        let payload_bytes = received_chunks
-            .iter()
-            .map(|chunk| chunk.len() as u64)
-            .sum::<u64>();
-
-        let t1 = Instant::now();
-        let local_basis_count = from.len();
-        let item = commit_sync_storage(
-            Arc::clone(&self.storage),
-            activation,
-            destination,
-            manifest,
-            chunk_infos,
-            from,
-            received_chunks,
-        )
-        .await?;
-        let store_elapsed = t1.elapsed();
+        let storage_result = ingest_worker
+            .await
+            .map_err(|_| ClientError::StorageWorker)?;
+        let wire_bytes = match transfer_result {
+            Ok(wire_bytes) => wire_bytes,
+            Err(error) => {
+                if matches!(error, crate::error::ServerRequest::StorageIngestClosed) {
+                    if let Err(storage_error) = storage_result {
+                        return Err(ClientError::Core(storage_error));
+                    }
+                }
+                return Err(ClientError::ServerRequest(error));
+            }
+        };
+        let (item, received_chunk_count, payload_bytes, store_elapsed) =
+            storage_result.map_err(ClientError::Core)?;
 
         tracing::info!(
             "distd_sync_local_basis_chunks={} distd_sync_manifest_chunks={} distd_sync_wire_bytes={wire_bytes} distd_sync_payload_bytes={payload_bytes} distd_sync_received_chunks={} distd_network_ms={} distd_store_ms={}",
@@ -404,6 +439,7 @@ impl From<&ItemMetadata> for LocalActivationMetadata {
     }
 }
 
+#[cfg(test)]
 async fn commit_sync_storage(
     storage: Arc<FsStorage>,
     activation: LocalActivationMetadata,

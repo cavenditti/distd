@@ -14,6 +14,8 @@ level = "DEBUG"
 
 [client]
 name = ""
+# Backward-compatible name: caps missing payload admitted for transfer and
+# temporary disk staging; payload is streamed through bounded memory buffers.
 max_sync_memory_mib = 512
 sync = [
   "ok"

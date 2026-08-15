@@ -171,6 +171,13 @@ pub fn decode_wire_rejection(
 
 pub const SYNC_PAYLOAD_COMPRESSION_NONE: i32 = 0;
 pub const SYNC_PAYLOAD_COMPRESSION_ZSTD: i32 = 1;
+/// Maximum uncompressed payload assembled into one sync response frame.
+///
+/// Keeping this materially below the QUIC flow-control windows bounds the
+/// sender, receiver, decoder, and storage handoff buffers at the same time.
+pub const SYNC_PAYLOAD_BATCH_TARGET_BYTES: usize = 4 * 1024 * 1024;
+pub const SYNC_QUIC_CONNECTION_WINDOW_BYTES: u32 = 16 * 1024 * 1024;
+pub const SYNC_QUIC_STREAM_WINDOW_BYTES: u32 = 8 * 1024 * 1024;
 const SYNC_PAYLOAD_COMPRESSION_MIN_BYTES: usize = 64 * 1024;
 const SYNC_PAYLOAD_COMPRESSION_MIN_SAVINGS_BYTES: usize = 8 * 1024;
 const SYNC_PAYLOAD_ZSTD_LEVEL: i32 = 1;
@@ -369,6 +376,46 @@ pub fn decode_sync_payload_owned(
                 });
             }
             Ok(decoded)
+        }
+        other => Err(PayloadCompressionError::UnknownCodec(other)),
+    }
+}
+
+/// Decode an owned protobuf byte field without copying uncompressed payloads.
+pub fn decode_sync_payload_bytes(
+    compression: i32,
+    data: bytes::Bytes,
+    uncompressed_size: u32,
+) -> Result<bytes::Bytes, PayloadCompressionError> {
+    let expected_size = if uncompressed_size == 0 {
+        data.len()
+    } else {
+        uncompressed_size as usize
+    };
+    if expected_size > MAX_SYNC_DECOMPRESSED_BYTES {
+        return Err(PayloadCompressionError::SizeTooLarge);
+    }
+
+    match compression {
+        SYNC_PAYLOAD_COMPRESSION_NONE => {
+            if data.len() != expected_size {
+                return Err(PayloadCompressionError::SizeMismatch {
+                    expected: expected_size,
+                    actual: data.len(),
+                });
+            }
+            Ok(data)
+        }
+        SYNC_PAYLOAD_COMPRESSION_ZSTD => {
+            let decoded = zstd::bulk::decompress(&data, expected_size)
+                .map_err(|err| PayloadCompressionError::Decompress(err.to_string()))?;
+            if decoded.len() != expected_size {
+                return Err(PayloadCompressionError::SizeMismatch {
+                    expected: expected_size,
+                    actual: decoded.len(),
+                });
+            }
+            Ok(bytes::Bytes::from(decoded))
         }
         other => Err(PayloadCompressionError::UnknownCodec(other)),
     }

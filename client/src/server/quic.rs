@@ -7,7 +7,10 @@ use distd_core::proto::{
     sync_message::Msg, ClientKeepAlive, ClientRegister, ManifestRequest, PossessionBitfield,
     ServerMetadata, SyncMessage,
 };
-use distd_core::transport::{decode_sync_payload_owned, TransportOp};
+use distd_core::transport::{
+    decode_sync_payload_bytes, TransportOp, SYNC_QUIC_CONNECTION_WINDOW_BYTES,
+    SYNC_QUIC_STREAM_WINDOW_BYTES,
+};
 use distd_core::utils::frame::{
     read_length_delimited_async, read_length_delimited_or_wire_rejection_async,
     read_response_frame_length_async, write_current_wire_preface_async,
@@ -19,11 +22,12 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, Error as TlsError, SignatureScheme};
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use uuid::Uuid;
 
 use crate::{
     error::{ServerConnection, ServerRequest},
+    server::ReceivedChunkBatch,
     server_url::CanonicalServerUrl,
 };
 
@@ -179,9 +183,9 @@ impl QuicTransportClient {
         ));
 
         let mut transport = quinn::TransportConfig::default();
-        transport.receive_window(quinn::VarInt::from_u32(64 * 1024 * 1024));
-        transport.stream_receive_window(quinn::VarInt::from_u32(32 * 1024 * 1024));
-        transport.send_window(64 * 1024 * 1024);
+        transport.receive_window(quinn::VarInt::from_u32(SYNC_QUIC_CONNECTION_WINDOW_BYTES));
+        transport.stream_receive_window(quinn::VarInt::from_u32(SYNC_QUIC_STREAM_WINDOW_BYTES));
+        transport.send_window(SYNC_QUIC_CONNECTION_WINDOW_BYTES as u64);
         transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
         transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(32));
         transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(0));
@@ -398,6 +402,55 @@ impl QuicSyncSession {
         self.finished = true;
         Ok((received, wire_bytes))
     }
+
+    pub async fn send_possession_and_stream_chunks(
+        mut self,
+        possession: PossessionBitfield,
+        chunk_sizes: &[usize],
+        sender: mpsc::Sender<ReceivedChunkBatch>,
+    ) -> Result<u64, ServerRequest> {
+        let bitfield = Bitfield::from_bytes(&possession.bitfield)
+            .filter(|bitfield| bitfield.chunk_count() as usize == chunk_sizes.len())
+            .ok_or(ServerRequest::UnexpectedMessage)?;
+        let expected_missing = bitfield.missing_indices();
+
+        write_length_delimited_async(&mut self.send, &possession)
+            .await
+            .map_err(|err| ServerRequest::Quic(err.to_string()))?;
+        self.send
+            .finish()
+            .map_err(|err| ServerRequest::Quic(err.to_string()))?;
+
+        let mut decoder = SyncChunkDecoder::new(chunk_sizes, expected_missing);
+        loop {
+            match read_length_delimited_async::<_, SyncMessage>(&mut self.recv).await {
+                Ok(message) => {
+                    let batch = decoder.decode(message)?;
+                    sender
+                        .send(batch)
+                        .await
+                        .map_err(|_| ServerRequest::StorageIngestClosed)?;
+                }
+                Err(distd_core::utils::frame::FrameError::IoError(err))
+                    if err.kind() == std::io::ErrorKind::UnexpectedEof =>
+                {
+                    break
+                }
+                Err(err) => return Err(ServerRequest::Quic(err.to_string())),
+            }
+        }
+        decoder.ensure_complete()?;
+        drop(sender);
+
+        let wire_bytes = self
+            .connection
+            .stats()
+            .udp_rx
+            .bytes
+            .saturating_sub(self.starting_received_bytes);
+        self.finished = true;
+        Ok(wire_bytes)
+    }
 }
 
 struct SyncChunkDecoder<'a> {
@@ -418,6 +471,13 @@ impl<'a> SyncChunkDecoder<'a> {
     }
 
     fn push(&mut self, message: SyncMessage) -> Result<(), ServerRequest> {
+        let batch = self.decode(message)?;
+        self.received
+            .extend(batch.chunks.into_iter().map(|(_, chunk)| chunk));
+        Ok(())
+    }
+
+    fn decode(&mut self, message: SyncMessage) -> Result<ReceivedChunkBatch, ServerRequest> {
         match message {
             SyncMessage {
                 msg: Some(Msg::ChunkData(cd)),
@@ -425,7 +485,7 @@ impl<'a> SyncChunkDecoder<'a> {
                 if self.expected_missing.get(self.next_expected) != Some(&cd.chunk_index) {
                     return Err(ServerRequest::UnexpectedMessage);
                 }
-                let decoded = ReceivedChunk::from(decode_sync_payload_owned(
+                let decoded = ReceivedChunk::from(decode_sync_payload_bytes(
                     cd.compression,
                     cd.data,
                     cd.uncompressed_size,
@@ -437,9 +497,10 @@ impl<'a> SyncChunkDecoder<'a> {
                 if decoded.len() != expected_size {
                     return Err(ServerRequest::UnexpectedMessage);
                 }
-                self.received.push(decoded);
                 self.next_expected += 1;
-                Ok(())
+                Ok(ReceivedChunkBatch {
+                    chunks: vec![(cd.chunk_index, decoded)],
+                })
             }
             SyncMessage {
                 msg: Some(Msg::BulkData(bd)),
@@ -477,7 +538,7 @@ impl<'a> SyncChunkDecoder<'a> {
                     .chunk_sizes
                     .get(start_index..end_index)
                     .ok_or(ServerRequest::UnexpectedMessage)?;
-                let decoded = ReceivedChunk::from(decode_sync_payload_owned(
+                let decoded = ReceivedChunk::from(decode_sync_payload_bytes(
                     bd.compression,
                     bd.data,
                     bd.uncompressed_size,
@@ -500,20 +561,34 @@ impl<'a> SyncChunkDecoder<'a> {
                     return Err(ServerRequest::UnexpectedMessage);
                 }
 
-                self.received
-                    .extend(ranges.into_iter().map(|range| decoded.slice(range)));
+                let chunks = ranges
+                    .into_iter()
+                    .enumerate()
+                    .map(|(offset, range)| {
+                        (
+                            bd.start_index + u32::try_from(offset).expect("bulk count is u32"),
+                            decoded.slice(range),
+                        )
+                    })
+                    .collect();
                 self.next_expected = expected_end;
-                Ok(())
+                Ok(ReceivedChunkBatch { chunks })
             }
             _ => Err(ServerRequest::UnexpectedMessage),
         }
     }
 
     fn finish(self) -> Result<Vec<ReceivedChunk>, ServerRequest> {
-        if self.next_expected != self.expected_missing.len() {
-            return Err(ServerRequest::UnexpectedMessage);
-        }
+        self.ensure_complete()?;
         Ok(self.received)
+    }
+
+    fn ensure_complete(&self) -> Result<(), ServerRequest> {
+        if self.next_expected == self.expected_missing.len() {
+            Ok(())
+        } else {
+            Err(ServerRequest::UnexpectedMessage)
+        }
     }
 }
 
@@ -599,7 +674,7 @@ mod tests {
             let frame = SyncMessage {
                 msg: Some(Msg::ChunkData(ChunkData {
                     chunk_index: 0,
-                    data: vec![1, 2, 3],
+                    data: vec![1, 2, 3].into(),
                     compression: PayloadCompression::Unspecified as i32,
                     uncompressed_size: 3,
                 })),
@@ -647,7 +722,7 @@ mod tests {
             msg: Some(Msg::BulkData(BulkData {
                 start_index: 1,
                 count: 2,
-                data: vec![3, 4, 5, 6, 7],
+                data: vec![3, 4, 5, 6, 7].into(),
                 compression: PayloadCompression::Unspecified as i32,
                 uncompressed_size: 5,
             })),
@@ -672,7 +747,7 @@ mod tests {
             msg: Some(Msg::BulkData(BulkData {
                 start_index: 0,
                 count: 2,
-                data: vec![1, 2, 3],
+                data: vec![1, 2, 3].into(),
                 compression: PayloadCompression::Unspecified as i32,
                 uncompressed_size: 3,
             })),
@@ -695,7 +770,7 @@ mod tests {
             msg: Some(Msg::BulkData(BulkData {
                 start_index: u32::MAX,
                 count: 2,
-                data: Vec::new(),
+                data: Vec::new().into(),
                 compression: PayloadCompression::Unspecified as i32,
                 uncompressed_size: 0,
             })),
@@ -720,7 +795,7 @@ mod tests {
                 msg: Some(Msg::BulkData(BulkData {
                     start_index: 0,
                     count: 2,
-                    data: vec![10, 11, 12, 13],
+                    data: vec![10, 11, 12, 13].into(),
                     compression: PayloadCompression::Unspecified as i32,
                     uncompressed_size: 4,
                 })),
@@ -741,7 +816,7 @@ mod tests {
             .push(SyncMessage {
                 msg: Some(Msg::ChunkData(ChunkData {
                     chunk_index: 0,
-                    data: vec![1, 2],
+                    data: vec![1, 2].into(),
                     compression: PayloadCompression::Unspecified as i32,
                     uncompressed_size: 2,
                 })),
@@ -752,7 +827,7 @@ mod tests {
                 msg: Some(Msg::BulkData(BulkData {
                     start_index: 1,
                     count: 2,
-                    data: vec![3, 4, 5, 6, 7],
+                    data: vec![3, 4, 5, 6, 7].into(),
                     compression: PayloadCompression::Unspecified as i32,
                     uncompressed_size: 5,
                 })),
@@ -786,7 +861,7 @@ mod tests {
             .push(SyncMessage {
                 msg: Some(Msg::ChunkData(ChunkData {
                     chunk_index: 0,
-                    data: encoded.data,
+                    data: encoded.data.into(),
                     compression: encoded.compression,
                     uncompressed_size: encoded.uncompressed_size,
                 })),
@@ -811,7 +886,7 @@ mod tests {
                 msg: Some(Msg::BulkData(BulkData {
                     start_index: 0,
                     count: 2,
-                    data: encoded.data,
+                    data: encoded.data.into(),
                     compression: encoded.compression,
                     uncompressed_size: encoded.uncompressed_size,
                 })),
@@ -834,7 +909,7 @@ mod tests {
             SyncMessage {
                 msg: Some(Msg::ChunkData(ChunkData {
                     chunk_index: index,
-                    data: data.to_vec(),
+                    data: data.to_vec().into(),
                     compression: PayloadCompression::Unspecified as i32,
                     uncompressed_size: data.len() as u32,
                 })),
@@ -854,7 +929,7 @@ mod tests {
                 msg: Some(Msg::BulkData(BulkData {
                     start_index: 0,
                     count: 2,
-                    data: vec![1, 3],
+                    data: vec![1, 3].into(),
                     compression: PayloadCompression::Unspecified as i32,
                     uncompressed_size: 2,
                 })),
@@ -867,7 +942,7 @@ mod tests {
                 msg: Some(Msg::BulkData(BulkData {
                     start_index: 0,
                     count: 2,
-                    data: vec![1, 2],
+                    data: vec![1, 2].into(),
                     compression: PayloadCompression::Unspecified as i32,
                     uncompressed_size: 2,
                 })),
@@ -878,7 +953,7 @@ mod tests {
                 msg: Some(Msg::BulkData(BulkData {
                     start_index: 1,
                     count: 2,
-                    data: vec![2, 3],
+                    data: vec![2, 3].into(),
                     compression: PayloadCompression::Unspecified as i32,
                     uncompressed_size: 2,
                 })),
@@ -892,7 +967,7 @@ mod tests {
                 msg: Some(Msg::BulkData(BulkData {
                     start_index: 0,
                     count: 0,
-                    data: Vec::new(),
+                    data: Vec::new().into(),
                     compression: PayloadCompression::Unspecified as i32,
                     uncompressed_size: 0,
                 })),

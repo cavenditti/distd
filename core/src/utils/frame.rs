@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use prost::Message;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -135,7 +136,7 @@ where
     let frame_len = read_response_frame_length_async(reader, MAX_FRAME_PAYLOAD_BYTES).await?;
     let mut payload = vec![0u8; frame_len];
     reader.read_exact(&mut payload).await?;
-    Ok(M::decode(payload.as_slice())?)
+    Ok(M::decode(Bytes::from(payload))?)
 }
 
 /// Read a response frame length or return a typed fixed-size compatibility rejection.
@@ -191,7 +192,7 @@ where
     }
     let mut payload = vec![0u8; frame_len];
     reader.read_exact(&mut payload).await?;
-    Ok(M::decode(payload.as_slice())?)
+    Ok(M::decode(Bytes::from(payload))?)
 }
 
 pub async fn write_transport_op_async<W>(writer: &mut W, op: TransportOp) -> Result<(), FrameError>

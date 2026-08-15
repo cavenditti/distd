@@ -43,6 +43,8 @@ const FS_STORAGE_ROOT_DOMAIN: &[u8] = b"distd fs storage root identity v1\0";
 const FS_STORAGE_REVISION_NAMESPACE: &str = ".distd-revisions-v1";
 const FS_STORAGE_REVISION_MARKER_DOMAIN: &[u8] = b"distd fs server revision marker v1\0";
 const FS_STORAGE_REVISION_MARKER_EXTENSION: &str = "item";
+const FS_SYNC_INGEST_NAMESPACE: &str = ".distd-ingest-v1";
+const FS_SYNC_INGEST_EXTENSION: &str = "pack";
 const FS_STORAGE_MAX_LINK_RECORDS: usize = 65_536;
 const FS_STORAGE_MAX_LINK_DEPTH: usize = 256;
 const FS_ACTIVATION_NAMESPACE: &str = ".distd-activation-v1";
@@ -245,6 +247,34 @@ struct FsActivationTransactionV2 {
 enum ChunkData {
     Owned(Arc<Vec<u8>>),
     Shared(ReceivedChunk),
+}
+
+#[derive(Clone, Debug)]
+struct PackedChunkSource {
+    file: Arc<File>,
+    offset: u64,
+    length: usize,
+}
+
+#[derive(Clone, Debug)]
+enum StagedChunkSource {
+    Memory(ChunkData),
+    Pack(PackedChunkSource),
+}
+
+impl StagedChunkSource {
+    fn len(&self) -> usize {
+        match self {
+            Self::Memory(data) => data.as_ref().len(),
+            Self::Pack(data) => data.length,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PackedChunkRecord {
+    offset: u64,
+    length: usize,
 }
 
 impl ChunkData {
@@ -2706,6 +2736,182 @@ pub struct FsStorage {
     tree_cache: Mutex<HotNodeCache>,
 }
 
+/// A bounded-memory filesystem ingestion transaction for one verified sync.
+///
+/// Incoming chunks are verified and appended to one transfer-scoped pack. The
+/// pack remains unselectable until [`FsSyncIngest::finish`] reconstructs the
+/// signed revision and completes the existing atomic activation transaction.
+#[derive(Debug)]
+pub struct FsSyncIngest {
+    storage: Arc<FsStorage>,
+    name: ItemName,
+    path: PathBuf,
+    revision: u32,
+    description: Option<String>,
+    manifest: Manifest,
+    chunk_infos: Vec<ChunkInfo>,
+    local_hashes: Vec<Hash>,
+    expected_missing: Vec<bool>,
+    received: Vec<bool>,
+    packed_by_hash: HashMap<Hash, PackedChunkRecord>,
+    pack_path: PathBuf,
+    pack: Option<File>,
+    next_offset: u64,
+    received_chunks: usize,
+    received_bytes: u64,
+    finished: bool,
+}
+
+impl FsSyncIngest {
+    /// Verify and durably append one manifest-positioned chunk.
+    pub fn push_chunk(&mut self, index: u32, data: &ReceivedChunk) -> Result<(), Error> {
+        let index = usize::try_from(index).map_err(InvalidParameter::from)?;
+        let expected = self
+            .chunk_infos
+            .get(index)
+            .copied()
+            .ok_or_else(|| Error::Storage(StorageError::TreeReconstruct))?;
+        if !self.expected_missing.get(index).copied().unwrap_or(false)
+            || self.received.get(index).copied().unwrap_or(false)
+            || data.len() as u64 != expected.size
+            || do_hash(data.as_ref()) != expected.hash
+        {
+            return Err(Error::Storage(StorageError::TreeReconstruct));
+        }
+
+        if !self.packed_by_hash.contains_key(&expected.hash) {
+            let pack = self
+                .pack
+                .as_mut()
+                .ok_or_else(|| invalid_state("sync ingest pack is closed"))?;
+            pack.write_all(data.as_ref())?;
+            self.packed_by_hash.insert(
+                expected.hash,
+                PackedChunkRecord {
+                    offset: self.next_offset,
+                    length: data.len(),
+                },
+            );
+            self.next_offset = self
+                .next_offset
+                .checked_add(data.len() as u64)
+                .ok_or_else(|| invalid_state("sync ingest pack size overflows"))?;
+        }
+
+        self.received[index] = true;
+        self.received_chunks = self
+            .received_chunks
+            .checked_add(1)
+            .ok_or_else(|| invalid_state("sync received chunk count overflows"))?;
+        self.received_bytes = self
+            .received_bytes
+            .checked_add(data.len() as u64)
+            .ok_or_else(|| invalid_state("sync received payload size overflows"))?;
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn received_chunks(&self) -> usize {
+        self.received_chunks
+    }
+
+    #[must_use]
+    pub fn received_bytes(&self) -> u64 {
+        self.received_bytes
+    }
+
+    /// Seal the transfer pack, reconstruct the signed revision and atomically
+    /// activate it. No pack bytes are inserted into the application hot cache.
+    pub fn finish(mut self) -> Result<Item, Error> {
+        if self
+            .expected_missing
+            .iter()
+            .zip(&self.received)
+            .any(|(expected, received)| expected != received)
+        {
+            return Err(Error::Storage(StorageError::TreeReconstruct));
+        }
+
+        let pack = self
+            .pack
+            .take()
+            .ok_or_else(|| invalid_state("sync ingest pack is closed"))?;
+        pack.sync_all()?;
+        let pack = Arc::new(pack);
+        let staged_data = self
+            .packed_by_hash
+            .iter()
+            .map(|(hash, record)| {
+                (
+                    *hash,
+                    StagedChunkSource::Pack(PackedChunkSource {
+                        file: Arc::clone(&pack),
+                        offset: record.offset,
+                        length: record.length,
+                    }),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        let result = self.storage.receive_sync_item_sources(
+            self.name.clone(),
+            self.path.clone(),
+            self.revision,
+            self.description.clone(),
+            &self.manifest,
+            &self.chunk_infos,
+            &self.local_hashes,
+            &staged_data,
+        );
+        drop(staged_data);
+        drop(pack);
+        if let Err(error) = remove_file(&self.pack_path)
+            .map_err(Error::from)
+            .and_then(|()| Self::sync_pack_parent(&self.pack_path))
+        {
+            tracing::warn!(
+                path = %self.pack_path.display(),
+                %error,
+                "activated revision but could not fully clean its ingest pack"
+            );
+        }
+        self.finished = true;
+        result
+    }
+
+    fn sync_pack_parent(path: &Path) -> Result<(), Error> {
+        let parent = path.parent().ok_or(Error::MissingData)?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    }
+}
+
+impl Drop for FsSyncIngest {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.pack.take();
+        match remove_file(&self.pack_path) {
+            Ok(()) => {
+                if let Err(error) = Self::sync_pack_parent(&self.pack_path) {
+                    tracing::warn!(
+                        path = %self.pack_path.display(),
+                        %error,
+                        "failed to sync aborted ingest cleanup"
+                    );
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                path = %self.pack_path.display(),
+                %error,
+                "failed to remove aborted ingest pack"
+            ),
+        }
+    }
+}
+
 impl Default for FsStorage {
     fn default() -> Self {
         let activation_fault_hook = Arc::new(RwLock::new(None));
@@ -2737,6 +2943,131 @@ impl Default for FsStorage {
 }
 
 impl FsStorage {
+    fn cleanup_stale_sync_ingests(&self) -> Result<(), Error> {
+        let ingest_root = self
+            .inner
+            .read()
+            .unwrap()
+            .root
+            .join(FS_SYNC_INGEST_NAMESPACE);
+        let metadata = match fs::symlink_metadata(&ingest_root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(invalid_state("sync ingest namespace is not a directory"));
+        }
+
+        let mut removed = false;
+        for entry in fs::read_dir(&ingest_root)? {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            let valid_name = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| {
+                    stem.len() == 32
+                        && stem.bytes().all(|byte| byte.is_ascii_hexdigit())
+                        && path.extension().and_then(|extension| extension.to_str())
+                            == Some(FS_SYNC_INGEST_EXTENSION)
+                });
+            if !metadata.is_file() || metadata.file_type().is_symlink() || !valid_name {
+                return Err(invalid_state(
+                    "sync ingest namespace contains an invalid entry",
+                ));
+            }
+            remove_file(&path)?;
+            removed = true;
+            tracing::info!(
+                path = %path.display(),
+                "removed an incomplete sync ingest from a previous process"
+            );
+        }
+        if removed {
+            File::open(&ingest_root)?.sync_all()?;
+        }
+        Ok(())
+    }
+
+    /// Begin a bounded-memory ingestion transaction for a manifest that has
+    /// already passed transport and publisher verification.
+    pub fn begin_sync_ingest(
+        self: &Arc<Self>,
+        name: ItemName,
+        path: PathBuf,
+        revision: u32,
+        description: Option<String>,
+        manifest: Manifest,
+        chunk_infos: Vec<ChunkInfo>,
+        local_hashes: Vec<Hash>,
+    ) -> Result<FsSyncIngest, Error> {
+        let path = self.canonical_activation_destination(&path)?;
+        if chunk_infos.len() != manifest.chunk_count as usize {
+            return Err(Error::Storage(StorageError::TreeReconstruct));
+        }
+
+        let available_hashes: HashSet<Hash> = local_hashes.iter().copied().collect();
+        let expected_missing = chunk_infos
+            .iter()
+            .map(|chunk| !available_hashes.contains(&chunk.hash))
+            .collect::<Vec<_>>();
+        let ingest_root = self
+            .inner
+            .read()
+            .unwrap()
+            .root
+            .join(FS_SYNC_INGEST_NAMESPACE);
+        match fs::symlink_metadata(&ingest_root) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => return Err(invalid_state("sync ingest namespace is not a directory")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&ingest_root)?;
+                Self::sync_parent(&ingest_root)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+
+        let (pack_path, pack) = loop {
+            let candidate = ingest_root.join(format!(
+                "{}.{}",
+                uuid::Uuid::new_v4().simple(),
+                FS_SYNC_INGEST_EXTENSION
+            ));
+            match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(file) => break (candidate, file),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+        };
+
+        Ok(FsSyncIngest {
+            storage: Arc::clone(self),
+            name,
+            path,
+            revision,
+            description,
+            manifest,
+            received: vec![false; chunk_infos.len()],
+            chunk_infos,
+            local_hashes,
+            expected_missing,
+            packed_by_hash: HashMap::default(),
+            pack_path,
+            pack: Some(pack),
+            next_offset: 0,
+            received_chunks: 0,
+            received_bytes: 0,
+            finished: false,
+        })
+    }
+
     /// Return cache-owned payload accounting for integration assertions.
     #[doc(hidden)]
     pub fn chunk_cache_stats(&self) -> ChunkCacheStats {
@@ -4445,7 +4776,7 @@ impl FsStorage {
         chunk_infos: &[ChunkInfo],
         available_hashes: &HashSet<Hash>,
         received_chunks: &mut VecDeque<ReceivedChunk>,
-        staged_data: &mut HashMap<Hash, ChunkData>,
+        staged_data: &mut HashMap<Hash, StagedChunkSource>,
         received_in_order: &mut Vec<(Hash, ReceivedChunk)>,
     ) -> Result<(Vec<ChunkInfo>, Arc<Node>), Error> {
         let mut partials = Vec::with_capacity(chunk_infos.len());
@@ -4479,7 +4810,10 @@ impl FsStorage {
                         return Err(Error::Storage(StorageError::TreeReconstruct));
                     }
                     received_in_order.push((chunk_info.hash, data.clone()));
-                    staged_data.insert(chunk_info.hash, ChunkData::Shared(data));
+                    staged_data.insert(
+                        chunk_info.hash,
+                        StagedChunkSource::Memory(ChunkData::Shared(data)),
+                    );
                 }
 
                 partials.push(Arc::new(Node::Skipped {
@@ -4493,13 +4827,86 @@ impl FsStorage {
         Ok((chunks, root))
     }
 
+    fn read_pack_exact_at(file: &File, offset: u64, bytes: &mut [u8]) -> Result<(), Error> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            file.read_exact_at(bytes, offset)?;
+        }
+        #[cfg(not(unix))]
+        {
+            let mut file = file.try_clone()?;
+            file.seek(std::io::SeekFrom::Start(offset))?;
+            file.read_exact(bytes)?;
+        }
+        Ok(())
+    }
+
+    fn write_verified_staged_chunk(
+        source: &StagedChunkSource,
+        expected: &ChunkInfo,
+        destination: &mut File,
+        buffer: &mut [u8],
+    ) -> Result<(), Error> {
+        if source.len() as u64 != expected.size {
+            return Err(Error::Storage(StorageError::TreeReconstruct));
+        }
+        match source {
+            StagedChunkSource::Memory(data) => {
+                if do_hash(data.as_ref()) != expected.hash {
+                    return Err(Error::Storage(StorageError::TreeReconstruct));
+                }
+                destination.write_all(data.as_ref())?;
+            }
+            StagedChunkSource::Pack(data) => {
+                let mut partials = Vec::with_capacity(data.length / CHUNK_SIZE + 1);
+                let mut copied = 0usize;
+                while copied < data.length {
+                    let this_len = (data.length - copied).min(buffer.len()).min(CHUNK_SIZE);
+                    let bytes = &mut buffer[..this_len];
+                    Self::read_pack_exact_at(
+                        &data.file,
+                        data.offset
+                            .checked_add(copied as u64)
+                            .ok_or_else(|| invalid_state("packed chunk offset overflows"))?,
+                        bytes,
+                    )?;
+                    partials.push(do_hash(bytes));
+                    destination.write_all(bytes)?;
+                    copied += this_len;
+                }
+                if partials.is_empty() {
+                    partials.push(do_hash(&[]));
+                }
+                while partials.len() > 1 {
+                    let count = partials.len();
+                    for (destination, source) in (0..count - 1).step_by(2).enumerate() {
+                        partials[destination] =
+                            merge_hashes(&partials[source], &partials[source + 1]);
+                    }
+                    let half = count / 2;
+                    if count % 2 == 0 {
+                        partials.truncate(half);
+                    } else {
+                        partials.swap(half, count - 1);
+                        partials.truncate(half + 1);
+                    }
+                }
+                if partials[0] != expected.hash {
+                    return Err(Error::Storage(StorageError::TreeReconstruct));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn materialize_activation_tree(
         &self,
         staging_root: &Path,
         kind: ActiveRevisionKind,
         manifest: &Manifest,
         chunks: &[ChunkInfo],
-        staged_data: &HashMap<Hash, ChunkData>,
+        staged_data: &HashMap<Hash, StagedChunkSource>,
         previous: Option<&FsActivationActiveV1>,
     ) -> Result<(), Error> {
         if kind == ActiveRevisionKind::File
@@ -4536,6 +4943,7 @@ impl FsStorage {
                 })
                 .collect::<Result<Vec<_>, Error>>()?
         };
+        let mut staged_buffer = vec![0u8; FS_ACTIVATION_COPY_BUFFER_BYTES];
         for (path, start, end, entry) in entries {
             if start > end || end > chunks.len() {
                 return Err(Error::Storage(StorageError::TreeReconstruct));
@@ -4579,12 +4987,7 @@ impl FsStorage {
             ))?;
             for chunk in &chunks[start..end] {
                 if let Some(data) = staged_data.get(&chunk.hash) {
-                    if data.as_ref().len() as u64 != chunk.size
-                        || do_hash(data.as_ref()) != chunk.hash
-                    {
-                        return Err(Error::Storage(StorageError::TreeReconstruct));
-                    }
-                    file.write_all(data.as_ref())?;
+                    Self::write_verified_staged_chunk(data, chunk, &mut file, &mut staged_buffer)?;
                 } else {
                     self.copy_existing_chunk_bounded(chunk, &mut file)?;
                 }
@@ -4610,7 +5013,7 @@ impl FsStorage {
         &self,
         staging_root: &Path,
         chunks: &[ChunkInfo],
-        staged_data: &HashMap<Hash, ChunkData>,
+        staged_data: &HashMap<Hash, StagedChunkSource>,
         previous: Option<&FsActivationActiveV1>,
     ) -> Result<bool, Error> {
         let Some(previous) = previous.filter(|previous| {
@@ -4644,6 +5047,7 @@ impl FsStorage {
             .read(true)
             .write(true)
             .open(staging_root)?;
+        let mut staged_buffer = vec![0u8; FS_ACTIVATION_COPY_BUFFER_BYTES];
         let mut candidate_offset = 0u64;
         let mut previous_offset = 0u64;
         for (index, chunk) in chunks.iter().enumerate() {
@@ -4652,12 +5056,7 @@ impl FsStorage {
             if !unchanged {
                 file.seek(std::io::SeekFrom::Start(candidate_offset))?;
                 if let Some(data) = staged_data.get(&chunk.hash) {
-                    if data.as_ref().len() as u64 != chunk.size
-                        || do_hash(data.as_ref()) != chunk.hash
-                    {
-                        return Err(Error::Storage(StorageError::TreeReconstruct));
-                    }
-                    file.write_all(data.as_ref())?;
+                    Self::write_verified_staged_chunk(data, chunk, &mut file, &mut staged_buffer)?;
                 } else {
                     self.copy_existing_chunk_bounded(chunk, &mut file)?;
                 }
@@ -5315,7 +5714,7 @@ impl FsStorage {
         &self,
         item: Item,
         destination: &Path,
-        staged_data: &HashMap<Hash, ChunkData>,
+        staged_data: &HashMap<Hash, StagedChunkSource>,
     ) -> Result<ActiveRevisionHandle, Error> {
         if self
             .activation_poisoned
@@ -5927,7 +6326,10 @@ impl FsStorage {
                         return Err(Error::Storage(StorageError::TreeReconstruct));
                     }
                     received_in_order.push((chunk_info.hash, data.clone()));
-                    staged_data.insert(chunk_info.hash, ChunkData::Shared(data));
+                    staged_data.insert(
+                        chunk_info.hash,
+                        StagedChunkSource::Memory(ChunkData::Shared(data)),
+                    );
                     Arc::new(Node::Skipped {
                         hash: chunk_info.hash,
                         size: chunk_info.size,
@@ -5973,6 +6375,88 @@ impl FsStorage {
         let _handle = self.activate_verified_item(item.clone(), &path, &staged_data)?;
 
         self.cache_verified_received_chunks(received_in_order);
+        Ok(item)
+    }
+
+    fn receive_sync_item_sources(
+        &self,
+        name: ItemName,
+        path: PathBuf,
+        revision: u32,
+        description: Option<String>,
+        manifest: &Manifest,
+        chunk_infos: &[ChunkInfo],
+        local_hashes: &[Hash],
+        staged_data: &HashMap<Hash, StagedChunkSource>,
+    ) -> Result<Item, Error> {
+        let path = self.canonical_activation_destination(&path)?;
+        if chunk_infos.len() != manifest.chunk_count as usize {
+            return Err(Error::Storage(StorageError::TreeReconstruct));
+        }
+
+        let available_hashes: HashSet<Hash> = local_hashes.iter().copied().collect();
+        let mut partials = Vec::with_capacity(chunk_infos.len());
+        let mut chunks = Vec::with_capacity(chunk_infos.len());
+        let mut accept_chunk = |chunk_info: ChunkInfo| -> Result<(), Error> {
+            if available_hashes.contains(&chunk_info.hash) {
+                if !self
+                    .inner
+                    .read()
+                    .unwrap()
+                    .data
+                    .contains_key(&chunk_info.hash)
+                {
+                    return Err(Error::Storage(StorageError::TreeReconstruct));
+                }
+            } else if staged_data
+                .get(&chunk_info.hash)
+                .is_none_or(|source| source.len() as u64 != chunk_info.size)
+            {
+                return Err(Error::Storage(StorageError::TreeReconstruct));
+            }
+            chunks.push(chunk_info);
+            partials.push(Arc::new(Node::Skipped {
+                hash: chunk_info.hash,
+                size: chunk_info.size,
+            }));
+            Ok(())
+        };
+
+        if manifest.entries.is_empty() {
+            for chunk_info in chunk_infos.iter().copied() {
+                accept_chunk(chunk_info)?;
+            }
+        } else {
+            for entry in &manifest.entries {
+                let start = entry.chunk_range.0 as usize;
+                let end = entry.chunk_range.1 as usize;
+                let selected = chunk_infos
+                    .get(start..end)
+                    .ok_or_else(|| Error::Storage(StorageError::TreeReconstruct))?;
+                for chunk_info in selected.iter().copied() {
+                    accept_chunk(chunk_info)?;
+                }
+            }
+        }
+
+        let root = self.finalize_sync_partials(partials)?;
+        if root.hash() != &manifest.root_hash || root.size() != manifest.total_size {
+            return Err(Error::Storage(StorageError::TreeReconstruct));
+        }
+
+        let item = Item::make_with_entries(
+            name,
+            path.clone(),
+            revision,
+            description,
+            root.chunk_info(),
+            chunks,
+            manifest.entries.clone(),
+            manifest.chunk_algorithm,
+        )?
+        .with_artifact_id(manifest.artifact_id.clone());
+
+        let _handle = self.activate_verified_item(item.clone(), &path, staged_data)?;
         Ok(item)
     }
 
@@ -6064,6 +6548,7 @@ impl FsStorage {
             chunk_cache: Mutex::new(HotChunkCache::new(cache_config.max_chunk_bytes)),
             tree_cache: Mutex::new(HotNodeCache::new(cache_config.max_tree_entries)),
         };
+        storage.cleanup_stale_sync_ingests()?;
         // Selectors are authoritative and independently enveloped. Authenticate them before
         // decoding the derived Fs checkpoint so stale direct-path backings claimed by an exact
         // selector cannot prevent recovery, while corrupt selectors still fail closed.
@@ -6342,6 +6827,59 @@ impl ChunkStorage for FsStorage {
         let node = self.get(root)?;
         let leaves = node.flatten_iter().ok()?;
         leaves.get(index as usize).map(|arc| (**arc).clone())
+    }
+
+    fn append_chunk_by_index(
+        &self,
+        root: &Hash,
+        index: u32,
+        destination: &mut Vec<u8>,
+    ) -> Option<usize> {
+        let Some(item) = self.item_for_root_hash(root) else {
+            let chunk = self.get_chunk_by_index(root, index)?;
+            let length = chunk.len();
+            destination.extend_from_slice(&chunk);
+            return Some(length);
+        };
+        let expected = item.chunks.get(index as usize)?;
+        let entry = {
+            let inner = self.inner.read().unwrap();
+            inner
+                .data
+                .get(&expected.hash)
+                .and_then(|entries| entries.first())
+                .cloned()
+        }?;
+        if !entry.populated.load(std::sync::atomic::Ordering::Relaxed) || entry.info != *expected {
+            return None;
+        }
+
+        let length = usize::try_from(entry.info.size).ok()?;
+        let start = destination.len();
+        let end = start.checked_add(length)?;
+        destination.try_reserve_exact(length).ok()?;
+        destination.resize(end, 0);
+        let output = &mut destination[start..end];
+        let mut read = self.is_immutable_backing(&entry.path)
+            && self
+                .read_immutable_backing(&entry.path, entry.offset, output)
+                .is_ok();
+        if !read {
+            if let Some(handle) = self.handle_for_path(&entry.path) {
+                read = handle.lock().unwrap().read(output, entry.offset).is_ok();
+            }
+        }
+        if !read {
+            if let Ok(mut file) = File::open(&entry.path) {
+                read = file.seek(std::io::SeekFrom::Start(entry.offset)).is_ok()
+                    && file.read_exact(output).is_ok();
+            }
+        }
+        if !read {
+            destination.truncate(start);
+            return None;
+        }
+        Some(length)
     }
 
     fn discard_unpublished_revision(&self, item: &Item) -> Result<(), Error> {
@@ -6918,7 +7456,7 @@ mod tests {
         item
     }
 
-    fn activation_staged_data(bytes: &[u8], item: &Item) -> HashMap<Hash, ChunkData> {
+    fn activation_staged_data(bytes: &[u8], item: &Item) -> HashMap<Hash, StagedChunkSource> {
         let mut offset = 0usize;
         item.chunks
             .iter()
@@ -6926,7 +7464,10 @@ mod tests {
                 let end = offset + chunk.size as usize;
                 let data = bytes[offset..end].to_vec();
                 offset = end;
-                (chunk.hash, ChunkData::Owned(Arc::new(data)))
+                (
+                    chunk.hash,
+                    StagedChunkSource::Memory(ChunkData::Owned(Arc::new(data))),
+                )
             })
             .collect()
     }
@@ -9014,6 +9555,162 @@ mod tests {
             .clone_data()
             .unwrap();
         assert_eq!(stored_v3, v3);
+    }
+
+    #[test]
+    fn fs_storage_streaming_ingest_activates_from_pack_without_caching_payload() {
+        use crate::chunk_storage::hashmap_storage::HashMapStorage;
+        use crate::item::Manifest;
+
+        let root = temp_path();
+        let storage = Arc::new(FsStorage::new(root.clone()).unwrap());
+        let source = HashMapStorage::default();
+        let data: Vec<u8> = (0..(CHUNK_SIZE * 9 + 317))
+            .map(|index| ((index * 29 + 17) % 251) as u8)
+            .collect();
+        let algorithm = ChunkAlgorithm::fixed_1m();
+        let (tree, chunks) = source.chunk_tree(&data, algorithm).unwrap();
+        assert!(chunks.iter().any(|chunk| chunk.size > CHUNK_SIZE as u64));
+        let manifest =
+            Manifest::from_tree("streamed-item".to_string(), 1, &tree, &chunks, algorithm);
+        let mut ingest = storage
+            .begin_sync_ingest(
+                "streamed-item".to_string(),
+                PathBuf::from("streamed.bin"),
+                1,
+                None,
+                manifest,
+                chunks.clone(),
+                Vec::new(),
+            )
+            .unwrap();
+        let mut offset = 0usize;
+        for (index, chunk) in chunks.iter().enumerate() {
+            let end = offset + chunk.size as usize;
+            ingest
+                .push_chunk(
+                    u32::try_from(index).unwrap(),
+                    &ReceivedChunk::copy_from_slice(&data[offset..end]),
+                )
+                .unwrap();
+            offset = end;
+        }
+        assert_eq!(ingest.received_bytes(), data.len() as u64);
+        assert_eq!(ingest.received_chunks(), chunks.len());
+
+        let item = ingest.finish().unwrap();
+
+        assert_eq!(item.metadata.root.hash, tree.hash().to_owned());
+        assert_eq!(fs::read(root.join("streamed.bin")).unwrap(), data);
+        let cache = storage.chunk_cache_stats();
+        assert_eq!(cache.current_bytes, 0);
+        assert_eq!(cache.peak_bytes, 0);
+        assert_eq!(
+            fs::read_dir(root.join(FS_SYNC_INGEST_NAMESPACE))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn fs_storage_streaming_ingest_rejects_corruption_and_cleans_pack() {
+        use crate::chunk_storage::hashmap_storage::HashMapStorage;
+        use crate::item::Manifest;
+
+        let root = temp_path();
+        let storage = Arc::new(FsStorage::new(root.clone()).unwrap());
+        let source = HashMapStorage::default();
+        let data = vec![0x5au8; CHUNK_SIZE];
+        let (tree, chunks) = source.chunk_tree(&data, ChunkAlgorithm::Fixed256K).unwrap();
+        let manifest = Manifest::from_tree(
+            "rejected-stream".to_string(),
+            1,
+            &tree,
+            &chunks,
+            ChunkAlgorithm::Fixed256K,
+        );
+        let mut ingest = storage
+            .begin_sync_ingest(
+                "rejected-stream".to_string(),
+                PathBuf::from("rejected.bin"),
+                1,
+                None,
+                manifest,
+                chunks,
+                Vec::new(),
+            )
+            .unwrap();
+        let corrupt = ReceivedChunk::from_vec(vec![0xa5u8; CHUNK_SIZE]);
+
+        assert!(ingest.push_chunk(0, &corrupt).is_err());
+        drop(ingest);
+
+        assert!(!root.join("rejected.bin").exists());
+        assert_eq!(
+            fs::read_dir(root.join(FS_SYNC_INGEST_NAMESPACE))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn fs_storage_startup_cleans_stale_streaming_ingest_pack() {
+        let root = temp_path();
+        let ingest_root = root.join(FS_SYNC_INGEST_NAMESPACE);
+        fs::create_dir_all(&ingest_root).unwrap();
+        let stale = ingest_root.join(format!(
+            "{}.{}",
+            uuid::Uuid::new_v4().simple(),
+            FS_SYNC_INGEST_EXTENSION
+        ));
+        fs::write(&stale, vec![0x5au8; CHUNK_SIZE]).unwrap();
+
+        let _storage = FsStorage::new(root).unwrap();
+
+        assert!(!stale.exists());
+        assert_eq!(fs::read_dir(ingest_root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn fs_storage_appends_served_chunks_without_populating_hot_cache() {
+        let root = temp_path();
+        let data: Vec<u8> = (0..(CHUNK_SIZE * 2 + 73))
+            .map(|index| ((index * 13 + 5) % 251) as u8)
+            .collect();
+        let storage = FsStorage::new(root.clone()).unwrap();
+        let item = storage
+            .create_item(
+                "served-item".to_string(),
+                PathBuf::from("served.bin"),
+                0,
+                None,
+                bytes::Bytes::copy_from_slice(&data),
+                ChunkAlgorithm::Fixed256K,
+            )
+            .unwrap();
+        let root_hash = item.metadata.root.hash;
+        let chunks = item.chunks.clone();
+        drop(storage);
+
+        let storage = FsStorage::new(root).unwrap();
+        assert_eq!(storage.chunk_cache_stats().current_bytes, 0);
+        let mut output = vec![0xabu8; 3];
+        for (index, chunk) in chunks.iter().enumerate() {
+            assert_eq!(
+                storage.append_chunk_by_index(
+                    &root_hash,
+                    u32::try_from(index).unwrap(),
+                    &mut output,
+                ),
+                Some(chunk.size as usize)
+            );
+        }
+
+        assert_eq!(&output[..3], &[0xab; 3]);
+        assert_eq!(&output[3..], data);
+        assert_eq!(storage.chunk_cache_stats().current_bytes, 0);
     }
 
     #[tokio::test]
@@ -12782,7 +13479,11 @@ mod tests {
             .unwrap()
         }
 
-        fn stage_one_chunk(bytes: &[u8], item: &Item, index: usize) -> HashMap<Hash, ChunkData> {
+        fn stage_one_chunk(
+            bytes: &[u8],
+            item: &Item,
+            index: usize,
+        ) -> HashMap<Hash, StagedChunkSource> {
             let chunk = item.chunks[index];
             let offset = item.chunks[..index]
                 .iter()
@@ -12791,13 +13492,10 @@ mod tests {
             let end = offset + chunk.size as usize;
             let staged = HashMap::from_iter([(
                 chunk.hash,
-                ChunkData::Owned(Arc::new(bytes[offset..end].to_vec())),
+                StagedChunkSource::Memory(ChunkData::Owned(Arc::new(bytes[offset..end].to_vec()))),
             )]);
             assert_eq!(
-                staged
-                    .values()
-                    .map(|data| data.as_ref().len())
-                    .sum::<usize>(),
+                staged.values().map(StagedChunkSource::len).sum::<usize>(),
                 ENTRY_BYTES
             );
             assert!(FS_ACTIVATION_COPY_BUFFER_BYTES + ENTRY_BYTES <= 8 * 1024 * 1024);

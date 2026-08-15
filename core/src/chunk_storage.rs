@@ -248,6 +248,18 @@ impl ReceivedChunk {
     }
 
     #[must_use]
+    pub fn from_bytes(data: Bytes) -> Self {
+        let allocation_bytes = data.len();
+        Self {
+            bytes: data,
+            backing: Arc::new(ReceivedBacking {
+                id: next_received_backing_id(),
+                allocation_bytes,
+            }),
+        }
+    }
+
+    #[must_use]
     pub fn copy_from_slice(data: &[u8]) -> Self {
         Self::from_vec(data.to_vec())
     }
@@ -302,6 +314,12 @@ impl ReceivedChunk {
 impl From<Vec<u8>> for ReceivedChunk {
     fn from(data: Vec<u8>) -> Self {
         Self::from_vec(data)
+    }
+}
+
+impl From<Bytes> for ReceivedChunk {
+    fn from(data: Bytes) -> Self {
+        Self::from_bytes(data)
     }
 }
 
@@ -390,6 +408,21 @@ pub trait ChunkStorage: HashTreeCapable<Arc<Node>, Error> {
         let node = self.get(root)?;
         let leaves = node.flatten_iter().ok()?;
         leaves.get(index as usize).map(|arc| (**arc).clone())
+    }
+
+    /// Append one positional chunk directly into a caller-owned transfer
+    /// buffer. Backends should override this to avoid an intermediate owned
+    /// chunk allocation on hot serving paths.
+    fn append_chunk_by_index(
+        &self,
+        root: &Hash,
+        index: u32,
+        destination: &mut Vec<u8>,
+    ) -> Option<usize> {
+        let chunk = self.get_chunk_by_index(root, index)?;
+        let length = chunk.len();
+        destination.extend_from_slice(&chunk);
+        Some(length)
     }
 
     /// Verify that an already-committed immutable revision is complete and

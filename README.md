@@ -28,7 +28,7 @@ QUIC.
 | Publisher signatures at the server publication boundary | Implemented |
 | Client publisher allowlist and signature verification | Implemented |
 | Durable publisher-sequence rollback protection | Implemented |
-| Configured client missing-payload memory admission | Implemented |
+| Configured client missing-payload admission | Implemented |
 
 The term “PPSPP-style” in the code refers only to the manifest → possession
 bitfield → missing-chunk exchange. There is currently no peer discovery,
@@ -74,12 +74,14 @@ only, `allow_unsigned_publication = true` may replace the publisher-key list.
 The two settings are mutually exclusive, and omitting both fails closed before
 the client connects or changes local artifact state.
 
-`client.max_sync_memory_mib` bounds decoded missing payload retained for one
-sync and defaults to 512 MiB (accepted range: 1 through 1,024 MiB). The client
-computes the exact missing-byte sum from the verified manifest and local
-possession basis, then rejects over-budget releases before advancing rollback
-state or sending possession. This budget excludes bounded manifest metadata and
-the one currently decoded protocol frame.
+`client.max_sync_memory_mib` is the backward-compatible name of the
+missing-payload admission limit and defaults to 512 MiB (accepted range: 1
+through 1,024 MiB). The client computes the exact missing-byte sum from the
+verified manifest and local possession basis, then rejects over-budget releases
+before advancing rollback state or sending possession. Admitted payload is not
+retained in RAM: verified chunks flow through a 4 MiB frame, a one-batch
+backpressure channel, and a transfer-scoped disk pack. The limit therefore
+controls transfer and temporary-disk exposure rather than heap allocation.
 
 Fetch an artifact by stable ID into a client-selected relative destination:
 
@@ -144,10 +146,13 @@ artifact identity.
   and atomic local activation.
 - `distd_bench`: isolated experimental harness and QUIC network shaper.
 
-Clients verify every received chunk and the complete manifest root before
-materializing a staging tree. Activation replaces the previous file or directory
-with a same-filesystem rename, so shorter files and removed directory entries do
-not survive an update.
+Clients verify each received chunk while appending it to a transfer-scoped pack,
+then re-verify the complete manifest root while materializing an immutable
+revision. Only the completed revision can enter the existing atomic activation
+transaction. Activation replaces the previous file or directory with a
+same-filesystem rename, so shorter files and removed directory entries do not
+survive an update. Aborted transfers remove their pack, and startup removes
+well-formed packs left by a process crash.
 
 ### QUIC wire contract
 
@@ -322,9 +327,9 @@ path around either requirement.
 - Multipart publication fields are still buffered before chunking, but each
   request remains capped at 512 MiB and aggregate declared bodies are bounded
   by `DISTD_PUBLICATION_MEMORY_MIB`.
-- A client retains all missing chunks for an admitted artifact until atomic
-  activation; `client.max_sync_memory_mib` now bounds that decoded payload, but
-  chunks are not yet streamed directly into activation staging.
+- Transfer packs are crash-safe but not resumable across process restarts; a
+  restarted client removes the incomplete pack and requests its missing chunks
+  again.
 - Server metadata and chunk storage must be backed up and restored together.
 - Client UUIDs are session authorization handles; after a server restart,
   clients re-enroll using the configured enrollment secret.

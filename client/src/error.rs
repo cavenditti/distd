@@ -86,7 +86,7 @@ pub enum ServerRequest {
     RollbackProtection(#[from] RollbackError),
 
     #[error(
-        "sync requires {required_bytes} bytes of missing-payload retention, configured limit is {limit_bytes} bytes"
+        "sync requires {required_bytes} bytes of missing-payload transfer and staging, configured limit is {limit_bytes} bytes"
     )]
     SyncMemoryLimit {
         required_bytes: u64,
@@ -95,6 +95,9 @@ pub enum ServerRequest {
 
     #[error("server metadata worker failed")]
     MetadataWorker,
+
+    #[error("client storage ingest worker stopped during sync")]
+    StorageIngestClosed,
 }
 
 #[derive(Error, Debug)]

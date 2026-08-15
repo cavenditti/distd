@@ -13,7 +13,10 @@ use rustc_hash::FxHashSet as HashSet;
 use std::{fmt::Debug, sync::Arc, time::Duration};
 use uuid::Uuid;
 
-use tokio::{sync::RwLock, time::Instant};
+use tokio::{
+    sync::{mpsc, RwLock},
+    time::Instant,
+};
 
 //use ring::agreement::PublicKey;
 
@@ -34,6 +37,17 @@ use distd_core::{
 mod quic;
 
 use quic::{QuicSyncSession, QuicTransportClient};
+
+#[derive(Debug)]
+pub(crate) struct ReceivedChunkBatch {
+    pub(crate) chunks: Vec<(u32, ReceivedChunk)>,
+}
+
+impl ReceivedChunkBatch {
+    pub(crate) fn into_chunks(self) -> Vec<(u32, ReceivedChunk)> {
+        self.chunks
+    }
+}
 
 #[derive(Clone, Debug)]
 enum TransportClient {
@@ -113,7 +127,7 @@ impl PendingManifest {
 }
 
 #[derive(Debug)]
-struct VerifiedSync {
+pub(crate) struct VerifiedSync {
     manifest: Manifest,
     chunks: Vec<ChunkInfo>,
     chunk_sizes: Vec<usize>,
@@ -256,6 +270,36 @@ impl SyncContinuation {
         }
     }
 
+    async fn send_possession_and_stream_chunks(
+        self,
+        possession: proto::PossessionBitfield,
+        chunk_sizes: &[usize],
+        sender: mpsc::Sender<ReceivedChunkBatch>,
+    ) -> Result<u64, ServerRequest> {
+        match self {
+            Self::Quic(session) => {
+                session
+                    .send_possession_and_stream_chunks(possession, chunk_sizes, sender)
+                    .await
+            }
+            #[cfg(test)]
+            Self::Observed(mut observed) => {
+                observed
+                    .observer
+                    .possession_sends
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let bitfield = distd_core::possession::Bitfield::from_bytes(&possession.bitfield)
+                    .ok_or(ServerRequest::UnexpectedMessage)?;
+                if bitfield.chunk_count() as usize != chunk_sizes.len() || !bitfield.is_complete() {
+                    return Err(ServerRequest::UnexpectedMessage);
+                }
+                drop(sender);
+                observed.completed = true;
+                Ok(0)
+            }
+        }
+    }
+
     fn abort(self) {
         match self {
             Self::Quic(session) => session.abort(),
@@ -272,6 +316,32 @@ impl SyncContinuation {
 }
 
 impl VerifiedSync {
+    pub(crate) fn manifest(&self) -> &Manifest {
+        &self.manifest
+    }
+
+    pub(crate) fn chunks(&self) -> &[ChunkInfo] {
+        &self.chunks
+    }
+
+    pub(crate) fn local_hashes(&self) -> &[Hash] {
+        &self.local_hashes
+    }
+
+    pub(crate) async fn transfer_into(
+        self,
+        sender: mpsc::Sender<ReceivedChunkBatch>,
+    ) -> Result<u64, ServerRequest> {
+        if let Some(fingerprint) = self.publisher_fingerprint {
+            tracing::debug!(%fingerprint, "publisher manifest verified");
+        } else {
+            tracing::warn!("unsigned publisher manifest accepted by explicit insecure policy");
+        }
+        self.continuation
+            .send_possession_and_stream_chunks(self.possession, &self.chunk_sizes, sender)
+            .await
+    }
+
     async fn transfer(
         self,
     ) -> Result<(Manifest, Vec<ChunkInfo>, Vec<ReceivedChunk>, u64, Vec<Hash>), ServerRequest> {
@@ -326,7 +396,7 @@ pub struct Server {
     /// Durable publisher-release high-water marks for this exact authority.
     rollback_state: ClientRollbackState,
 
-    /// Maximum decoded missing payload retained before activation.
+    /// Maximum missing payload admitted for transfer and disk staging.
     max_sync_payload_bytes: u64,
 
     /// Client Uuid assigned to client from server
@@ -687,6 +757,18 @@ impl Server {
         expected: ItemMetadata,
         local_basis: LocalChunkBasis,
     ) -> Result<(Manifest, Vec<ChunkInfo>, Vec<ReceivedChunk>, u64, Vec<Hash>), ServerRequest> {
+        self.prepare_sync_artifact_expected(requested_artifact_id, expected, local_basis)
+            .await?
+            .transfer()
+            .await
+    }
+
+    pub(crate) async fn prepare_sync_artifact_expected(
+        &self,
+        requested_artifact_id: String,
+        expected: ItemMetadata,
+        local_basis: LocalChunkBasis,
+    ) -> Result<VerifiedSync, ServerRequest> {
         require_requested_catalog_identity(&requested_artifact_id, &expected)?;
         let transport = self.shared.read().await.transport.clone();
         let manifest_request = proto::ManifestRequest {
@@ -694,7 +776,7 @@ impl Server {
             version: Some(u64::from(expected.revision)),
         };
         let pending = transport.open_sync(manifest_request).await?;
-        verify_and_transfer_pending(
+        verify_pending(
             pending,
             expected,
             local_basis,
@@ -735,6 +817,7 @@ impl Server {
     }
 }
 
+#[cfg(test)]
 async fn verify_and_transfer_pending<Basis>(
     pending: PendingSync,
     expected: ItemMetadata,
@@ -747,8 +830,34 @@ async fn verify_and_transfer_pending<Basis>(
 where
     Basis: Into<LocalChunkBasis>,
 {
+    verify_pending(
+        pending,
+        expected,
+        local_basis,
+        policy,
+        rollback_state,
+        authority,
+        max_sync_payload_bytes,
+    )
+    .await?
+    .transfer()
+    .await
+}
+
+async fn verify_pending<Basis>(
+    pending: PendingSync,
+    expected: ItemMetadata,
+    local_basis: Basis,
+    policy: PublisherPolicy,
+    rollback_state: ClientRollbackState,
+    authority: CanonicalServerUrl,
+    max_sync_payload_bytes: u64,
+) -> Result<VerifiedSync, ServerRequest>
+where
+    Basis: Into<LocalChunkBasis>,
+{
     let local_basis = local_basis.into();
-    verify_and_transfer_pending_with(pending, move |response| {
+    verify_pending_with(pending, move |response| {
         let parts = verify_manifest_response_with_basis(response, &expected, local_basis, &policy)?;
         let (
             manifest,
@@ -803,10 +912,36 @@ fn enforce_sync_memory_budget(required_bytes: u64, limit_bytes: u64) -> Result<(
     }
 }
 
+#[cfg(test)]
 async fn verify_and_transfer_pending_with<Verify, VerifyError>(
     pending: PendingSync,
     verify: Verify,
 ) -> Result<(Manifest, Vec<ChunkInfo>, Vec<ReceivedChunk>, u64, Vec<Hash>), ServerRequest>
+where
+    Verify: FnOnce(
+            proto::ManifestResponse,
+        ) -> Result<
+            (
+                Manifest,
+                Vec<ChunkInfo>,
+                Vec<usize>,
+                proto::PossessionBitfield,
+                PublisherAuthorization,
+                Vec<Hash>,
+                u64,
+            ),
+            VerifyError,
+        > + Send
+        + 'static,
+    VerifyError: Into<ServerRequest> + Send + 'static,
+{
+    verify_pending_with(pending, verify).await?.transfer().await
+}
+
+async fn verify_pending_with<Verify, VerifyError>(
+    pending: PendingSync,
+    verify: Verify,
+) -> Result<VerifiedSync, ServerRequest>
 where
     Verify: FnOnce(
             proto::ManifestResponse,
@@ -855,7 +990,7 @@ where
             return Err(ServerRequest::PublisherVerificationWorker);
         }
     };
-    VerifiedSync {
+    Ok(VerifiedSync {
         manifest,
         chunks,
         chunk_sizes,
@@ -863,9 +998,7 @@ where
         publisher_fingerprint: publisher_authorization.fingerprint(),
         local_hashes,
         continuation,
-    }
-    .transfer()
-    .await
+    })
 }
 
 fn require_requested_catalog_identity(

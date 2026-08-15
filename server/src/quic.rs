@@ -12,7 +12,10 @@ use distd_core::proto::sync_message::Msg;
 use distd_core::proto::{
     ClientKeepAlive, ClientRegister, ManifestRequest, PossessionBitfield, SyncMessage,
 };
-use distd_core::transport::{TransportOp, WireRejection, WireRejectionStatus};
+use distd_core::transport::{
+    TransportOp, WireRejection, WireRejectionStatus, SYNC_QUIC_CONNECTION_WINDOW_BYTES,
+    SYNC_QUIC_STREAM_WINDOW_BYTES,
+};
 use distd_core::utils::frame::{
     encode_length_delimited, read_length_delimited_async_with_limit, read_optional_uuid_async,
     read_transport_op_async, read_wire_preface_async, write_length_delimited_async,
@@ -841,9 +844,9 @@ fn make_server_config() -> Result<quinn::ServerConfig, ServerError> {
         .map_err(|err| ServerError::Quic(err.to_string()))?;
 
     let mut transport = quinn::TransportConfig::default();
-    transport.receive_window(quinn::VarInt::from_u32(64 * 1024 * 1024));
-    transport.stream_receive_window(quinn::VarInt::from_u32(32 * 1024 * 1024));
-    transport.send_window(64 * 1024 * 1024);
+    transport.receive_window(quinn::VarInt::from_u32(SYNC_QUIC_CONNECTION_WINDOW_BYTES));
+    transport.stream_receive_window(quinn::VarInt::from_u32(SYNC_QUIC_STREAM_WINDOW_BYTES));
+    transport.send_window(SYNC_QUIC_CONNECTION_WINDOW_BYTES as u64);
     transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
     transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(32));
     transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(0));
@@ -1114,7 +1117,10 @@ where
                         &mut iter_state.cursor,
                         Some(primary_path.as_path()),
                         iter_state.likely_precompressed,
-                        &mut |idx| self.storage().get_chunk_by_index(&root_hash, idx),
+                        &mut |idx, destination| {
+                            self.storage()
+                                .append_chunk_by_index(&root_hash, idx, destination)
+                        },
                     )
                     .map_err(|_| StreamFailure::internal(QuicPhase::Internal))?;
                     batch_build_ns += t0.elapsed().as_nanos() as u64;

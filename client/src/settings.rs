@@ -13,7 +13,10 @@ const MIB: u64 = 1024 * 1024;
 pub(crate) const DEFAULT_MAX_SYNC_MEMORY_MIB: u64 = 512;
 pub(crate) const MAX_SYNC_MEMORY_MIB: u64 = 1024;
 
-/// Validated payload-retention budget for one client synchronization.
+/// Validated missing-payload admission budget for one client synchronization.
+///
+/// The payload is streamed through bounded buffers; this limit controls the
+/// largest release the client is willing to transfer and stage on disk.
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) struct SyncMemoryBudget {
     bytes: u64,

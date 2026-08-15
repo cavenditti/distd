@@ -296,9 +296,23 @@ impl DistdRunner {
             .join(format!("server_storage_{storage_nonce}"));
         let server_state = self.work_dir.join("server-state");
         std::fs::create_dir_all(&server_state).map_err(|error| error.to_string())?;
-        let metadata_path = server_state.join("metadata.bitcode");
-        if metadata_path.exists() {
-            std::fs::remove_file(&metadata_path).map_err(|error| error.to_string())?;
+        // Each benchmark iteration gets a new storage root, so every metadata
+        // schema that can point at the previous root must be cleared as one
+        // coordinated piece of ephemeral benchmark state. Keeping only the
+        // obsolete bitcode path made iteration two load a valid selector for
+        // storage that had deliberately been removed.
+        for metadata_name in [
+            "metadata.release.state",
+            "metadata.signed.state",
+            "metadata.state",
+            "metadata.bitcode",
+        ] {
+            let metadata_path = server_state.join(metadata_name);
+            match std::fs::remove_file(&metadata_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.to_string()),
+            }
         }
 
         let bins = Self::binary_paths()?;

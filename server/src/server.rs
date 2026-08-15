@@ -20,7 +20,7 @@ use distd_core::proto::{
 use distd_core::signature::{
     PublisherReleaseEnvelope, PublisherReleaseSequence, PublisherSignatureEnvelope,
 };
-use distd_core::transport::maybe_compress_sync_payload_owned;
+use distd_core::transport::{maybe_compress_sync_payload_owned, SYNC_PAYLOAD_BATCH_TARGET_BYTES};
 use distd_core::utils::serde::BitcodeSerializable;
 use distd_core::utils::uuid::slice_to_uuid;
 use ring::error::KeyRejected;
@@ -720,7 +720,10 @@ where
             &missing,
             Some(item.metadata.path.as_path()),
             likely_precompressed,
-            |idx| self.storage.get_chunk_by_index(&root_hash, idx),
+            |idx, destination| {
+                self.storage
+                    .append_chunk_by_index(&root_hash, idx, destination)
+            },
         )? {
             messages.push(batch);
         }
@@ -1448,7 +1451,6 @@ fn same_signed_statement_content(left: &Item, right: &Item) -> bool {
         && left.chunks == right.chunks
 }
 
-const BULK_TARGET_BYTES: usize = 16 * 1024 * 1024;
 const BULK_MAX_CHUNKS: usize = 512;
 
 /// State for streaming sync chunk batches one at a time.
@@ -1467,13 +1469,13 @@ pub fn build_one_batch<F>(
     load_chunk: &mut F,
 ) -> Result<Option<SyncMessage>, String>
 where
-    F: FnMut(u32) -> Option<Vec<u8>>,
+    F: FnMut(u32, &mut Vec<u8>) -> Option<usize>,
 {
     while *cursor < missing.len() {
         let start_index = missing[*cursor];
         let mut current_index = start_index;
         let mut count = 0usize;
-        let mut bulk_buf = Vec::with_capacity(BULK_TARGET_BYTES);
+        let mut bulk_buf = Vec::with_capacity(SYNC_PAYLOAD_BATCH_TARGET_BYTES);
 
         while *cursor < missing.len() && count < BULK_MAX_CHUNKS {
             let idx = missing[*cursor];
@@ -1481,18 +1483,23 @@ where
                 break;
             }
 
-            let Some(data) = load_chunk(idx) else {
+            let checkpoint = bulk_buf.len();
+            let Some(length) = load_chunk(idx, &mut bulk_buf) else {
+                bulk_buf.truncate(checkpoint);
                 if count == 0 {
                     *cursor += 1;
                 }
                 break;
             };
 
-            if count > 0 && bulk_buf.len() + data.len() > BULK_TARGET_BYTES {
+            if bulk_buf.len() != checkpoint.saturating_add(length) {
+                return Err("chunk loader appended an invalid byte count".to_string());
+            }
+            if count > 0 && bulk_buf.len() > SYNC_PAYLOAD_BATCH_TARGET_BYTES {
+                bulk_buf.truncate(checkpoint);
                 break;
             }
 
-            bulk_buf.extend_from_slice(&data);
             count += 1;
             *cursor += 1;
             current_index += 1;
@@ -1510,7 +1517,7 @@ where
             SyncMessage {
                 msg: Some(Msg::ChunkData(proto::ChunkData {
                     chunk_index: start_index,
-                    data: encoded.data,
+                    data: encoded.data.into(),
                     compression: encoded.compression,
                     uncompressed_size: encoded.uncompressed_size,
                 })),
@@ -1518,7 +1525,7 @@ where
         } else {
             SyncMessage {
                 msg: Some(Msg::BulkData(proto::BulkData {
-                    data: encoded.data,
+                    data: encoded.data.into(),
                     start_index,
                     count: count as u32,
                     compression: encoded.compression,
@@ -1538,7 +1545,7 @@ fn build_sync_payload_batches<F>(
     mut load_chunk: F,
 ) -> Result<Vec<SyncMessage>, String>
 where
-    F: FnMut(u32) -> Option<Vec<u8>>,
+    F: FnMut(u32, &mut Vec<u8>) -> Option<usize>,
 {
     let mut messages = Vec::new();
     let mut cursor = 0;
@@ -1976,11 +1983,15 @@ mod tests {
 
     #[test]
     fn builds_bulk_messages_for_contiguous_partial_runs() {
-        let messages = build_sync_payload_batches(&[1, 2, 4], None, false, |idx| match idx {
-            1 => Some(vec![1, 2]),
-            2 => Some(vec![3, 4]),
-            4 => Some(vec![9]),
-            _ => None,
+        let messages = build_sync_payload_batches(&[1, 2, 4], None, false, |idx, output| {
+            let data = match idx {
+                1 => &[1, 2][..],
+                2 => &[3, 4][..],
+                4 => &[9][..],
+                _ => return None,
+            };
+            output.extend_from_slice(data);
+            Some(data.len())
         })
         .expect("build sync payload batches");
 
@@ -2008,10 +2019,14 @@ mod tests {
 
     #[test]
     fn skips_missing_chunks_absent_from_storage() {
-        let messages = build_sync_payload_batches(&[0, 1, 2], None, false, |idx| match idx {
-            1 => Some(vec![7, 8]),
-            2 => Some(vec![9, 10]),
-            _ => None,
+        let messages = build_sync_payload_batches(&[0, 1, 2], None, false, |idx, output| {
+            let data = match idx {
+                1 => &[7, 8][..],
+                2 => &[9, 10][..],
+                _ => return None,
+            };
+            output.extend_from_slice(data);
+            Some(data.len())
         })
         .expect("build sync payload batches");
 
