@@ -154,6 +154,31 @@ same-filesystem rename, so shorter files and removed directory entries do not
 survive an update. Aborted transfers remove their pack, and startup removes
 well-formed packs left by a process crash.
 
+### Random-access blob reads
+
+`distd_core::blob::BlobReader` exposes a file through `std::io::Read`,
+`std::io::Seek`, and `read_at(offset, buffer)` without assembling an output file.
+Use `BlobReader::new(&storage, &item)` for a single-file artifact or
+`BlobReader::open_file(&storage, &item, "relative/path")` for a directory entry.
+`read_at` preserves the stream cursor; offsets are relative to the selected file.
+
+The reader indexes actual chunk sizes, supports fixed and content-defined
+profiles, and verifies each touched chunk's length and BLAKE3 hash before
+returning bytes. It retains one verified chunk plus an offset index; backend
+caches have their own budgets. HashMap, filesystem, redb, and standalone CAS
+storage implement the `BlobChunkSource` interface. Reads use chunk identities
+directly and do not require a complete stored tree.
+
+Unavailable chunks return `NotFound` with a typed `MissingChunk` containing the
+hash and size, allowing a caller to fetch the chunk and retry. Reads that reach
+a missing or corrupt chunk after copying valid bytes return that verified
+prefix; the next read at the failing offset reports the error. Opening does not
+require all payloads to be resident. Network fetching, lazy mounting, Snix blob
+identities, and activation before transfer completion remain future work.
+Callers must authenticate the revision with the existing publisher and rollback
+policies before using this interface; metadata consistency and chunk integrity
+checks alone do not establish publisher trust.
+
 ### QUIC wire contract
 
 Every operation stream begins with the fixed 12-byte V1 preface

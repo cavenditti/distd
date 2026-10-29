@@ -2,6 +2,7 @@
 // `test` is nightly-only; keep it only for nightly builds where benchmarks are run.
 #![cfg_attr(all(test, feature = "nightly-bench"), feature(test))]
 
+pub mod blob;
 pub mod chunk_storage;
 pub mod chunks;
 pub mod durable_state;

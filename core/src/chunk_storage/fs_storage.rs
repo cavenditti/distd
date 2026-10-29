@@ -6784,6 +6784,27 @@ impl FsStorage {
     }
 }
 
+impl crate::blob::BlobChunkSource for FsStorage {
+    fn read_chunk(&self, expected: &ChunkInfo) -> std::io::Result<super::node::ArcChunk> {
+        // Check backing metadata before read_chunk_data allocates a chunk buffer.
+        let info = self
+            .inner
+            .read()
+            .unwrap()
+            .data
+            .get(&expected.hash)
+            .and_then(|entries| entries.first())
+            .map(|entry| entry.info)
+            .ok_or_else(|| crate::blob::missing_chunk(expected))?;
+        if info != *expected {
+            return Err(crate::blob::invalid_chunk_size());
+        }
+        self.read_chunk_data(&expected.hash)
+            .map(ChunkData::into_owned)
+            .ok_or_else(|| crate::blob::missing_chunk(expected))
+    }
+}
+
 impl ChunkStorage for FsStorage {
     fn get(&self, hash: &Hash) -> Option<Arc<Node>> {
         let linked = self.inner.read().unwrap().links.get(hash).cloned();

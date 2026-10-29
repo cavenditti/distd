@@ -23,6 +23,22 @@ impl Clone for HashMapStorage {
     }
 }
 
+impl crate::blob::BlobChunkSource for HashMapStorage {
+    fn read_chunk(
+        &self,
+        expected: &crate::chunks::ChunkInfo,
+    ) -> std::io::Result<super::node::ArcChunk> {
+        let node = self
+            .get(&expected.hash)
+            .ok_or_else(|| crate::blob::missing_chunk(expected))?;
+        match node.as_ref() {
+            Node::Stored { data, .. } if data.len() as u64 == expected.size => Ok(data.clone()),
+            Node::Stored { .. } => Err(crate::blob::invalid_chunk_size()),
+            _ => Err(crate::blob::missing_chunk(expected)),
+        }
+    }
+}
+
 impl ChunkStorage for HashMapStorage {
     fn get(&self, hash: &Hash) -> Option<Arc<Node>> {
         self.data.read().unwrap().get(hash).cloned()

@@ -250,6 +250,31 @@ impl RedbStorage {
     }
 }
 
+impl crate::blob::BlobChunkSource for RedbStorage {
+    fn read_chunk(
+        &self,
+        expected: &crate::chunks::ChunkInfo,
+    ) -> std::io::Result<super::node::ArcChunk> {
+        let transaction = self.db.begin_read().map_err(std::io::Error::other)?;
+        let chunks = match transaction.open_table(CHUNK_TABLE) {
+            Ok(chunks) => chunks,
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                return Err(crate::blob::missing_chunk(expected));
+            }
+            Err(error) => return Err(std::io::Error::other(error)),
+        };
+        let data = chunks
+            .get(expected.hash.as_bytes())
+            .map_err(std::io::Error::other)?
+            .ok_or_else(|| crate::blob::missing_chunk(expected))?;
+        let bytes = data.value();
+        if bytes.len() as u64 != expected.size {
+            return Err(crate::blob::invalid_chunk_size());
+        }
+        Ok(Arc::new(bytes.to_vec()))
+    }
+}
+
 impl ChunkStorage for RedbStorage {
     fn get(&self, hash: &Hash) -> Option<Arc<Node>> {
         Self::get_from_snapshot(&self.db.begin_read().ok()?, hash)

@@ -4,7 +4,7 @@
 //! This provides natural deduplication and resume capability.
 
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::hash::Hash;
@@ -91,6 +91,35 @@ impl CasStorage {
         }
         fs::rename(&staging, dest)?;
         Ok(())
+    }
+}
+
+impl crate::blob::BlobChunkSource for CasStorage {
+    fn read_chunk(
+        &self,
+        expected: &crate::chunks::ChunkInfo,
+    ) -> std::io::Result<super::node::ArcChunk> {
+        let mut file = fs::File::open(self.chunk_path(&expected.hash)).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                crate::blob::missing_chunk(expected)
+            } else {
+                error
+            }
+        })?;
+        if file.metadata()?.len() != expected.size {
+            return Err(crate::blob::invalid_chunk_size());
+        }
+        let size = usize::try_from(expected.size).map_err(|_| crate::blob::invalid_chunk_size())?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(size)
+            .map_err(std::io::Error::other)?;
+        bytes.resize(size, 0);
+        file.read_exact(&mut bytes)?;
+        if file.read(&mut [0])? != 0 {
+            return Err(crate::blob::invalid_chunk_size());
+        }
+        Ok(std::sync::Arc::new(bytes))
     }
 }
 
