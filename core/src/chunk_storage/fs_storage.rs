@@ -3323,6 +3323,75 @@ impl FsStorage {
         }
     }
 
+    /// Materialize and publish a verified whole-file CAS blob from `file_chunks` and `source`
+    /// into `.distd-activation-v1/blobs/<2-hex-prefix>/<blob_hash>`, returning the CAS blob path.
+    pub fn materialize_cas_blob_from_source(
+        &self,
+        file_chunks: &[ChunkInfo],
+        source: &impl crate::blob::BlobChunkSource,
+    ) -> std::io::Result<PathBuf> {
+        let blob_hash = Self::file_blob_hash(file_chunks)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
+        let expected_size = file_chunks.iter().try_fold(0u64, |acc, chunk| {
+            acc.checked_add(chunk.size).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "file blob size overflows u64",
+                )
+            })
+        })?;
+        if self.has_cas_blob(&blob_hash, expected_size) {
+            return Ok(self.cas_blob_path(&blob_hash));
+        }
+
+        let ingest_root = self
+            .inner
+            .read()
+            .unwrap()
+            .root
+            .join(FS_SYNC_INGEST_NAMESPACE);
+        match fs::symlink_metadata(&ingest_root) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(std::io::Error::other(
+                    "sync ingest namespace is not a directory",
+                ))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&ingest_root)?;
+                Self::sync_parent(&ingest_root).map_err(std::io::Error::other)?;
+            }
+            Err(error) => return Err(error),
+        }
+
+        let (temp_path, mut temp_file) =
+            Self::open_new_ingest_pack(&ingest_root).map_err(std::io::Error::other)?;
+        let write_result = (|| -> std::io::Result<PathBuf> {
+            for chunk in file_chunks {
+                let bytes = source.read_chunk(chunk)?;
+                if bytes.len() as u64 != chunk.size {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "chunk size differs from manifest",
+                    ));
+                }
+                if do_hash(bytes.as_slice()) != chunk.hash {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "chunk failed BLAKE3 verification",
+                    ));
+                }
+                temp_file.write_all(bytes.as_slice())?;
+            }
+            temp_file.sync_all()?;
+            self.publish_cas_blob_from_path(&temp_path, &blob_hash, expected_size)
+                .map_err(std::io::Error::other)
+        })();
+        drop(temp_file);
+        let _ = fs::remove_file(&temp_path);
+        write_result
+    }
+
     fn try_hardlink_cas_blob(
         &self,
         blob_hash: &Hash,

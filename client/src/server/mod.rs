@@ -788,6 +788,107 @@ impl Server {
         .await
     }
 
+    /// Fetch a targeted subset of missing chunks on demand over QUIC for lazy range hydration.
+    ///
+    /// Authenticates the artifact's manifest and publisher signature, constructs a selective
+    /// [`proto::PossessionBitfield`] requesting only the first manifest occurrence of each hash in
+    /// `requested_chunks`, verifies every received chunk's BLAKE3 digest and declared length, and
+    /// returns the verified `(ChunkInfo, ReceivedChunk)` pairs.
+    pub async fn fetch_chunks_on_demand(
+        &self,
+        artifact_id: &str,
+        requested_chunks: &[ChunkInfo],
+    ) -> Result<(Vec<(ChunkInfo, ReceivedChunk)>, u64), ServerRequest> {
+        if requested_chunks.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        let expected = self
+            .metadata_item(artifact_id)
+            .await
+            .ok_or(ServerRequest::UnexpectedMessage)?;
+        require_requested_catalog_identity(artifact_id, &expected)?;
+        let requested_hashes: Vec<Hash> = requested_chunks.iter().map(|c| c.hash).collect();
+        let transport = self.shared.read().await.transport.clone();
+        let manifest_request = proto::ManifestRequest {
+            artifact_id: artifact_id.to_owned(),
+            version: Some(u64::from(expected.revision)),
+        };
+        let pending = transport.open_sync(manifest_request).await?;
+        let policy = self.publisher_policy.clone();
+        let rollback_state = self.rollback_state.clone();
+        let authority = self.url.clone();
+        let max_sync_payload_bytes = self.max_sync_payload_bytes;
+
+        let verified = verify_pending_with(pending, move |response| {
+            let parts = verify_manifest_response_selective(
+                response,
+                &expected,
+                &requested_hashes,
+                &policy,
+            )?;
+            let (
+                manifest,
+                chunks,
+                chunk_sizes,
+                possession,
+                authorization,
+                selected_hashes,
+                missing_payload_bytes,
+            ) = parts;
+            enforce_sync_memory_budget(missing_payload_bytes, max_sync_payload_bytes)?;
+            if let Some(verified) = authorization.rollback() {
+                let receipt =
+                    rollback_state.authorize(&authority, &manifest.artifact_id, verified)?;
+                if !receipt.matches(
+                    &authority,
+                    &manifest.artifact_id,
+                    verified.sequence(),
+                    verified.statement_identity(),
+                ) {
+                    return Err(ServerRequest::PublisherVerificationWorker);
+                }
+            }
+            Ok((
+                manifest,
+                chunks,
+                chunk_sizes,
+                possession,
+                authorization,
+                selected_hashes,
+                missing_payload_bytes,
+            ))
+        })
+        .await?;
+
+        let bitfield = distd_core::possession::Bitfield::from_bytes(&verified.possession.bitfield)
+            .ok_or(ServerRequest::UnexpectedMessage)?;
+        let missing_indices = bitfield.missing_indices();
+        let expected_infos: Vec<ChunkInfo> = missing_indices
+            .iter()
+            .map(|&idx| {
+                verified
+                    .chunks
+                    .get(idx as usize)
+                    .copied()
+                    .ok_or(ServerRequest::UnexpectedMessage)
+            })
+            .collect::<Result<_, _>>()?;
+
+        let (_manifest, _chunks, received, wire_bytes, _) = verified.transfer().await?;
+        if received.len() != expected_infos.len() {
+            return Err(ServerRequest::UnexpectedMessage);
+        }
+        let mut verified_pairs = Vec::with_capacity(received.len());
+        for (info, data) in expected_infos.into_iter().zip(received) {
+            if data.len() as u64 != info.size || distd_core::hash::hash(data.as_ref()) != info.hash
+            {
+                return Err(ServerRequest::UnexpectedMessage);
+            }
+            verified_pairs.push((info, data));
+        }
+        Ok((verified_pairs, wire_bytes))
+    }
+
     /// Fetch metadata from server in a loop
     pub async fn fetch_loop(mut self) {
         loop {
@@ -1228,6 +1329,55 @@ fn verify_manifest_response_with_basis(
         },
         publisher_authorization,
         local_hashes,
+        missing_payload_bytes,
+    ))
+}
+
+fn verify_manifest_response_selective(
+    response: proto::ManifestResponse,
+    expected: &ItemMetadata,
+    requested_hashes: &[Hash],
+    policy: &PublisherPolicy,
+) -> Result<VerifiedManifestParts, PublisherAuthenticityError> {
+    let (
+        manifest,
+        chunks,
+        chunk_sizes,
+        _full_possession,
+        publisher_authorization,
+        _local_hashes,
+        _full_missing_bytes,
+    ) = verify_manifest_response_with_basis(
+        response,
+        expected,
+        LocalChunkBasis::default(),
+        policy,
+    )?;
+
+    let mut needed: HashSet<Hash> = requested_hashes.iter().copied().collect();
+    let mut bitfield = distd_core::possession::Bitfield::empty(manifest.chunk_count);
+    let mut missing_payload_bytes = 0u64;
+    for (index, chunk) in chunks.iter().enumerate() {
+        let index_u32 =
+            u32::try_from(index).map_err(|_| PublisherAuthenticityError::MalformedAttestation)?;
+        if needed.remove(&chunk.hash) {
+            missing_payload_bytes = missing_payload_bytes
+                .checked_add(chunk.size)
+                .ok_or(PublisherAuthenticityError::MalformedAttestation)?;
+        } else {
+            bitfield.set(index_u32);
+        }
+    }
+
+    Ok((
+        manifest,
+        chunks,
+        chunk_sizes,
+        proto::PossessionBitfield {
+            bitfield: bitfield.to_bytes(),
+        },
+        publisher_authorization,
+        requested_hashes.to_vec(),
         missing_payload_bytes,
     ))
 }
@@ -2829,5 +2979,36 @@ mod tests {
         let _: uuid::Uuid = server.client_uuid();
         // The authority and pin fields are private. Reconnect reads those same
         // immutable fields together with this private enrolled UUID.
+    }
+
+    #[test]
+    fn selective_manifest_verification_requests_only_target_chunks() {
+        let item = reference_item(8, false);
+        let (response, expected, policy) = signed_response_for_item(item.clone(), [9u8; 32]);
+        let requested_hashes = vec![item.chunks[1].hash, item.chunks[5].hash];
+        let (
+            _manifest,
+            chunks,
+            _chunk_sizes,
+            possession,
+            _auth,
+            selected_hashes,
+            missing_payload_bytes,
+        ) = super::verify_manifest_response_selective(
+            response,
+            &expected,
+            &requested_hashes,
+            &policy,
+        )
+        .unwrap();
+
+        assert_eq!(chunks.len(), 8);
+        assert_eq!(selected_hashes, requested_hashes);
+        assert_eq!(
+            missing_payload_bytes,
+            item.chunks[1].size + item.chunks[5].size
+        );
+        let bitfield = distd_core::possession::Bitfield::from_bytes(&possession.bitfield).unwrap();
+        assert_eq!(bitfield.missing_indices(), vec![1, 5]);
     }
 }
