@@ -1,0 +1,2450 @@
+{
+  "schema": "distd.redb-storage-microbenchmark.v1",
+  "date": "2026-10-29",
+  "scope": "Local storage only; not a QUIC acceptance run or an end-to-end/network benchmark.",
+  "baseline_commit": "70c727b85d2b7b7e7594a7c208f7abf48e29d2b8",
+  "baseline_storage_sha256": "4f6bda8664c43ecc7b36b9b26b83817bdcb6fd6a7fbfbdc1f26b4d29935ea593",
+  "baseline_benchmark_source_sha256_before_formatting": "2a0e371fcb05cce61882c48331fbc8bc294e23aad886338502cc21097ce196d9",
+  "final_candidate_source_sha256": {
+    "core/src/chunk_storage/redb.rs": "20e0a2ec959b66138f8c055dd20bdfbecc6457799286a0d8d5929d5e588c696f",
+    "core/src/chunk_storage/redb/byte_slice.rs": "e34c72f8c25bfd636a8eb2c29364a59e140be43198ad89a2a67d47dfe00cb7e9",
+    "core/examples/redb_storage_bench.rs": "37cfe6e8d2173202d4e40d7853be3d8778c07397ae5c00a8fe98ba5fac56561d",
+    "Cargo.lock": "77fff7ee1035a78bf510b676eff5d90ae3bd15b13dbd170c4ad47dba54e1f11e"
+  },
+  "executable_sha256": {
+    "baseline": "bf48772cad3d239eb955abb1392751eb3861dcb907961f0ebf44c57becf8c3a2",
+    "candidate": "d86a0cbff9a4cc205c1f0223492768681f518ac1b799ae9c299eac72766aa517",
+    "candidate-final": "d86a0cbff9a4cc205c1f0223492768681f518ac1b799ae9c299eac72766aa517"
+  },
+  "toolchain": "rustc 1.96.0 (ac68faa20 2026-05-25)\nbinary: rustc\ncommit-hash: ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96\ncommit-date: 2026-05-25\nhost: aarch64-apple-darwin\nrelease: 1.96.0\nLLVM version: 22.1.2\n",
+  "platform": "ProductName:\t\tmacOS\nProductVersion:\t\t27.0.1\nBuildVersion:\t\t26A434\narm64\n",
+  "build_command": "cargo build --release -p distd_core --features redb --locked --example redb_storage_bench",
+  "run_order": [
+    "baseline",
+    "candidate",
+    "baseline-repeat",
+    "candidate-final"
+  ],
+  "method": [
+    "Each run completes with exit code 0 and produces 5 samples for each of 3 workloads and 4 phases.",
+    "Each sample creates a fresh database under the system temporary directory and reopens it before reads.",
+    "The tree phase runs first, then indexed reads, then append; read phases share the reopened database cache.",
+    "Preparation is outside the timed commit. Commit includes its existing metadata and payload verification.",
+    "Trees and reads are checked against ordered expected chunk hashes and sizes; committed revision verification also runs after every sample.",
+    "Allocation measurements count requested allocation/reallocation bytes; they are allocation traffic, not live/peak RSS or filesystem I/O.",
+    "The append destination is preallocated outside its measured phase; indexed reads retain their owned results.",
+    "The unique 16 MiB file has a distinct 8-byte prefix per fixed 256 KiB chunk; the repeated file contains one repeated chunk.",
+    "The directory workload has 2048 ordered files, each 64 bytes with a distinct 8-byte prefix.",
+    "No network or competing transfer implementation is measured. These results do not establish end-to-end transfer speed.",
+    "The initial candidate and baseline-repeat bracket the candidate measurement; candidate-final repeats the measurement after final formatting and validation."
+  ],
+  "comparison_using_repeat_baseline_and_final_candidate": [
+    {
+      "case": "unique-16mib",
+      "phase": "commit",
+      "baseline_ms": 43.880167,
+      "candidate_ms": 33.6205,
+      "baseline_allocated_bytes": 209887577,
+      "candidate_allocated_bytes": 176333145,
+      "elapsed_ratio_baseline_over_candidate": 1.3051610475751403
+    },
+    {
+      "case": "unique-16mib",
+      "phase": "tree",
+      "baseline_ms": 11.612291,
+      "candidate_ms": 3.11375,
+      "baseline_allocated_bytes": 83998141,
+      "candidate_allocated_bytes": 83981048,
+      "elapsed_ratio_baseline_over_candidate": 3.7293588117222
+    },
+    {
+      "case": "unique-16mib",
+      "phase": "indexed",
+      "baseline_ms": 8.086208,
+      "candidate_ms": 0.38875,
+      "baseline_allocated_bytes": 16931152,
+      "candidate_allocated_bytes": 16800080,
+      "elapsed_ratio_baseline_over_candidate": 20.80053504823151
+    },
+    {
+      "case": "unique-16mib",
+      "phase": "append",
+      "baseline_ms": 8.062041,
+      "candidate_ms": 0.324,
+      "baseline_allocated_bytes": 16921408,
+      "candidate_allocated_bytes": 13120,
+      "elapsed_ratio_baseline_over_candidate": 24.882842592592596
+    },
+    {
+      "case": "repeated-16mib",
+      "phase": "commit",
+      "baseline_ms": 26.844542,
+      "candidate_ms": 18.662083,
+      "baseline_allocated_bytes": 35184107,
+      "candidate_allocated_bytes": 1629675,
+      "elapsed_ratio_baseline_over_candidate": 1.4384536817245965
+    },
+    {
+      "case": "repeated-16mib",
+      "phase": "tree",
+      "baseline_ms": 8.444,
+      "candidate_ms": 0.059041,
+      "baseline_allocated_bytes": 17901041,
+      "candidate_allocated_bytes": 1332732,
+      "elapsed_ratio_baseline_over_candidate": 143.019257803899
+    },
+    {
+      "case": "repeated-16mib",
+      "phase": "indexed",
+      "baseline_ms": 6.707041,
+      "candidate_ms": 0.329,
+      "baseline_allocated_bytes": 16931324,
+      "candidate_allocated_bytes": 16800252,
+      "elapsed_ratio_baseline_over_candidate": 20.386142857142858
+    },
+    {
+      "case": "repeated-16mib",
+      "phase": "append",
+      "baseline_ms": 6.606125,
+      "candidate_ms": 0.308792,
+      "baseline_allocated_bytes": 16921408,
+      "candidate_allocated_bytes": 13120,
+      "elapsed_ratio_baseline_over_candidate": 21.393446073732477
+    },
+    {
+      "case": "small-files-2048",
+      "phase": "commit",
+      "baseline_ms": 10.332416,
+      "candidate_ms": 11.186792,
+      "baseline_allocated_bytes": 6621753,
+      "candidate_allocated_bytes": 6359609,
+      "elapsed_ratio_baseline_over_candidate": 0.9236263622314601
+    },
+    {
+      "case": "small-files-2048",
+      "phase": "tree",
+      "baseline_ms": 5.2325,
+      "candidate_ms": 2.114459,
+      "baseline_allocated_bytes": 3223205,
+      "candidate_allocated_bytes": 2564072,
+      "elapsed_ratio_baseline_over_candidate": 2.4746282618863735
+    },
+    {
+      "case": "small-files-2048",
+      "phase": "indexed",
+      "baseline_ms": 53.55575,
+      "candidate_ms": 2.08675,
+      "baseline_allocated_bytes": 135079952,
+      "candidate_allocated_bytes": 862224,
+      "elapsed_ratio_baseline_over_candidate": 25.664669941296278
+    },
+    {
+      "case": "small-files-2048",
+      "phase": "append",
+      "baseline_ms": 53.895667,
+      "candidate_ms": 2.025833,
+      "baseline_allocated_bytes": 134768640,
+      "candidate_allocated_bytes": 419840,
+      "elapsed_ratio_baseline_over_candidate": 26.604200346227948
+    }
+  ],
+  "runs": {
+    "baseline": {
+      "samples": [
+        {
+          "case": "unique-16mib",
+          "phase": "commit",
+          "sample": 0,
+          "elapsed_ns": 50369250,
+          "allocations": 14272,
+          "allocated_bytes": 209887577
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "tree",
+          "sample": 0,
+          "elapsed_ns": 11790542,
+          "allocations": 4464,
+          "allocated_bytes": 83998141
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "indexed",
+          "sample": 0,
+          "elapsed_ns": 7901959,
+          "allocations": 1475,
+          "allocated_bytes": 16931152
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "append",
+          "sample": 0,
+          "elapsed_ns": 7470959,
+          "allocations": 1472,
+          "allocated_bytes": 16921408
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "commit",
+          "sample": 1,
+          "elapsed_ns": 43506417,
+          "allocations": 14272,
+          "allocated_bytes": 209887577
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "tree",
+          "sample": 1,
+          "elapsed_ns": 11683333,
+          "allocations": 4464,
+          "allocated_bytes": 83998141
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "indexed",
+          "sample": 1,
+          "elapsed_ns": 9284292,
+          "allocations": 1475,
+          "allocated_bytes": 16931152
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "append",
+          "sample": 1,
+          "elapsed_ns": 9196625,
+          "allocations": 1472,
+          "allocated_bytes": 16921408
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "commit",
+          "sample": 2,
+          "elapsed_ns": 44586542,
+          "allocations": 14272,
+          "allocated_bytes": 209887577
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "tree",
+          "sample": 2,
+          "elapsed_ns": 11586666,
+          "allocations": 4464,
+          "allocated_bytes": 83998141
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "indexed",
+          "sample": 2,
+          "elapsed_ns": 8377459,
+          "allocations": 1475,
+          "allocated_bytes": 16931152
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "append",
+          "sample": 2,
+          "elapsed_ns": 8561250,
+          "allocations": 1472,
+          "allocated_bytes": 16921408
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "commit",
+          "sample": 3,
+          "elapsed_ns": 46620916,
+          "allocations": 14272,
+          "allocated_bytes": 209887577
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "tree",
+          "sample": 3,
+          "elapsed_ns": 12030625,
+          "allocations": 4464,
+          "allocated_bytes": 83998141
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "indexed",
+          "sample": 3,
+          "elapsed_ns": 9327250,
+          "allocations": 1475,
+          "allocated_bytes": 16931152
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "append",
+          "sample": 3,
+          "elapsed_ns": 8683875,
+          "allocations": 1472,
+          "allocated_bytes": 16921408
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "commit",
+          "sample": 4,
+          "elapsed_ns": 41850541,
+          "allocations": 14272,
+          "allocated_bytes": 209887577
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "tree",
+          "sample": 4,
+          "elapsed_ns": 10789625,
+          "allocations": 4464,
+          "allocated_bytes": 83998141
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "indexed",
+          "sample": 4,
+          "elapsed_ns": 6551375,
+          "allocations": 1475,
+          "allocated_bytes": 16931152
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "append",
+          "sample": 4,
+          "elapsed_ns": 6736334,
+          "allocations": 1472,
+          "allocated_bytes": 16921408
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "commit",
+          "sample": 0,
+          "elapsed_ns": 27800833,
+          "allocations": 439,
+          "allocated_bytes": 35184107
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "tree",
+          "sample": 0,
+          "elapsed_ns": 8494958,
+          "allocations": 4202,
+          "allocated_bytes": 17901041
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "indexed",
+          "sample": 0,
+          "elapsed_ns": 6631250,
+          "allocations": 1477,
+          "allocated_bytes": 16931324
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "append",
+          "sample": 0,
+          "elapsed_ns": 6783542,
+          "allocations": 1472,
+          "allocated_bytes": 16921408
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "commit",
+          "sample": 1,
+          "elapsed_ns": 26836041,
+          "allocations": 439,
+          "allocated_bytes": 35184107
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "tree",
+          "sample": 1,
+          "elapsed_ns": 8487125,
+          "allocations": 4202,
+          "allocated_bytes": 17901041
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "indexed",
+          "sample": 1,
+          "elapsed_ns": 7275916,
+          "allocations": 1477,
+          "allocated_bytes": 16931324
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "append",
+          "sample": 1,
+          "elapsed_ns": 8508334,
+          "allocations": 1472,
+          "allocated_bytes": 16921408
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "commit",
+          "sample": 2,
+          "elapsed_ns": 26460042,
+          "allocations": 439,
+          "allocated_bytes": 35184107
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "tree",
+          "sample": 2,
+          "elapsed_ns": 8441250,
+          "allocations": 4202,
+          "allocated_bytes": 17901041
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "indexed",
+          "sample": 2,
+          "elapsed_ns": 7849750,
+          "allocations": 1477,
+          "allocated_bytes": 16931324
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "append",
+          "sample": 2,
+          "elapsed_ns": 7355625,
+          "allocations": 1472,
+          "allocated_bytes": 16921408
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "commit",
+          "sample": 3,
+          "elapsed_ns": 26855625,
+          "allocations": 439,
+          "allocated_bytes": 35184107
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "tree",
+          "sample": 3,
+          "elapsed_ns": 8652334,
+          "allocations": 4202,
+          "allocated_bytes": 17901041
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "indexed",
+          "sample": 3,
+          "elapsed_ns": 8209084,
+          "allocations": 1477,
+          "allocated_bytes": 16931324
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "append",
+          "sample": 3,
+          "elapsed_ns": 8539125,
+          "allocations": 1472,
+          "allocated_bytes": 16921408
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "commit",
+          "sample": 4,
+          "elapsed_ns": 27679250,
+          "allocations": 439,
+          "allocated_bytes": 35184107
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "tree",
+          "sample": 4,
+          "elapsed_ns": 8786667,
+          "allocations": 4202,
+          "allocated_bytes": 17901041
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "indexed",
+          "sample": 4,
+          "elapsed_ns": 7435583,
+          "allocations": 1477,
+          "allocated_bytes": 16931324
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "append",
+          "sample": 4,
+          "elapsed_ns": 8717708,
+          "allocations": 1472,
+          "allocated_bytes": 16921408
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "commit",
+          "sample": 0,
+          "elapsed_ns": 10361042,
+          "allocations": 36655,
+          "allocated_bytes": 6621753
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "tree",
+          "sample": 0,
+          "elapsed_ns": 5469750,
+          "allocations": 135684,
+          "allocated_bytes": 3223205
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "indexed",
+          "sample": 0,
+          "elapsed_ns": 54637667,
+          "allocations": 47107,
+          "allocated_bytes": 135079952
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "append",
+          "sample": 0,
+          "elapsed_ns": 54619542,
+          "allocations": 47104,
+          "allocated_bytes": 134768640
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "commit",
+          "sample": 1,
+          "elapsed_ns": 10360750,
+          "allocations": 36655,
+          "allocated_bytes": 6621753
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "tree",
+          "sample": 1,
+          "elapsed_ns": 5395333,
+          "allocations": 135684,
+          "allocated_bytes": 3223205
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "indexed",
+          "sample": 1,
+          "elapsed_ns": 53817667,
+          "allocations": 47107,
+          "allocated_bytes": 135079952
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "append",
+          "sample": 1,
+          "elapsed_ns": 53176792,
+          "allocations": 47104,
+          "allocated_bytes": 134768640
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "commit",
+          "sample": 2,
+          "elapsed_ns": 9319791,
+          "allocations": 36655,
+          "allocated_bytes": 6621753
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "tree",
+          "sample": 2,
+          "elapsed_ns": 5551958,
+          "allocations": 135684,
+          "allocated_bytes": 3223205
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "indexed",
+          "sample": 2,
+          "elapsed_ns": 54125458,
+          "allocations": 47107,
+          "allocated_bytes": 135079952
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "append",
+          "sample": 2,
+          "elapsed_ns": 52843125,
+          "allocations": 47104,
+          "allocated_bytes": 134768640
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "commit",
+          "sample": 3,
+          "elapsed_ns": 10309959,
+          "allocations": 36655,
+          "allocated_bytes": 6621753
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "tree",
+          "sample": 3,
+          "elapsed_ns": 5257292,
+          "allocations": 135684,
+          "allocated_bytes": 3223205
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "indexed",
+          "sample": 3,
+          "elapsed_ns": 53276709,
+          "allocations": 47107,
+          "allocated_bytes": 135079952
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "append",
+          "sample": 3,
+          "elapsed_ns": 52913167,
+          "allocations": 47104,
+          "allocated_bytes": 134768640
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "commit",
+          "sample": 4,
+          "elapsed_ns": 10349334,
+          "allocations": 36655,
+          "allocated_bytes": 6621753
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "tree",
+          "sample": 4,
+          "elapsed_ns": 5250000,
+          "allocations": 135684,
+          "allocated_bytes": 3223205
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "indexed",
+          "sample": 4,
+          "elapsed_ns": 55267166,
+          "allocations": 47107,
+          "allocated_bytes": 135079952
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "append",
+          "sample": 4,
+          "elapsed_ns": 55079083,
+          "allocations": 47104,
+          "allocated_bytes": 134768640
+        }
+      ],
+      "medians": [
+        {
+          "case": "unique-16mib",
+          "phase": "commit",
+          "elapsed_ms": 44.586542,
+          "allocations": 14272,
+          "allocated_bytes": 209887577
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "tree",
+          "elapsed_ms": 11.683333,
+          "allocations": 4464,
+          "allocated_bytes": 83998141
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "indexed",
+          "elapsed_ms": 8.377459,
+          "allocations": 1475,
+          "allocated_bytes": 16931152
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "append",
+          "elapsed_ms": 8.56125,
+          "allocations": 1472,
+          "allocated_bytes": 16921408
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "commit",
+          "elapsed_ms": 26.855625,
+          "allocations": 439,
+          "allocated_bytes": 35184107
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "tree",
+          "elapsed_ms": 8.494958,
+          "allocations": 4202,
+          "allocated_bytes": 17901041
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "indexed",
+          "elapsed_ms": 7.435583,
+          "allocations": 1477,
+          "allocated_bytes": 16931324
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "append",
+          "elapsed_ms": 8.508334,
+          "allocations": 1472,
+          "allocated_bytes": 16921408
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "commit",
+          "elapsed_ms": 10.349334,
+          "allocations": 36655,
+          "allocated_bytes": 6621753
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "tree",
+          "elapsed_ms": 5.395333,
+          "allocations": 135684,
+          "allocated_bytes": 3223205
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "indexed",
+          "elapsed_ms": 54.125458,
+          "allocations": 47107,
+          "allocated_bytes": 135079952
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "append",
+          "elapsed_ms": 53.176792,
+          "allocations": 47104,
+          "allocated_bytes": 134768640
+        }
+      ]
+    },
+    "candidate": {
+      "samples": [
+        {
+          "case": "unique-16mib",
+          "phase": "commit",
+          "sample": 0,
+          "elapsed_ns": 44884959,
+          "allocations": 14144,
+          "allocated_bytes": 176333145
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "tree",
+          "sample": 0,
+          "elapsed_ns": 3993542,
+          "allocations": 697,
+          "allocated_bytes": 83981048
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "indexed",
+          "sample": 0,
+          "elapsed_ns": 1307875,
+          "allocations": 1411,
+          "allocated_bytes": 16800080
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "append",
+          "sample": 0,
+          "elapsed_ns": 1256916,
+          "allocations": 1344,
+          "allocated_bytes": 13120
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "commit",
+          "sample": 1,
+          "elapsed_ns": 33018084,
+          "allocations": 14144,
+          "allocated_bytes": 176333145
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "tree",
+          "sample": 1,
+          "elapsed_ns": 2816083,
+          "allocations": 697,
+          "allocated_bytes": 83981048
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "indexed",
+          "sample": 1,
+          "elapsed_ns": 844000,
+          "allocations": 1411,
+          "allocated_bytes": 16800080
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "append",
+          "sample": 1,
+          "elapsed_ns": 819041,
+          "allocations": 1344,
+          "allocated_bytes": 13120
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "commit",
+          "sample": 2,
+          "elapsed_ns": 33771000,
+          "allocations": 14144,
+          "allocated_bytes": 176333145
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "tree",
+          "sample": 2,
+          "elapsed_ns": 2803333,
+          "allocations": 697,
+          "allocated_bytes": 83981048
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "indexed",
+          "sample": 2,
+          "elapsed_ns": 361750,
+          "allocations": 1411,
+          "allocated_bytes": 16800080
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "append",
+          "sample": 2,
+          "elapsed_ns": 367583,
+          "allocations": 1344,
+          "allocated_bytes": 13120
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "commit",
+          "sample": 3,
+          "elapsed_ns": 31575166,
+          "allocations": 14144,
+          "allocated_bytes": 176333145
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "tree",
+          "sample": 3,
+          "elapsed_ns": 2717416,
+          "allocations": 697,
+          "allocated_bytes": 83981048
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "indexed",
+          "sample": 3,
+          "elapsed_ns": 336875,
+          "allocations": 1411,
+          "allocated_bytes": 16800080
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "append",
+          "sample": 3,
+          "elapsed_ns": 362083,
+          "allocations": 1344,
+          "allocated_bytes": 13120
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "commit",
+          "sample": 4,
+          "elapsed_ns": 31625208,
+          "allocations": 14144,
+          "allocated_bytes": 176333145
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "tree",
+          "sample": 4,
+          "elapsed_ns": 2896167,
+          "allocations": 697,
+          "allocated_bytes": 83981048
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "indexed",
+          "sample": 4,
+          "elapsed_ns": 346125,
+          "allocations": 1411,
+          "allocated_bytes": 16800080
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "append",
+          "sample": 4,
+          "elapsed_ns": 335250,
+          "allocations": 1344,
+          "allocated_bytes": 13120
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "commit",
+          "sample": 0,
+          "elapsed_ns": 18790000,
+          "allocations": 311,
+          "allocated_bytes": 1629675
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "tree",
+          "sample": 0,
+          "elapsed_ns": 68000,
+          "allocations": 70,
+          "allocated_bytes": 1332732
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "indexed",
+          "sample": 0,
+          "elapsed_ns": 319000,
+          "allocations": 1413,
+          "allocated_bytes": 16800252
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "append",
+          "sample": 0,
+          "elapsed_ns": 281667,
+          "allocations": 1344,
+          "allocated_bytes": 13120
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "commit",
+          "sample": 1,
+          "elapsed_ns": 19571583,
+          "allocations": 311,
+          "allocated_bytes": 1629675
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "tree",
+          "sample": 1,
+          "elapsed_ns": 67667,
+          "allocations": 70,
+          "allocated_bytes": 1332732
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "indexed",
+          "sample": 1,
+          "elapsed_ns": 295500,
+          "allocations": 1413,
+          "allocated_bytes": 16800252
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "append",
+          "sample": 1,
+          "elapsed_ns": 284792,
+          "allocations": 1344,
+          "allocated_bytes": 13120
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "commit",
+          "sample": 2,
+          "elapsed_ns": 19275375,
+          "allocations": 311,
+          "allocated_bytes": 1629675
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "tree",
+          "sample": 2,
+          "elapsed_ns": 51708,
+          "allocations": 70,
+          "allocated_bytes": 1332732
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "indexed",
+          "sample": 2,
+          "elapsed_ns": 320500,
+          "allocations": 1413,
+          "allocated_bytes": 16800252
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "append",
+          "sample": 2,
+          "elapsed_ns": 255375,
+          "allocations": 1344,
+          "allocated_bytes": 13120
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "commit",
+          "sample": 3,
+          "elapsed_ns": 18127917,
+          "allocations": 311,
+          "allocated_bytes": 1629675
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "tree",
+          "sample": 3,
+          "elapsed_ns": 52291,
+          "allocations": 70,
+          "allocated_bytes": 1332732
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "indexed",
+          "sample": 3,
+          "elapsed_ns": 300250,
+          "allocations": 1413,
+          "allocated_bytes": 16800252
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "append",
+          "sample": 3,
+          "elapsed_ns": 280333,
+          "allocations": 1344,
+          "allocated_bytes": 13120
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "commit",
+          "sample": 4,
+          "elapsed_ns": 17096375,
+          "allocations": 311,
+          "allocated_bytes": 1629675
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "tree",
+          "sample": 4,
+          "elapsed_ns": 48917,
+          "allocations": 70,
+          "allocated_bytes": 1332732
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "indexed",
+          "sample": 4,
+          "elapsed_ns": 294959,
+          "allocations": 1413,
+          "allocated_bytes": 16800252
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "append",
+          "sample": 4,
+          "elapsed_ns": 299875,
+          "allocations": 1344,
+          "allocated_bytes": 13120
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "commit",
+          "sample": 0,
+          "elapsed_ns": 9344834,
+          "allocations": 32559,
+          "allocated_bytes": 6359609
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "tree",
+          "sample": 0,
+          "elapsed_ns": 1695250,
+          "allocations": 12885,
+          "allocated_bytes": 2564072
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "indexed",
+          "sample": 0,
+          "elapsed_ns": 1543250,
+          "allocations": 45059,
+          "allocated_bytes": 862224
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "append",
+          "sample": 0,
+          "elapsed_ns": 1471708,
+          "allocations": 43008,
+          "allocated_bytes": 419840
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "commit",
+          "sample": 1,
+          "elapsed_ns": 10381209,
+          "allocations": 32559,
+          "allocated_bytes": 6359609
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "tree",
+          "sample": 1,
+          "elapsed_ns": 1922167,
+          "allocations": 12885,
+          "allocated_bytes": 2564072
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "indexed",
+          "sample": 1,
+          "elapsed_ns": 1808209,
+          "allocations": 45059,
+          "allocated_bytes": 862224
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "append",
+          "sample": 1,
+          "elapsed_ns": 1614375,
+          "allocations": 43008,
+          "allocated_bytes": 419840
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "commit",
+          "sample": 2,
+          "elapsed_ns": 9348500,
+          "allocations": 32559,
+          "allocated_bytes": 6359609
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "tree",
+          "sample": 2,
+          "elapsed_ns": 1747000,
+          "allocations": 12885,
+          "allocated_bytes": 2564072
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "indexed",
+          "sample": 2,
+          "elapsed_ns": 1793584,
+          "allocations": 45059,
+          "allocated_bytes": 862224
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "append",
+          "sample": 2,
+          "elapsed_ns": 1814750,
+          "allocations": 43008,
+          "allocated_bytes": 419840
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "commit",
+          "sample": 3,
+          "elapsed_ns": 10352292,
+          "allocations": 32559,
+          "allocated_bytes": 6359609
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "tree",
+          "sample": 3,
+          "elapsed_ns": 1717542,
+          "allocations": 12885,
+          "allocated_bytes": 2564072
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "indexed",
+          "sample": 3,
+          "elapsed_ns": 1798625,
+          "allocations": 45059,
+          "allocated_bytes": 862224
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "append",
+          "sample": 3,
+          "elapsed_ns": 1761458,
+          "allocations": 43008,
+          "allocated_bytes": 419840
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "commit",
+          "sample": 4,
+          "elapsed_ns": 10874291,
+          "allocations": 32559,
+          "allocated_bytes": 6359609
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "tree",
+          "sample": 4,
+          "elapsed_ns": 1774833,
+          "allocations": 12885,
+          "allocated_bytes": 2564072
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "indexed",
+          "sample": 4,
+          "elapsed_ns": 1734583,
+          "allocations": 45059,
+          "allocated_bytes": 862224
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "append",
+          "sample": 4,
+          "elapsed_ns": 1889583,
+          "allocations": 43008,
+          "allocated_bytes": 419840
+        }
+      ],
+      "medians": [
+        {
+          "case": "unique-16mib",
+          "phase": "commit",
+          "elapsed_ms": 33.018084,
+          "allocations": 14144,
+          "allocated_bytes": 176333145
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "tree",
+          "elapsed_ms": 2.816083,
+          "allocations": 697,
+          "allocated_bytes": 83981048
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "indexed",
+          "elapsed_ms": 0.36175,
+          "allocations": 1411,
+          "allocated_bytes": 16800080
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "append",
+          "elapsed_ms": 0.367583,
+          "allocations": 1344,
+          "allocated_bytes": 13120
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "commit",
+          "elapsed_ms": 18.79,
+          "allocations": 311,
+          "allocated_bytes": 1629675
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "tree",
+          "elapsed_ms": 0.052291,
+          "allocations": 70,
+          "allocated_bytes": 1332732
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "indexed",
+          "elapsed_ms": 0.30025,
+          "allocations": 1413,
+          "allocated_bytes": 16800252
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "append",
+          "elapsed_ms": 0.281667,
+          "allocations": 1344,
+          "allocated_bytes": 13120
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "commit",
+          "elapsed_ms": 10.352292,
+          "allocations": 32559,
+          "allocated_bytes": 6359609
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "tree",
+          "elapsed_ms": 1.747,
+          "allocations": 12885,
+          "allocated_bytes": 2564072
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "indexed",
+          "elapsed_ms": 1.793584,
+          "allocations": 45059,
+          "allocated_bytes": 862224
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "append",
+          "elapsed_ms": 1.761458,
+          "allocations": 43008,
+          "allocated_bytes": 419840
+        }
+      ]
+    },
+    "baseline-repeat": {
+      "samples": [
+        {
+          "case": "unique-16mib",
+          "phase": "commit",
+          "sample": 0,
+          "elapsed_ns": 46876458,
+          "allocations": 14272,
+          "allocated_bytes": 209887577
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "tree",
+          "sample": 0,
+          "elapsed_ns": 11612291,
+          "allocations": 4464,
+          "allocated_bytes": 83998141
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "indexed",
+          "sample": 0,
+          "elapsed_ns": 9114750,
+          "allocations": 1475,
+          "allocated_bytes": 16931152
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "append",
+          "sample": 0,
+          "elapsed_ns": 9840916,
+          "allocations": 1472,
+          "allocated_bytes": 16921408
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "commit",
+          "sample": 1,
+          "elapsed_ns": 45557708,
+          "allocations": 14272,
+          "allocated_bytes": 209887577
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "tree",
+          "sample": 1,
+          "elapsed_ns": 13033042,
+          "allocations": 4464,
+          "allocated_bytes": 83998141
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "indexed",
+          "sample": 1,
+          "elapsed_ns": 8658125,
+          "allocations": 1475,
+          "allocated_bytes": 16931152
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "append",
+          "sample": 1,
+          "elapsed_ns": 8062041,
+          "allocations": 1472,
+          "allocated_bytes": 16921408
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "commit",
+          "sample": 2,
+          "elapsed_ns": 43880167,
+          "allocations": 14272,
+          "allocated_bytes": 209887577
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "tree",
+          "sample": 2,
+          "elapsed_ns": 11754125,
+          "allocations": 4464,
+          "allocated_bytes": 83998141
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "indexed",
+          "sample": 2,
+          "elapsed_ns": 8086208,
+          "allocations": 1475,
+          "allocated_bytes": 16931152
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "append",
+          "sample": 2,
+          "elapsed_ns": 8574875,
+          "allocations": 1472,
+          "allocated_bytes": 16921408
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "commit",
+          "sample": 3,
+          "elapsed_ns": 42651250,
+          "allocations": 14272,
+          "allocated_bytes": 209887577
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "tree",
+          "sample": 3,
+          "elapsed_ns": 11433208,
+          "allocations": 4464,
+          "allocated_bytes": 83998141
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "indexed",
+          "sample": 3,
+          "elapsed_ns": 6500834,
+          "allocations": 1475,
+          "allocated_bytes": 16931152
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "append",
+          "sample": 3,
+          "elapsed_ns": 6952833,
+          "allocations": 1472,
+          "allocated_bytes": 16921408
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "commit",
+          "sample": 4,
+          "elapsed_ns": 41809458,
+          "allocations": 14272,
+          "allocated_bytes": 209887577
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "tree",
+          "sample": 4,
+          "elapsed_ns": 10707125,
+          "allocations": 4464,
+          "allocated_bytes": 83998141
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "indexed",
+          "sample": 4,
+          "elapsed_ns": 6498166,
+          "allocations": 1475,
+          "allocated_bytes": 16931152
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "append",
+          "sample": 4,
+          "elapsed_ns": 6587250,
+          "allocations": 1472,
+          "allocated_bytes": 16921408
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "commit",
+          "sample": 0,
+          "elapsed_ns": 26868166,
+          "allocations": 439,
+          "allocated_bytes": 35184107
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "tree",
+          "sample": 0,
+          "elapsed_ns": 8444000,
+          "allocations": 4202,
+          "allocated_bytes": 17901041
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "indexed",
+          "sample": 0,
+          "elapsed_ns": 6903000,
+          "allocations": 1477,
+          "allocated_bytes": 16931324
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "append",
+          "sample": 0,
+          "elapsed_ns": 6560750,
+          "allocations": 1472,
+          "allocated_bytes": 16921408
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "commit",
+          "sample": 1,
+          "elapsed_ns": 26899625,
+          "allocations": 439,
+          "allocated_bytes": 35184107
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "tree",
+          "sample": 1,
+          "elapsed_ns": 8498708,
+          "allocations": 4202,
+          "allocated_bytes": 17901041
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "indexed",
+          "sample": 1,
+          "elapsed_ns": 6605666,
+          "allocations": 1477,
+          "allocated_bytes": 16931324
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "append",
+          "sample": 1,
+          "elapsed_ns": 6688667,
+          "allocations": 1472,
+          "allocated_bytes": 16921408
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "commit",
+          "sample": 2,
+          "elapsed_ns": 26292250,
+          "allocations": 439,
+          "allocated_bytes": 35184107
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "tree",
+          "sample": 2,
+          "elapsed_ns": 8441666,
+          "allocations": 4202,
+          "allocated_bytes": 17901041
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "indexed",
+          "sample": 2,
+          "elapsed_ns": 7632542,
+          "allocations": 1477,
+          "allocated_bytes": 16931324
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "append",
+          "sample": 2,
+          "elapsed_ns": 6606125,
+          "allocations": 1472,
+          "allocated_bytes": 16921408
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "commit",
+          "sample": 3,
+          "elapsed_ns": 26844542,
+          "allocations": 439,
+          "allocated_bytes": 35184107
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "tree",
+          "sample": 3,
+          "elapsed_ns": 8482625,
+          "allocations": 4202,
+          "allocated_bytes": 17901041
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "indexed",
+          "sample": 3,
+          "elapsed_ns": 6707041,
+          "allocations": 1477,
+          "allocated_bytes": 16931324
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "append",
+          "sample": 3,
+          "elapsed_ns": 6562167,
+          "allocations": 1472,
+          "allocated_bytes": 16921408
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "commit",
+          "sample": 4,
+          "elapsed_ns": 26838666,
+          "allocations": 439,
+          "allocated_bytes": 35184107
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "tree",
+          "sample": 4,
+          "elapsed_ns": 8402959,
+          "allocations": 4202,
+          "allocated_bytes": 17901041
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "indexed",
+          "sample": 4,
+          "elapsed_ns": 6658584,
+          "allocations": 1477,
+          "allocated_bytes": 16931324
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "append",
+          "sample": 4,
+          "elapsed_ns": 6645417,
+          "allocations": 1472,
+          "allocated_bytes": 16921408
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "commit",
+          "sample": 0,
+          "elapsed_ns": 10410000,
+          "allocations": 36655,
+          "allocated_bytes": 6621753
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "tree",
+          "sample": 0,
+          "elapsed_ns": 5317583,
+          "allocations": 135684,
+          "allocated_bytes": 3223205
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "indexed",
+          "sample": 0,
+          "elapsed_ns": 53062292,
+          "allocations": 47107,
+          "allocated_bytes": 135079952
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "append",
+          "sample": 0,
+          "elapsed_ns": 52896500,
+          "allocations": 47104,
+          "allocated_bytes": 134768640
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "commit",
+          "sample": 1,
+          "elapsed_ns": 10434500,
+          "allocations": 36655,
+          "allocated_bytes": 6621753
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "tree",
+          "sample": 1,
+          "elapsed_ns": 5181417,
+          "allocations": 135684,
+          "allocated_bytes": 3223205
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "indexed",
+          "sample": 1,
+          "elapsed_ns": 52530167,
+          "allocations": 47107,
+          "allocated_bytes": 135079952
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "append",
+          "sample": 1,
+          "elapsed_ns": 52131584,
+          "allocations": 47104,
+          "allocated_bytes": 134768640
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "commit",
+          "sample": 2,
+          "elapsed_ns": 10332416,
+          "allocations": 36655,
+          "allocated_bytes": 6621753
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "tree",
+          "sample": 2,
+          "elapsed_ns": 5232500,
+          "allocations": 135684,
+          "allocated_bytes": 3223205
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "indexed",
+          "sample": 2,
+          "elapsed_ns": 53555750,
+          "allocations": 47107,
+          "allocated_bytes": 135079952
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "append",
+          "sample": 2,
+          "elapsed_ns": 56161792,
+          "allocations": 47104,
+          "allocated_bytes": 134768640
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "commit",
+          "sample": 3,
+          "elapsed_ns": 9373959,
+          "allocations": 36655,
+          "allocated_bytes": 6621753
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "tree",
+          "sample": 3,
+          "elapsed_ns": 5336459,
+          "allocations": 135684,
+          "allocated_bytes": 3223205
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "indexed",
+          "sample": 3,
+          "elapsed_ns": 54058500,
+          "allocations": 47107,
+          "allocated_bytes": 135079952
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "append",
+          "sample": 3,
+          "elapsed_ns": 54465167,
+          "allocations": 47104,
+          "allocated_bytes": 134768640
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "commit",
+          "sample": 4,
+          "elapsed_ns": 10322000,
+          "allocations": 36655,
+          "allocated_bytes": 6621753
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "tree",
+          "sample": 4,
+          "elapsed_ns": 5223625,
+          "allocations": 135684,
+          "allocated_bytes": 3223205
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "indexed",
+          "sample": 4,
+          "elapsed_ns": 54514500,
+          "allocations": 47107,
+          "allocated_bytes": 135079952
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "append",
+          "sample": 4,
+          "elapsed_ns": 53895667,
+          "allocations": 47104,
+          "allocated_bytes": 134768640
+        }
+      ],
+      "medians": [
+        {
+          "case": "unique-16mib",
+          "phase": "commit",
+          "elapsed_ms": 43.880167,
+          "allocations": 14272,
+          "allocated_bytes": 209887577
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "tree",
+          "elapsed_ms": 11.612291,
+          "allocations": 4464,
+          "allocated_bytes": 83998141
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "indexed",
+          "elapsed_ms": 8.086208,
+          "allocations": 1475,
+          "allocated_bytes": 16931152
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "append",
+          "elapsed_ms": 8.062041,
+          "allocations": 1472,
+          "allocated_bytes": 16921408
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "commit",
+          "elapsed_ms": 26.844542,
+          "allocations": 439,
+          "allocated_bytes": 35184107
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "tree",
+          "elapsed_ms": 8.444,
+          "allocations": 4202,
+          "allocated_bytes": 17901041
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "indexed",
+          "elapsed_ms": 6.707041,
+          "allocations": 1477,
+          "allocated_bytes": 16931324
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "append",
+          "elapsed_ms": 6.606125,
+          "allocations": 1472,
+          "allocated_bytes": 16921408
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "commit",
+          "elapsed_ms": 10.332416,
+          "allocations": 36655,
+          "allocated_bytes": 6621753
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "tree",
+          "elapsed_ms": 5.2325,
+          "allocations": 135684,
+          "allocated_bytes": 3223205
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "indexed",
+          "elapsed_ms": 53.55575,
+          "allocations": 47107,
+          "allocated_bytes": 135079952
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "append",
+          "elapsed_ms": 53.895667,
+          "allocations": 47104,
+          "allocated_bytes": 134768640
+        }
+      ]
+    },
+    "candidate-final": {
+      "samples": [
+        {
+          "case": "unique-16mib",
+          "phase": "commit",
+          "sample": 0,
+          "elapsed_ns": 48542917,
+          "allocations": 14144,
+          "allocated_bytes": 176333145
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "tree",
+          "sample": 0,
+          "elapsed_ns": 4454541,
+          "allocations": 697,
+          "allocated_bytes": 83981048
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "indexed",
+          "sample": 0,
+          "elapsed_ns": 1463750,
+          "allocations": 1411,
+          "allocated_bytes": 16800080
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "append",
+          "sample": 0,
+          "elapsed_ns": 1275500,
+          "allocations": 1344,
+          "allocated_bytes": 13120
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "commit",
+          "sample": 1,
+          "elapsed_ns": 36188000,
+          "allocations": 14144,
+          "allocated_bytes": 176333145
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "tree",
+          "sample": 1,
+          "elapsed_ns": 3337291,
+          "allocations": 697,
+          "allocated_bytes": 83981048
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "indexed",
+          "sample": 1,
+          "elapsed_ns": 472250,
+          "allocations": 1411,
+          "allocated_bytes": 16800080
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "append",
+          "sample": 1,
+          "elapsed_ns": 623958,
+          "allocations": 1344,
+          "allocated_bytes": 13120
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "commit",
+          "sample": 2,
+          "elapsed_ns": 33620500,
+          "allocations": 14144,
+          "allocated_bytes": 176333145
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "tree",
+          "sample": 2,
+          "elapsed_ns": 3113750,
+          "allocations": 697,
+          "allocated_bytes": 83981048
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "indexed",
+          "sample": 2,
+          "elapsed_ns": 349042,
+          "allocations": 1411,
+          "allocated_bytes": 16800080
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "append",
+          "sample": 2,
+          "elapsed_ns": 323125,
+          "allocations": 1344,
+          "allocated_bytes": 13120
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "commit",
+          "sample": 3,
+          "elapsed_ns": 32808334,
+          "allocations": 14144,
+          "allocated_bytes": 176333145
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "tree",
+          "sample": 3,
+          "elapsed_ns": 2996666,
+          "allocations": 697,
+          "allocated_bytes": 83981048
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "indexed",
+          "sample": 3,
+          "elapsed_ns": 388750,
+          "allocations": 1411,
+          "allocated_bytes": 16800080
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "append",
+          "sample": 3,
+          "elapsed_ns": 324000,
+          "allocations": 1344,
+          "allocated_bytes": 13120
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "commit",
+          "sample": 4,
+          "elapsed_ns": 31623500,
+          "allocations": 14144,
+          "allocated_bytes": 176333145
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "tree",
+          "sample": 4,
+          "elapsed_ns": 2800292,
+          "allocations": 697,
+          "allocated_bytes": 83981048
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "indexed",
+          "sample": 4,
+          "elapsed_ns": 353125,
+          "allocations": 1411,
+          "allocated_bytes": 16800080
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "append",
+          "sample": 4,
+          "elapsed_ns": 312625,
+          "allocations": 1344,
+          "allocated_bytes": 13120
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "commit",
+          "sample": 0,
+          "elapsed_ns": 18662083,
+          "allocations": 311,
+          "allocated_bytes": 1629675
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "tree",
+          "sample": 0,
+          "elapsed_ns": 67834,
+          "allocations": 70,
+          "allocated_bytes": 1332732
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "indexed",
+          "sample": 0,
+          "elapsed_ns": 311083,
+          "allocations": 1413,
+          "allocated_bytes": 16800252
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "append",
+          "sample": 0,
+          "elapsed_ns": 395916,
+          "allocations": 1344,
+          "allocated_bytes": 13120
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "commit",
+          "sample": 1,
+          "elapsed_ns": 19579375,
+          "allocations": 311,
+          "allocated_bytes": 1629675
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "tree",
+          "sample": 1,
+          "elapsed_ns": 56291,
+          "allocations": 70,
+          "allocated_bytes": 1332732
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "indexed",
+          "sample": 1,
+          "elapsed_ns": 394667,
+          "allocations": 1413,
+          "allocated_bytes": 16800252
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "append",
+          "sample": 1,
+          "elapsed_ns": 313583,
+          "allocations": 1344,
+          "allocated_bytes": 13120
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "commit",
+          "sample": 2,
+          "elapsed_ns": 18586291,
+          "allocations": 311,
+          "allocated_bytes": 1629675
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "tree",
+          "sample": 2,
+          "elapsed_ns": 56000,
+          "allocations": 70,
+          "allocated_bytes": 1332732
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "indexed",
+          "sample": 2,
+          "elapsed_ns": 336167,
+          "allocations": 1413,
+          "allocated_bytes": 16800252
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "append",
+          "sample": 2,
+          "elapsed_ns": 308792,
+          "allocations": 1344,
+          "allocated_bytes": 13120
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "commit",
+          "sample": 3,
+          "elapsed_ns": 19231083,
+          "allocations": 311,
+          "allocated_bytes": 1629675
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "tree",
+          "sample": 3,
+          "elapsed_ns": 59041,
+          "allocations": 70,
+          "allocated_bytes": 1332732
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "indexed",
+          "sample": 3,
+          "elapsed_ns": 329000,
+          "allocations": 1413,
+          "allocated_bytes": 16800252
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "append",
+          "sample": 3,
+          "elapsed_ns": 298417,
+          "allocations": 1344,
+          "allocated_bytes": 13120
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "commit",
+          "sample": 4,
+          "elapsed_ns": 18542709,
+          "allocations": 311,
+          "allocated_bytes": 1629675
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "tree",
+          "sample": 4,
+          "elapsed_ns": 73417,
+          "allocations": 70,
+          "allocated_bytes": 1332732
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "indexed",
+          "sample": 4,
+          "elapsed_ns": 308917,
+          "allocations": 1413,
+          "allocated_bytes": 16800252
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "append",
+          "sample": 4,
+          "elapsed_ns": 289375,
+          "allocations": 1344,
+          "allocated_bytes": 13120
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "commit",
+          "sample": 0,
+          "elapsed_ns": 10291459,
+          "allocations": 32559,
+          "allocated_bytes": 6359609
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "tree",
+          "sample": 0,
+          "elapsed_ns": 1895125,
+          "allocations": 12885,
+          "allocated_bytes": 2564072
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "indexed",
+          "sample": 0,
+          "elapsed_ns": 1787083,
+          "allocations": 45059,
+          "allocated_bytes": 862224
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "append",
+          "sample": 0,
+          "elapsed_ns": 1728375,
+          "allocations": 43008,
+          "allocated_bytes": 419840
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "commit",
+          "sample": 1,
+          "elapsed_ns": 10247416,
+          "allocations": 32559,
+          "allocated_bytes": 6359609
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "tree",
+          "sample": 1,
+          "elapsed_ns": 2042417,
+          "allocations": 12885,
+          "allocated_bytes": 2564072
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "indexed",
+          "sample": 1,
+          "elapsed_ns": 1976583,
+          "allocations": 45059,
+          "allocated_bytes": 862224
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "append",
+          "sample": 1,
+          "elapsed_ns": 1880000,
+          "allocations": 43008,
+          "allocated_bytes": 419840
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "commit",
+          "sample": 2,
+          "elapsed_ns": 11186792,
+          "allocations": 32559,
+          "allocated_bytes": 6359609
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "tree",
+          "sample": 2,
+          "elapsed_ns": 2128792,
+          "allocations": 12885,
+          "allocated_bytes": 2564072
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "indexed",
+          "sample": 2,
+          "elapsed_ns": 2102375,
+          "allocations": 45059,
+          "allocated_bytes": 862224
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "append",
+          "sample": 2,
+          "elapsed_ns": 2025833,
+          "allocations": 43008,
+          "allocated_bytes": 419840
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "commit",
+          "sample": 3,
+          "elapsed_ns": 12229500,
+          "allocations": 32559,
+          "allocated_bytes": 6359609
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "tree",
+          "sample": 3,
+          "elapsed_ns": 2158833,
+          "allocations": 12885,
+          "allocated_bytes": 2564072
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "indexed",
+          "sample": 3,
+          "elapsed_ns": 2092000,
+          "allocations": 45059,
+          "allocated_bytes": 862224
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "append",
+          "sample": 3,
+          "elapsed_ns": 2057125,
+          "allocations": 43008,
+          "allocated_bytes": 419840
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "commit",
+          "sample": 4,
+          "elapsed_ns": 12172583,
+          "allocations": 32559,
+          "allocated_bytes": 6359609
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "tree",
+          "sample": 4,
+          "elapsed_ns": 2114459,
+          "allocations": 12885,
+          "allocated_bytes": 2564072
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "indexed",
+          "sample": 4,
+          "elapsed_ns": 2086750,
+          "allocations": 45059,
+          "allocated_bytes": 862224
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "append",
+          "sample": 4,
+          "elapsed_ns": 2057209,
+          "allocations": 43008,
+          "allocated_bytes": 419840
+        }
+      ],
+      "medians": [
+        {
+          "case": "unique-16mib",
+          "phase": "commit",
+          "elapsed_ms": 33.6205,
+          "allocations": 14144,
+          "allocated_bytes": 176333145
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "tree",
+          "elapsed_ms": 3.11375,
+          "allocations": 697,
+          "allocated_bytes": 83981048
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "indexed",
+          "elapsed_ms": 0.38875,
+          "allocations": 1411,
+          "allocated_bytes": 16800080
+        },
+        {
+          "case": "unique-16mib",
+          "phase": "append",
+          "elapsed_ms": 0.324,
+          "allocations": 1344,
+          "allocated_bytes": 13120
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "commit",
+          "elapsed_ms": 18.662083,
+          "allocations": 311,
+          "allocated_bytes": 1629675
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "tree",
+          "elapsed_ms": 0.059041,
+          "allocations": 70,
+          "allocated_bytes": 1332732
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "indexed",
+          "elapsed_ms": 0.329,
+          "allocations": 1413,
+          "allocated_bytes": 16800252
+        },
+        {
+          "case": "repeated-16mib",
+          "phase": "append",
+          "elapsed_ms": 0.308792,
+          "allocations": 1344,
+          "allocated_bytes": 13120
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "commit",
+          "elapsed_ms": 11.186792,
+          "allocations": 32559,
+          "allocated_bytes": 6359609
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "tree",
+          "elapsed_ms": 2.114459,
+          "allocations": 12885,
+          "allocated_bytes": 2564072
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "indexed",
+          "elapsed_ms": 2.08675,
+          "allocations": 45059,
+          "allocated_bytes": 862224
+        },
+        {
+          "case": "small-files-2048",
+          "phase": "append",
+          "elapsed_ms": 2.025833,
+          "allocations": 43008,
+          "allocated_bytes": 419840
+        }
+      ]
+    }
+  },
+  "validation": {
+    "format": "passed",
+    "workspace_check": "passed",
+    "workspace_clippy_correctness_and_suspicious": "passed",
+    "workspace_test_summary": [
+      "test result: ok. 103 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 23.60s",
+      "test result: ok. 16 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.15s",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.92s",
+      "test result: ok. 82 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.67s",
+      "test result: ok. 226 passed; 0 failed; 10 ignored; 0 measured; 0 filtered out; finished in 12.26s",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "test result: ok. 94 passed; 0 failed; 6 ignored; 0 measured; 0 filtered out; finished in 0.67s",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+    ]
+  }
+}

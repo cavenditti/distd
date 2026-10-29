@@ -193,6 +193,22 @@ presented as controlled network comparisons.
 “Resume” remains a planned workload. A complete transfer is not labeled as a
 resume measurement.
 
+The redb storage microbenchmark checks committed bytes after reopening each
+database, then measures tree reconstruction, indexed reads, and appending into
+a preallocated transfer buffer. It covers unique and repeated 16 MiB payloads
+and 2,048 small files, with five fresh databases per workload:
+
+```bash
+cargo run --release -p distd_core --features redb --locked --example redb_storage_bench
+```
+
+Its JSON lines report elapsed time and allocation traffic (requested bytes,
+not peak memory). These are local storage measurements; they do not measure
+QUIC transfer speed or compare distd with other distribution systems.
+The [2026-10-29 storage comparison](docs/benchmarks/redb-storage-2026-10-29.json)
+records baseline and candidate samples, allocation counts, source identities,
+and validation results.
+
 ### Frozen QUIC Fetch acceptance workflow
 
 `quic-fetch-acceptance` is a fail-closed acceptance driver for one preregistered

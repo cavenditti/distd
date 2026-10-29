@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -11,16 +12,19 @@ use super::{Node, StorageError};
 
 use redb::{Database, Error, ReadTransaction, ReadableTable, TableDefinition};
 
-const CHUNK_TABLE: TableDefinition<&[u8; 32], Vec<u8>> = TableDefinition::new("distd_chunks");
+mod byte_slice;
+use byte_slice::ByteSlice;
+
+const CHUNK_TABLE: TableDefinition<&[u8; 32], ByteSlice> = TableDefinition::new("distd_chunks");
 const LINK_TABLE: TableDefinition<&[u8; 32], ([u8; 32], [u8; 32])> =
     TableDefinition::new("distd_links");
-const CHUNK_LIST_TABLE: TableDefinition<&[u8; 32], Vec<u8>> =
+const CHUNK_LIST_TABLE: TableDefinition<&[u8; 32], ByteSlice> =
     TableDefinition::new("distd_chunk_lists");
 
-/// Dead simple in-memory global storage
+/// Durable content-addressed chunks, links, and ordered revision indexes.
 #[derive(Debug, Clone)]
 pub struct RedbStorage {
-    db: Arc<Database>, //<Hash, Arc<Node>>,
+    db: Arc<Database>,
 }
 
 impl RedbStorage {
@@ -29,36 +33,81 @@ impl RedbStorage {
         Ok(Self { db: Arc::new(db) })
     }
 
-    fn get_stored_node(&self, read_txn: &ReadTransaction, hash: &Hash) -> Option<Node> {
-        read_txn
-            .open_table(CHUNK_TABLE)
-            .ok()
-            .and_then(|table| table.get(&hash.as_bytes()).ok()?)
-            .map(|guard| guard.value())
-            .map(|v| Node::Stored {
-                hash: *hash,
-                data: Arc::new(v),
-            })
+    fn get_from_snapshot(read_txn: &ReadTransaction, root: &Hash) -> Option<Arc<Node>> {
+        enum Visit {
+            Enter(Hash),
+            Parent { hash: Hash, left: Hash, right: Hash },
+        }
+
+        let chunks = read_txn.open_table(CHUNK_TABLE).ok()?;
+        let links = read_txn.open_table(LINK_TABLE).ok();
+        let mut pending = vec![Visit::Enter(*root)];
+        let mut completed: HashMap<Hash, Arc<Node>> = HashMap::new();
+        let mut active = HashSet::new();
+        while let Some(visit) = pending.pop() {
+            match visit {
+                Visit::Enter(hash) => {
+                    if completed.contains_key(&hash) {
+                        continue;
+                    }
+                    if let Some(data) = chunks.get(hash.as_bytes()).ok()? {
+                        completed.insert(
+                            hash,
+                            Arc::new(Node::Stored {
+                                hash,
+                                data: Arc::new(data.value().to_vec()),
+                            }),
+                        );
+                        continue;
+                    }
+                    if !active.insert(hash) {
+                        return None; // Corrupt cyclic link graph.
+                    }
+                    let (left, right) = links.as_ref()?.get(hash.as_bytes()).ok()??.value();
+                    let left = Hash::from_bytes(left);
+                    let right = Hash::from_bytes(right);
+                    pending.push(Visit::Parent { hash, left, right });
+                    pending.push(Visit::Enter(right));
+                    pending.push(Visit::Enter(left));
+                }
+                Visit::Parent { hash, left, right } => {
+                    let left = completed.get(&left)?.clone();
+                    let right = completed.get(&right)?.clone();
+                    completed.insert(
+                        hash,
+                        Arc::new(Node::Parent {
+                            hash,
+                            size: left.size().checked_add(right.size())?,
+                            left,
+                            right,
+                        }),
+                    );
+                    active.remove(&hash);
+                }
+            }
+        }
+        completed.remove(root)
     }
 
-    fn get_parent_node(&self, read_txn: &ReadTransaction, hash: &Hash) -> Option<Node> {
-        read_txn
-            .open_table(LINK_TABLE)
-            .ok()
-            .and_then(|table| table.get(hash.as_bytes()).ok()?)
-            .map(|guard| guard.value())
-            .and_then(|v| {
-                let left = self.get(&Hash::from_bytes(v.0))?;
-                let right = self.get(&Hash::from_bytes(v.1))?;
-                {
-                    Some(Node::Parent {
-                        hash: *hash,
-                        size: left.size() + right.size(),
-                        left,
-                        right,
-                    })
-                }
-            })
+    fn with_chunk_by_index<T>(
+        &self,
+        root: &Hash,
+        index: u32,
+        consume: impl FnOnce(&[u8]) -> T,
+    ) -> Option<T> {
+        let read_txn = self.db.begin_read().ok()?;
+        let lists = read_txn.open_table(CHUNK_LIST_TABLE).ok()?;
+        let encoded = lists.get(root.as_bytes()).ok()??;
+        let encoded = encoded.value();
+        if encoded.len() % 32 != 0 {
+            return None;
+        }
+        let start = usize::try_from(index).ok()?.checked_mul(32)?;
+        let end = start.checked_add(32)?;
+        let hash = Hash::from_bytes(encoded.get(start..end)?.try_into().ok()?);
+        let chunks = read_txn.open_table(CHUNK_TABLE).ok()?;
+        let chunk = chunks.get(hash.as_bytes()).ok()??;
+        Some(consume(chunk.value()))
     }
 
     fn commit_prepared_payloads(&self, item: Item, payloads: &[Bytes]) -> Result<Item, CoreError> {
@@ -72,9 +121,7 @@ impl RedbStorage {
                     .chunk_boundaries(payload.as_ref())
             };
             for (offset, length) in boundaries {
-                leaves.push(Bytes::copy_from_slice(
-                    &payload.as_ref()[offset..offset + length],
-                ));
+                leaves.push(payload.slice(offset..offset + length));
             }
         }
         if leaves.len() != item.chunks.len()
@@ -110,14 +157,14 @@ impl RedbStorage {
                 let existing = chunks
                     .get(chunk.hash.as_bytes())
                     .map_err(|error| CoreError::Other(error.to_string()))?
-                    .map(|value| value.value());
+                    .map(|value| value.value() == data.as_ref());
                 if let Some(existing) = existing {
-                    if existing.as_slice() != data.as_ref() {
+                    if !existing {
                         return Err(StorageError::ImmutableConflict.into());
                     }
                 } else {
                     chunks
-                        .insert(chunk.hash.as_bytes(), data.to_vec())
+                        .insert(chunk.hash.as_bytes(), data.as_ref())
                         .map_err(|error| CoreError::Other(error.to_string()))?;
                 }
             }
@@ -185,14 +232,14 @@ impl RedbStorage {
             let existing = lists
                 .get(item.metadata.root.hash.as_bytes())
                 .map_err(|error| CoreError::Other(error.to_string()))?
-                .map(|value| value.value());
+                .map(|value| value.value() == encoded);
             if let Some(existing) = existing {
-                if existing != encoded {
+                if !existing {
                     return Err(StorageError::ImmutableConflict.into());
                 }
             } else {
                 lists
-                    .insert(item.metadata.root.hash.as_bytes(), encoded)
+                    .insert(item.metadata.root.hash.as_bytes(), encoded.as_slice())
                     .map_err(|error| CoreError::Other(error.to_string()))?;
             }
         }
@@ -205,14 +252,7 @@ impl RedbStorage {
 
 impl ChunkStorage for RedbStorage {
     fn get(&self, hash: &Hash) -> Option<Arc<Node>> {
-        self.db
-            .begin_read()
-            .ok()
-            .and_then(|read_txn| {
-                self.get_stored_node(&read_txn, hash)
-                    .or(self.get_parent_node(&read_txn, hash))
-            })
-            .map(Arc::new)
+        Self::get_from_snapshot(&self.db.begin_read().ok()?, hash)
     }
 
     fn store_chunk(&self, hash: Hash, chunk: &[u8]) -> Result<Arc<Node>, StorageError> {
@@ -242,14 +282,14 @@ impl ChunkStorage for RedbStorage {
             let existing = table
                 .get(hash.as_bytes())
                 .map_err(|e| StorageError::Io(std::io::Error::other(e)))?
-                .map(|value| value.value());
+                .map(|value| value.value() == chunk);
             if let Some(existing) = existing {
-                if existing.as_slice() != chunk {
+                if !existing {
                     return Err(StorageError::ImmutableConflict);
                 }
             } else {
                 table
-                    .insert(hash.as_bytes(), Vec::from(chunk))
+                    .insert(hash.as_bytes(), chunk)
                     .map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
             }
         }
@@ -354,7 +394,8 @@ impl ChunkStorage for RedbStorage {
     fn chunk_list(&self, root: &Hash) -> Vec<Hash> {
         let direct = self.db.begin_read().ok().and_then(|read_txn| {
             let table = read_txn.open_table(CHUNK_LIST_TABLE).ok()?;
-            let bytes = table.get(root.as_bytes()).ok()??.value();
+            let bytes = table.get(root.as_bytes()).ok()??;
+            let bytes = bytes.value();
             if bytes.len() % 32 != 0 {
                 return None;
             }
@@ -373,14 +414,19 @@ impl ChunkStorage for RedbStorage {
     }
 
     fn get_chunk_by_index(&self, root: &Hash, index: u32) -> Option<Vec<u8>> {
-        let read_txn = self.db.begin_read().ok()?;
-        let lists = read_txn.open_table(CHUNK_LIST_TABLE).ok()?;
-        let encoded = lists.get(root.as_bytes()).ok()??;
-        let start = usize::try_from(index).ok()?.checked_mul(32)?;
-        let end = start.checked_add(32)?;
-        let hash = Hash::from_bytes(encoded.value().get(start..end)?.try_into().ok()?);
-        let chunks = read_txn.open_table(CHUNK_TABLE).ok()?;
-        Some(chunks.get(hash.as_bytes()).ok()??.value())
+        self.with_chunk_by_index(root, index, <[u8]>::to_vec)
+    }
+
+    fn append_chunk_by_index(
+        &self,
+        root: &Hash,
+        index: u32,
+        destination: &mut Vec<u8>,
+    ) -> Option<usize> {
+        self.with_chunk_by_index(root, index, |chunk| {
+            destination.extend_from_slice(chunk);
+            chunk.len()
+        })
     }
 
     fn commit_revision(&self, item: Item, file: Bytes) -> Result<Item, CoreError>
@@ -459,6 +505,253 @@ mod tests {
     }
 
     crate::chunk_storage::tests::chunk_storage_tests!(RedbStorage, make_redb_storage);
+
+    #[test]
+    fn legacy_database_remains_readable_in_both_directions() {
+        const LEGACY_CHUNKS: TableDefinition<&[u8; 32], Vec<u8>> =
+            TableDefinition::new("distd_chunks");
+        const LEGACY_LISTS: TableDefinition<&[u8; 32], Vec<u8>> =
+            TableDefinition::new("distd_chunk_lists");
+        let path = SelfDeletingPath::new(random_path());
+        let left = do_hash(b"left");
+        let right = do_hash(b"right");
+        let parent = merge_hashes(&left, &right);
+        let root = merge_hashes(&parent, &left);
+        let expected = [left, right, left];
+        {
+            let db = Database::create(&*path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut chunks = txn.open_table(LEGACY_CHUNKS).unwrap();
+                chunks.insert(left.as_bytes(), b"left".to_vec()).unwrap();
+                chunks.insert(right.as_bytes(), b"right".to_vec()).unwrap();
+                let mut links = txn.open_table(LINK_TABLE).unwrap();
+                links
+                    .insert(parent.as_bytes(), (*left.as_bytes(), *right.as_bytes()))
+                    .unwrap();
+                links
+                    .insert(root.as_bytes(), (*parent.as_bytes(), *left.as_bytes()))
+                    .unwrap();
+                txn.open_table(LEGACY_LISTS)
+                    .unwrap()
+                    .insert(
+                        root.as_bytes(),
+                        expected
+                            .iter()
+                            .flat_map(|hash| hash.as_bytes().iter().copied())
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let fresh = Bytes::from_static(b"new content");
+        let item;
+        {
+            let storage = RedbStorage::new(&path).unwrap();
+            let tree = storage.get(&root).unwrap();
+            assert_eq!(tree.clone_data().unwrap(), b"leftrightleft");
+            assert_eq!(tree.flatten().unwrap(), expected);
+            assert_eq!(storage.chunk_list(&root), expected);
+            let mut destination = b"prefix:".to_vec();
+            for (index, bytes) in [b"left".as_slice(), b"right", b"left"].iter().enumerate() {
+                assert_eq!(
+                    storage.get_chunk_by_index(&root, index as u32).as_deref(),
+                    Some(*bytes)
+                );
+                assert_eq!(
+                    storage.append_chunk_by_index(&root, index as u32, &mut destination),
+                    Some(bytes.len())
+                );
+            }
+            assert_eq!(destination, b"prefix:leftrightleft");
+            for index in [3, u32::MAX] {
+                assert!(storage.get_chunk_by_index(&root, index).is_none());
+                assert!(storage
+                    .append_chunk_by_index(&root, index, &mut destination)
+                    .is_none());
+                assert_eq!(destination, b"prefix:leftrightleft");
+            }
+            item = storage
+                .prepare_revision(
+                    "fresh".into(),
+                    "fresh".into(),
+                    "fresh.bin".into(),
+                    0,
+                    None,
+                    fresh.clone(),
+                    crate::chunks::ChunkAlgorithm::fixed_aligned(4, 1),
+                )
+                .unwrap();
+            storage
+                .commit_revision(item.clone(), fresh.clone())
+                .unwrap();
+        }
+        {
+            let db = Database::open(&*path).unwrap();
+            let txn = db.begin_read().unwrap();
+            let chunks = txn.open_table(LEGACY_CHUNKS).unwrap();
+            for (chunk, bytes) in item.chunks.iter().zip(fresh.chunks(4)) {
+                assert_eq!(
+                    chunks.get(chunk.hash.as_bytes()).unwrap().unwrap().value(),
+                    bytes
+                );
+            }
+            let lists = txn.open_table(LEGACY_LISTS).unwrap();
+            let encoded = lists
+                .get(item.metadata.root.hash.as_bytes())
+                .unwrap()
+                .unwrap()
+                .value();
+            assert_eq!(
+                encoded,
+                item.chunks
+                    .iter()
+                    .flat_map(|chunk| chunk.hash.as_bytes().iter().copied())
+                    .collect::<Vec<_>>()
+            );
+        }
+        let storage = RedbStorage::new(&path).unwrap();
+        storage.verify_committed_revision(&item).unwrap();
+    }
+
+    #[test]
+    fn tree_reads_reuse_shared_nodes_within_one_snapshot() {
+        let storage = make_redb_storage();
+        let leaf = storage.insert_chunk(b"shared").unwrap();
+        let parent = storage.link(leaf.clone(), leaf).unwrap();
+        let root = storage.link(parent.clone(), parent).unwrap();
+        let loaded = storage.get(root.hash()).unwrap();
+        let (left, right) = loaded.children().unwrap();
+        assert!(Arc::ptr_eq(left, right));
+        let (left, right) = left.children().unwrap();
+        assert!(Arc::ptr_eq(left, right));
+        assert_eq!(loaded.clone_data().unwrap(), b"sharedsharedsharedshared");
+
+        let snapshot = storage.db.begin_read().unwrap();
+        let txn = storage.db.begin_write().unwrap();
+        txn.open_table(CHUNK_TABLE)
+            .unwrap()
+            .remove(left.hash().as_bytes())
+            .unwrap();
+        txn.commit().unwrap();
+        assert!(RedbStorage::get_from_snapshot(&snapshot, root.hash()).is_some());
+        assert!(storage.get(root.hash()).is_none());
+    }
+
+    #[test]
+    fn invalid_index_or_missing_payload_does_not_append_bytes() {
+        let storage = make_redb_storage();
+        let leaf = storage.insert_chunk(b"present").unwrap();
+        let root = do_hash(b"index");
+        let missing = do_hash(b"absent");
+        let mut destination = b"unchanged".to_vec();
+        for encoded in [
+            [leaf.hash().as_bytes().as_slice(), &[0]].concat(),
+            missing.as_bytes().to_vec(),
+        ] {
+            let txn = storage.db.begin_write().unwrap();
+            txn.open_table(CHUNK_LIST_TABLE)
+                .unwrap()
+                .insert(root.as_bytes(), encoded.as_slice())
+                .unwrap();
+            txn.commit().unwrap();
+            assert!(storage.get_chunk_by_index(&root, 0).is_none());
+            assert!(storage
+                .append_chunk_by_index(&root, 0, &mut destination)
+                .is_none());
+            assert_eq!(destination, b"unchanged");
+        }
+    }
+
+    #[test]
+    fn tree_read_rejects_cycles_and_size_overflow() {
+        let storage = make_redb_storage();
+        let leaf = storage.insert_chunk(b"x").unwrap();
+        let cycle = do_hash(b"cycle");
+        let txn = storage.db.begin_write().unwrap();
+        let mut root = *leaf.hash();
+        {
+            let mut links = txn.open_table(LINK_TABLE).unwrap();
+            links
+                .insert(
+                    cycle.as_bytes(),
+                    (*cycle.as_bytes(), *leaf.hash().as_bytes()),
+                )
+                .unwrap();
+            for _ in 0..64 {
+                let parent = merge_hashes(&root, &root);
+                links
+                    .insert(parent.as_bytes(), (*root.as_bytes(), *root.as_bytes()))
+                    .unwrap();
+                root = parent;
+            }
+        }
+        txn.commit().unwrap();
+        assert!(storage.get(&cycle).is_none());
+        assert!(storage.get(&root).is_none());
+    }
+
+    #[test]
+    fn failed_batched_commit_does_not_publish_partial_chunks() {
+        let storage = make_redb_storage();
+        let data = Bytes::from_static(b"aaaabbbb");
+        let item = storage
+            .prepare_revision(
+                "artifact".into(),
+                "artifact".into(),
+                "artifact.bin".into(),
+                0,
+                None,
+                data.clone(),
+                crate::chunks::ChunkAlgorithm::fixed_aligned(4, 1),
+            )
+            .unwrap();
+        let first = item.chunks[0].hash;
+        let root = item.metadata.root.hash;
+        let txn = storage.db.begin_write().unwrap();
+        txn.open_table(CHUNK_TABLE)
+            .unwrap()
+            .insert(item.chunks[1].hash.as_bytes(), b"corrupt".as_slice())
+            .unwrap();
+        txn.commit().unwrap();
+        assert!(matches!(
+            storage.commit_revision(item, data),
+            Err(CoreError::Storage(StorageError::ImmutableConflict))
+        ));
+        assert!(storage.get(&first).is_none());
+        assert!(storage.get(&root).is_none());
+        assert!(storage.chunk_list(&root).is_empty());
+    }
+
+    #[test]
+    fn empty_directory_files_keep_their_ordered_chunk_entries() {
+        let storage = make_redb_storage();
+        let files = vec![
+            (PathBuf::from("z.bin"), Bytes::new()),
+            (PathBuf::from("a.bin"), Bytes::from_static(b"data")),
+            (PathBuf::from("m.bin"), Bytes::new()),
+        ];
+        let item = storage
+            .prepare_revision_from_files(
+                "artifact".into(),
+                "artifact".into(),
+                "directory".into(),
+                0,
+                None,
+                files.clone(),
+                crate::chunks::ChunkAlgorithm::default(),
+            )
+            .unwrap();
+        storage
+            .commit_revision_from_files(item.clone(), files)
+            .unwrap();
+        storage.verify_committed_revision(&item).unwrap();
+        let root = item.metadata.root.hash;
+        assert_eq!(storage.get_chunk_by_index(&root, 0).unwrap(), b"data");
+        assert_eq!(storage.get_chunk_by_index(&root, 1).unwrap(), b"");
+        assert_eq!(storage.get_chunk_by_index(&root, 2).unwrap(), b"");
+    }
 
     #[test]
     fn rejects_mismatched_immutable_keys() {
