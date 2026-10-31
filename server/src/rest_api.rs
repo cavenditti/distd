@@ -1,5 +1,10 @@
 use std::{
-    collections::HashMap, fmt::Debug, net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc,
+    collections::{BTreeMap, HashMap},
+    fmt::Debug,
+    net::SocketAddr,
+    path::PathBuf,
+    str::FromStr,
+    sync::Arc,
     time::Duration,
 };
 
@@ -30,6 +35,7 @@ use distd_core::{
     chunks::{ChunkAlgorithm, ChunkingPolicy},
     feed::{Feed, Name as FeedName},
     hash::Hash,
+    item::EntryKind,
     metadata::Server as ServerMetadata,
     signature::{
         PublisherPublicKey, PublisherReleaseEnvelope, PublisherReleaseSequence, PublisherSignature,
@@ -146,7 +152,7 @@ fn publication_envelope(headers: &HeaderMap) -> Result<PublicationRequestAttesta
             )),
         ),
         (Some(version), Some(key), Some(signature), Some(sequence))
-            if version.as_bytes() == b"2" =>
+            if matches!(version.as_bytes(), b"2" | b"3") =>
         {
             let sequence = sequence.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
             if sequence.is_empty()
@@ -175,7 +181,9 @@ fn publication_error_status(error: &ServerError) -> StatusCode {
         | ServerError::Publication(PublicationError::InvalidSignature(_)) => StatusCode::FORBIDDEN,
         ServerError::Publication(PublicationError::AttestationConflict) => StatusCode::CONFLICT,
         ServerError::Publication(
-            PublicationError::UnsignedForbidden | PublicationError::ReplayableForbidden,
+            PublicationError::UnsignedForbidden
+            | PublicationError::ReplayableForbidden
+            | PublicationError::EntryKindsRequireRelease,
         ) => StatusCode::BAD_REQUEST,
         ServerError::State(message) if message.contains("read-only until restart") => {
             StatusCode::SERVICE_UNAVAILABLE
@@ -506,19 +514,29 @@ impl UploadedFileAccumulator {
     }
 }
 
-async fn collect_uploaded_files(
-    mut multipart: Multipart,
-) -> Result<Vec<(PathBuf, axum::body::Bytes)>, StatusCode> {
+/// Uploaded files plus the kinds of non-regular entries. Multipart field `item` is a regular
+/// file, `item-executable` an executable file, and `item-symlink` a symbolic link whose body
+/// is its UTF-8 target.
+type UploadedEntries = (
+    Vec<(PathBuf, axum::body::Bytes)>,
+    BTreeMap<PathBuf, EntryKind>,
+);
+
+async fn collect_uploaded_files(mut multipart: Multipart) -> Result<UploadedEntries, StatusCode> {
     let mut uploaded_files = UploadedFileAccumulator::new();
+    let mut kinds = BTreeMap::new();
 
     while let Some(field) = multipart
         .next_field()
         .await
         .map_err(|error| error.status())?
     {
-        if field.name() != Some("item") {
-            continue;
-        }
+        let (executable, symlink) = match field.name() {
+            Some("item") => (false, false),
+            Some("item-executable") => (true, false),
+            Some("item-symlink") => (false, true),
+            _ => continue,
+        };
         let (file_name, next_path_bytes) = uploaded_files.prepare_next(field.file_name())?;
         let data = field
             .bytes()
@@ -530,10 +548,20 @@ async fn collect_uploaded_files(
                 );
             })
             .map_err(|error| error.status())?;
+        let data = if symlink {
+            let target = String::from_utf8(data.to_vec()).map_err(|_| StatusCode::BAD_REQUEST)?;
+            kinds.insert(file_name.clone(), EntryKind::Symlink { target });
+            axum::body::Bytes::new()
+        } else {
+            if executable {
+                kinds.insert(file_name.clone(), EntryKind::Executable);
+            }
+            data
+        };
         uploaded_files.retain_prepared(file_name, next_path_bytes, data)?;
     }
 
-    Ok(uploaded_files.into_files())
+    Ok((uploaded_files.into_files(), kinds))
 }
 
 /// Publish an item
@@ -556,7 +584,7 @@ where
     if artifact_id.is_empty() || artifact_id.len() > 256 || item_data.name.len() > 256 {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let mut uploaded_files =
+    let (mut uploaded_files, kinds) =
         tokio::time::timeout_at(body_deadline.0, collect_uploaded_files(multipart))
             .await
             .map_err(|_| StatusCode::REQUEST_TIMEOUT)??;
@@ -564,6 +592,14 @@ where
     if uploaded_files.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
+    // Entry kinds are signed only by a V3 release statement, which must be declared exactly
+    // when the upload has a non-regular entry.
+    let declares_v3 = singleton_header(&headers, PUBLISHER_VERSION_HEADER)?
+        .is_some_and(|version| version.as_bytes() == b"3");
+    if declares_v3 == kinds.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let single_file = uploaded_files.len() == 1 && kinds.is_empty();
 
     let requested_policy = item_data
         .chunking
@@ -571,7 +607,7 @@ where
         .unwrap_or("auto")
         .parse::<ChunkingPolicy>()
         .map_err(|_| StatusCode::BAD_REQUEST)?;
-    let chunk_algorithm = if uploaded_files.len() == 1 {
+    let chunk_algorithm = if single_file {
         let (relative_path, data) = &uploaded_files[0];
         let probe_path = if relative_path.as_os_str().is_empty() {
             &item_data.path
@@ -583,7 +619,7 @@ where
         ChunkAlgorithm::from_policy(requested_policy, &item_data.path, &[], true)
     };
 
-    let result = if uploaded_files.len() == 1 {
+    let result = if single_file {
         let (_, file) = uploaded_files.pop().unwrap();
         match envelope {
             PublicationRequestAttestation::ReleaseV2 { sequence, envelope } => {
@@ -630,12 +666,13 @@ where
         match envelope {
             PublicationRequestAttestation::ReleaseV2 { sequence, envelope } => {
                 server
-                    .publish_release_item_from_files_as(
+                    .publish_release_entries_as(
                         artifact_id,
                         item_data.name,
                         destination,
                         item_data.description,
                         uploaded_files,
+                        kinds,
                         chunk_algorithm,
                         sequence,
                         envelope,

@@ -285,6 +285,7 @@ mod tests {
     use crate::chunk_storage::ChunkStorage;
     use crate::chunks::ChunkAlgorithm;
     use crate::composefs::inspect_composefs_erofs;
+    use crate::item::EntryKind;
     use crate::utils::testing::temp_path;
 
     fn directory_revision(storage: &FsStorage, revision: u32, tail: &[u8]) -> Item {
@@ -436,5 +437,146 @@ mod tests {
             .lazy_revision(Path::new("lazy-pkg"))
             .unwrap()
             .is_some());
+    }
+
+    fn kinded_files() -> (
+        Vec<(PathBuf, Bytes)>,
+        std::collections::BTreeMap<PathBuf, EntryKind>,
+    ) {
+        (
+            vec![
+                (PathBuf::from("bin/hello"), Bytes::from(vec![0x7f; 6000])),
+                (PathBuf::from("bin/hi"), Bytes::new()),
+            ],
+            std::collections::BTreeMap::from([
+                (PathBuf::from("bin/hello"), EntryKind::Executable),
+                (
+                    PathBuf::from("bin/hi"),
+                    EntryKind::Symlink {
+                        target: "/nix/store/abc-hello/bin/hello".to_string(),
+                    },
+                ),
+            ]),
+        )
+    }
+
+    fn kinded_revision(storage: &FsStorage) -> Item {
+        let (files, kinds) = kinded_files();
+        storage
+            .prepare_revision_from_entries(
+                "kinded-pkg".to_string(),
+                "kinded-pkg".to_string(),
+                PathBuf::from("kinded-pkg"),
+                1,
+                None,
+                files,
+                kinds,
+                ChunkAlgorithm::fixed_aligned(4096, 1),
+            )
+            .unwrap()
+    }
+
+    fn state_schema(storage: &FsStorage) -> u16 {
+        let path = storage.inner.read().unwrap().persistance_path.clone();
+        crate::durable_state::read_enveloped_state_any(
+            &path,
+            DurableStateKind::FsStorage,
+            &[1, 2],
+            MAX_DURABLE_STATE_PAYLOAD,
+        )
+        .unwrap()
+        .0
+    }
+
+    #[test]
+    fn kinded_revisions_persist_in_kinded_layouts_only() {
+        let root = temp_path();
+        let storage = FsStorage::new(root.clone()).unwrap();
+        let regular = directory_revision(&storage, 1, b"readme\n");
+        storage
+            .commit_revision_from_files(
+                regular.clone(),
+                vec![
+                    (
+                        PathBuf::from("bin/tool"),
+                        Bytes::from(vec![0x7f; 3 * 4096 + 17]),
+                    ),
+                    (
+                        PathBuf::from("share/doc/README"),
+                        Bytes::from_static(b"readme\n"),
+                    ),
+                ],
+            )
+            .unwrap();
+        assert_eq!(state_schema(&storage), 1);
+
+        let kinded = kinded_revision(&storage);
+        let (files, _) = kinded_files();
+        let committed = storage
+            .commit_revision_from_files(kinded.clone(), files)
+            .unwrap();
+        assert_eq!(committed.manifest.entries, kinded.manifest.entries);
+        assert_eq!(state_schema(&storage), 2);
+        let markers: Vec<_> = fs::read_dir(root.join(".distd-revisions-v1").join("items"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        let extensions: std::collections::BTreeSet<_> = markers
+            .iter()
+            .filter_map(|path| path.extension()?.to_str().map(str::to_owned))
+            .collect();
+        assert_eq!(extensions, ["item".to_string(), "kitem".to_string()].into());
+
+        drop(storage);
+        let reopened = FsStorage::new(root).unwrap();
+        let reloaded = reopened.item_for_path(Path::new("kinded-pkg")).unwrap();
+        assert_eq!(reloaded.manifest.entries, kinded.manifest.entries);
+        assert_eq!(
+            reopened
+                .item_for_path(Path::new("lazy-pkg"))
+                .unwrap()
+                .manifest
+                .entries,
+            regular.manifest.entries
+        );
+    }
+
+    #[test]
+    fn eager_ingest_refuses_kinds_and_lazy_activation_projects_them() {
+        let storage = std::sync::Arc::new(FsStorage::new(temp_path()).unwrap());
+        let item = kinded_revision(&storage);
+        let refused = storage.begin_sync_ingest(
+            item.metadata.name.clone(),
+            PathBuf::from("kinded-pkg"),
+            1,
+            None,
+            item.manifest.clone(),
+            item.chunks.clone(),
+            Vec::new(),
+        );
+        assert!(refused.is_err());
+
+        let lazy = storage
+            .activate_lazy_revision(
+                item.metadata.name.clone(),
+                Path::new("kinded-pkg"),
+                1,
+                None,
+                &item.manifest,
+                &item.chunks,
+            )
+            .unwrap();
+        assert_eq!(lazy.item.manifest.entries, item.manifest.entries);
+        assert_eq!(lazy.image.files.len(), 1);
+        assert!(lazy.image.files[0].executable);
+        assert_eq!(lazy.image.symlinks.len(), 1);
+        assert_eq!(
+            lazy.image.symlinks[0].target,
+            "/nix/store/abc-hello/bin/hello"
+        );
+        assert_eq!(
+            storage.lazy_revision(Path::new("kinded-pkg")).unwrap(),
+            Some(lazy)
+        );
     }
 }

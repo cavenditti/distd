@@ -29,7 +29,8 @@ use distd_core::{
     proto::{self},
     signature::{
         PublisherKeyFingerprint, PublisherPublicKey, PublisherReleaseEnvelope,
-        PublisherReleaseSequence, PublisherSignature, PublisherSignatureEnvelope,
+        PublisherReleaseSequence, PublisherReleaseStatement, PublisherSignature,
+        PublisherSignatureEnvelope,
     },
     version::VERSION,
 };
@@ -326,6 +327,11 @@ impl VerifiedSync {
 
     pub(crate) fn local_hashes(&self) -> &[Hash] {
         &self.local_hashes
+    }
+
+    /// Abandon a verified session before any possession is sent.
+    pub(crate) fn abort(self) {
+        self.continuation.abort();
     }
 
     pub(crate) async fn transfer_into(
@@ -1271,7 +1277,7 @@ fn publisher_attestation_from_transport(
                 ),
             ))
         }
-        (Some(2), Some(sequence), public_key, signature)
+        (Some(2 | 3), Some(sequence), public_key, signature)
             if !public_key.is_empty() && !signature.is_empty() =>
         {
             Ok(PublisherTransportAttestation::ReleaseV2 {
@@ -1309,8 +1315,9 @@ fn verify_manifest_response_with_basis(
     local_basis: LocalChunkBasis,
     policy: &PublisherPolicy,
 ) -> Result<VerifiedManifestParts, PublisherAuthenticityError> {
+    let statement_version = response.publisher_statement_version;
     let attestation = publisher_attestation_from_transport(
-        response.publisher_statement_version,
+        statement_version,
         response.publisher_release_sequence,
         &response.publisher_public_key,
         &response.publisher_signature,
@@ -1361,13 +1368,26 @@ fn verify_manifest_response_with_basis(
         entries: response
             .entries
             .into_iter()
-            .map(|entry| FileEntry {
-                relative_path: entry.relative_path,
-                size: entry.size,
-                chunk_range: (entry.chunk_start, entry.chunk_end),
-            })
-            .collect(),
+            .map(FileEntry::try_from_proto)
+            .collect::<Result<_, _>>()
+            .map_err(|_| PublisherAuthenticityError::MalformedAttestation)?,
     };
+    // Entry kinds exist only under a V3 release statement, and the declared version must be
+    // the one the manifest requires, so no reader can be offered kinds it would ignore.
+    match attestation {
+        PublisherTransportAttestation::ReleaseV2 { .. } => {
+            let required = u32::from(PublisherReleaseStatement::version_for(&manifest));
+            if statement_version != Some(required) {
+                return Err(PublisherAuthenticityError::MalformedAttestation);
+            }
+        }
+        PublisherTransportAttestation::Unsigned
+        | PublisherTransportAttestation::ReplayableV1(_) => {
+            if !manifest.has_only_regular_entries() {
+                return Err(PublisherAuthenticityError::MalformedAttestation);
+            }
+        }
+    }
     let publisher_authorization =
         policy.authorize_transport_manifest(attestation, &manifest, &chunks)?;
 
@@ -1488,7 +1508,7 @@ mod tests {
         chunk_storage::{hashmap_storage::HashMapStorage, ChunkStorage},
         chunks::{ChunkAlgorithm, CHUNK_SIZE},
         hash::{hash, Hash},
-        item::Item,
+        item::{EntryKind, FileEntry, Item},
         proto,
         signature::{
             PublisherPublicKey, PublisherReleaseEnvelope, PublisherReleaseSequence,
@@ -1601,12 +1621,7 @@ mod tests {
                 .manifest
                 .entries
                 .iter()
-                .map(|entry| proto::FileEntry {
-                    relative_path: entry.relative_path.clone(),
-                    size: entry.size,
-                    chunk_start: entry.chunk_range.0,
-                    chunk_end: entry.chunk_range.1,
-                })
+                .map(FileEntry::to_proto)
                 .collect(),
             chunk_algorithm: Some(item.manifest.chunk_algorithm.to_proto()),
             chunk_sizes: item
@@ -1616,7 +1631,7 @@ mod tests {
                 .collect(),
             publisher_public_key: envelope.public_key().as_bytes().to_vec(),
             publisher_signature: envelope.signature().as_bytes().to_vec(),
-            publisher_statement_version: Some(2),
+            publisher_statement_version: Some(u32::from(statement.version())),
             publisher_release_sequence: Some(sequence.get()),
         };
         (response, item.metadata, policy)
@@ -1682,6 +1697,7 @@ mod tests {
                         u32::try_from(index).unwrap(),
                         u32::try_from(index + 1).unwrap(),
                     ),
+                    kind: EntryKind::Regular,
                 })
                 .collect()
         } else {
@@ -1817,18 +1833,100 @@ mod tests {
             publisher_attestation_from_transport(Some(2), None, &[3; 32], &[5; 64]),
             Err(PublisherAuthenticityError::MalformedAttestation)
         ));
+        // V3 release statements reuse the release envelope; the manifest decides which
+        // version is required.
+        assert!(matches!(
+            publisher_attestation_from_transport(Some(3), Some(7), &[3; 32], &[5; 64]),
+            Ok(PublisherTransportAttestation::ReleaseV2 { .. })
+        ));
         for (version, sequence) in [
             (None, None),
             (None, Some(7)),
             (Some(0), Some(7)),
             (Some(1), Some(7)),
-            (Some(3), Some(7)),
+            (Some(3), None),
+            (Some(4), Some(7)),
         ] {
             assert!(matches!(
                 publisher_attestation_from_transport(version, sequence, &[3; 32], &[5; 64]),
                 Err(PublisherAuthenticityError::MalformedAttestation)
             ));
         }
+    }
+
+    #[test]
+    fn entry_kinds_are_accepted_only_under_the_v3_release_version() {
+        let storage = HashMapStorage::default();
+        let item = storage
+            .prepare_revision_from_entries(
+                "kinded-client-artifact".to_string(),
+                "kinded-client-artifact".to_string(),
+                std::path::PathBuf::from("kinded-client-artifact"),
+                0,
+                None,
+                vec![
+                    (
+                        std::path::PathBuf::from("bin/tool"),
+                        bytes::Bytes::from_static(b"#!/bin/sh\n"),
+                    ),
+                    (std::path::PathBuf::from("bin/link"), bytes::Bytes::new()),
+                ],
+                std::collections::BTreeMap::from([
+                    (std::path::PathBuf::from("bin/tool"), EntryKind::Executable),
+                    (
+                        std::path::PathBuf::from("bin/link"),
+                        EntryKind::Symlink {
+                            target: "tool".to_string(),
+                        },
+                    ),
+                ]),
+                ChunkAlgorithm::Fixed256K,
+            )
+            .unwrap();
+        let (response, expected, policy) =
+            signed_response_for_item_at_sequence(item.clone(), [61; 32], 1);
+        assert_eq!(response.publisher_statement_version, Some(3));
+        let manifest = verify_manifest_response(response.clone(), &expected, Vec::new(), &policy)
+            .unwrap()
+            .0;
+        assert_eq!(manifest.entries, item.manifest.entries);
+        assert_eq!(
+            manifest.entries[0].kind,
+            EntryKind::Symlink {
+                target: "tool".to_string()
+            }
+        );
+
+        let mut downgraded = response.clone();
+        downgraded.publisher_statement_version = Some(2);
+        let mut confused = response.clone();
+        confused.entries[1].symlink_target = Some("tool".to_string());
+        let mut unknown = response.clone();
+        unknown.entries[1].kind = Some(99);
+        for malformed in [downgraded, confused, unknown] {
+            assert!(matches!(
+                verify_manifest_response(malformed, &expected, Vec::new(), &policy),
+                Err(PublisherAuthenticityError::MalformedAttestation)
+            ));
+        }
+
+        let mut stripped = response.clone();
+        stripped.entries[1].kind = None;
+        assert!(matches!(
+            verify_manifest_response(stripped, &expected, Vec::new(), &policy),
+            Err(PublisherAuthenticityError::InvalidSignature)
+        ));
+
+        let mut unsigned = response;
+        unsigned.publisher_statement_version = None;
+        unsigned.publisher_release_sequence = None;
+        unsigned.publisher_public_key.clear();
+        unsigned.publisher_signature.clear();
+        let insecure = PublisherPolicy::from_config(&[], true).unwrap();
+        assert!(matches!(
+            verify_manifest_response(unsigned, &expected, Vec::new(), &insecure),
+            Err(PublisherAuthenticityError::MalformedAttestation)
+        ));
     }
 
     #[test]

@@ -104,8 +104,11 @@ cargo run -p distd_client -- get --lazy artifact-id local/path
 ```
 
 A lazy activation is independent of an eager one for the same destination.
-Images currently carry fixed `0444` file and `0555` directory modes and no
-symbolic links.
+Images use `0444` for regular files, `0555` for executable files and
+directories, and `S_IFLNK` inodes for symbolic links. Eager `get` refuses
+artifacts with executable or symlink entries and points to `--lazy`: eager
+activation hard-links files with shared CAS blobs, so a per-entry mode cannot
+be represented safely.
 
 Publish through the authenticated HTTP endpoint:
 
@@ -122,7 +125,18 @@ curl --fail-with-body \
 
 The detached signature covers distd's canonical V2 publisher release statement
 for the publisher-controlled sequence, typed manifest, and ordered chunks—not
-the multipart or Protobuf bytes. Sequences are monotonic per artifact. Private
+the multipart or Protobuf bytes.
+
+Directory releases may mark entries as executable files (multipart field
+`item-executable`) or symbolic links (field `item-symlink`, whose body is the
+UTF-8 target, such as `/nix/store/…-hello/bin/hello`). A symlink is an empty
+entry covering one empty chunk; its target must be nonempty NFC UTF-8 of at
+most 4,095 bytes without NUL. Such releases are signed as a V3 statement, which
+adds each entry's kind and target, and the request must declare
+`X-Distd-Publisher-Statement-Version: 3`. Manifests with only regular files
+keep their exact V2 statement and every existing persisted encoding. Unsigned
+and replayable V1 publications cannot carry entry kinds, so older clients
+always reject them as an unknown statement version. Sequences are monotonic per artifact. Private
 key tooling remains intentionally outside the server. Every key referenced by
 retained signed history must remain in `DISTD_PUBLISHER_PUBLIC_KEYS`; removing
 one makes secure startup and sync fail closed. For isolated research only,

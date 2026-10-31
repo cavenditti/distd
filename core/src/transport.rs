@@ -634,9 +634,11 @@ mod tests {
 
     #[test]
     fn protobuf_v1_schema_source_is_hash_pinned() {
+        // Re-pinned for the additive `FileEntry.kind`/`symlink_target` fields. They stay V1:
+        // entry kinds appear only under a V3 release statement, which older readers reject.
         assert_eq!(
             crate::hash::hash(include_bytes!("../proto/distd.proto")).to_string(),
-            "cb8bf604924e013182f2072daaa688c69d3ab0c55f66affbf5122f0055f8106d"
+            "637e023cc92f563998432c7de1ee173594bfc1a29209d8fb6cdc65efa454ddf2"
         );
     }
 

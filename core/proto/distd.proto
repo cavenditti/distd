@@ -84,11 +84,26 @@ message ChunkAlgorithmProfile {
   uint64 seed = 12;
 }
 
+enum EntryKind {
+  ENTRY_KIND_UNSPECIFIED = 0;
+  ENTRY_KIND_REGULAR = 1;
+  ENTRY_KIND_EXECUTABLE = 2;
+  ENTRY_KIND_SYMLINK = 3;
+}
+
 message FileEntry {
   string relative_path = 1;
+  // Zero for symbolic links, which cover exactly one empty chunk.
   uint64 size = 2;
   uint32 chunk_start = 3;
   uint32 chunk_end = 4;
+  // Omitted for regular files, so regular-only manifests keep their exact
+  // encoding. Every other kind is valid only in a manifest attested by a V3
+  // publisher release statement: older readers reject that statement version
+  // before they could ignore the kind.
+  optional EntryKind kind = 5;
+  // Present exactly when kind is ENTRY_KIND_SYMLINK.
+  optional string symlink_target = 6;
 }
 
 message PossessionBitfield {

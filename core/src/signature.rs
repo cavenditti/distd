@@ -10,13 +10,14 @@ use crate::{
     chunk_storage::validate_revision_metadata,
     chunks::{ChunkAlgorithm, ChunkInfo},
     hash::{hash, merge_hashes, Hash},
-    item::{FileEntry, Item, Manifest},
+    item::{EntryKind, FileEntry, Item, Manifest, MAX_SYMLINK_TARGET_BYTES},
     utils::frame::MAX_FRAME_PAYLOAD_BYTES,
 };
 
 const STATEMENT_DOMAIN: &[u8] = b"distd publisher statement v1\0";
 const ENVELOPE_DOMAIN: &[u8] = b"distd publisher signature envelope v1\0";
 const RELEASE_STATEMENT_DOMAIN: &[u8] = b"distd publisher release statement v2\0";
+const RELEASE_STATEMENT_DOMAIN_V3: &[u8] = b"distd publisher release statement v3\0";
 const RELEASE_ENVELOPE_DOMAIN: &[u8] = b"distd publisher release envelope v2\0";
 const RELEASE_IDENTITY_DOMAIN: &[u8] = b"distd publisher release identity v1\0";
 const FINGERPRINT_DOMAIN: &[u8] = b"distd publisher public key fingerprint v1\0";
@@ -24,6 +25,9 @@ const FINGERPRINT_DOMAIN: &[u8] = b"distd publisher public key fingerprint v1\0"
 pub const PUBLISHER_STATEMENT_VERSION_V1: u16 = 1;
 /// Format version of the rollback-protected publisher release statement.
 pub const PUBLISHER_RELEASE_STATEMENT_VERSION_V2: u16 = 2;
+/// Format version of the release statement that additionally signs entry kinds (executable
+/// files and symbolic-link targets). Manifests with only regular entries always use V2.
+pub const PUBLISHER_RELEASE_STATEMENT_VERSION_V3: u16 = 3;
 const MAX_ARTIFACT_ID_BYTES: usize = 256;
 const MAX_ENTRY_PATH_BYTES: usize = 4_096;
 const MAX_CHUNKS: usize = 65_536;
@@ -293,6 +297,7 @@ impl PublisherStatement {
                 relative_path: reader.utf8_u16("entry path", MAX_ENTRY_PATH_BYTES)?,
                 size: reader.u64()?,
                 chunk_range: (reader.u32()?, reader.u32()?),
+                kind: EntryKind::Regular,
             });
         }
         if reader.remaining() != 0 {
@@ -340,6 +345,11 @@ impl PublisherStatement {
         chunks: &[ChunkInfo],
         encoded_size: usize,
     ) -> Result<Self, SignatureEnvelopeError> {
+        if !manifest.has_only_regular_entries() {
+            return Err(SignatureEnvelopeError::InvalidStatement(
+                "replayable statements cannot attest entry kinds",
+            ));
+        }
         let mut bytes = Vec::with_capacity(encoded_size);
         bytes.extend_from_slice(STATEMENT_DOMAIN);
         push_u16(&mut bytes, PUBLISHER_STATEMENT_VERSION_V1);
@@ -386,18 +396,30 @@ impl PublisherStatement {
     }
 }
 
-/// A fully decoded and validated canonical V2 publisher release statement.
+/// A fully decoded and validated canonical V2 or V3 publisher release statement.
 ///
 /// Unlike [`PublisherStatement`], this statement signs the publisher-controlled
-/// artifact release sequence used by rollback policy.
+/// artifact release sequence used by rollback policy. The version is a function
+/// of the manifest: V3 exactly when some entry is executable or a symbolic link.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PublisherReleaseStatement {
     bytes: Vec<u8>,
     sequence: PublisherReleaseSequence,
+    version: u16,
 }
 
 impl PublisherReleaseStatement {
-    /// Construct the canonical V2 release statement from a typed sync manifest
+    /// Release statement version required to attest `manifest`.
+    #[must_use]
+    pub fn version_for(manifest: &Manifest) -> u16 {
+        if manifest.has_only_regular_entries() {
+            PUBLISHER_RELEASE_STATEMENT_VERSION_V2
+        } else {
+            PUBLISHER_RELEASE_STATEMENT_VERSION_V3
+        }
+    }
+
+    /// Construct the canonical release statement from a typed sync manifest
     /// and its ordered chunk identities.
     pub fn from_manifest(
         manifest: &Manifest,
@@ -405,10 +427,15 @@ impl PublisherReleaseStatement {
         sequence: PublisherReleaseSequence,
     ) -> Result<Self, SignatureEnvelopeError> {
         let v1_size = validate_manifest(manifest, chunks)?;
-        Self::encode_validated(manifest, chunks, sequence, release_statement_size(v1_size)?)
+        Self::encode_validated(
+            manifest,
+            chunks,
+            sequence,
+            release_statement_size(v1_size, manifest)?,
+        )
     }
 
-    /// Construct the canonical V2 release statement from an authoritative
+    /// Construct the canonical release statement from an authoritative
     /// typed item.
     pub fn from_item(
         item: &Item,
@@ -421,11 +448,11 @@ impl PublisherReleaseStatement {
             &item.manifest,
             &item.chunks,
             sequence,
-            release_statement_size(v1_size)?,
+            release_statement_size(v1_size, &item.manifest)?,
         )
     }
 
-    /// Decode exact canonical V2 release statement bytes for fixtures and
+    /// Decode exact canonical V2 or V3 release statement bytes for fixtures and
     /// external signing tooling.
     pub fn decode(bytes: &[u8]) -> Result<Self, SignatureEnvelopeError> {
         if bytes.len() > MAX_FRAME_PAYLOAD_BYTES {
@@ -435,9 +462,15 @@ impl PublisherReleaseStatement {
             });
         }
         let mut reader = Reader::new(bytes);
-        reader.expect_domain(RELEASE_STATEMENT_DOMAIN)?;
+        let expected_version = if bytes.starts_with(RELEASE_STATEMENT_DOMAIN_V3) {
+            reader.expect_domain(RELEASE_STATEMENT_DOMAIN_V3)?;
+            PUBLISHER_RELEASE_STATEMENT_VERSION_V3
+        } else {
+            reader.expect_domain(RELEASE_STATEMENT_DOMAIN)?;
+            PUBLISHER_RELEASE_STATEMENT_VERSION_V2
+        };
         let version = reader.u16()?;
-        if version != PUBLISHER_RELEASE_STATEMENT_VERSION_V2 {
+        if version != expected_version {
             return Err(SignatureEnvelopeError::UnsupportedStatementVersion(version));
         }
         let body_length = usize::try_from(reader.u32()?)
@@ -468,13 +501,27 @@ impl PublisherReleaseStatement {
                 size: reader.u64()?,
             });
         }
-        let entry_count = reader.bounded_count("entries", MAX_ENTRIES, 18)?;
+        let minimum_entry_bytes = if version == PUBLISHER_RELEASE_STATEMENT_VERSION_V3 {
+            19
+        } else {
+            18
+        };
+        let entry_count = reader.bounded_count("entries", MAX_ENTRIES, minimum_entry_bytes)?;
         let mut entries = Vec::with_capacity(entry_count);
         for _ in 0..entry_count {
+            let relative_path = reader.utf8_u16("entry path", MAX_ENTRY_PATH_BYTES)?;
+            let size = reader.u64()?;
+            let chunk_range = (reader.u32()?, reader.u32()?);
+            let kind = if version == PUBLISHER_RELEASE_STATEMENT_VERSION_V3 {
+                decode_entry_kind(&mut reader)?
+            } else {
+                EntryKind::Regular
+            };
             entries.push(FileEntry {
-                relative_path: reader.utf8_u16("entry path", MAX_ENTRY_PATH_BYTES)?,
-                size: reader.u64()?,
-                chunk_range: (reader.u32()?, reader.u32()?),
+                relative_path,
+                size,
+                chunk_range,
+                kind,
             });
         }
         if reader.remaining() != 0 {
@@ -491,12 +538,18 @@ impl PublisherReleaseStatement {
             chunk_algorithm,
             entries,
         };
+        if Self::version_for(&manifest) != version {
+            return Err(SignatureEnvelopeError::InvalidStatement(
+                "statement version does not match its entry kinds",
+            ));
+        }
         validate_manifest(&manifest, &chunks)?;
         drop(manifest);
         drop(chunks);
         Ok(Self {
             bytes: bytes.to_vec(),
             sequence,
+            version,
         })
     }
 
@@ -515,6 +568,13 @@ impl PublisherReleaseStatement {
         self.sequence
     }
 
+    /// Statement format version: [`PUBLISHER_RELEASE_STATEMENT_VERSION_V2`] or
+    /// [`PUBLISHER_RELEASE_STATEMENT_VERSION_V3`].
+    #[must_use]
+    pub const fn version(&self) -> u16 {
+        self.version
+    }
+
     #[must_use]
     pub fn identity(&self) -> PublisherReleaseIdentity {
         let mut hasher = blake3::Hasher::new();
@@ -529,9 +589,14 @@ impl PublisherReleaseStatement {
         sequence: PublisherReleaseSequence,
         encoded_size: usize,
     ) -> Result<Self, SignatureEnvelopeError> {
+        let version = Self::version_for(manifest);
         let mut bytes = Vec::with_capacity(encoded_size);
-        bytes.extend_from_slice(RELEASE_STATEMENT_DOMAIN);
-        push_u16(&mut bytes, PUBLISHER_RELEASE_STATEMENT_VERSION_V2);
+        if version == PUBLISHER_RELEASE_STATEMENT_VERSION_V3 {
+            bytes.extend_from_slice(RELEASE_STATEMENT_DOMAIN_V3);
+        } else {
+            bytes.extend_from_slice(RELEASE_STATEMENT_DOMAIN);
+        }
+        push_u16(&mut bytes, version);
         let body_length_offset = bytes.len();
         push_u32(&mut bytes, 0);
         let body_start = bytes.len();
@@ -557,6 +622,9 @@ impl PublisherReleaseStatement {
             push_u64(&mut bytes, entry.size);
             push_u32(&mut bytes, entry.chunk_range.0);
             push_u32(&mut bytes, entry.chunk_range.1);
+            if version == PUBLISHER_RELEASE_STATEMENT_VERSION_V3 {
+                encode_entry_kind(&mut bytes, &entry.kind)?;
+            }
         }
         if bytes.len() != encoded_size || bytes.len() > MAX_FRAME_PAYLOAD_BYTES {
             return Err(SignatureEnvelopeError::StatementLimit {
@@ -572,7 +640,11 @@ impl PublisherReleaseStatement {
         })?;
         bytes[body_length_offset..body_length_offset + 4]
             .copy_from_slice(&body_length.to_le_bytes());
-        Ok(Self { bytes, sequence })
+        Ok(Self {
+            bytes,
+            sequence,
+            version,
+        })
     }
 }
 
@@ -934,6 +1006,7 @@ fn validate_manifest_after_valid_item(
     } else {
         for entry in &manifest.entries {
             validate_entry_path(&entry.relative_path)?;
+            validate_entry_kind(entry)?;
             encoded_entry_bytes = encoded_entry_bytes
                 .checked_add(2 + entry.relative_path.len() + 8 + 4 + 4)
                 .ok_or(SignatureEnvelopeError::StatementLimit {
@@ -994,6 +1067,7 @@ fn validate_entries(
     let mut encoded_size = 0usize;
     for entry in entries {
         validate_entry_path(&entry.relative_path)?;
+        validate_entry_kind(entry)?;
         encoded_size = encoded_size
             .checked_add(2 + entry.relative_path.len() + 8 + 4 + 4)
             .ok_or(SignatureEnvelopeError::StatementLimit {
@@ -1259,11 +1333,24 @@ fn estimated_statement_size(
     Ok(size)
 }
 
-fn release_statement_size(v1_size: usize) -> Result<usize, SignatureEnvelopeError> {
+fn release_statement_size(
+    v1_size: usize,
+    manifest: &Manifest,
+) -> Result<usize, SignatureEnvelopeError> {
+    let kind_bytes = if manifest.has_only_regular_entries() {
+        0
+    } else {
+        manifest
+            .entries
+            .iter()
+            .map(|entry| encoded_entry_kind_size(&entry.kind))
+            .sum()
+    };
     let size = v1_size
         .checked_sub(STATEMENT_DOMAIN.len())
         .and_then(|value| value.checked_add(RELEASE_STATEMENT_DOMAIN.len()))
         .and_then(|value| value.checked_add(8))
+        .and_then(|value| value.checked_add(kind_bytes))
         .ok_or(SignatureEnvelopeError::StatementLimit {
             field: "statement bytes",
             limit: MAX_FRAME_PAYLOAD_BYTES,
@@ -1275,6 +1362,52 @@ fn release_statement_size(v1_size: usize) -> Result<usize, SignatureEnvelopeErro
         });
     }
     Ok(size)
+}
+
+const ENTRY_KIND_REGULAR: u8 = 0;
+const ENTRY_KIND_EXECUTABLE: u8 = 1;
+const ENTRY_KIND_SYMLINK: u8 = 2;
+
+fn encoded_entry_kind_size(kind: &EntryKind) -> usize {
+    1 + kind.symlink_target().map_or(0, |target| 2 + target.len())
+}
+
+fn encode_entry_kind(bytes: &mut Vec<u8>, kind: &EntryKind) -> Result<(), SignatureEnvelopeError> {
+    match kind {
+        EntryKind::Regular => bytes.push(ENTRY_KIND_REGULAR),
+        EntryKind::Executable => bytes.push(ENTRY_KIND_EXECUTABLE),
+        EntryKind::Symlink { target } => {
+            bytes.push(ENTRY_KIND_SYMLINK);
+            push_string_u16(bytes, target)?;
+        }
+    }
+    Ok(())
+}
+
+fn decode_entry_kind(reader: &mut Reader<'_>) -> Result<EntryKind, SignatureEnvelopeError> {
+    match reader.u8()? {
+        ENTRY_KIND_REGULAR => Ok(EntryKind::Regular),
+        ENTRY_KIND_EXECUTABLE => Ok(EntryKind::Executable),
+        ENTRY_KIND_SYMLINK => Ok(EntryKind::Symlink {
+            target: reader.utf8_u16("symlink target", MAX_SYMLINK_TARGET_BYTES)?,
+        }),
+        _ => Err(SignatureEnvelopeError::InvalidStatement(
+            "entry kind tag is invalid",
+        )),
+    }
+}
+
+fn validate_entry_kind(entry: &FileEntry) -> Result<(), SignatureEnvelopeError> {
+    entry
+        .kind
+        .validate()
+        .map_err(SignatureEnvelopeError::InvalidStatement)?;
+    if entry.kind.symlink_target().is_some() && entry.size != 0 {
+        return Err(SignatureEnvelopeError::InvalidStatement(
+            "symlink entry must cover exactly one empty chunk",
+        ));
+    }
+    Ok(())
 }
 
 const fn encoded_algorithm_size(algorithm: ChunkAlgorithm) -> usize {
@@ -1646,16 +1779,19 @@ mod tests {
                     relative_path: "a.txt".to_string(),
                     size: 5,
                     chunk_range: (0, 1),
+                    kind: EntryKind::Regular,
                 },
                 FileEntry {
                     relative_path: "empty.txt".to_string(),
                     size: 0,
                     chunk_range: (1, 2),
+                    kind: EntryKind::Regular,
                 },
                 FileEntry {
                     relative_path: "z.txt".to_string(),
                     size: 5,
                     chunk_range: (2, 3),
+                    kind: EntryKind::Regular,
                 },
             ],
             ChunkAlgorithm::fixed_aligned(4, 1),
@@ -2669,6 +2805,7 @@ mod tests {
                 relative_path: "x".repeat(MAX_ENTRY_PATH_BYTES),
                 size: 1,
                 chunk_range: (0, 1),
+                kind: EntryKind::Regular,
             }],
         };
         assert!(PublisherStatement::from_parts(&path_manifest, &[chunk]).is_ok());
@@ -2708,6 +2845,7 @@ mod tests {
                 ),
                 size: 1,
                 chunk_range: (index as u32, index as u32 + 1),
+                kind: EntryKind::Regular,
             })
             .collect();
         let manifest = Manifest {
@@ -2819,6 +2957,7 @@ mod tests {
                     relative_path: "a".to_string(),
                     size: 1,
                     chunk_range: (0, 1),
+                    kind: EntryKind::Regular,
                 };
                 MAX_ENTRIES + 1
             ],
@@ -2857,6 +2996,7 @@ mod tests {
                 relative_path: "empty".to_string(),
                 size: 0,
                 chunk_range: (0, 2),
+                kind: EntryKind::Regular,
             }],
             ..too_many_entries.clone()
         };
@@ -2881,6 +3021,7 @@ mod tests {
                         relative_path: path.to_string(),
                         size: 1,
                         chunk_range: (index as u32, index as u32 + 1),
+                        kind: EntryKind::Regular,
                     })
                     .collect(),
                 ..too_many_entries.clone()
@@ -2901,6 +3042,7 @@ mod tests {
                 relative_path: "nonempty".to_string(),
                 size: 1,
                 chunk_range: (0, 2),
+                kind: EntryKind::Regular,
             }],
             ..too_many_entries
         };
@@ -2979,6 +3121,7 @@ mod tests {
                             relative_path: format!("f{index:05}"),
                             size: 8,
                             chunk_range: (index as u32, index as u32 + 1),
+                            kind: EntryKind::Regular,
                         })
                         .collect()
                 })
@@ -3225,5 +3368,165 @@ mod tests {
             .chunks_exact(2)
             .map(|pair| hex_nibble(pair[0]).unwrap() << 4 | hex_nibble(pair[1]).unwrap())
             .collect()
+    }
+
+    fn kinded_item() -> Item {
+        item_for(
+            &[b"#!/bin/sh\n", b"", b"data"],
+            vec![
+                FileEntry {
+                    relative_path: "bin/tool".to_string(),
+                    size: 10,
+                    chunk_range: (0, 1),
+                    kind: EntryKind::Executable,
+                },
+                FileEntry {
+                    relative_path: "bin/tool-link".to_string(),
+                    size: 0,
+                    chunk_range: (1, 2),
+                    kind: EntryKind::Symlink {
+                        target: "/nix/store/abc-tool/bin/tool".to_string(),
+                    },
+                },
+                FileEntry {
+                    relative_path: "share/data".to_string(),
+                    size: 4,
+                    chunk_range: (2, 3),
+                    kind: EntryKind::Regular,
+                },
+            ],
+            ChunkAlgorithm::fixed_aligned(4, 1),
+        )
+    }
+
+    #[test]
+    fn entry_kinds_are_signed_by_v3_release_statements() {
+        let item = kinded_item();
+        let sequence = PublisherReleaseSequence::new(3);
+        let (statement, envelope, _key) = signed_release(&item, sequence);
+        assert_eq!(statement.version(), PUBLISHER_RELEASE_STATEMENT_VERSION_V3);
+        assert_eq!(
+            PublisherReleaseStatement::version_for(&item.manifest),
+            PUBLISHER_RELEASE_STATEMENT_VERSION_V3
+        );
+        assert!(statement
+            .as_bytes()
+            .starts_with(RELEASE_STATEMENT_DOMAIN_V3));
+        assert_eq!(
+            PublisherReleaseStatement::decode(statement.as_bytes()).unwrap(),
+            statement
+        );
+        assert!(envelope.verify(&item, sequence).is_ok());
+        assert!(envelope
+            .verify_manifest(&item.manifest, &item.chunks, sequence)
+            .is_ok());
+
+        let tampers: [fn(&mut Vec<FileEntry>); 4] = [
+            |entries| entries[0].kind = EntryKind::Regular,
+            |entries| entries[2].kind = EntryKind::Executable,
+            |entries| {
+                entries[1].kind = EntryKind::Symlink {
+                    target: "/etc/passwd".to_string(),
+                }
+            },
+            // Dropping every kind yields a valid regular-only manifest and so a V2 statement.
+            |entries| {
+                for entry in entries {
+                    entry.kind = EntryKind::Regular;
+                }
+            },
+        ];
+        for tamper in tampers {
+            let mut forged = item.clone();
+            tamper(&mut forged.manifest.entries);
+            assert_eq!(
+                envelope.verify_manifest(&forged.manifest, &forged.chunks, sequence),
+                Err(SignatureEnvelopeError::InvalidSignature)
+            );
+        }
+
+        assert_eq!(
+            PublisherStatement::from_item(&item),
+            Err(SignatureEnvelopeError::InvalidStatement(
+                "replayable statements cannot attest entry kinds"
+            ))
+        );
+    }
+
+    #[test]
+    fn entry_kind_statements_reject_invalid_links_and_noncanonical_versions() {
+        let sequence = PublisherReleaseSequence::new(1);
+        for (target, size) in [("", 0), ("a\0b", 0), ("ok", 4)] {
+            let mut item = kinded_item();
+            item.manifest.entries[1].kind = EntryKind::Symlink {
+                target: target.to_string(),
+            };
+            if size != 0 {
+                item.manifest.entries[1] = FileEntry {
+                    relative_path: "bin/tool-link".to_string(),
+                    size,
+                    chunk_range: (1, 2),
+                    kind: EntryKind::Symlink {
+                        target: target.to_string(),
+                    },
+                };
+            }
+            assert!(matches!(
+                PublisherReleaseStatement::from_manifest(&item.manifest, &item.chunks, sequence),
+                Err(SignatureEnvelopeError::InvalidStatement(_))
+            ));
+        }
+
+        // A V3 encoding of a regular-only manifest is not canonical.
+        let regular = directory_item();
+        let v2 = PublisherReleaseStatement::from_item(&regular, sequence).unwrap();
+        assert_eq!(v2.version(), PUBLISHER_RELEASE_STATEMENT_VERSION_V2);
+        let v2_bytes = v2.as_bytes();
+        let entry_bytes: usize = regular
+            .manifest
+            .entries
+            .iter()
+            .map(|entry| 18 + entry.relative_path.len())
+            .sum();
+        let entries_start = v2_bytes.len() - entry_bytes;
+        let mut v3_bytes = RELEASE_STATEMENT_DOMAIN_V3.to_vec();
+        v3_bytes.extend_from_slice(&PUBLISHER_RELEASE_STATEMENT_VERSION_V3.to_le_bytes());
+        let body_offset = RELEASE_STATEMENT_DOMAIN.len() + 2;
+        let body_length =
+            u32::from_le_bytes(v2_bytes[body_offset..body_offset + 4].try_into().unwrap());
+        let entry_count = u32::try_from(regular.manifest.entries.len()).unwrap();
+        v3_bytes.extend_from_slice(&(body_length + entry_count).to_le_bytes());
+        v3_bytes.extend_from_slice(&v2_bytes[body_offset + 4..entries_start]);
+        let mut offset = entries_start;
+        for entry in &regular.manifest.entries {
+            let length = 18 + entry.relative_path.len();
+            v3_bytes.extend_from_slice(&v2_bytes[offset..offset + length]);
+            v3_bytes.push(ENTRY_KIND_REGULAR);
+            offset += length;
+        }
+        assert_eq!(
+            PublisherReleaseStatement::decode(&v3_bytes),
+            Err(SignatureEnvelopeError::InvalidStatement(
+                "statement version does not match its entry kinds"
+            ))
+        );
+
+        // The V2 domain cannot carry version 3, and unknown kind tags are rejected.
+        let mut wrong_version = v2_bytes.to_vec();
+        wrong_version[RELEASE_STATEMENT_DOMAIN.len()..RELEASE_STATEMENT_DOMAIN.len() + 2]
+            .copy_from_slice(&PUBLISHER_RELEASE_STATEMENT_VERSION_V3.to_le_bytes());
+        assert_eq!(
+            PublisherReleaseStatement::decode(&wrong_version),
+            Err(SignatureEnvelopeError::UnsupportedStatementVersion(3))
+        );
+        let kinded = PublisherReleaseStatement::from_item(&kinded_item(), sequence).unwrap();
+        let mut bad_tag = kinded.as_bytes().to_vec();
+        *bad_tag.last_mut().unwrap() = 9;
+        assert_eq!(
+            PublisherReleaseStatement::decode(&bad_tag),
+            Err(SignatureEnvelopeError::InvalidStatement(
+                "entry kind tag is invalid"
+            ))
+        );
     }
 }

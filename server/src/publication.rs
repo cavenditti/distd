@@ -90,6 +90,7 @@ impl PublishedRevision {
     /// Construct a record while verifying any signed attestation against the
     /// complete typed Item. Unsigned construction remains explicit.
     pub fn new(item: Item, attestation: PublicationAttestation) -> Result<Self, PublicationError> {
+        require_release_for_entry_kinds(&item, &attestation)?;
         match attestation {
             PublicationAttestation::ReleaseV2 { sequence, envelope } => {
                 envelope.verify(&item, sequence)?;
@@ -162,6 +163,22 @@ pub enum PublicationError {
     /// The typed Item or signature does not form a valid publisher attestation.
     #[error("publisher signature is invalid: {0}")]
     InvalidSignature(#[from] SignatureEnvelopeError),
+    /// Executable and symlink entries exist only under a V3 release statement.
+    #[error("executable and symlink entries require a signed publisher release")]
+    EntryKindsRequireRelease,
+}
+
+/// Entry kinds are signed only by release statements; any other attestation would leave them
+/// unauthenticated or invisible to older readers.
+fn require_release_for_entry_kinds(
+    item: &Item,
+    attestation: &PublicationAttestation,
+) -> Result<(), PublicationError> {
+    if attestation.is_rollback_protected() || item.manifest.has_only_regular_entries() {
+        Ok(())
+    } else {
+        Err(PublicationError::EntryKindsRequireRelease)
+    }
 }
 
 /// Exact-key publisher policy for new publication and durable compatibility.
@@ -231,6 +248,7 @@ impl PublisherPolicy {
         if matches!(self, Self::Required { .. }) {
             return Err(PublicationError::ReplayableForbidden);
         }
+        require_release_for_entry_kinds(&item, &PublicationAttestation::ReplayableV1(envelope))?;
         PublishedRevision::new(item, PublicationAttestation::ReplayableV1(envelope))
     }
 
@@ -241,7 +259,10 @@ impl PublisherPolicy {
     ) -> Result<PublishedRevision, PublicationError> {
         match self {
             Self::Required { .. } => Err(PublicationError::UnsignedForbidden),
-            Self::ExplicitlyInsecureUnsigned => Ok(PublishedRevision::unsigned(item)),
+            Self::ExplicitlyInsecureUnsigned => {
+                require_release_for_entry_kinds(&item, &PublicationAttestation::UnsignedLegacy)?;
+                Ok(PublishedRevision::unsigned(item))
+            }
         }
     }
 
@@ -252,6 +273,7 @@ impl PublisherPolicy {
         &self,
         revision: &PublishedRevision,
     ) -> Result<(), PublicationError> {
+        require_release_for_entry_kinds(revision.item(), revision.attestation())?;
         match revision.attestation() {
             PublicationAttestation::ReleaseV2 { sequence, envelope } => {
                 if let Self::Required { keys } = self {

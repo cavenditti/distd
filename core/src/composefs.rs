@@ -7,6 +7,10 @@
 //!   store (`.distd-activation-v1/blobs`), or
 //! - stores its payload inline (`EROFS_INODE_FLAT_INLINE`) when small inline file bytes are
 //!   provided.
+//!
+//! Executable entries get the executable permission bits, and symbolic links become `S_IFLNK`
+//! inodes whose signed target is stored inline (or in one data block when it cannot share the
+//! inode's block).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -16,7 +20,7 @@ use crate::chunk_storage::validate_revision_metadata;
 use crate::chunks::ChunkInfo;
 use crate::error::{Error, InvalidParameter};
 use crate::hash::Hash;
-use crate::item::Item;
+use crate::item::{EntryKind, Item};
 
 /// EROFS v1 superblock magic (`0xe0f5e1e2`).
 pub const EROFS_SUPER_MAGIC_V1: u32 = 0xe0f5_e1e2;
@@ -37,6 +41,7 @@ const EROFS_NULL_ADDR: u32 = 0xffff_ffff;
 
 const EROFS_FT_REG_FILE: u8 = 1;
 const EROFS_FT_DIR: u8 = 2;
+const EROFS_FT_SYMLINK: u8 = 7;
 
 /// `EROFS_XATTR_INDEX_TRUSTED` (`"trusted."` prefix).
 pub const EROFS_XATTR_INDEX_TRUSTED: u8 = 4;
@@ -46,12 +51,15 @@ const XATTR_OVERLAY_METACOPY_SUFFIX: &[u8] = b"overlay.metacopy";
 const S_IFMT: u16 = 0o170000;
 const S_IFDIR: u16 = 0o040000;
 const S_IFREG: u16 = 0o100000;
+const S_IFLNK: u16 = 0o120000;
 
 /// Options controlling `composefs` EROFS image generation.
 #[derive(Clone, Debug)]
 pub struct ComposefsOptions {
     /// File mode bits (low 12 bits) for regular files (default `0o444`).
     pub file_permissions: u16,
+    /// File mode bits (low 12 bits) for executable files (default `0o555`).
+    pub executable_permissions: u16,
     /// Directory mode bits (low 12 bits) for directories (default `0o555`).
     pub dir_permissions: u16,
     /// Deterministic mtime seconds since UNIX_EPOCH (default `0`).
@@ -68,6 +76,7 @@ impl Default for ComposefsOptions {
     fn default() -> Self {
         Self {
             file_permissions: 0o444,
+            executable_permissions: 0o555,
             dir_permissions: 0o555,
             mtime_sec: 0,
             max_inline_bytes: 256,
@@ -91,6 +100,19 @@ pub struct ComposefsFileProjection {
     pub redirect_path: Option<String>,
     /// Inline payload stored inside the EROFS inode, if inlined.
     pub inline_data: Option<Vec<u8>>,
+    /// Whether the inode carries executable permission bits.
+    pub executable: bool,
+    /// Assigned EROFS 32-byte slot NID.
+    pub nid: u64,
+}
+
+/// Summary of a symbolic link inside a `composefs` EROFS image.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ComposefsSymlinkProjection {
+    /// Relative path inside the image.
+    pub relative_path: String,
+    /// Link target, exactly as signed in the manifest.
+    pub target: String,
     /// Assigned EROFS 32-byte slot NID.
     pub nid: u64,
 }
@@ -108,12 +130,14 @@ pub struct ComposefsImageInfo {
     pub uuid: [u8; 16],
     /// Projected regular files in canonical path order.
     pub files: Vec<ComposefsFileProjection>,
+    /// Projected symbolic links in canonical path order.
+    pub symlinks: Vec<ComposefsSymlinkProjection>,
 }
 
 #[derive(Debug)]
 struct DirBuilderNode {
     subdirs: BTreeMap<String, DirBuilderNode>,
-    files: BTreeMap<String, FileSpec>,
+    files: BTreeMap<String, NodeSpec>,
 }
 
 impl DirBuilderNode {
@@ -132,6 +156,19 @@ struct FileSpec {
     blob_hash: Hash,
     redirect_path: Option<String>,
     inline_data: Option<Vec<u8>>,
+    executable: bool,
+}
+
+#[derive(Clone, Debug)]
+struct SymlinkSpec {
+    relative_path: String,
+    target: String,
+}
+
+#[derive(Clone, Debug)]
+enum NodeSpec {
+    File(FileSpec),
+    Symlink(SymlinkSpec),
 }
 
 #[derive(Clone, Debug)]
@@ -141,6 +178,9 @@ enum PlannedNodeKind {
         nlink: u32,
     },
     File(FileSpec),
+    /// A symbolic link whose target does not fit inline and needs one data block.
+    SymlinkBlock(SymlinkSpec),
+    SymlinkInline(SymlinkSpec),
 }
 
 #[derive(Clone, Debug)]
@@ -277,7 +317,7 @@ fn encode_directory_blocks(
 fn insert_file_into_tree(
     root: &mut DirBuilderNode,
     relative_path: &Path,
-    spec: FileSpec,
+    spec: NodeSpec,
 ) -> Result<(), Error> {
     let canonical = crate::utils::path::validate_relative(relative_path)?;
     let components: Vec<String> = canonical
@@ -344,6 +384,14 @@ fn flatten_tree(
         children.push((name.clone(), child_idx, EROFS_FT_DIR));
     }
     for (name, spec) in &node.files {
+        let spec = match spec {
+            NodeSpec::File(spec) => spec,
+            NodeSpec::Symlink(link) => {
+                let link_idx = plan_symlink(link, options, nodes)?;
+                children.push((name.clone(), link_idx, EROFS_FT_SYMLINK));
+                continue;
+            }
+        };
         let file_idx = nodes.len();
         let file_ino = u32::try_from(file_idx + 1).map_err(InvalidParameter::from)?;
         let (xattr_icount, xattr_body, inline_tail) =
@@ -375,7 +423,12 @@ fn flatten_tree(
         } else {
             EROFS_INODE_LAYOUT_PLAIN
         };
-        let mode = S_IFREG | (options.file_permissions & 0o7777);
+        let permissions = if spec.executable {
+            options.executable_permissions
+        } else {
+            options.file_permissions
+        };
+        let mode = S_IFREG | (permissions & 0o7777);
         let inode_bytes = encode_extended_inode(
             layout,
             xattr_icount,
@@ -400,10 +453,58 @@ fn flatten_tree(
     Ok(dir_index)
 }
 
+/// Plan a symbolic-link inode. Its inode is final unless the target needs a data block, whose
+/// address is filled in once directory and link data blocks are laid out.
+fn plan_symlink(
+    link: &SymlinkSpec,
+    options: &ComposefsOptions,
+    nodes: &mut Vec<PlannedNode>,
+) -> Result<usize, Error> {
+    let link_idx = nodes.len();
+    let ino = u32::try_from(link_idx + 1).map_err(InvalidParameter::from)?;
+    let target = link.target.as_bytes();
+    let inline = EROFS_INODE_EXTENDED_SIZE + target.len() <= EROFS_BLOCK_SIZE;
+    let (layout, inline_tail, kind) = if inline {
+        (
+            EROFS_INODE_LAYOUT_INLINE,
+            target.to_vec(),
+            PlannedNodeKind::SymlinkInline(link.clone()),
+        )
+    } else {
+        (
+            EROFS_INODE_LAYOUT_PLAIN,
+            Vec::new(),
+            PlannedNodeKind::SymlinkBlock(link.clone()),
+        )
+    };
+    let inode_bytes = encode_extended_inode(
+        layout,
+        0,
+        S_IFLNK | 0o777,
+        1,
+        target.len() as u64,
+        EROFS_NULL_ADDR,
+        ino,
+        options.mtime_sec,
+    );
+    nodes.push(PlannedNode {
+        ino,
+        kind,
+        encoded_inode_and_xattrs: inode_bytes.to_vec(),
+        inline_tail,
+        nid: 0,
+        inode_offset: 0,
+        data_start_block: EROFS_NULL_ADDR,
+        data_size: target.len() as u64,
+    });
+    Ok(link_idx)
+}
+
 fn build_file_spec(
     relative_path: String,
     size: u64,
     file_chunks: &[ChunkInfo],
+    executable: bool,
     options: &ComposefsOptions,
 ) -> Result<FileSpec, Error> {
     let blob_hash = FsStorage::file_blob_hash(file_chunks)?;
@@ -420,6 +521,7 @@ fn build_file_spec(
                 blob_hash,
                 redirect_path: None,
                 inline_data: Some(inline_bytes.clone()),
+                executable,
             });
         }
     }
@@ -431,6 +533,7 @@ fn build_file_spec(
         blob_hash,
         redirect_path: Some(redirect_path),
         inline_data: None,
+        executable,
     })
 }
 
@@ -456,9 +559,10 @@ pub fn build_composefs_erofs(
             file_name.clone(),
             item.manifest.total_size,
             &item.chunks,
+            false,
             options,
         )?;
-        insert_file_into_tree(&mut root_tree, Path::new(&file_name), spec)?;
+        insert_file_into_tree(&mut root_tree, Path::new(&file_name), NodeSpec::File(spec))?;
     } else {
         for entry in &item.manifest.entries {
             let start = entry.chunk_range.0 as usize;
@@ -467,12 +571,19 @@ pub fn build_composefs_erofs(
                 .chunks
                 .get(start..end)
                 .ok_or_else(|| Error::Other("manifest entry chunk range out of bounds".to_string()))?;
-            let spec = build_file_spec(
-                entry.relative_path.clone(),
-                entry.size,
-                file_chunks,
-                options,
-            )?;
+            let spec = match &entry.kind {
+                EntryKind::Symlink { target } => NodeSpec::Symlink(SymlinkSpec {
+                    relative_path: entry.relative_path.clone(),
+                    target: target.clone(),
+                }),
+                EntryKind::Regular | EntryKind::Executable => NodeSpec::File(build_file_spec(
+                    entry.relative_path.clone(),
+                    entry.size,
+                    file_chunks,
+                    entry.kind == EntryKind::Executable,
+                    options,
+                )?),
+            };
             insert_file_into_tree(&mut root_tree, Path::new(&entry.relative_path), spec)?;
         }
     }
@@ -526,7 +637,24 @@ pub fn build_composefs_erofs(
                     .collect();
                 Some((resolved, *nlink))
             }
-            PlannedNodeKind::File(_) => None,
+            PlannedNodeKind::SymlinkBlock(link) => {
+                let mut block = link.target.as_bytes().to_vec();
+                block.resize(EROFS_BLOCK_SIZE, 0);
+                let start_block = current_data_block;
+                current_data_block = current_data_block
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Other("composefs block count overflow".to_string()))?;
+                nodes[idx].data_start_block = start_block;
+                nodes[idx].encoded_inode_and_xattrs[24..28]
+                    .copy_from_slice(&start_block.to_le_bytes());
+                dir_data_payloads.push((
+                    usize::try_from(start_block).map_err(InvalidParameter::from)?
+                        * EROFS_BLOCK_SIZE,
+                    block,
+                ));
+                None
+            }
+            PlannedNodeKind::File(_) | PlannedNodeKind::SymlinkInline(_) => None,
         };
         if let Some((resolved_children, nlink)) = dir_info {
             let dir_blocks = encode_directory_blocks(self_nid, parent_nid, &resolved_children)?;
@@ -566,6 +694,7 @@ pub fn build_composefs_erofs(
 
     // Write all inodes + inline xattrs + inline tails.
     let mut projections = Vec::new();
+    let mut symlinks = Vec::new();
     for node in &nodes {
         let start = node.inode_offset;
         let end_meta = start + node.encoded_inode_and_xattrs.len();
@@ -574,15 +703,24 @@ pub fn build_composefs_erofs(
             image[end_meta..end_meta + node.inline_tail.len()]
                 .copy_from_slice(&node.inline_tail);
         }
-        if let PlannedNodeKind::File(spec) = &node.kind {
-            projections.push(ComposefsFileProjection {
+        match &node.kind {
+            PlannedNodeKind::File(spec) => projections.push(ComposefsFileProjection {
                 relative_path: spec.relative_path.clone(),
                 size: spec.size,
                 blob_hash: spec.blob_hash,
                 redirect_path: spec.redirect_path.clone(),
                 inline_data: spec.inline_data.clone(),
+                executable: spec.executable,
                 nid: node.nid,
-            });
+            }),
+            PlannedNodeKind::SymlinkInline(link) | PlannedNodeKind::SymlinkBlock(link) => {
+                symlinks.push(ComposefsSymlinkProjection {
+                    relative_path: link.relative_path.clone(),
+                    target: link.target.clone(),
+                    nid: node.nid,
+                });
+            }
+            PlannedNodeKind::Directory { .. } => {}
         }
     }
 
@@ -614,12 +752,14 @@ pub fn build_composefs_erofs(
     sb[64..80].copy_from_slice(b"distd-composefs\0");
 
     projections.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    symlinks.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
     let info = ComposefsImageInfo {
         root_nid,
         total_inodes,
         total_blocks,
         uuid,
         files: projections,
+        symlinks,
     };
     Ok((image, info))
 }
@@ -660,15 +800,18 @@ pub fn inspect_composefs_erofs(image: &[u8]) -> Result<ComposefsImageInfo, Error
     uuid.copy_from_slice(&sb[48..64]);
 
     let mut files = Vec::new();
+    let mut symlinks = Vec::new();
     walk_erofs_directory(
         image,
         meta_blkaddr,
         u64::from(root_nid),
         "",
         &mut files,
+        &mut symlinks,
         0,
     )?;
     files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    symlinks.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
 
     Ok(ComposefsImageInfo {
         root_nid,
@@ -676,6 +819,7 @@ pub fn inspect_composefs_erofs(image: &[u8]) -> Result<ComposefsImageInfo, Error
         total_blocks,
         uuid,
         files,
+        symlinks,
     })
 }
 
@@ -685,6 +829,7 @@ fn walk_erofs_directory(
     dir_nid: u64,
     prefix: &str,
     files: &mut Vec<ComposefsFileProjection>,
+    symlinks: &mut Vec<ComposefsSymlinkProjection>,
     depth: usize,
 ) -> Result<(), Error> {
     if depth > 64 {
@@ -755,11 +900,27 @@ fn walk_erofs_directory(
             };
             match file_type {
                 EROFS_FT_DIR => {
-                    walk_erofs_directory(image, meta_blkaddr, child_nid, &rel_path, files, depth + 1)?;
+                    walk_erofs_directory(
+                        image,
+                        meta_blkaddr,
+                        child_nid,
+                        &rel_path,
+                        files,
+                        symlinks,
+                        depth + 1,
+                    )?;
                 }
                 EROFS_FT_REG_FILE => {
                     let proj = read_erofs_file_inode(image, meta_blkaddr, child_nid, rel_path)?;
                     files.push(proj);
+                }
+                EROFS_FT_SYMLINK => {
+                    symlinks.push(read_erofs_symlink_inode(
+                        image,
+                        meta_blkaddr,
+                        child_nid,
+                        rel_path,
+                    )?);
                 }
                 other => {
                     return Err(Error::Other(format!(
@@ -860,6 +1021,52 @@ fn read_erofs_file_inode(
         blob_hash,
         redirect_path,
         inline_data,
+        executable: i_mode & 0o111 != 0,
+        nid,
+    })
+}
+
+fn read_erofs_symlink_inode(
+    image: &[u8],
+    meta_blkaddr: u32,
+    nid: u64,
+    relative_path: String,
+) -> Result<ComposefsSymlinkProjection, Error> {
+    let inode_offset = usize::try_from(meta_blkaddr).map_err(InvalidParameter::from)?
+        * EROFS_BLOCK_SIZE
+        + usize::try_from(nid).map_err(InvalidParameter::from)? * EROFS_SLOT_SIZE;
+    if inode_offset + EROFS_INODE_EXTENDED_SIZE > image.len() {
+        return Err(Error::Other("EROFS symlink NID out of bounds".to_string()));
+    }
+    let inode = &image[inode_offset..inode_offset + EROFS_INODE_EXTENDED_SIZE];
+    let i_format = u16::from_le_bytes(inode[0..2].try_into().unwrap());
+    let layout = (i_format >> 1) & 0x7;
+    let xattr_icount = u16::from_le_bytes(inode[2..4].try_into().unwrap());
+    let i_mode = u16::from_le_bytes(inode[4..6].try_into().unwrap());
+    if i_mode & S_IFMT != S_IFLNK || xattr_icount != 0 {
+        return Err(Error::Other("expected EROFS symlink inode".to_string()));
+    }
+    let size = usize::try_from(u64::from_le_bytes(inode[12..20].try_into().unwrap()))
+        .map_err(InvalidParameter::from)?;
+    let data_offset = match layout {
+        EROFS_INODE_LAYOUT_INLINE => inode_offset + EROFS_INODE_EXTENDED_SIZE,
+        EROFS_INODE_LAYOUT_PLAIN => {
+            let blkaddr = u32::from_le_bytes(inode[24..28].try_into().unwrap());
+            usize::try_from(blkaddr).map_err(InvalidParameter::from)? * EROFS_BLOCK_SIZE
+        }
+        _ => return Err(Error::Other("unsupported EROFS symlink layout".to_string())),
+    };
+    if size == 0 || size >= EROFS_BLOCK_SIZE || data_offset + size > image.len() {
+        return Err(Error::Other(
+            "EROFS symlink target out of bounds".to_string(),
+        ));
+    }
+    let target = std::str::from_utf8(&image[data_offset..data_offset + size])
+        .map_err(|_| Error::Other("EROFS symlink target is not valid UTF-8".to_string()))?
+        .to_string();
+    Ok(ComposefsSymlinkProjection {
+        relative_path,
+        target,
         nid,
     })
 }
@@ -904,8 +1111,9 @@ mod tests {
     use crate::chunk_storage::hashmap_storage::HashMapStorage;
     use crate::chunk_storage::ChunkStorage;
     use crate::chunks::ChunkAlgorithm;
-    use crate::item::FileEntry;
+    use crate::item::{EntryKind, FileEntry};
     use crate::utils::testing::temp_path;
+    use std::collections::BTreeMap;
 
     #[test]
     fn composefs_erofs_projects_directory_manifest_with_cas_blob_redirects_and_inline_files() {
@@ -943,16 +1151,19 @@ mod tests {
                 relative_path: "include/demo.h".to_string(),
                 size: header_file.len() as u64,
                 chunk_range: (hdr_start, hdr_end),
+                kind: EntryKind::Regular,
             },
             FileEntry {
                 relative_path: "lib/libdemo.so".to_string(),
                 size: lib_binary.len() as u64,
                 chunk_range: (lib_start, lib_end),
+                kind: EntryKind::Regular,
             },
             FileEntry {
                 relative_path: "lib/pkgconfig/demo.pc".to_string(),
                 size: pkg_config.len() as u64,
                 chunk_range: (pc_start, pc_end),
+                kind: EntryKind::Regular,
             },
         ];
 
@@ -1062,5 +1273,72 @@ mod tests {
         assert_eq!(written_info, info1);
         let disk_bytes = std::fs::read(&erofs_path).unwrap();
         assert_eq!(inspect_composefs_erofs(&disk_bytes).unwrap(), info1);
+    }
+
+    #[test]
+    fn composefs_erofs_projects_executable_files_and_symlinks() {
+        let storage = HashMapStorage::default();
+        let long_target = format!("/nix/store/{}", "x".repeat(4060));
+        let item = storage
+            .prepare_revision_from_entries(
+                "nix-pkg".to_string(),
+                "nix-pkg".to_string(),
+                PathBuf::from("nix-pkg"),
+                1,
+                None,
+                vec![
+                    (
+                        PathBuf::from("bin/hello"),
+                        bytes::Bytes::from(vec![0x7f; 5000]),
+                    ),
+                    (PathBuf::from("bin/hi"), bytes::Bytes::new()),
+                    (PathBuf::from("lib/long"), bytes::Bytes::new()),
+                    (
+                        PathBuf::from("share/doc"),
+                        bytes::Bytes::from_static(b"plain\n"),
+                    ),
+                ],
+                BTreeMap::from([
+                    (PathBuf::from("bin/hello"), EntryKind::Executable),
+                    (
+                        PathBuf::from("bin/hi"),
+                        EntryKind::Symlink {
+                            target: "hello".to_string(),
+                        },
+                    ),
+                    (
+                        PathBuf::from("lib/long"),
+                        EntryKind::Symlink {
+                            target: long_target.clone(),
+                        },
+                    ),
+                ]),
+                ChunkAlgorithm::fixed_aligned(4096, 1),
+            )
+            .unwrap();
+
+        let (image, info) = build_composefs_erofs(&item, &ComposefsOptions::default()).unwrap();
+        assert_eq!(
+            build_composefs_erofs(&item, &ComposefsOptions::default()).unwrap(),
+            (image.clone(), info.clone())
+        );
+        assert_eq!(inspect_composefs_erofs(&image).unwrap(), info);
+
+        let files: Vec<_> = info
+            .files
+            .iter()
+            .map(|file| (file.relative_path.as_str(), file.executable))
+            .collect();
+        assert_eq!(files, [("bin/hello", true), ("share/doc", false)]);
+        assert!(info.files.iter().all(|file| file.redirect_path.is_some()));
+        let links: Vec<_> = info
+            .symlinks
+            .iter()
+            .map(|link| (link.relative_path.as_str(), link.target.as_str()))
+            .collect();
+        assert_eq!(
+            links,
+            [("bin/hi", "hello"), ("lib/long", long_target.as_str())]
+        );
     }
 }

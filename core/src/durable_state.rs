@@ -280,6 +280,32 @@ pub fn read_enveloped_state(
     Ok(payload.to_vec())
 }
 
+/// Read and validate an enveloped state file whose payload may use any schema in `accepted`,
+/// returning the schema it was written with. A schema outside `accepted` is reported against
+/// `accepted[0]`.
+pub fn read_enveloped_state_any(
+    path: &Path,
+    expected_kind: DurableStateKind,
+    accepted: &[u16],
+    maximum_payload: u64,
+) -> Result<(u16, Vec<u8>), DurableStateError> {
+    let maximum_file_size = u64::try_from(HEADER_SIZE)
+        .map_err(|_| DurableStateError::LengthOverflow)?
+        .checked_add(maximum_payload)
+        .ok_or(DurableStateError::LengthOverflow)?;
+    let encoded = read_bounded_file(path, maximum_file_size)?;
+    let written = (encoded.len() >= HEADER_PREFIX_SIZE).then(|| read_u16(&encoded, 12));
+    let schema = written
+        .filter(|schema| accepted.contains(schema))
+        .or_else(|| accepted.first().copied())
+        .ok_or(DurableStateError::UnsupportedPayloadSchema {
+            expected: 0,
+            actual: written.unwrap_or(0),
+        })?;
+    let payload = decode_envelope(&encoded, expected_kind, schema, maximum_payload)?;
+    Ok((schema, payload.to_vec()))
+}
+
 /// Encode and durably replace a state file in the same directory.
 ///
 /// A failure before rename leaves the old destination in place and removes

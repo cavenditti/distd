@@ -10,7 +10,7 @@ use axum::body::Bytes;
 use distd_core::chunk_storage::ChunkStorage;
 use distd_core::chunks::{chunk_algorithm_likely_precompressed, ChunkAlgorithm};
 use distd_core::hash::Hash;
-use distd_core::item::{ArtifactId, Item, Name as ItemName};
+use distd_core::item::{ArtifactId, EntryKind, FileEntry, Item, Name as ItemName};
 use distd_core::metadata::Server as ServerMetadata;
 use distd_core::possession::Bitfield;
 use distd_core::proto::{
@@ -18,7 +18,8 @@ use distd_core::proto::{
     ServerMetadata as ProtoServerMetadata, SyncMessage,
 };
 use distd_core::signature::{
-    PublisherReleaseEnvelope, PublisherReleaseSequence, PublisherSignatureEnvelope,
+    PublisherReleaseEnvelope, PublisherReleaseSequence, PublisherReleaseStatement,
+    PublisherSignatureEnvelope,
 };
 use distd_core::transport::{maybe_compress_sync_payload_owned, SYNC_PAYLOAD_BATCH_TARGET_BYTES};
 use distd_core::utils::serde::BitcodeSerializable;
@@ -637,7 +638,9 @@ where
                 PublicationAttestation::ReleaseV2 { sequence, envelope } => (
                     envelope.public_key().as_bytes().to_vec(),
                     envelope.signature().as_bytes().to_vec(),
-                    Some(2),
+                    Some(u32::from(PublisherReleaseStatement::version_for(
+                        &item.manifest,
+                    ))),
                     Some(sequence.get()),
                 ),
                 PublicationAttestation::ReplayableV1(envelope) => (
@@ -672,12 +675,7 @@ where
                     .manifest
                     .entries
                     .iter()
-                    .map(|entry| proto::FileEntry {
-                        relative_path: entry.relative_path.clone(),
-                        size: entry.size,
-                        chunk_start: entry.chunk_range.0,
-                        chunk_end: entry.chunk_range.1,
-                    })
+                    .map(FileEntry::to_proto)
                     .collect(),
                 chunk_algorithm: Some(item.manifest.chunk_algorithm.to_proto()),
                 chunk_sizes,
@@ -1159,6 +1157,7 @@ where
             path,
             description,
             files,
+            BTreeMap::new(),
             chunk_algorithm,
             PublicationRequestAttestation::Unsigned,
         )
@@ -1185,6 +1184,7 @@ where
             path,
             description,
             files,
+            BTreeMap::new(),
             chunk_algorithm,
             PublicationRequestAttestation::ReplayableV1(envelope),
         )
@@ -1206,12 +1206,44 @@ where
     where
         T: 'static,
     {
+        self.publish_release_entries_as(
+            artifact_id,
+            name,
+            path,
+            description,
+            files,
+            BTreeMap::new(),
+            chunk_algorithm,
+            sequence,
+            envelope,
+        )
+        .await
+    }
+
+    /// Publish a rollback-protected directory release whose entries may be executable files or
+    /// symbolic links (supplied as empty files). Such releases carry a V3 statement.
+    pub async fn publish_release_entries_as(
+        &self,
+        artifact_id: ArtifactId,
+        name: ItemName,
+        path: PathBuf,
+        description: Option<String>,
+        files: Vec<(PathBuf, Bytes)>,
+        kinds: BTreeMap<PathBuf, EntryKind>,
+        chunk_algorithm: ChunkAlgorithm,
+        sequence: PublisherReleaseSequence,
+        envelope: PublisherReleaseEnvelope,
+    ) -> Result<Item, ServerError>
+    where
+        T: 'static,
+    {
         self.publish_item_from_files_as_with_attestation(
             artifact_id,
             name,
             path,
             description,
             files,
+            kinds,
             chunk_algorithm,
             PublicationRequestAttestation::ReleaseV2 { sequence, envelope },
         )
@@ -1225,6 +1257,7 @@ where
         path: PathBuf,
         description: Option<String>,
         files: Vec<(PathBuf, Bytes)>,
+        kinds: BTreeMap<PathBuf, EntryKind>,
         chunk_algorithm: ChunkAlgorithm,
         attestation: PublicationRequestAttestation,
     ) -> Result<Item, ServerError>
@@ -1241,6 +1274,7 @@ where
                     path,
                     description,
                     files,
+                    kinds,
                     chunk_algorithm,
                     attestation,
                 )
@@ -1257,6 +1291,7 @@ where
         path: PathBuf,
         description: Option<String>,
         files: Vec<(PathBuf, Bytes)>,
+        kinds: BTreeMap<PathBuf, EntryKind>,
         chunk_algorithm: ChunkAlgorithm,
         attestation: PublicationRequestAttestation,
     ) -> Result<Item, ServerError> {
@@ -1279,6 +1314,7 @@ where
                     0,
                     description,
                     &files,
+                    &kinds,
                     chunk_algorithm,
                 )
                 .map(|prepared| (prepared, files))
@@ -1574,15 +1610,18 @@ mod tests {
     use distd_core::durable_state::{
         replace_enveloped_state, DurableReplaceStage, DurableStateError, DurableStateKind,
     };
-    use distd_core::item::Item;
+    use distd_core::item::{EntryKind, FileEntry, Item};
     use distd_core::proto::ManifestRequest;
     use distd_core::proto::{sync_message::Msg, PayloadCompression};
     use prost::Message as _;
-    use std::path::Path;
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
 
-    use crate::publication::{PublicationError, PublishedRevision, PublisherPolicy};
+    use crate::publication::{
+        PublicationError, PublicationRequestAttestation, PublishedRevision, PublisherPolicy,
+    };
     use distd_core::signature::{
         PublisherPublicKey, PublisherReleaseEnvelope, PublisherReleaseSequence,
         PublisherReleaseStatement, PublisherSignature,
@@ -2420,6 +2459,91 @@ mod tests {
             response.publisher_signature,
             envelope.signature().as_bytes()
         );
+    }
+
+    #[tokio::test]
+    async fn release_directories_publish_and_serve_signed_entry_kinds() {
+        let storage = HashMapStorage::default();
+        let files: Vec<(PathBuf, Bytes)> = vec![
+            ("bin/hello".into(), Bytes::from_static(b"\x7fELF")),
+            ("bin/hi".into(), Bytes::new()),
+        ];
+        let kinds = BTreeMap::from([
+            (PathBuf::from("bin/hello"), EntryKind::Executable),
+            (
+                PathBuf::from("bin/hi"),
+                EntryKind::Symlink {
+                    target: "hello".to_string(),
+                },
+            ),
+        ]);
+        let algorithm = ChunkAlgorithm::default();
+        let prepared = storage
+            .prepare_revision_from_entries(
+                "nix-hello".to_string(),
+                "hello".to_string(),
+                "hello".into(),
+                0,
+                None,
+                files.clone(),
+                kinds.clone(),
+                algorithm,
+            )
+            .unwrap();
+        let (sequence, envelope) = signed_release(&prepared, [29; 32], 1);
+        let server = ProductionServer::new_ephemeral(storage)
+            .with_publisher_policy(PublisherPolicy::required([envelope.public_key()]));
+        let published = server
+            .publish_release_entries_as(
+                "nix-hello".to_string(),
+                "hello".to_string(),
+                "hello".into(),
+                None,
+                files.clone(),
+                kinds.clone(),
+                algorithm,
+                sequence,
+                envelope,
+            )
+            .await
+            .unwrap();
+        assert_eq!(published.manifest.entries, prepared.manifest.entries);
+
+        let (response, _) = server
+            .sync_manifest_response(ManifestRequest {
+                artifact_id: "nix-hello".to_string(),
+                version: Some(0),
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.publisher_statement_version, Some(3));
+        let entries = response
+            .entries
+            .into_iter()
+            .map(|entry| FileEntry::try_from_proto(entry).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, prepared.manifest.entries);
+
+        // Without a release statement, nothing would authenticate the kinds.
+        let insecure = Server::new_ephemeral(HashMapStorage::default());
+        let refused = insecure
+            .publish_item_from_files_as_with_attestation(
+                "nix-hello".to_string(),
+                "hello".to_string(),
+                "hello".into(),
+                None,
+                files,
+                kinds,
+                algorithm,
+                PublicationRequestAttestation::Unsigned,
+            )
+            .await;
+        assert!(matches!(
+            refused,
+            Err(ServerError::Publication(
+                PublicationError::EntryKindsRequireRelease
+            ))
+        ));
     }
 
     #[tokio::test]

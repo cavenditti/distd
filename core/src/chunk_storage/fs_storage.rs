@@ -21,13 +21,13 @@ use crate::{
     chunk_storage::StorageError,
     chunks::{ChunkAlgorithm, ChunkInfo, CHUNK_SIZE},
     durable_state::{
-        read_bounded_file, read_enveloped_state, replace_enveloped_state,
+        read_bounded_file, read_enveloped_state, read_enveloped_state_any, replace_enveloped_state,
         replace_enveloped_state_with_hook, DurableReplaceStage, DurableStateKind,
         MAX_DURABLE_STATE_PAYLOAD,
     },
     error::{Error, InvalidParameter},
     hash::{hash as do_hash, merge_hashes, Hash, HashTreeCapable},
-    item::{FileEntry, Item, Manifest, Name as ItemName},
+    item::{v1::ItemV1, EntryKind, FileEntry, Item, Manifest, Name as ItemName},
     utils::settings::cache_dir,
 };
 
@@ -42,10 +42,16 @@ const DEFAULT_IMMUTABLE_READER_ENTRIES: usize = 32;
 const DEFAULT_WRITE_HANDLE_ENTRIES: usize = 32;
 const WRITE_HANDLE_BUFFER_BYTES: usize = CHUNK_SIZE;
 const FS_STORAGE_PAYLOAD_SCHEMA: u16 = 1;
+/// Storage-state schema whose revisions use the kinded layout; written only while some stored
+/// revision has an executable or symlink entry.
+const FS_STORAGE_KINDED_PAYLOAD_SCHEMA: u16 = 2;
 const FS_STORAGE_ROOT_DOMAIN: &[u8] = b"distd fs storage root identity v1\0";
 const FS_STORAGE_REVISION_NAMESPACE: &str = ".distd-revisions-v1";
 const FS_STORAGE_REVISION_MARKER_DOMAIN: &[u8] = b"distd fs server revision marker v1\0";
 const FS_STORAGE_REVISION_MARKER_EXTENSION: &str = "item";
+const FS_STORAGE_KINDED_REVISION_MARKER_DOMAIN: &[u8] =
+    b"distd fs server revision marker kinded v1\0";
+const FS_STORAGE_KINDED_REVISION_MARKER_EXTENSION: &str = "kitem";
 const FS_SYNC_INGEST_NAMESPACE: &str = ".distd-ingest-v1";
 const FS_SYNC_INGEST_EXTENSION: &str = "pack";
 const FS_STORAGE_MAX_LINK_RECORDS: usize = 65_536;
@@ -197,6 +203,7 @@ struct FsActivationActiveV1 {
     destination: PathBuf,
     destination_identity: [u8; 32],
     revision_identity: [u8; 32],
+    #[serde(with = "crate::item::v1::item")]
     item: Item,
     kind: u8,
     seals: Vec<FsActivationFileSealV1>,
@@ -238,6 +245,7 @@ struct FsActivationTransactionV2 {
     destination_identity: [u8; 32],
     candidate_revision_identity: [u8; 32],
     previous: Option<FsActivationActiveV1>,
+    #[serde(with = "crate::item::v1::item")]
     item: Item,
     kind: u8,
     phase: FsActivationPhaseV2,
@@ -1204,9 +1212,28 @@ enum FsStorageNodeV1 {
 }
 
 /// Canonical schema-1 payload. Constructor-owned paths and runtime-only state
-/// deliberately do not appear here.
+/// deliberately do not appear here. Revisions use the frozen V1 layout; see
+/// [`FsStorageStateV1::encode`] for the kinded schema-2 form of the same state.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct FsStorageStateV1 {
+    root_identity: [u8; 32],
+    #[serde(with = "crate::item::v1::seq")]
+    items: Vec<Item>,
+    data: Vec<FsStorageDataEntryV1>,
+    links: Vec<FsStorageLinkEntryV1>,
+}
+
+/// Schema-2 payload: schema 1 with revisions in the kinded layout.
+#[derive(Debug, Serialize)]
+struct FsStorageStateV2Ref<'a> {
+    root_identity: &'a [u8; 32],
+    items: &'a [Item],
+    data: &'a [FsStorageDataEntryV1],
+    links: &'a [FsStorageLinkEntryV1],
+}
+
+#[derive(Debug, Deserialize)]
+struct FsStorageStateV2 {
     root_identity: [u8; 32],
     items: Vec<Item>,
     data: Vec<FsStorageDataEntryV1>,
@@ -1218,6 +1245,7 @@ struct FsStorageStateV1 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LegacyFsStorageState {
     root: PathBuf,
+    #[serde(with = "crate::item::v1::seq")]
     items: HashSet<Item>,
     persistance_path: PathBuf,
     data: HashMap<Hash, Vec<Arc<InFileChunk>>>,
@@ -1229,6 +1257,15 @@ fn invalid_state(message: impl Into<String>) -> Error {
         "invalid filesystem-storage state: {}",
         message.into()
     ))
+}
+
+/// Eager activation materializes files hard-linked with shared CAS blobs and seals them as
+/// plain regular files, so it cannot represent per-entry modes or symbolic links.
+fn eager_kinds_unsupported() -> Error {
+    Error::Other(
+        "eager activation does not support executable or symlink entries; use lazy activation"
+            .to_string(),
+    )
 }
 
 fn activation_indeterminate(error: impl std::fmt::Display) -> Error {
@@ -1918,6 +1955,43 @@ fn materialize_flat_link(records: Vec<FsStorageNodeV1>) -> Result<Arc<Node>, Err
 }
 
 impl FsStorageStateV1 {
+    /// Payload schema and bytes: schema 1 unless a stored revision has entry kinds, which only
+    /// the schema-2 layout can encode.
+    fn encode(&self) -> Result<(u16, Vec<u8>), Error> {
+        let payload = if self
+            .items
+            .iter()
+            .all(|item| item.manifest.has_only_regular_entries())
+        {
+            (FS_STORAGE_PAYLOAD_SCHEMA, bitcode::serialize(self))
+        } else {
+            (
+                FS_STORAGE_KINDED_PAYLOAD_SCHEMA,
+                bitcode::serialize(&FsStorageStateV2Ref {
+                    root_identity: &self.root_identity,
+                    items: &self.items,
+                    data: &self.data,
+                    links: &self.links,
+                }),
+            )
+        };
+        Ok((payload.0, payload.1.map_err(InvalidParameter::from)?))
+    }
+
+    fn decode(schema: u16, payload: &[u8]) -> Result<Self, Error> {
+        if schema == FS_STORAGE_KINDED_PAYLOAD_SCHEMA {
+            let state: FsStorageStateV2 =
+                bitcode::deserialize(payload).map_err(InvalidParameter::from)?;
+            return Ok(Self {
+                root_identity: state.root_identity,
+                items: state.items,
+                data: state.data,
+                links: state.links,
+            });
+        }
+        bitcode::deserialize(payload).map_err(|error| InvalidParameter::from(error).into())
+    }
+
     fn from_runtime(state: &FsStorageState) -> Result<Self, Error> {
         let root_identity = fs_storage_root_identity(&state.root)?;
 
@@ -3090,6 +3164,9 @@ impl FsStorage {
         local_hashes: Vec<Hash>,
     ) -> Result<FsSyncIngest, Error> {
         let path = self.canonical_activation_destination(&path)?;
+        if !manifest.has_only_regular_entries() {
+            return Err(eager_kinds_unsupported());
+        }
         if chunk_infos.len() != manifest.chunk_count as usize || chunk_infos.is_empty() {
             return Err(Error::Storage(StorageError::TreeReconstruct));
         }
@@ -3490,7 +3567,8 @@ impl FsStorage {
 
     fn activation_revision_identity(item: &Item) -> Result<[u8; 32], Error> {
         super::validate_revision_metadata(item)?;
-        let payload = bitcode::serialize(item).map_err(InvalidParameter::from)?;
+        let item = ItemV1::from_regular(item).ok_or_else(eager_kinds_unsupported)?;
+        let payload = bitcode::serialize(&item).map_err(InvalidParameter::from)?;
         let mut hasher = blake3::Hasher::new();
         hasher.update(FS_ACTIVATION_REVISION_DOMAIN);
         hasher.update(&payload);
@@ -4506,19 +4584,33 @@ impl FsStorage {
             })
     }
 
+    /// Content-addressed marker path and payload. Regular-only revisions keep the V1 layout,
+    /// domain, and extension; revisions with entry kinds use the kinded marker family.
     fn revision_marker(&self, item: &Item) -> Result<(PathBuf, Vec<u8>), Error> {
-        let payload = bitcode::serialize(item).map_err(InvalidParameter::from)?;
+        let (payload, domain, extension) = match ItemV1::from_regular(item) {
+            Some(regular) => (
+                bitcode::serialize(&regular),
+                FS_STORAGE_REVISION_MARKER_DOMAIN,
+                FS_STORAGE_REVISION_MARKER_EXTENSION,
+            ),
+            None => (
+                bitcode::serialize(item),
+                FS_STORAGE_KINDED_REVISION_MARKER_DOMAIN,
+                FS_STORAGE_KINDED_REVISION_MARKER_EXTENSION,
+            ),
+        };
+        let payload = payload.map_err(InvalidParameter::from)?;
         if payload.len() as u64 > MAX_DURABLE_STATE_PAYLOAD {
             return Err(invalid_state("server revision marker exceeds size limit"));
         }
         let mut hasher = blake3::Hasher::new();
-        hasher.update(FS_STORAGE_REVISION_MARKER_DOMAIN);
+        hasher.update(domain);
         hasher.update(&payload);
         let identity = hasher.finalize();
         let path = self.path(
             &Path::new(FS_STORAGE_REVISION_NAMESPACE)
                 .join("items")
-                .join(format!("{identity}.{FS_STORAGE_REVISION_MARKER_EXTENSION}")),
+                .join(format!("{identity}.{extension}")),
         )?;
         Ok((path, payload))
     }
@@ -4641,15 +4733,18 @@ impl FsStorage {
             if file_name.starts_with('.') && file_name.ends_with(".tmp") {
                 continue;
             }
-            if Path::new(&file_name)
+            let kinded = match Path::new(&file_name)
                 .extension()
                 .and_then(std::ffi::OsStr::to_str)
-                != Some(FS_STORAGE_REVISION_MARKER_EXTENSION)
             {
-                return Err(invalid_state(format!(
-                    "unexpected server revision marker entry {file_name}"
-                )));
-            }
+                Some(FS_STORAGE_REVISION_MARKER_EXTENSION) => false,
+                Some(FS_STORAGE_KINDED_REVISION_MARKER_EXTENSION) => true,
+                _ => {
+                    return Err(invalid_state(format!(
+                        "unexpected server revision marker entry {file_name}"
+                    )));
+                }
+            };
             let path = entry.path();
             let metadata = fs::symlink_metadata(&path)?;
             if !metadata.is_file() || metadata.file_type().is_symlink() {
@@ -4659,7 +4754,13 @@ impl FsStorage {
                 )));
             }
             let payload = read_bounded_file(&path, MAX_DURABLE_STATE_PAYLOAD)?;
-            let item: Item = bitcode::deserialize(&payload).map_err(InvalidParameter::from)?;
+            let item: Item = if kinded {
+                bitcode::deserialize(&payload).map_err(InvalidParameter::from)?
+            } else {
+                bitcode::deserialize::<ItemV1>(&payload)
+                    .map_err(InvalidParameter::from)?
+                    .into()
+            };
             super::validate_revision_metadata(&item)?;
             let (expected_path, expected_payload) = self.revision_marker(&item)?;
             if path != expected_path || payload != expected_payload {
@@ -5141,6 +5242,7 @@ impl FsStorage {
                 relative_path: relative_path.to_string_lossy().to_string(),
                 size: data.len() as u64,
                 chunk_range: (start, next_chunk_index),
+                kind: EntryKind::Regular,
             });
         }
 
@@ -6944,13 +7046,13 @@ impl FsStorage {
                 inner.persistance_path.clone(),
             )
         };
-        let payload = bitcode::serialize(&canonical)
-            .inspect_err(|error| tracing::error!("Serialization error: {error}"))
-            .map_err(InvalidParameter::from)?;
+        let (schema, payload) = canonical
+            .encode()
+            .inspect_err(|error| tracing::error!("Serialization error: {error}"))?;
         replace_enveloped_state(
             &persistence_path,
             DurableStateKind::FsStorage,
-            FS_STORAGE_PAYLOAD_SCHEMA,
+            schema,
             &payload,
             MAX_DURABLE_STATE_PAYLOAD,
         )?;
@@ -7041,14 +7143,13 @@ impl FsStorage {
         let state = match fs::symlink_metadata(&persistance_path) {
             Ok(_) => {
                 tracing::debug!("FsStorage envelope found, loading…");
-                let payload = read_enveloped_state(
+                let (schema, payload) = read_enveloped_state_any(
                     &persistance_path,
                     DurableStateKind::FsStorage,
-                    FS_STORAGE_PAYLOAD_SCHEMA,
+                    &[FS_STORAGE_PAYLOAD_SCHEMA, FS_STORAGE_KINDED_PAYLOAD_SCHEMA],
                     MAX_DURABLE_STATE_PAYLOAD,
                 )?;
-                let canonical: FsStorageStateV1 =
-                    bitcode::deserialize(&payload).map_err(InvalidParameter::from)?;
+                let canonical = FsStorageStateV1::decode(schema, &payload)?;
                 canonical.into_runtime(root.clone(), persistance_path.clone(), &selected)?
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -7705,13 +7806,14 @@ impl ChunkStorage for FsStorage {
     where
         Self: Sized,
     {
-        let expected = self.prepare_revision_from_files(
+        let expected = self.prepare_revision_from_entries(
             item.metadata.artifact_id.clone(),
             item.metadata.name.clone(),
             item.metadata.path.clone(),
             item.metadata.revision,
             item.metadata.description.clone(),
             files.clone(),
+            super::entry_kinds(&item),
             item.manifest.chunk_algorithm,
         )?;
         if !super::same_revision(&item, &expected) {
@@ -7988,11 +8090,13 @@ mod tests {
                     relative_path: "a.bin".to_string(),
                     size: first.len() as u64,
                     chunk_range: (0, 1),
+                    kind: EntryKind::Regular,
                 },
                 FileEntry {
                     relative_path: "b.bin".to_string(),
                     size: second.len() as u64,
                     chunk_range: (1, 2),
+                    kind: EntryKind::Regular,
                 },
             ],
             ChunkAlgorithm::fixed_aligned(4, 1),
@@ -8021,6 +8125,7 @@ mod tests {
                 relative_path: (*path).to_string(),
                 size: bytes.len() as u64,
                 chunk_range: (index as u32, index as u32 + 1),
+                kind: EntryKind::Regular,
             })
             .collect();
         let mut item = Item::make_with_entries(
@@ -9116,6 +9221,7 @@ mod tests {
                 relative_path: "nested/./file.txt".to_string(),
                 size: info.size,
                 chunk_range: (0, 1),
+                kind: EntryKind::Regular,
             }],
             ChunkAlgorithm::default(),
         )
@@ -11628,6 +11734,7 @@ mod tests {
                 relative_path: "nested/file".to_string(),
                 size: info.size,
                 chunk_range: (0, 1),
+                kind: EntryKind::Regular,
             }],
             ChunkAlgorithm::default(),
         )
@@ -14411,11 +14518,13 @@ mod tests {
                     relative_path: "dir/alpha.bin".to_string(),
                     size: 16,
                     chunk_range: (0, 2),
+                    kind: EntryKind::Regular,
                 },
                 FileEntry {
                     relative_path: "dir/beta.bin".to_string(),
                     size: 16,
                     chunk_range: (2, 4),
+                    kind: EntryKind::Regular,
                 },
             ],
             ChunkAlgorithm::fixed_aligned(8, 1),

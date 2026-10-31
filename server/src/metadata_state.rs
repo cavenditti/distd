@@ -14,12 +14,12 @@ use distd_core::{
     chunk_storage::validate_revision_metadata,
     chunks::{ChunkAlgorithm, ChunkInfo},
     durable_state::{
-        read_bounded_file, read_enveloped_state, replace_enveloped_state, DurableStateError,
-        DurableStateKind,
+        read_bounded_file, read_enveloped_state, read_enveloped_state_any, replace_enveloped_state,
+        DurableStateError, DurableStateKind,
     },
     feed::{Feed, Name as FeedName},
     hash::Hash,
-    item::{ArtifactId, FileEntry, Format as ItemFormat, Item, Manifest},
+    item::{ArtifactId, EntryKind, FileEntry, Format as ItemFormat, Item, Manifest},
     metadata::Item as ItemMetadata,
     signature::{
         PublisherPublicKey, PublisherReleaseEnvelope, PublisherReleaseSequence, PublisherSignature,
@@ -36,6 +36,9 @@ use crate::{
 };
 
 pub const SERVER_PUBLICATION_SCHEMA: u16 = 3;
+/// Schema-3 layout extended with per-entry kinds. Written only while some
+/// revision has executable or symlink entries, so other state stays schema 3.
+pub const SERVER_KINDED_PUBLICATION_SCHEMA: u16 = 4;
 const SIGNED_SERVER_PUBLICATION_SCHEMA: u16 = 2;
 const LEGACY_SERVER_PUBLICATION_SCHEMA: u16 = 1;
 pub const MAX_SERVER_PUBLICATION_PAYLOAD: u64 = 64 * 1024 * 1024;
@@ -95,7 +98,7 @@ impl MetadataReplace for StageFailingMetadataReplace {
         distd_core::durable_state::replace_enveloped_state_with_hook(
             path,
             DurableStateKind::ServerPublication,
-            SERVER_PUBLICATION_SCHEMA,
+            publication_schema(payload),
             payload,
             MAX_SERVER_PUBLICATION_PAYLOAD,
             |stage| {
@@ -117,7 +120,7 @@ impl MetadataReplace for DurableMetadataReplace {
         replace_enveloped_state(
             path,
             DurableStateKind::ServerPublication,
-            SERVER_PUBLICATION_SCHEMA,
+            publication_schema(payload),
             payload,
             MAX_SERVER_PUBLICATION_PAYLOAD,
         )
@@ -282,6 +285,7 @@ impl MetadataStateStore {
 }
 
 const CURRENT_PAYLOAD_MAGIC: &[u8; 8] = b"DSPUBV3\0";
+const KINDED_PAYLOAD_MAGIC: &[u8; 8] = b"DSPUBV4\0";
 const SCHEMA2_PAYLOAD_MAGIC: &[u8; 8] = b"DSPUBV2\0";
 const SCHEMA1_PAYLOAD_MAGIC: &[u8; 8] = b"DSPUBV1\0";
 const MAX_STRING_BYTES: usize = 16 * 1024 * 1024;
@@ -290,6 +294,7 @@ const MAX_STRING_BYTES: usize = 16 * 1024 * 1024;
 struct LegacyMetadataV0 {
     version: Version,
     feeds: HashMap<FeedName, Feed>,
+    #[serde(with = "distd_core::item::v1::map")]
     items: HashMap<ArtifactId, Item>,
 }
 
@@ -297,13 +302,87 @@ struct LegacyMetadataV0 {
 struct LegacyMetadataV1 {
     version: Version,
     feeds: HashMap<FeedName, Feed>,
+    #[serde(with = "distd_core::item::v1::map")]
     items: HashMap<ArtifactId, Item>,
-    #[serde(default)]
+    #[serde(default, with = "legacy_versions_v1")]
     versions: HashMap<ArtifactId, BTreeMap<u64, Item>>,
 }
 
+/// Revision histories of the pre-envelope layout, in the V1 revision layout.
+mod legacy_versions_v1 {
+    use std::collections::{BTreeMap, HashMap};
+
+    use distd_core::item::{v1::ItemV1, ArtifactId, Item};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        versions: &HashMap<ArtifactId, BTreeMap<u64, Item>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        versions
+            .iter()
+            .map(|(artifact_id, history)| {
+                let history = history
+                    .iter()
+                    .map(|(revision, item)| {
+                        ItemV1::from_regular(item)
+                            .map(|item| (*revision, item))
+                            .ok_or_else(|| {
+                                serde::ser::Error::custom(
+                                    "the V1 revision layout cannot encode entry kinds",
+                                )
+                            })
+                    })
+                    .collect::<Result<BTreeMap<_, _>, S::Error>>()?;
+                Ok((artifact_id.clone(), history))
+            })
+            .collect::<Result<HashMap<_, _>, S::Error>>()?
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<HashMap<ArtifactId, BTreeMap<u64, Item>>, D::Error> {
+        Ok(
+            HashMap::<ArtifactId, BTreeMap<u64, ItemV1>>::deserialize(deserializer)?
+                .into_iter()
+                .map(|(artifact_id, history)| {
+                    (
+                        artifact_id,
+                        history
+                            .into_iter()
+                            .map(|(revision, item)| (revision, Item::from(item)))
+                            .collect(),
+                    )
+                })
+                .collect(),
+        )
+    }
+}
+
+fn has_entry_kinds(metadata: &InternalMetadata) -> bool {
+    metadata
+        .versions
+        .values()
+        .flat_map(BTreeMap::values)
+        .any(|revision| !revision.item().manifest.has_only_regular_entries())
+}
+
+/// Envelope schema matching a canonical payload's magic.
+fn publication_schema(payload: &[u8]) -> u16 {
+    if payload.starts_with(KINDED_PAYLOAD_MAGIC) {
+        SERVER_KINDED_PUBLICATION_SCHEMA
+    } else {
+        SERVER_PUBLICATION_SCHEMA
+    }
+}
+
 fn canonical_payload(metadata: &InternalMetadata) -> Result<Vec<u8>, ServerError> {
-    canonical_payload_with_magic(metadata, CURRENT_PAYLOAD_MAGIC, true)
+    if has_entry_kinds(metadata) {
+        canonical_payload_with_magic(metadata, KINDED_PAYLOAD_MAGIC, true)
+    } else {
+        canonical_payload_with_magic(metadata, CURRENT_PAYLOAD_MAGIC, true)
+    }
 }
 
 fn canonical_payload_with_magic(
@@ -335,6 +414,7 @@ fn canonical_payload_with_magic(
         ));
     }
     let mut writer = WireWriterV1::new();
+    writer.entry_kinds = magic == KINDED_PAYLOAD_MAGIC;
     writer.bytes(magic)?;
     writer.version(metadata.version)?;
 
@@ -365,11 +445,16 @@ fn canonical_payload_with_magic(
 /// Variant tags and field order below are part of the durable wire contract.
 struct WireWriterV1 {
     bytes: Vec<u8>,
+    /// Schema 4 appends each entry's kind; earlier schemas cannot encode kinds.
+    entry_kinds: bool,
 }
 
 impl WireWriterV1 {
     fn new() -> Self {
-        Self { bytes: Vec::new() }
+        Self {
+            bytes: Vec::new(),
+            entry_kinds: false,
+        }
     }
 
     fn finish(self) -> Vec<u8> {
@@ -576,6 +661,20 @@ impl WireWriterV1 {
             self.u64(entry.size)?;
             self.u32(entry.chunk_range.0)?;
             self.u32(entry.chunk_range.1)?;
+            match (&entry.kind, self.entry_kinds) {
+                (EntryKind::Regular, false) => {}
+                (_, false) => {
+                    return Err(ServerError::State(
+                        "server publication schema 3 cannot encode entry kinds".to_string(),
+                    ));
+                }
+                (EntryKind::Regular, true) => self.u8(0)?,
+                (EntryKind::Executable, true) => self.u8(1)?,
+                (EntryKind::Symlink { target }, true) => {
+                    self.u8(2)?;
+                    self.string(target)?;
+                }
+            }
         }
 
         self.count(item.chunks.len())?;
@@ -616,11 +715,16 @@ impl WireWriterV1 {
 
 struct WireReaderV1<'a> {
     remaining: &'a [u8],
+    /// Schema 4 appends each entry's kind.
+    entry_kinds: bool,
 }
 
 impl<'a> WireReaderV1<'a> {
     fn new(bytes: &'a [u8]) -> Self {
-        Self { remaining: bytes }
+        Self {
+            remaining: bytes,
+            entry_kinds: false,
+        }
     }
 
     fn take(&mut self, length: usize) -> Result<&'a [u8], ServerError> {
@@ -811,10 +915,30 @@ impl<'a> WireReaderV1<'a> {
         let entry_count = self.count(MAX_REVISIONS, "file entry")?;
         let mut entries = Vec::with_capacity(entry_count.min(4096));
         for _ in 0..entry_count {
+            let relative_path = self.string()?;
+            let size = self.u64()?;
+            let chunk_range = (self.u32()?, self.u32()?);
+            let kind = if self.entry_kinds {
+                match self.u8()? {
+                    0 => EntryKind::Regular,
+                    1 => EntryKind::Executable,
+                    2 => EntryKind::Symlink {
+                        target: self.string()?,
+                    },
+                    _ => {
+                        return Err(ServerError::State(
+                            "server publication entry kind tag is invalid".to_string(),
+                        ));
+                    }
+                }
+            } else {
+                EntryKind::Regular
+            };
             entries.push(FileEntry {
-                relative_path: self.string()?,
-                size: self.u64()?,
-                chunk_range: (self.u32()?, self.u32()?),
+                relative_path,
+                size,
+                chunk_range,
+                kind,
             });
         }
         let encoded_chunk_count = self.count(MAX_REVISIONS, "chunk")?;
@@ -860,13 +984,19 @@ impl<'a> WireReaderV1<'a> {
                 PublisherPublicKey::from_bytes(self.array()?),
                 PublisherSignature::from_bytes(self.array()?),
             )),
-            2 if schema == PublicationPayloadSchema::V3 => PublicationAttestation::ReleaseV2 {
-                sequence: PublisherReleaseSequence::new(self.u64()?),
-                envelope: PublisherReleaseEnvelope::from_parts(
-                    PublisherPublicKey::from_bytes(self.array()?),
-                    PublisherSignature::from_bytes(self.array()?),
-                ),
-            },
+            2 if matches!(
+                schema,
+                PublicationPayloadSchema::V3 | PublicationPayloadSchema::V4
+            ) =>
+            {
+                PublicationAttestation::ReleaseV2 {
+                    sequence: PublisherReleaseSequence::new(self.u64()?),
+                    envelope: PublisherReleaseEnvelope::from_parts(
+                        PublisherPublicKey::from_bytes(self.array()?),
+                        PublisherSignature::from_bytes(self.array()?),
+                    ),
+                }
+            }
             _ => {
                 return Err(ServerError::State(
                     "server publication attestation tag is invalid".to_string(),
@@ -911,13 +1041,17 @@ impl<'a> WireReaderV1<'a> {
 }
 
 fn read_current(path: &Path) -> Result<InternalMetadata, ServerError> {
-    let payload = read_enveloped_state(
+    let (schema, payload) = read_enveloped_state_any(
         path,
         DurableStateKind::ServerPublication,
-        SERVER_PUBLICATION_SCHEMA,
+        &[SERVER_PUBLICATION_SCHEMA, SERVER_KINDED_PUBLICATION_SCHEMA],
         MAX_SERVER_PUBLICATION_PAYLOAD,
     )?;
-    decode_current_payload(&payload)
+    if schema == SERVER_KINDED_PUBLICATION_SCHEMA {
+        decode_payload(&payload, KINDED_PAYLOAD_MAGIC, PublicationPayloadSchema::V4)
+    } else {
+        decode_current_payload(&payload)
+    }
 }
 
 fn read_schema2(path: &Path) -> Result<InternalMetadata, ServerError> {
@@ -1037,6 +1171,7 @@ enum PublicationPayloadSchema {
     V1,
     V2,
     V3,
+    V4,
 }
 
 fn decode_payload(
@@ -1045,6 +1180,7 @@ fn decode_payload(
     schema: PublicationPayloadSchema,
 ) -> Result<InternalMetadata, ServerError> {
     let mut reader = WireReaderV1::new(payload);
+    reader.entry_kinds = schema == PublicationPayloadSchema::V4;
     reader.expect_bytes(magic)?;
     let version = reader.version()?;
 
@@ -1768,6 +1904,7 @@ mod tests {
                     relative_path: "bin/payload".to_string(),
                     size: 7,
                     chunk_range: (0, 1),
+                    kind: EntryKind::Regular,
                 }],
             },
             chunks: vec![chunk],
@@ -1861,6 +1998,85 @@ mod tests {
         assert!(encode_p95 <= std::time::Duration::from_millis(10));
         assert!(decode_p95 <= std::time::Duration::from_millis(70));
         assert!(decode_max <= std::time::Duration::from_millis(100));
+    }
+
+    #[test]
+    fn entry_kinds_use_schema_four_only_while_present_and_roundtrip() {
+        let directory = directory();
+        let paths = MetadataPaths::in_state_directory(&directory);
+        let (store, _) =
+            MetadataStateStore::open_with_validator(paths.clone(), |_| Ok(())).unwrap();
+        let schema = |path: &Path| {
+            read_enveloped_state_any(
+                path,
+                DurableStateKind::ServerPublication,
+                &[SERVER_PUBLICATION_SCHEMA, SERVER_KINDED_PUBLICATION_SCHEMA],
+                MAX_SERVER_PUBLICATION_PAYLOAD,
+            )
+            .unwrap()
+        };
+
+        let regular = signed_metadata_with("regular", b"regular payload", [41; 32]);
+        store.replace_and_verify(&regular).unwrap();
+        assert_eq!(schema(&paths.current).0, SERVER_PUBLICATION_SCHEMA);
+
+        let item = HashMapStorage::default()
+            .prepare_revision_from_entries(
+                "kinded".to_string(),
+                "kinded".to_string(),
+                "kinded".into(),
+                0,
+                None,
+                vec![
+                    ("bin/tool".into(), Bytes::from_static(b"#!/bin/sh\n")),
+                    ("bin/link".into(), Bytes::new()),
+                ],
+                BTreeMap::from([
+                    (PathBuf::from("bin/tool"), EntryKind::Executable),
+                    (
+                        PathBuf::from("bin/link"),
+                        EntryKind::Symlink {
+                            target: "/nix/store/abc-tool/bin/tool".to_string(),
+                        },
+                    ),
+                ]),
+                ChunkAlgorithm::default(),
+            )
+            .unwrap();
+        assert!(
+            PublishedRevision::new(item.clone(), PublicationAttestation::UnsignedLegacy).is_err()
+        );
+        let sequence = PublisherReleaseSequence::new(1);
+        let published = PublishedRevision::new(
+            item.clone(),
+            PublicationAttestation::ReleaseV2 {
+                sequence,
+                envelope: release_envelope(&item, [43; 32], sequence),
+            },
+        )
+        .unwrap();
+        let mut kinded = regular.clone();
+        kinded.items.insert("kinded".to_string(), published.clone());
+        kinded.versions.insert(
+            "kinded".to_string(),
+            BTreeMap::from([(item.manifest.version, published)]),
+        );
+        store.replace_and_verify(&kinded).unwrap();
+        let (written_schema, payload) = schema(&paths.current);
+        assert_eq!(written_schema, SERVER_KINDED_PUBLICATION_SCHEMA);
+        assert!(payload.starts_with(KINDED_PAYLOAD_MAGIC));
+        drop(store);
+        let (store, reopened) =
+            MetadataStateStore::open_with_validator(paths.clone(), |_| Ok(())).unwrap();
+        assert_eq!(reopened, kinded);
+        assert_eq!(
+            reopened.items["kinded"].item().manifest.entries,
+            item.manifest.entries
+        );
+
+        store.replace_and_verify(&regular).unwrap();
+        assert_eq!(schema(&paths.current).0, SERVER_PUBLICATION_SCHEMA);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

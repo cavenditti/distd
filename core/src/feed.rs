@@ -16,7 +16,9 @@ pub struct Feed {
     /// Name of the feed
     pub name: Name,
 
-    /// Paths of items in the feed
+    /// Paths of items in the feed. Stored in the V1 revision layout, so feeds keep their
+    /// existing encodings and cannot hold revisions with entry kinds.
+    #[serde(with = "crate::item::v1::map")]
     pub paths: BTreeMap<PathBuf, Item>,
 }
 

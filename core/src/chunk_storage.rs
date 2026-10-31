@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     ops::{Deref, Range},
     path::PathBuf,
     sync::{
@@ -17,7 +17,7 @@ use crate::hash::{hash, Hash, HashTreeCapable};
 use crate::{
     chunks::{ChunkAlgorithm, ChunkInfo},
     hash::merge_hashes,
-    item::{ArtifactId, FileEntry, Item, Name as ItemName},
+    item::{ArtifactId, EntryKind, FileEntry, Item, Name as ItemName},
 };
 
 static NEXT_RECEIVED_BACKING_ID: AtomicU64 = AtomicU64::new(1);
@@ -87,6 +87,17 @@ fn same_revision(candidate: &Item, actual: &Item) -> bool {
         && candidate.metadata.root == actual.metadata.root
         && candidate.manifest == actual.manifest
         && candidate.chunks == actual.chunks
+}
+
+/// Non-regular entry kinds of `item`, keyed by relative path, in the form the directory
+/// preparation API accepts.
+pub(crate) fn entry_kinds(item: &Item) -> BTreeMap<PathBuf, EntryKind> {
+    item.manifest
+        .entries
+        .iter()
+        .filter(|entry| !entry.kind.is_regular())
+        .map(|entry| (PathBuf::from(&entry.relative_path), entry.kind.clone()))
+        .collect()
 }
 
 fn invalid_committed_revision(reason: impl Into<String>) -> Error {
@@ -183,6 +194,12 @@ pub fn validate_revision_metadata(item: &Item) -> Result<ChunkInfo, Error> {
         if size != entry.size {
             return Err(invalid_committed_revision(
                 "directory entry size differs from its chunks",
+            ));
+        }
+        entry.kind.validate().map_err(invalid_committed_revision)?;
+        if entry.kind.symlink_target().is_some() && (entry.size != 0 || end - start != 1) {
+            return Err(invalid_committed_revision(
+                "symlink entry must cover exactly one empty chunk",
             ));
         }
         next_chunk = end;
@@ -611,6 +628,36 @@ pub trait ChunkStorage: HashTreeCapable<Arc<Node>, Error> {
     where
         Self: Sized,
     {
+        self.prepare_revision_from_entries(
+            artifact_id,
+            name,
+            path,
+            revision,
+            description,
+            files,
+            BTreeMap::new(),
+            chunk_algorithm,
+        )
+    }
+
+    /// Build exact multi-file revision metadata with explicit entry kinds.
+    ///
+    /// Paths absent from `kinds` are regular files. A symbolic link is supplied as an empty
+    /// file whose kind names its target; every key of `kinds` must name a supplied file.
+    fn prepare_revision_from_entries(
+        &self,
+        artifact_id: ArtifactId,
+        name: ItemName,
+        path: PathBuf,
+        revision: u32,
+        description: Option<String>,
+        files: Vec<(PathBuf, Bytes)>,
+        kinds: BTreeMap<PathBuf, EntryKind>,
+        chunk_algorithm: ChunkAlgorithm,
+    ) -> Result<Item, Error>
+    where
+        Self: Sized,
+    {
         let path = validate_revision_authority(&artifact_id, &path)?;
         if files.is_empty() {
             return Err(Error::MissingData);
@@ -641,6 +688,12 @@ pub trait ChunkStorage: HashTreeCapable<Arc<Node>, Error> {
                 "directory revision contains duplicate paths".to_string(),
             ));
         }
+        let kinds = kinds
+            .into_iter()
+            .map(|(relative_path, kind)| {
+                Ok((crate::utils::path::validate_relative(&relative_path)?, kind))
+            })
+            .collect::<Result<BTreeMap<_, _>, Error>>()?;
         self.prepare_revision_from_sorted_files(
             artifact_id,
             name,
@@ -648,6 +701,7 @@ pub trait ChunkStorage: HashTreeCapable<Arc<Node>, Error> {
             revision,
             description,
             &files,
+            &kinds,
             chunk_algorithm,
         )
     }
@@ -662,6 +716,7 @@ pub trait ChunkStorage: HashTreeCapable<Arc<Node>, Error> {
         revision: u32,
         description: Option<String>,
         files: &[(PathBuf, Bytes)],
+        kinds: &BTreeMap<PathBuf, EntryKind>,
         chunk_algorithm: ChunkAlgorithm,
     ) -> Result<Item, Error>
     where
@@ -671,6 +726,7 @@ pub trait ChunkStorage: HashTreeCapable<Arc<Node>, Error> {
         if files.is_empty() {
             return Err(Error::MissingData);
         }
+        let mut matched_kinds = 0usize;
         let mut chunks = Vec::new();
         let mut entries = Vec::with_capacity(files.len());
         let mut previous: Option<&PathBuf> = None;
@@ -695,6 +751,20 @@ pub trait ChunkStorage: HashTreeCapable<Arc<Node>, Error> {
                 ));
             }
             previous = Some(relative_path);
+            let kind = match kinds.get(relative_path) {
+                Some(kind) => {
+                    matched_kinds += 1;
+                    kind.clone()
+                }
+                None => EntryKind::Regular,
+            };
+            kind.validate()
+                .map_err(|reason| Error::Other(reason.to_string()))?;
+            if kind.symlink_target().is_some() && !data.is_empty() {
+                return Err(Error::Other(
+                    "symlink entry must not carry file data".to_string(),
+                ));
+            }
             let relative_path = relative_path
                 .to_str()
                 .expect("validated directory revision path is UTF-8");
@@ -707,7 +777,13 @@ pub trait ChunkStorage: HashTreeCapable<Arc<Node>, Error> {
                 relative_path: relative_path.to_string(),
                 size: data.len() as u64,
                 chunk_range: (start, end),
+                kind,
             });
+        }
+        if matched_kinds != kinds.len() {
+            return Err(Error::Other(
+                "entry kind names a path that is not in the revision".to_string(),
+            ));
         }
         let root = prepared_tree(&chunks)?;
         Ok(Item::make_with_entries(
@@ -760,13 +836,14 @@ pub trait ChunkStorage: HashTreeCapable<Arc<Node>, Error> {
     where
         Self: Sized,
     {
-        let expected = self.prepare_revision_from_files(
+        let expected = self.prepare_revision_from_entries(
             item.metadata.artifact_id.clone(),
             item.metadata.name.clone(),
             item.metadata.path.clone(),
             item.metadata.revision,
             item.metadata.description.clone(),
             files.clone(),
+            entry_kinds(&item),
             item.manifest.chunk_algorithm,
         )?;
         if !same_revision(&item, &expected) {
@@ -912,6 +989,90 @@ mod tests {
     use std::sync::atomic::AtomicU64;
 
     use crate::{chunk_storage::hashmap_storage::HashMapStorage, chunks::CHUNK_SIZE, hash::hash};
+
+    fn prepare_kinded(
+        files: Vec<(&str, &'static [u8])>,
+        kinds: Vec<(&str, EntryKind)>,
+    ) -> Result<Item, Error> {
+        HashMapStorage::default().prepare_revision_from_entries(
+            "kinded".to_string(),
+            "kinded".to_string(),
+            PathBuf::from("kinded"),
+            0,
+            None,
+            files
+                .into_iter()
+                .map(|(path, data)| (PathBuf::from(path), Bytes::from_static(data)))
+                .collect(),
+            kinds
+                .into_iter()
+                .map(|(path, kind)| (PathBuf::from(path), kind))
+                .collect(),
+            ChunkAlgorithm::default(),
+        )
+    }
+
+    #[test]
+    fn entry_kinds_are_prepared_as_empty_chunk_links_and_validated() {
+        let link = |target: &str| EntryKind::Symlink {
+            target: target.to_string(),
+        };
+        let item = prepare_kinded(
+            vec![
+                ("bin/tool", b"#!/bin/sh\n"),
+                ("bin/tool.sh", b""),
+                ("doc", b"x"),
+            ],
+            vec![
+                ("bin/tool", EntryKind::Executable),
+                ("bin/tool.sh", link("tool")),
+            ],
+        )
+        .unwrap();
+        validate_revision_metadata(&item).unwrap();
+        let kinds: Vec<_> = item
+            .manifest
+            .entries
+            .iter()
+            .map(|entry| (entry.relative_path.as_str(), entry.kind.clone()))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ("bin/tool", EntryKind::Executable),
+                ("bin/tool.sh", link("tool")),
+                ("doc", EntryKind::Regular),
+            ]
+        );
+        let link_entry = &item.manifest.entries[1];
+        assert_eq!(link_entry.size, 0);
+        assert_eq!(
+            item.chunks[link_entry.chunk_range.0 as usize..link_entry.chunk_range.1 as usize],
+            [ChunkInfo {
+                hash: hash(&[]),
+                size: 0
+            }]
+        );
+        assert_eq!(entry_kinds(&item).len(), 2);
+
+        assert!(prepare_kinded(vec![("link", b"data")], vec![("link", link("x"))]).is_err());
+        assert!(prepare_kinded(vec![("file", b"data")], vec![("missing", link("x"))]).is_err());
+        for target in ["", "a\0b"] {
+            assert!(prepare_kinded(vec![("link", b"")], vec![("link", link(target))]).is_err());
+        }
+        assert!(prepare_kinded(
+            vec![("link", b"")],
+            vec![(
+                "link",
+                link(&"t".repeat(crate::item::MAX_SYMLINK_TARGET_BYTES + 1))
+            )]
+        )
+        .is_err());
+
+        let mut sized_link = item.clone();
+        sized_link.manifest.entries[2].kind = link("tool");
+        assert!(validate_revision_metadata(&sized_link).is_err());
+    }
 
     #[test]
     fn received_backing_identity_exhaustion_is_fail_stop() {
@@ -1064,11 +1225,13 @@ mod tests {
                 relative_path: "a".to_string(),
                 size: 4,
                 chunk_range: (0, 1),
+                kind: EntryKind::Regular,
             },
             FileEntry {
                 relative_path: "a/b".to_string(),
                 size: 4,
                 chunk_range: (1, 2),
+                kind: EntryKind::Regular,
             },
         ];
 
