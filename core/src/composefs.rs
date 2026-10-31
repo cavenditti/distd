@@ -394,16 +394,16 @@ fn flatten_tree(
         };
         let file_idx = nodes.len();
         let file_ino = u32::try_from(file_idx + 1).map_err(InvalidParameter::from)?;
-        let (xattr_icount, xattr_body, inline_tail) =
-            if let Some(inline_bytes) = &spec.inline_data {
-                (0u16, Vec::new(), inline_bytes.clone())
-            } else {
-                let redirect = spec.redirect_path.as_deref().ok_or_else(|| {
-                    Error::Other("non-inline composefs file requires redirect path".to_string())
-                })?;
-                let (icount, body) = encode_redirect_xattr_body(redirect)?;
-                (icount, body, Vec::new())
-            };
+        let (xattr_icount, xattr_body, inline_tail) = if let Some(inline_bytes) = &spec.inline_data
+        {
+            (0u16, Vec::new(), inline_bytes.clone())
+        } else {
+            let redirect = spec.redirect_path.as_deref().ok_or_else(|| {
+                Error::Other("non-inline composefs file requires redirect path".to_string())
+            })?;
+            let (icount, body) = encode_redirect_xattr_body(redirect)?;
+            (icount, body, Vec::new())
+        };
         let mut encoded = Vec::with_capacity(EROFS_INODE_EXTENDED_SIZE + xattr_body.len());
         encoded.resize(EROFS_INODE_EXTENDED_SIZE, 0);
         encoded.extend_from_slice(&xattr_body);
@@ -444,10 +444,7 @@ fn flatten_tree(
         children.push((name.clone(), file_idx, EROFS_FT_REG_FILE));
     }
 
-    if let PlannedNodeKind::Directory {
-        children: slot, ..
-    } = &mut nodes[dir_index].kind
-    {
+    if let PlannedNodeKind::Directory { children: slot, .. } = &mut nodes[dir_index].kind {
         *slot = children;
     }
     Ok(dir_index)
@@ -567,10 +564,9 @@ pub fn build_composefs_erofs(
         for entry in &item.manifest.entries {
             let start = entry.chunk_range.0 as usize;
             let end = entry.chunk_range.1 as usize;
-            let file_chunks = item
-                .chunks
-                .get(start..end)
-                .ok_or_else(|| Error::Other("manifest entry chunk range out of bounds".to_string()))?;
+            let file_chunks = item.chunks.get(start..end).ok_or_else(|| {
+                Error::Other("manifest entry chunk range out of bounds".to_string())
+            })?;
             let spec = match &entry.kind {
                 EntryKind::Symlink { target } => NodeSpec::Symlink(SymlinkSpec {
                     relative_path: entry.relative_path.clone(),
@@ -658,8 +654,8 @@ pub fn build_composefs_erofs(
         };
         if let Some((resolved_children, nlink)) = dir_info {
             let dir_blocks = encode_directory_blocks(self_nid, parent_nid, &resolved_children)?;
-            let block_count =
-                u32::try_from(dir_blocks.len() / EROFS_BLOCK_SIZE).map_err(InvalidParameter::from)?;
+            let block_count = u32::try_from(dir_blocks.len() / EROFS_BLOCK_SIZE)
+                .map_err(InvalidParameter::from)?;
             let dir_size = dir_blocks.len() as u64;
             let start_block = current_data_block;
             current_data_block = current_data_block
@@ -700,8 +696,7 @@ pub fn build_composefs_erofs(
         let end_meta = start + node.encoded_inode_and_xattrs.len();
         image[start..end_meta].copy_from_slice(&node.encoded_inode_and_xattrs);
         if !node.inline_tail.is_empty() {
-            image[end_meta..end_meta + node.inline_tail.len()]
-                .copy_from_slice(&node.inline_tail);
+            image[end_meta..end_meta + node.inline_tail.len()].copy_from_slice(&node.inline_tail);
         }
         match &node.kind {
             PlannedNodeKind::File(spec) => projections.push(ComposefsFileProjection {
@@ -833,13 +828,17 @@ fn walk_erofs_directory(
     depth: usize,
 ) -> Result<(), Error> {
     if depth > 64 {
-        return Err(Error::Other("EROFS directory recursion limit exceeded".to_string()));
+        return Err(Error::Other(
+            "EROFS directory recursion limit exceeded".to_string(),
+        ));
     }
     let inode_offset = usize::try_from(meta_blkaddr).map_err(InvalidParameter::from)?
         * EROFS_BLOCK_SIZE
         + usize::try_from(dir_nid).map_err(InvalidParameter::from)? * EROFS_SLOT_SIZE;
     if inode_offset + EROFS_INODE_EXTENDED_SIZE > image.len() {
-        return Err(Error::Other("EROFS directory NID out of bounds".to_string()));
+        return Err(Error::Other(
+            "EROFS directory NID out of bounds".to_string(),
+        ));
     }
     let inode = &image[inode_offset..inode_offset + EROFS_INODE_EXTENDED_SIZE];
     let i_format = u16::from_le_bytes(inode[0..2].try_into().unwrap());
@@ -876,8 +875,11 @@ fn walk_erofs_directory(
                 u16::from_le_bytes(block[d_off + 8..d_off + 10].try_into().unwrap()) as usize;
             let file_type = block[d_off + 10];
             let name_end = if idx + 1 < dirent_count {
-                u16::from_le_bytes(block[(idx + 1) * 12 + 8..(idx + 1) * 12 + 10].try_into().unwrap())
-                    as usize
+                u16::from_le_bytes(
+                    block[(idx + 1) * 12 + 8..(idx + 1) * 12 + 10]
+                        .try_into()
+                        .unwrap(),
+                ) as usize
             } else {
                 let mut end = name_start;
                 while end < EROFS_BLOCK_SIZE && block[end] != 0 {
@@ -886,7 +888,9 @@ fn walk_erofs_directory(
                 end
             };
             if name_start > name_end || name_end > EROFS_BLOCK_SIZE {
-                return Err(Error::Other("EROFS dirent name slice out of bounds".to_string()));
+                return Err(Error::Other(
+                    "EROFS dirent name slice out of bounds".to_string(),
+                ));
             }
             let name = std::str::from_utf8(&block[name_start..name_end])
                 .map_err(|_| Error::Other("EROFS dirent name is not valid UTF-8".to_string()))?;
@@ -951,7 +955,9 @@ fn read_erofs_file_inode(
     let xattr_icount = u16::from_le_bytes(inode[2..4].try_into().unwrap());
     let i_mode = u16::from_le_bytes(inode[4..6].try_into().unwrap());
     if i_mode & S_IFMT != S_IFREG {
-        return Err(Error::Other("expected EROFS regular file inode".to_string()));
+        return Err(Error::Other(
+            "expected EROFS regular file inode".to_string(),
+        ));
     }
     let size = u64::from_le_bytes(inode[12..20].try_into().unwrap());
     let xattr_bytes = if xattr_icount == 0 {
@@ -962,7 +968,9 @@ fn read_erofs_file_inode(
     let xattr_start = inode_offset + EROFS_INODE_EXTENDED_SIZE;
     let xattr_end = xattr_start + xattr_bytes;
     if xattr_end > image.len() {
-        return Err(Error::Other("EROFS inline xattrs out of bounds".to_string()));
+        return Err(Error::Other(
+            "EROFS inline xattrs out of bounds".to_string(),
+        ));
     }
 
     let mut redirect_path = None;
@@ -971,8 +979,9 @@ fn read_erofs_file_inode(
         while cursor + 4 <= xattr_end {
             let name_len = usize::from(image[cursor]);
             let name_index = image[cursor + 1];
-            let value_len =
-                usize::from(u16::from_le_bytes(image[cursor + 2..cursor + 4].try_into().unwrap()));
+            let value_len = usize::from(u16::from_le_bytes(
+                image[cursor + 2..cursor + 4].try_into().unwrap(),
+            ));
             let entry_end = cursor + 4 + name_len + value_len;
             if entry_end > xattr_end {
                 return Err(Error::Other("EROFS xattr entry out of bounds".to_string()));
@@ -992,7 +1001,9 @@ fn read_erofs_file_inode(
     let (blob_hash, inline_data) = if layout == EROFS_INODE_LAYOUT_INLINE {
         let len = usize::try_from(size).map_err(InvalidParameter::from)?;
         if xattr_end + len > image.len() {
-            return Err(Error::Other("EROFS inline file data out of bounds".to_string()));
+            return Err(Error::Other(
+                "EROFS inline file data out of bounds".to_string(),
+            ));
         }
         let inline_bytes = image[xattr_end..xattr_end + len].to_vec();
         let chunk = ChunkInfo {
@@ -1168,7 +1179,7 @@ mod tests {
         ];
 
         // Compute tree root over all_chunks using HashMapStorage
-        let mut partials: Vec< std::sync::Arc<crate::chunk_storage::Node> > = all_chunks
+        let mut partials: Vec<std::sync::Arc<crate::chunk_storage::Node>> = all_chunks
             .iter()
             .map(|c| {
                 std::sync::Arc::new(crate::chunk_storage::Node::Skipped {
@@ -1182,7 +1193,11 @@ mod tests {
             let mut next = Vec::with_capacity((count + 1) / 2);
             let mut i = 0;
             while i + 1 < count {
-                next.push(source.link(partials[i].clone(), partials[i + 1].clone()).unwrap());
+                next.push(
+                    source
+                        .link(partials[i].clone(), partials[i + 1].clone())
+                        .unwrap(),
+                );
                 i += 2;
             }
             if i < count {

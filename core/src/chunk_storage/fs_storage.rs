@@ -3319,7 +3319,11 @@ impl FsStorage {
     }
 
     /// Open a resident whole-file blob from the CAS blob store for zero-copy passthrough reads.
-    pub fn open_cas_blob(&self, blob_hash: &Hash, expected_size: u64) -> Result<Option<File>, Error> {
+    pub fn open_cas_blob(
+        &self,
+        blob_hash: &Hash,
+        expected_size: u64,
+    ) -> Result<Option<File>, Error> {
         let path = self.cas_blob_path(blob_hash);
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
@@ -14557,15 +14561,24 @@ mod tests {
             .unwrap();
         ingest.finish().unwrap();
 
-        assert_eq!(fs::read(root.join("pkg-out/dir/alpha.bin")).unwrap(), file_a);
+        assert_eq!(
+            fs::read(root.join("pkg-out/dir/alpha.bin")).unwrap(),
+            file_a
+        );
         assert_eq!(fs::read(root.join("pkg-out/dir/beta.bin")).unwrap(), file_b);
 
         let blob_hash_a = FsStorage::file_blob_hash(&item.chunks[0..2]).unwrap();
         let blob_hash_b = FsStorage::file_blob_hash(&item.chunks[2..4]).unwrap();
         assert!(storage.has_cas_blob(&blob_hash_a, 16));
         assert!(storage.has_cas_blob(&blob_hash_b, 16));
-        assert_eq!(fs::read(storage.cas_blob_path(&blob_hash_a)).unwrap(), file_a);
-        assert_eq!(fs::read(storage.cas_blob_path(&blob_hash_b)).unwrap(), file_b);
+        assert_eq!(
+            fs::read(storage.cas_blob_path(&blob_hash_a)).unwrap(),
+            file_a
+        );
+        assert_eq!(
+            fs::read(storage.cas_blob_path(&blob_hash_b)).unwrap(),
+            file_b
+        );
 
         // Activate a second distinct artifact containing an identical file (`file_a`)
         // and verify it shares the exact same CAS blob inode without rewriting bytes.
