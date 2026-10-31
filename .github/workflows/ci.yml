@@ -35,4 +35,4 @@ jobs:
           sudo apt-get install --yes protobuf-compiler
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --all-features --locked
+      - run: cargo +nightly test --workspace --all-features --locked
