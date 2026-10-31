@@ -329,11 +329,6 @@ impl VerifiedSync {
         &self.local_hashes
     }
 
-    /// Abandon a verified session before any possession is sent.
-    pub(crate) fn abort(self) {
-        self.continuation.abort();
-    }
-
     pub(crate) async fn transfer_into(
         self,
         sender: mpsc::Sender<ReceivedChunkBatch>,

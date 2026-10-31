@@ -105,10 +105,18 @@ cargo run -p distd_client -- get --lazy artifact-id local/path
 
 A lazy activation is independent of an eager one for the same destination.
 Images use `0444` for regular files, `0555` for executable files and
-directories, and `S_IFLNK` inodes for symbolic links. Eager `get` refuses
-artifacts with executable or symlink entries and points to `--lazy`: eager
-activation hard-links files with shared CAS blobs, so a per-entry mode cannot
-be represented safely.
+directories, and `S_IFLNK` inodes for symbolic links.
+
+Eager `get` materializes the same entry kinds in the destination. Executable
+files gain an execute bit wherever they grant read permission, and symbolic
+links are created with their signed target, absolute or relative, and are never
+followed. Activation replaces or removes only links it created; any other
+symbolic link in the destination makes activation fail before it switches
+revisions, leaving the link in place. The immutable revision tree under `.distd-activation-v1/revisions`
+shares inodes with the CAS blobs, so it holds content only: its links are real
+links, but modes exist only in the destination copy. Symbolic links require a
+Unix filesystem. Activation records for revisions with entry kinds use active
+schema 2 and transaction schema 3; regular-only records are unchanged.
 
 Publish through the authenticated HTTP endpoint:
 

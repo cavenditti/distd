@@ -165,9 +165,6 @@ pub enum Client {
     #[error("User specified item doesn't exist on server")]
     MissingItem,
 
-    #[error("artifact has executable or symlink entries, which only lazy activation (`get --lazy`) supports")]
-    EagerEntryKinds,
-
     #[error("Error reported from core: '{0}'")]
     Core(#[from] distd_core::error::Error),
 }

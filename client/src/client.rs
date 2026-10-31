@@ -254,10 +254,6 @@ impl Client<FsStorage> {
             .server
             .prepare_sync_artifact_expected(requested_artifact_id, target, from)
             .await?;
-        if !prepared.manifest().has_only_regular_entries() {
-            prepared.abort();
-            return Err(ClientError::EagerEntryKinds);
-        }
         let manifest_chunk_count = prepared.chunks().len();
         let local_basis_count = prepared.local_hashes().len();
         let manifest = prepared.manifest().clone();

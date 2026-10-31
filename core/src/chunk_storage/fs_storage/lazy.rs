@@ -542,20 +542,9 @@ mod tests {
     }
 
     #[test]
-    fn eager_ingest_refuses_kinds_and_lazy_activation_projects_them() {
-        let storage = std::sync::Arc::new(FsStorage::new(temp_path()).unwrap());
+    fn lazy_activation_projects_entry_kinds() {
+        let storage = FsStorage::new(temp_path()).unwrap();
         let item = kinded_revision(&storage);
-        let refused = storage.begin_sync_ingest(
-            item.metadata.name.clone(),
-            PathBuf::from("kinded-pkg"),
-            1,
-            None,
-            item.manifest.clone(),
-            item.chunks.clone(),
-            Vec::new(),
-        );
-        assert!(refused.is_err());
-
         let lazy = storage
             .activate_lazy_revision(
                 item.metadata.name.clone(),

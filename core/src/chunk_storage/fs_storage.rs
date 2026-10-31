@@ -59,8 +59,13 @@ const FS_STORAGE_MAX_LINK_DEPTH: usize = 256;
 const FS_ACTIVATION_NAMESPACE: &str = ".distd-activation-v1";
 const FS_ACTIVATION_ACTIVE_SCHEMA: u16 = 1;
 const FS_ACTIVATION_TRANSACTION_SCHEMA: u16 = 2;
+/// Activation record schemas whose revisions use the kinded layout; written only when a record
+/// carries an executable or symlink entry, so regular activations keep their exact records.
+const FS_ACTIVATION_KINDED_ACTIVE_SCHEMA: u16 = 2;
+const FS_ACTIVATION_KINDED_TRANSACTION_SCHEMA: u16 = 3;
 const FS_ACTIVATION_DESTINATION_DOMAIN: &[u8] = b"distd activation destination v1\0";
 const FS_ACTIVATION_REVISION_DOMAIN: &[u8] = b"distd activation revision v1\0";
+const FS_ACTIVATION_KINDED_REVISION_DOMAIN: &[u8] = b"distd activation revision kinded v1\0";
 const FS_ACTIVATION_MAX_RECORDS: usize = 65_536;
 const FS_ACTIVATION_COPY_BUFFER_BYTES: usize = 1024 * 1024;
 
@@ -209,6 +214,83 @@ struct FsActivationActiveV1 {
     seals: Vec<FsActivationFileSealV1>,
 }
 
+/// Schema-2 active selector: [`FsActivationActiveV1`] with its revision in the kinded layout.
+#[derive(Serialize, Deserialize)]
+struct FsActivationActiveKindedV2 {
+    root_identity: [u8; 32],
+    destination: PathBuf,
+    destination_identity: [u8; 32],
+    revision_identity: [u8; 32],
+    item: Item,
+    kind: u8,
+    seals: Vec<FsActivationFileSealV1>,
+}
+
+impl From<FsActivationActiveV1> for FsActivationActiveKindedV2 {
+    fn from(active: FsActivationActiveV1) -> Self {
+        Self {
+            root_identity: active.root_identity,
+            destination: active.destination,
+            destination_identity: active.destination_identity,
+            revision_identity: active.revision_identity,
+            item: active.item,
+            kind: active.kind,
+            seals: active.seals,
+        }
+    }
+}
+
+impl From<FsActivationActiveKindedV2> for FsActivationActiveV1 {
+    fn from(active: FsActivationActiveKindedV2) -> Self {
+        Self {
+            root_identity: active.root_identity,
+            destination: active.destination,
+            destination_identity: active.destination_identity,
+            revision_identity: active.revision_identity,
+            item: active.item,
+            kind: active.kind,
+            seals: active.seals,
+        }
+    }
+}
+
+impl FsActivationActiveV1 {
+    fn schema(&self) -> u16 {
+        if self.item.manifest.has_only_regular_entries() {
+            FS_ACTIVATION_ACTIVE_SCHEMA
+        } else {
+            FS_ACTIVATION_KINDED_ACTIVE_SCHEMA
+        }
+    }
+
+    fn encode(&self) -> Result<(u16, Vec<u8>), Error> {
+        let schema = self.schema();
+        let payload = if schema == FS_ACTIVATION_ACTIVE_SCHEMA {
+            bitcode::serialize(self)
+        } else {
+            bitcode::serialize(&FsActivationActiveKindedV2::from(self.clone()))
+        };
+        Ok((schema, payload.map_err(InvalidParameter::from)?))
+    }
+
+    /// Decode either layout, accepting only the schema its entry kinds select.
+    fn decode(schema: u16, payload: &[u8]) -> Result<Self, Error> {
+        let active: Self = if schema == FS_ACTIVATION_KINDED_ACTIVE_SCHEMA {
+            bitcode::deserialize::<FsActivationActiveKindedV2>(payload)
+                .map_err(InvalidParameter::from)?
+                .into()
+        } else {
+            bitcode::deserialize(payload).map_err(InvalidParameter::from)?
+        };
+        if active.schema() != schema {
+            return Err(invalid_state(
+                "active reference schema does not match its entry kinds",
+            ));
+        }
+        Ok(active)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct FsActivationFileSealV1 {
     relative_path: Option<PathBuf>,
@@ -252,6 +334,104 @@ struct FsActivationTransactionV2 {
     candidate_seals: Vec<FsActivationFileSealV1>,
     mirror_staging_path: PathBuf,
     mirror_backup_path: PathBuf,
+}
+
+/// Schema-3 transaction: [`FsActivationTransactionV2`] with the candidate and prior revisions in
+/// the kinded layout.
+#[derive(Serialize, Deserialize)]
+struct FsActivationTransactionKindedV3 {
+    root_identity: [u8; 32],
+    transaction_id: [u8; 16],
+    destination: PathBuf,
+    destination_identity: [u8; 32],
+    candidate_revision_identity: [u8; 32],
+    previous: Option<FsActivationActiveKindedV2>,
+    item: Item,
+    kind: u8,
+    phase: FsActivationPhaseV2,
+    candidate_seals: Vec<FsActivationFileSealV1>,
+    mirror_staging_path: PathBuf,
+    mirror_backup_path: PathBuf,
+}
+
+impl From<FsActivationTransactionV2> for FsActivationTransactionKindedV3 {
+    fn from(transaction: FsActivationTransactionV2) -> Self {
+        Self {
+            root_identity: transaction.root_identity,
+            transaction_id: transaction.transaction_id,
+            destination: transaction.destination,
+            destination_identity: transaction.destination_identity,
+            candidate_revision_identity: transaction.candidate_revision_identity,
+            previous: transaction.previous.map(Into::into),
+            item: transaction.item,
+            kind: transaction.kind,
+            phase: transaction.phase,
+            candidate_seals: transaction.candidate_seals,
+            mirror_staging_path: transaction.mirror_staging_path,
+            mirror_backup_path: transaction.mirror_backup_path,
+        }
+    }
+}
+
+impl From<FsActivationTransactionKindedV3> for FsActivationTransactionV2 {
+    fn from(transaction: FsActivationTransactionKindedV3) -> Self {
+        Self {
+            root_identity: transaction.root_identity,
+            transaction_id: transaction.transaction_id,
+            destination: transaction.destination,
+            destination_identity: transaction.destination_identity,
+            candidate_revision_identity: transaction.candidate_revision_identity,
+            previous: transaction.previous.map(Into::into),
+            item: transaction.item,
+            kind: transaction.kind,
+            phase: transaction.phase,
+            candidate_seals: transaction.candidate_seals,
+            mirror_staging_path: transaction.mirror_staging_path,
+            mirror_backup_path: transaction.mirror_backup_path,
+        }
+    }
+}
+
+impl FsActivationTransactionV2 {
+    fn schema(&self) -> u16 {
+        if self.item.manifest.has_only_regular_entries()
+            && self
+                .previous
+                .as_ref()
+                .is_none_or(|previous| previous.item.manifest.has_only_regular_entries())
+        {
+            FS_ACTIVATION_TRANSACTION_SCHEMA
+        } else {
+            FS_ACTIVATION_KINDED_TRANSACTION_SCHEMA
+        }
+    }
+
+    fn encode(&self) -> Result<(u16, Vec<u8>), Error> {
+        let schema = self.schema();
+        let payload = if schema == FS_ACTIVATION_TRANSACTION_SCHEMA {
+            bitcode::serialize(self)
+        } else {
+            bitcode::serialize(&FsActivationTransactionKindedV3::from(self.clone()))
+        };
+        Ok((schema, payload.map_err(InvalidParameter::from)?))
+    }
+
+    /// Decode either layout, accepting only the schema its entry kinds select.
+    fn decode(schema: u16, payload: &[u8]) -> Result<Self, Error> {
+        let transaction: Self = if schema == FS_ACTIVATION_KINDED_TRANSACTION_SCHEMA {
+            bitcode::deserialize::<FsActivationTransactionKindedV3>(payload)
+                .map_err(InvalidParameter::from)?
+                .into()
+        } else {
+            bitcode::deserialize(payload).map_err(InvalidParameter::from)?
+        };
+        if transaction.schema() != schema {
+            return Err(invalid_state(
+                "activation transaction schema does not match its entry kinds",
+            ));
+        }
+        Ok(transaction)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1259,13 +1439,12 @@ fn invalid_state(message: impl Into<String>) -> Error {
     ))
 }
 
-/// Eager activation materializes files hard-linked with shared CAS blobs and seals them as
-/// plain regular files, so it cannot represent per-entry modes or symbolic links.
-fn eager_kinds_unsupported() -> Error {
-    Error::Other(
-        "eager activation does not support executable or symlink entries; use lazy activation"
-            .to_string(),
-    )
+static EMPTY_CHUNK_HASH: std::sync::LazyLock<Hash> = std::sync::LazyLock::new(|| do_hash(&[]));
+
+/// The empty chunk carries no bytes, so it is available without a backing. A symbolic link
+/// covers it alone and never backs it: reading through the link would follow its target.
+fn is_empty_chunk(hash: &Hash, size: u64) -> bool {
+    size == 0 && *hash == *EMPTY_CHUNK_HASH
 }
 
 fn activation_indeterminate(error: impl std::fmt::Display) -> Error {
@@ -1658,7 +1837,7 @@ fn validate_link_node(
                     })
                 });
                 let has_link = links.get(hash).is_some_and(|linked| linked.size() == *size);
-                if !has_chunk && !has_link {
+                if !has_chunk && !has_link && !is_empty_chunk(hash, *size) {
                     return Err(invalid_state(format!(
                         "link leaf {hash} has no populated chunk or parent of size {size}"
                     )));
@@ -3164,9 +3343,6 @@ impl FsStorage {
         local_hashes: Vec<Hash>,
     ) -> Result<FsSyncIngest, Error> {
         let path = self.canonical_activation_destination(&path)?;
-        if !manifest.has_only_regular_entries() {
-            return Err(eager_kinds_unsupported());
-        }
         if chunk_infos.len() != manifest.chunk_count as usize || chunk_infos.is_empty() {
             return Err(Error::Storage(StorageError::TreeReconstruct));
         }
@@ -3497,7 +3673,7 @@ impl FsStorage {
                         return Err(Error::Storage(StorageError::TreeReconstruct));
                     }
                 }
-            } else {
+            } else if !is_empty_chunk(&chunk.hash, chunk.size) {
                 let has_backing = self
                     .inner
                     .read()
@@ -3571,10 +3747,16 @@ impl FsStorage {
 
     fn activation_revision_identity(item: &Item) -> Result<[u8; 32], Error> {
         super::validate_revision_metadata(item)?;
-        let item = ItemV1::from_regular(item).ok_or_else(eager_kinds_unsupported)?;
-        let payload = bitcode::serialize(&item).map_err(InvalidParameter::from)?;
+        let (domain, payload) = match ItemV1::from_regular(item) {
+            Some(regular) => (FS_ACTIVATION_REVISION_DOMAIN, bitcode::serialize(&regular)),
+            None => (
+                FS_ACTIVATION_KINDED_REVISION_DOMAIN,
+                bitcode::serialize(item),
+            ),
+        };
+        let payload = payload.map_err(InvalidParameter::from)?;
         let mut hasher = blake3::Hasher::new();
-        hasher.update(FS_ACTIVATION_REVISION_DOMAIN);
+        hasher.update(domain);
         hasher.update(&payload);
         Ok(*hasher.finalize().as_bytes())
     }
@@ -3710,10 +3892,11 @@ impl FsStorage {
         match fs::symlink_metadata(path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error.into()),
-            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            // Removing a symbolic link unlinks the link itself, never its target.
+            Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
                 fs::remove_file(path)?;
             }
-            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            Ok(metadata) if metadata.is_dir() => {
                 fs::remove_dir_all(path)?;
             }
             Ok(_) => {
@@ -3735,10 +3918,10 @@ impl FsStorage {
         match fs::symlink_metadata(path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error.into()),
-            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
                 fs::remove_file(path)?;
             }
-            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            Ok(metadata) if metadata.is_dir() => {
                 fs::remove_dir_all(path)?;
             }
             Ok(_) => return Err(invalid_state("recovery cleanup target has an unsafe type")),
@@ -3816,17 +3999,21 @@ impl FsStorage {
         Ok(())
     }
 
-    fn write_activation_record<T: Serialize>(
+    fn write_activation_record(
         &self,
         path: &Path,
-        schema: u16,
         record: ActivationRecordKind,
-        value: &T,
+        (schema, payload): (u16, Vec<u8>),
     ) -> Result<(), Error> {
-        let payload = bitcode::serialize(value).map_err(InvalidParameter::from)?;
         match (schema, record) {
-            (FS_ACTIVATION_ACTIVE_SCHEMA, ActivationRecordKind::Active)
-            | (FS_ACTIVATION_TRANSACTION_SCHEMA, ActivationRecordKind::Transaction(_)) => {}
+            (
+                FS_ACTIVATION_ACTIVE_SCHEMA | FS_ACTIVATION_KINDED_ACTIVE_SCHEMA,
+                ActivationRecordKind::Active,
+            )
+            | (
+                FS_ACTIVATION_TRANSACTION_SCHEMA | FS_ACTIVATION_KINDED_TRANSACTION_SCHEMA,
+                ActivationRecordKind::Transaction(_),
+            ) => {}
             _ => return Err(invalid_state("activation record kind/schema mismatch")),
         }
         let hook = self.activation_fault_hook.read().unwrap().clone();
@@ -3928,14 +4115,16 @@ impl FsStorage {
     }
 
     fn decode_active_ref(&self, path: &Path) -> Result<FsActivationActiveV1, Error> {
-        let payload = read_enveloped_state(
+        let (schema, payload) = read_enveloped_state_any(
             path,
             DurableStateKind::FsActivation,
-            FS_ACTIVATION_ACTIVE_SCHEMA,
+            &[
+                FS_ACTIVATION_ACTIVE_SCHEMA,
+                FS_ACTIVATION_KINDED_ACTIVE_SCHEMA,
+            ],
             MAX_DURABLE_STATE_PAYLOAD,
         )?;
-        let active: FsActivationActiveV1 =
-            bitcode::deserialize(&payload).map_err(InvalidParameter::from)?;
+        let active = FsActivationActiveV1::decode(schema, &payload)?;
         self.validate_active_ref(path, &active)?;
         Ok(active)
     }
@@ -4005,10 +4194,7 @@ impl FsStorage {
                 for entry in &item.manifest.entries {
                     let relative =
                         crate::utils::path::validate_relative(Path::new(&entry.relative_path))?;
-                    if expected_files
-                        .insert(relative.clone(), entry.size)
-                        .is_some()
-                    {
+                    if expected_files.insert(relative.clone(), entry).is_some() {
                         return Err(invalid_state("duplicate immutable activation entry"));
                     }
                     let mut parent = relative.parent();
@@ -4029,9 +4215,19 @@ impl FsStorage {
                             .map_err(|_| invalid_state("immutable activation escaped root"))?;
                         let metadata = fs::symlink_metadata(&path)?;
                         if metadata.file_type().is_symlink() {
-                            return Err(invalid_state("immutable activation contains a symlink"));
-                        }
-                        if metadata.is_dir() {
+                            let target = expected_files
+                                .get(relative)
+                                .and_then(|entry| entry.kind.symlink_target())
+                                .ok_or_else(|| {
+                                    invalid_state("immutable activation contains a symlink")
+                                })?;
+                            if !Self::is_entry_symlink(&path, target)? {
+                                return Err(invalid_state(
+                                    "immutable activation symlink target mismatch",
+                                ));
+                            }
+                            found_files += 1;
+                        } else if metadata.is_dir() {
                             if !expected_directories.contains(relative) {
                                 return Err(invalid_state(
                                     "immutable activation contains an unexpected directory",
@@ -4039,10 +4235,15 @@ impl FsStorage {
                             }
                             directories.push(path);
                         } else if metadata.is_file() {
-                            let expected = expected_files.get(relative).ok_or_else(|| {
-                                invalid_state("immutable activation contains an unexpected file")
-                            })?;
-                            if metadata.len() != *expected {
+                            let expected = expected_files
+                                .get(relative)
+                                .filter(|entry| entry.kind.symlink_target().is_none())
+                                .ok_or_else(|| {
+                                    invalid_state(
+                                        "immutable activation contains an unexpected file",
+                                    )
+                                })?;
+                            if metadata.len() != expected.size {
                                 return Err(invalid_state(
                                     "immutable activation entry size mismatch",
                                 ));
@@ -4064,14 +4265,17 @@ impl FsStorage {
         }
     }
 
+    /// Seal the entry at `path` without following it: a regular file, or the symbolic link
+    /// itself when `symlink` is set.
     fn activation_file_seal(
         path: &Path,
         relative_path: Option<PathBuf>,
+        symlink: bool,
     ) -> Result<FsActivationFileSealV1, Error> {
         let metadata = fs::symlink_metadata(path)?;
-        if !metadata.is_file() || metadata.file_type().is_symlink() {
+        if symlink != metadata.file_type().is_symlink() || (!symlink && !metadata.is_file()) {
             return Err(invalid_state(
-                "activation seal target is not a regular file",
+                "activation seal target has the wrong entry type",
             ));
         }
         #[cfg(unix)]
@@ -4112,7 +4316,7 @@ impl FsStorage {
         kind: ActiveRevisionKind,
     ) -> Result<Vec<FsActivationFileSealV1>, Error> {
         match kind {
-            ActiveRevisionKind::File => Ok(vec![Self::activation_file_seal(root, None)?]),
+            ActiveRevisionKind::File => Ok(vec![Self::activation_file_seal(root, None, false)?]),
             ActiveRevisionKind::Directory => item
                 .manifest
                 .entries
@@ -4120,7 +4324,11 @@ impl FsStorage {
                 .map(|entry| {
                     let relative =
                         crate::utils::path::validate_relative(Path::new(&entry.relative_path))?;
-                    Self::activation_file_seal(&root.join(&relative), Some(relative))
+                    Self::activation_file_seal(
+                        &root.join(&relative),
+                        Some(relative),
+                        entry.kind.symlink_target().is_some(),
+                    )
                 })
                 .collect(),
         }
@@ -4345,14 +4553,16 @@ impl FsStorage {
         }
         let paths = self.canonical_activation_records(&transactions, "transaction", 32)?;
         for path in paths {
-            let payload = read_enveloped_state(
+            let (schema, payload) = read_enveloped_state_any(
                 &path,
                 DurableStateKind::FsActivation,
-                FS_ACTIVATION_TRANSACTION_SCHEMA,
+                &[
+                    FS_ACTIVATION_TRANSACTION_SCHEMA,
+                    FS_ACTIVATION_KINDED_TRANSACTION_SCHEMA,
+                ],
                 MAX_DURABLE_STATE_PAYLOAD,
             )?;
-            let transaction: FsActivationTransactionV2 =
-                bitcode::deserialize(&payload).map_err(InvalidParameter::from)?;
+            let transaction = FsActivationTransactionV2::decode(schema, &payload)?;
             self.validate_activation_transaction(&path, &transaction)?;
             let selected = self
                 .active_refs
@@ -5113,6 +5323,9 @@ impl FsStorage {
         if let Some(cached) = self.cached_chunk_data(hash) {
             return Some(cached);
         }
+        if is_empty_chunk(hash, 0) {
+            return Some(ChunkData::Owned(Arc::new(Vec::new())));
+        }
 
         let entry = {
             let inner = self.inner.read().unwrap();
@@ -5281,12 +5494,13 @@ impl FsStorage {
                 chunks.push(chunk_info);
 
                 if available_hashes.contains(&chunk_info.hash) {
-                    if !self
-                        .inner
-                        .read()
-                        .unwrap()
-                        .data
-                        .contains_key(&chunk_info.hash)
+                    if !is_empty_chunk(&chunk_info.hash, chunk_info.size)
+                        && !self
+                            .inner
+                            .read()
+                            .unwrap()
+                            .data
+                            .contains_key(&chunk_info.hash)
                     {
                         return Err(Error::Storage(StorageError::TreeReconstruct));
                     }
@@ -5479,10 +5693,20 @@ impl FsStorage {
                     ))?;
                 }
             }
+            // A symbolic link carries no data. Executable entries are materialized like regular
+            // ones: revision files share inodes with CAS blobs, so modes exist only in the mirror.
+            if let Some(target) = entry.and_then(|entry| entry.kind.symlink_target()) {
+                Self::create_entry_symlink(target, &path)?;
+                self.activation_fault(ActivationFaultStage::Operation(
+                    ActivationOperation::MaterializeFileCreate,
+                ))?;
+                continue;
+            }
             if let (Some(previous), Some(entry)) = (previous, entry) {
                 if let Some(previous_entry) =
                     previous.item.manifest.entries.iter().find(|candidate| {
                         candidate.relative_path == entry.relative_path
+                            && candidate.kind.symlink_target().is_none()
                             && candidate.size == entry.size
                             && previous.item.chunks
                                 [candidate.chunk_range.0 as usize..candidate.chunk_range.1 as usize]
@@ -5540,6 +5764,72 @@ impl FsStorage {
             )?;
         }
         Ok(())
+    }
+
+    /// Create the symbolic link a symlink entry describes. Its target is never resolved.
+    fn create_entry_symlink(target: &str, path: &Path) -> Result<(), Error> {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, path)?;
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (target, path);
+            Err(invalid_state(
+                "eager activation of symlink entries requires a Unix filesystem",
+            ))
+        }
+    }
+
+    /// Whether `path` itself is a symbolic link whose target is exactly `target`.
+    fn is_entry_symlink(path: &Path, target: &str) -> Result<bool, Error> {
+        if !fs::symlink_metadata(path)?.file_type().is_symlink() {
+            return Ok(false);
+        }
+        Ok(fs::read_link(path)?.as_os_str() == std::ffi::OsStr::new(target))
+    }
+
+    /// Grant execute permission wherever the regular file at `path` grants read permission.
+    fn make_executable(path: &Path) -> Result<(), Error> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let metadata = fs::symlink_metadata(path)?;
+            if !metadata.is_file() {
+                return Err(invalid_state(
+                    "executable mirror entry is not a regular file",
+                ));
+            }
+            let mut permissions = metadata.permissions();
+            let mode = permissions.mode();
+            permissions.set_mode(mode | ((mode & 0o444) >> 2));
+            fs::set_permissions(path, permissions)?;
+        }
+        #[cfg(not(unix))]
+        let _ = path;
+        Ok(())
+    }
+
+    /// Whether the mirror entry at `path` already matches `entry`'s kind, size, and target.
+    fn mirror_entry_matches(path: &Path, entry: &FileEntry) -> bool {
+        let Ok(metadata) = fs::symlink_metadata(path) else {
+            return false;
+        };
+        match &entry.kind {
+            EntryKind::Symlink { target } => Self::is_entry_symlink(path, target).unwrap_or(false),
+            EntryKind::Regular => metadata.is_file() && metadata.len() == entry.size,
+            EntryKind::Executable => {
+                #[cfg(unix)]
+                let executable = {
+                    use std::os::unix::fs::PermissionsExt;
+                    metadata.permissions().mode() & 0o111 != 0
+                };
+                #[cfg(not(unix))]
+                let executable = true;
+                metadata.is_file() && metadata.len() == entry.size && executable
+            }
+        }
     }
 
     fn materialize_incremental_activation_file(
@@ -5622,6 +5912,9 @@ impl FsStorage {
         output: &mut File,
         output_offset: u64,
     ) -> Result<(), Error> {
+        if is_empty_chunk(&chunk.hash, chunk.size) {
+            return Ok(());
+        }
         let backing = self
             .inner
             .read()
@@ -5666,6 +5959,9 @@ impl FsStorage {
         chunk: &ChunkInfo,
         output: &mut File,
     ) -> Result<(), Error> {
+        if is_empty_chunk(&chunk.hash, chunk.size) {
+            return Ok(());
+        }
         let backing = self
             .inner
             .read()
@@ -5739,12 +6035,29 @@ impl FsStorage {
         })
     }
 
+    /// Relative paths of an item's symlink entries: the only symbolic links an activation
+    /// creates in, and so may later replace or remove from, its mirror.
+    fn symlink_entry_paths(item: &Item) -> Result<HashSet<PathBuf>, Error> {
+        item.manifest
+            .entries
+            .iter()
+            .filter(|entry| entry.kind.symlink_target().is_some())
+            .map(|entry| crate::utils::path::validate_relative(Path::new(&entry.relative_path)))
+            .collect()
+    }
+
     fn preflight_compatibility_mirror(
         &self,
         destination: &Path,
         item: &Item,
         kind: ActiveRevisionKind,
+        previous: Option<&FsActivationActiveV1>,
     ) -> Result<(), Error> {
+        // Any other symbolic link was not created by activation, so it is left in place.
+        let owned_symlinks = previous
+            .map(|previous| Self::symlink_entry_paths(&previous.item))
+            .transpose()?
+            .unwrap_or_default();
         let storage_root = self.inner.read().unwrap().root.clone();
         let relative = destination
             .strip_prefix(&storage_root)
@@ -5785,9 +6098,14 @@ impl FsStorage {
                         for entry in fs::read_dir(&directories[index])? {
                             let entry = entry?;
                             let metadata = fs::symlink_metadata(entry.path())?;
-                            if metadata.file_type().is_symlink()
-                                || (!metadata.is_file() && !metadata.is_dir())
-                            {
+                            // An owned symbolic link is a leaf: it is replaced or removed as a
+                            // link and never traversed.
+                            let owned_symlink = metadata.file_type().is_symlink()
+                                && entry
+                                    .path()
+                                    .strip_prefix(destination)
+                                    .is_ok_and(|relative| owned_symlinks.contains(relative));
+                            if !owned_symlink && !metadata.is_file() && !metadata.is_dir() {
                                 return Err(invalid_state(
                                     "activation destination contains an unsafe entry",
                                 ));
@@ -5812,9 +6130,9 @@ impl FsStorage {
                 for component in relative.components() {
                     current.push(component.as_os_str());
                     match fs::symlink_metadata(&current) {
-                        Ok(metadata)
-                            if !metadata.file_type().is_symlink()
-                                && (metadata.is_file() || metadata.is_dir()) => {}
+                        // The walk above admitted only owned links, which are never traversed.
+                        Ok(metadata) if metadata.file_type().is_symlink() => break,
+                        Ok(metadata) if metadata.is_file() || metadata.is_dir() => {}
                         Ok(_) => {
                             return Err(invalid_state(
                                 "activation destination entry has an unsafe type",
@@ -5894,7 +6212,7 @@ impl FsStorage {
             _ => {}
         }
         let entries = if item.manifest.entries.is_empty() {
-            vec![(root.to_path_buf(), 0usize, item.chunks.len())]
+            vec![(root.to_path_buf(), 0usize, item.chunks.len(), None)]
         } else {
             item.manifest
                 .entries
@@ -5906,11 +6224,20 @@ impl FsStorage {
                         ))?),
                         entry.chunk_range.0 as usize,
                         entry.chunk_range.1 as usize,
+                        entry.kind.symlink_target(),
                     ))
                 })
                 .collect::<Result<Vec<_>, Error>>()?
         };
-        for (path, start, end) in entries {
+        for (path, start, end, symlink_target) in entries {
+            if let Some(target) = symlink_target {
+                if !Self::is_entry_symlink(&path, target)? {
+                    return Err(invalid_state(
+                        "immutable activation symlink target mismatch",
+                    ));
+                }
+                continue;
+            }
             let metadata = fs::symlink_metadata(&path)?;
             if !metadata.is_file() || metadata.file_type().is_symlink() {
                 return Err(invalid_state("immutable activation entry is not a file"));
@@ -6119,6 +6446,11 @@ impl FsStorage {
             Err(error) => return Err(error.into()),
         }
 
+        // Recovery may find links of either revision; any other link is not activation's.
+        let mut owned_symlinks = Self::symlink_entry_paths(item)?;
+        if let Some(previous) = previous {
+            owned_symlinks.extend(Self::symlink_entry_paths(&previous.item)?);
+        }
         let mut expected_files = HashMap::default();
         let mut expected_directories = HashSet::default();
         expected_directories.insert(PathBuf::new());
@@ -6142,13 +6474,15 @@ impl FsStorage {
                     .strip_prefix(destination)
                     .map_err(|_| invalid_state("compatibility mirror escaped destination"))?;
                 let metadata = fs::symlink_metadata(&path)?;
-                if metadata.file_type().is_symlink() || (!metadata.is_file() && !metadata.is_dir())
+                let is_symlink = metadata.file_type().is_symlink();
+                if (is_symlink && !owned_symlinks.contains(relative))
+                    || (!is_symlink && !metadata.is_file() && !metadata.is_dir())
                 {
                     return Err(invalid_state(
                         "compatibility mirror contains an unsafe entry",
                     ));
                 }
-                if metadata.is_dir() {
+                if metadata.is_dir() && !is_symlink {
                     directories.push(path);
                 } else if !expected_files.contains_key(relative) {
                     let backup = backup_root.join(relative);
@@ -6164,9 +6498,7 @@ impl FsStorage {
                                 ActivationOperation::MirrorEntryRemove,
                             ))?;
                         }
-                        Ok(metadata)
-                            if metadata.is_file() && !metadata.file_type().is_symlink() =>
-                        {
+                        Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
                             Self::remove_activation_path_checked(&path)?;
                             changed_directories
                                 .insert(path.parent().ok_or(Error::MissingData)?.to_path_buf());
@@ -6212,6 +6544,7 @@ impl FsStorage {
                     == Some(ActiveRevisionKind::Directory)
                     && previous.item.manifest.entries.iter().any(|candidate| {
                         candidate.relative_path == entry.relative_path
+                            && candidate.kind == entry.kind
                             && candidate.size == entry.size
                             && previous.item.chunks
                                 [candidate.chunk_range.0 as usize..candidate.chunk_range.1 as usize]
@@ -6219,13 +6552,7 @@ impl FsStorage {
                                     [entry.chunk_range.0 as usize..entry.chunk_range.1 as usize]
                     })
             });
-            if unchanged
-                && fs::symlink_metadata(&target).is_ok_and(|metadata| {
-                    metadata.is_file()
-                        && !metadata.file_type().is_symlink()
-                        && metadata.len() == entry.size
-                })
-            {
+            if unchanged && Self::mirror_entry_matches(&target, entry) {
                 continue;
             }
             let source = revision_root.join(&relative);
@@ -6236,24 +6563,42 @@ impl FsStorage {
                 &mut changed_directories,
             )?;
             Self::remove_activation_path_checked(&staging)?;
-            Self::clone_or_copy_file(&source, &staging)?;
-            self.activation_fault(ActivationFaultStage::Operation(
-                ActivationOperation::MirrorEntryCreate,
-            ))?;
-            self.activation_fault(ActivationFaultStage::Operation(
-                ActivationOperation::MirrorEntryWrite,
-            ))?;
-            File::open(&staging)?.sync_all()?;
-            self.activation_fault(ActivationFaultStage::Operation(
-                ActivationOperation::MirrorEntrySync,
-            ))?;
+            if let Some(link_target) = entry.kind.symlink_target() {
+                // The link is durable once its parent directory is synced after the rename.
+                Self::create_entry_symlink(link_target, &staging)?;
+                self.activation_fault(ActivationFaultStage::Operation(
+                    ActivationOperation::MirrorEntryCreate,
+                ))?;
+            } else {
+                Self::clone_or_copy_file(&source, &staging)?;
+                if entry.kind == EntryKind::Executable {
+                    Self::make_executable(&staging)?;
+                }
+                self.activation_fault(ActivationFaultStage::Operation(
+                    ActivationOperation::MirrorEntryCreate,
+                ))?;
+                self.activation_fault(ActivationFaultStage::Operation(
+                    ActivationOperation::MirrorEntryWrite,
+                ))?;
+                File::open(&staging)?.sync_all()?;
+                self.activation_fault(ActivationFaultStage::Operation(
+                    ActivationOperation::MirrorEntrySync,
+                ))?;
+            }
             let backup = backup_root.join(&relative);
             self.atomic_replace_owned(&staging, &target, &backup, Some(&mut changed_directories))?;
         }
         let mut changed_directories = changed_directories.into_iter().collect::<Vec<_>>();
         changed_directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
         for directory in changed_directories {
-            File::open(directory)?.sync_all()?;
+            // A removed directory's parent, also changed, records the removal. A leaf that
+            // replaced it must not be opened: a symbolic link would be followed.
+            match fs::symlink_metadata(&directory) {
+                Ok(metadata) if metadata.is_dir() => File::open(&directory)?.sync_all()?,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
             self.activation_fault(ActivationFaultStage::Operation(
                 ActivationOperation::MirrorDirectorySync,
             ))?;
@@ -6385,9 +6730,8 @@ impl FsStorage {
         self.activation_fault(ActivationFaultStage::BeforeIntent)?;
         self.write_activation_record(
             &transaction_path,
-            FS_ACTIVATION_TRANSACTION_SCHEMA,
             ActivationRecordKind::Transaction(ActivationTransactionPhase::Intent),
-            &transaction,
+            transaction.encode()?,
         )?;
         let staging_root = self.activation_staging_root(&transaction_id);
         let staging_parent = staging_root
@@ -6447,7 +6791,12 @@ impl FsStorage {
             self.activation_fault(ActivationFaultStage::AfterRevisionPublish)?;
             let candidate_seals = Self::collect_activation_seals(&revision_root, &item, kind)?;
             let destination_path = self.path(&destination)?;
-            self.preflight_compatibility_mirror(&destination_path, &item, kind)?;
+            self.preflight_compatibility_mirror(
+                &destination_path,
+                &item,
+                kind,
+                transaction.previous.as_ref(),
+            )?;
             self.activation_fault(ActivationFaultStage::AfterReady)?;
             let active = FsActivationActiveV1 {
                 root_identity,
@@ -6476,12 +6825,9 @@ impl FsStorage {
                 return Err(error);
             }
         };
-        if let Err(error) = self.write_activation_record(
-            &active_path,
-            FS_ACTIVATION_ACTIVE_SCHEMA,
-            ActivationRecordKind::Active,
-            &active,
-        ) {
+        if let Err(error) = active.encode().and_then(|encoded| {
+            self.write_activation_record(&active_path, ActivationRecordKind::Active, encoded)
+        }) {
             if matches!(
                 error,
                 Error::DurableState(
@@ -6584,7 +6930,13 @@ impl FsStorage {
                 }
             }
             ActiveRevisionKind::Directory => {
-                for entry in &item.manifest.entries {
+                // A symbolic link backs no chunk: reading through it would follow its target.
+                for entry in item
+                    .manifest
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.kind.symlink_target().is_none())
+                {
                     let path = revision_root.join(crate::utils::path::validate_relative(
                         Path::new(&entry.relative_path),
                     )?);
@@ -6633,30 +6985,23 @@ impl FsStorage {
         backup: &Path,
         mut changed_directories: Option<&mut HashSet<PathBuf>>,
     ) -> Result<(), Error> {
+        // Regular files and symbolic links are leaves, which rename replaces atomically
+        // without following.
+        fn is_leaf(metadata: &fs::Metadata) -> bool {
+            metadata.is_file() || metadata.file_type().is_symlink()
+        }
         let parent = destination.parent().ok_or(Error::MissingData)?;
         let destination_metadata = match fs::symlink_metadata(destination) {
-            Ok(metadata)
-                if !metadata.file_type().is_symlink()
-                    && (metadata.is_file() || metadata.is_dir()) =>
-            {
-                Some(metadata)
-            }
+            Ok(metadata) if is_leaf(&metadata) || metadata.is_dir() => Some(metadata),
             Ok(_) => return Err(invalid_state("replacement destination has an unsafe type")),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(error.into()),
         };
         let staging_metadata = fs::symlink_metadata(staging)?;
-        if staging_metadata.file_type().is_symlink()
-            || (!staging_metadata.is_file() && !staging_metadata.is_dir())
-        {
+        if !is_leaf(&staging_metadata) && !staging_metadata.is_dir() {
             return Err(invalid_state("replacement staging path has an unsafe type"));
         }
-        if destination_metadata
-            .as_ref()
-            .is_some_and(|metadata| metadata.is_file())
-            && staging_metadata.is_file()
-            && !staging_metadata.file_type().is_symlink()
-        {
+        if destination_metadata.as_ref().is_some_and(is_leaf) && is_leaf(&staging_metadata) {
             fs::rename(staging, destination)?;
             self.activation_fault(ActivationFaultStage::Operation(
                 ActivationOperation::MirrorEntryRename,
@@ -6674,12 +7019,7 @@ impl FsStorage {
         let mut moved_destination = false;
         if destination_metadata.is_some() {
             let backup_exists = match fs::symlink_metadata(backup) {
-                Ok(metadata)
-                    if !metadata.file_type().is_symlink()
-                        && (metadata.is_file() || metadata.is_dir()) =>
-                {
-                    true
-                }
+                Ok(metadata) if is_leaf(&metadata) || metadata.is_dir() => true,
                 Ok(_) => return Err(invalid_state("replacement backup path has an unsafe type")),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
                 Err(error) => return Err(error.into()),
@@ -6982,12 +7322,13 @@ impl FsStorage {
         let mut chunks = Vec::with_capacity(chunk_infos.len());
         let mut accept_chunk = |chunk_info: ChunkInfo| -> Result<(), Error> {
             if available_hashes.contains(&chunk_info.hash) {
-                if !self
-                    .inner
-                    .read()
-                    .unwrap()
-                    .data
-                    .contains_key(&chunk_info.hash)
+                if !is_empty_chunk(&chunk_info.hash, chunk_info.size)
+                    && !self
+                        .inner
+                        .read()
+                        .unwrap()
+                        .data
+                        .contains_key(&chunk_info.hash)
                 {
                     return Err(Error::Storage(StorageError::TreeReconstruct));
                 }
@@ -8226,9 +8567,8 @@ mod tests {
         storage
             .write_activation_record(
                 &storage.activation_transaction_path(&transaction_id),
-                FS_ACTIVATION_TRANSACTION_SCHEMA,
                 ActivationRecordKind::Transaction(ActivationTransactionPhase::Switched),
-                &transaction,
+                transaction.encode().unwrap(),
             )
             .unwrap();
         transaction
@@ -11837,9 +12177,8 @@ mod tests {
         storage
             .write_activation_record(
                 &transaction_path,
-                FS_ACTIVATION_TRANSACTION_SCHEMA,
                 ActivationRecordKind::Transaction(ActivationTransactionPhase::Ready),
-                &transaction,
+                transaction.encode().unwrap(),
             )
             .unwrap();
         storage
@@ -14395,9 +14734,8 @@ mod tests {
                 storage
                     .write_activation_record(
                         &active_path,
-                        FS_ACTIVATION_ACTIVE_SCHEMA,
                         ActivationRecordKind::Active,
-                        active.as_ref(),
+                        active.encode().unwrap(),
                     )
                     .unwrap();
                 selector_samples.push(started.elapsed());
@@ -14637,6 +14975,575 @@ mod tests {
             assert_eq!(cas_ino, dir_rev_ino);
             assert_eq!(cas_ino, single_rev_ino);
         }
+    }
+
+    /// One chunk per entry: regular and executable contents are at most four bytes, and a
+    /// symbolic link covers one empty chunk.
+    #[cfg(unix)]
+    fn kinded_activation_fixture(
+        entries: &[(&str, EntryKind, &[u8])],
+        revision: u32,
+    ) -> (Item, Vec<u8>) {
+        let mut bytes = Vec::new();
+        let mut chunks = Vec::new();
+        let mut file_entries = Vec::new();
+        for (index, (path, kind, contents)) in entries.iter().enumerate() {
+            assert!(
+                contents.len() <= 4 && (kind.symlink_target().is_none() || contents.is_empty())
+            );
+            bytes.extend_from_slice(contents);
+            chunks.push(ChunkInfo {
+                hash: do_hash(contents),
+                size: contents.len() as u64,
+            });
+            file_entries.push(FileEntry {
+                relative_path: (*path).to_string(),
+                size: contents.len() as u64,
+                chunk_range: (index as u32, index as u32 + 1),
+                kind: kind.clone(),
+            });
+        }
+        let root = crate::chunk_storage::prepared_tree(&chunks).unwrap();
+        let mut item = Item::make_with_entries(
+            "directory-artifact".to_string(),
+            PathBuf::from("artifact-dir"),
+            revision,
+            None,
+            root,
+            chunks,
+            file_entries,
+            ChunkAlgorithm::fixed_aligned(4, 1),
+        )
+        .unwrap();
+        item.metadata.created = std::time::SystemTime::UNIX_EPOCH;
+        item.metadata.updated = std::time::SystemTime::UNIX_EPOCH;
+        (item, bytes)
+    }
+
+    #[cfg(unix)]
+    fn link(target: &str) -> EntryKind {
+        EntryKind::Symlink {
+            target: target.to_string(),
+        }
+    }
+
+    /// The mirror holds exactly `entries`, with execute bits only on executable entries and
+    /// symbolic links that are never followed.
+    #[cfg(unix)]
+    fn assert_kinded_fixture(root: &Path, entries: &[(&str, EntryKind, &[u8])]) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = root.join("artifact-dir");
+        for (relative, kind, contents) in entries {
+            let path = directory.join(relative);
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            match kind {
+                EntryKind::Symlink { target } => {
+                    assert!(metadata.file_type().is_symlink(), "{relative}");
+                    assert_eq!(fs::read_link(&path).unwrap(), Path::new(target));
+                }
+                EntryKind::Regular | EntryKind::Executable => {
+                    assert!(metadata.is_file(), "{relative}");
+                    assert_eq!(fs::read(&path).unwrap(), *contents);
+                    assert_eq!(
+                        metadata.permissions().mode() & 0o111 != 0,
+                        *kind == EntryKind::Executable,
+                        "{relative}"
+                    );
+                }
+            }
+        }
+        let mut actual = Vec::new();
+        let mut pending = vec![directory.clone()];
+        while let Some(parent) = pending.pop() {
+            for entry in fs::read_dir(parent).unwrap() {
+                let path = entry.unwrap().path();
+                if fs::symlink_metadata(&path).unwrap().is_dir() {
+                    pending.push(path);
+                } else {
+                    actual.push(
+                        path.strip_prefix(&directory)
+                            .unwrap()
+                            .to_str()
+                            .unwrap()
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        actual.sort();
+        let mut expected = entries
+            .iter()
+            .map(|(path, _, _)| (*path).to_string())
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(actual, expected);
+    }
+
+    #[cfg(unix)]
+    fn activation_record_schema(path: &Path) -> u16 {
+        crate::durable_state::read_enveloped_state_any(
+            path,
+            DurableStateKind::FsActivation,
+            &[1, 2, 3],
+            MAX_DURABLE_STATE_PAYLOAD,
+        )
+        .unwrap()
+        .0
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn eager_ingest_materializes_executables_and_symlinks_in_the_mirror_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source = crate::chunk_storage::hashmap_storage::HashMapStorage::default();
+        let tool = vec![0x7f; 6000];
+        let files = vec![
+            (PathBuf::from("bin/hello"), bytes::Bytes::from(tool.clone())),
+            (PathBuf::from("bin/hi"), bytes::Bytes::new()),
+            (PathBuf::from("lib/store"), bytes::Bytes::new()),
+            (
+                PathBuf::from("share/doc/README"),
+                bytes::Bytes::from_static(b"readme\n"),
+            ),
+        ];
+        let kinds = std::collections::BTreeMap::from([
+            (PathBuf::from("bin/hello"), EntryKind::Executable),
+            (PathBuf::from("bin/hi"), link("hello")),
+            (PathBuf::from("lib/store"), link("/nix/store/abc-hello/lib")),
+        ]);
+        let item = source
+            .prepare_revision_from_entries(
+                "pkg".to_string(),
+                "pkg".to_string(),
+                PathBuf::from("pkg"),
+                1,
+                None,
+                files.clone(),
+                kinds,
+                ChunkAlgorithm::fixed_aligned(4096, 1),
+            )
+            .unwrap();
+
+        let root = temp_path();
+        let storage = Arc::new(FsStorage::new(root.clone()).unwrap());
+        let mut ingest = storage
+            .begin_sync_ingest(
+                item.metadata.name.clone(),
+                PathBuf::from("pkg"),
+                1,
+                None,
+                item.manifest.clone(),
+                item.chunks.clone(),
+                Vec::new(),
+            )
+            .unwrap();
+        for entry in &item.manifest.entries {
+            let (_, data) = files
+                .iter()
+                .find(|(path, _)| path.to_str() == Some(entry.relative_path.as_str()))
+                .unwrap();
+            let mut offset = 0usize;
+            for index in entry.chunk_range.0..entry.chunk_range.1 {
+                let size = item.chunks[index as usize].size as usize;
+                ingest
+                    .push_chunk(
+                        index,
+                        &ReceivedChunk::from_vec(data[offset..offset + size].to_vec()),
+                    )
+                    .unwrap();
+                offset += size;
+            }
+        }
+        let activated = ingest.finish().unwrap();
+        assert_eq!(activated.manifest.entries, item.manifest.entries);
+
+        let destination = root.join("pkg");
+        let hello = fs::symlink_metadata(destination.join("bin/hello")).unwrap();
+        let mode = hello.permissions().mode();
+        assert!(hello.is_file());
+        assert_eq!(mode & 0o111, (mode & 0o444) >> 2);
+        assert_ne!(mode & 0o111, 0);
+        assert_eq!(fs::read(destination.join("bin/hello")).unwrap(), tool);
+        assert_eq!(
+            fs::read_link(destination.join("bin/hi")).unwrap(),
+            Path::new("hello")
+        );
+        assert_eq!(fs::read(destination.join("bin/hi")).unwrap(), tool);
+        assert_eq!(
+            fs::read_link(destination.join("lib/store")).unwrap(),
+            Path::new("/nix/store/abc-hello/lib")
+        );
+        let readme = fs::symlink_metadata(destination.join("share/doc/README")).unwrap();
+        assert_eq!(readme.permissions().mode() & 0o111, 0);
+
+        // The executable's mode lives only on the mirror copy: the shared CAS blob is untouched.
+        let hello_blob = FsStorage::file_blob_hash(&item.chunks[0..2]).unwrap();
+        let blob = fs::symlink_metadata(storage.cas_blob_path(&hello_blob)).unwrap();
+        assert_eq!(blob.permissions().mode() & 0o111, 0);
+
+        let identity = storage
+            .activation_destination_identity(Path::new("pkg"))
+            .unwrap();
+        assert_eq!(
+            activation_record_schema(&storage.active_ref_path(&identity)),
+            FS_ACTIVATION_KINDED_ACTIVE_SCHEMA
+        );
+        let handle = storage
+            .open_active_revision(Path::new("pkg"))
+            .unwrap()
+            .unwrap();
+        let mut opened = Vec::new();
+        handle
+            .open_entry(Path::new("bin/hello"))
+            .unwrap()
+            .read_to_end(&mut opened)
+            .unwrap();
+        assert_eq!(opened, tool);
+        assert!(handle.open_entry(Path::new("bin/hi")).is_err());
+        drop(handle);
+        drop(storage);
+
+        for _ in 0..2 {
+            let restarted = FsStorage::new(root.clone()).unwrap();
+            assert_eq!(
+                restarted
+                    .open_active_revision(Path::new("pkg"))
+                    .unwrap()
+                    .unwrap()
+                    .item()
+                    .manifest
+                    .entries,
+                item.manifest.entries
+            );
+            assert_eq!(
+                fs::read_link(destination.join("bin/hi")).unwrap(),
+                Path::new("hello")
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn eager_kind_transitions_rewrite_mirror_entries_and_keep_regular_records_unchanged() {
+        let outside = temp_path();
+        fs::create_dir_all(&outside).unwrap();
+        let victim = outside.join("victim");
+        fs::write(&victim, b"keep").unwrap();
+
+        let regular: &[(&str, EntryKind, &[u8])] = &[
+            ("bin/tool", EntryKind::Regular, b"tool"),
+            ("d/x", EntryKind::Regular, b"dirx"),
+            ("s", EntryKind::Regular, b"data"),
+        ];
+        let kinded: &[(&str, EntryKind, &[u8])] = &[
+            ("bin/tool", EntryKind::Executable, b"tool"),
+            ("d", link("elsewhere"), b""),
+            ("s", link("bin/tool"), b""),
+        ];
+        let revisions = [regular, kinded, regular];
+
+        let root = temp_path();
+        let storage = FsStorage::new(root.clone()).unwrap();
+        let identity = storage
+            .activation_destination_identity(Path::new("artifact-dir"))
+            .unwrap();
+        for (index, entries) in revisions.into_iter().enumerate() {
+            let (item, bytes) = kinded_activation_fixture(entries, index as u32 + 1);
+            if index == 1 {
+                // A link activation did not create is refused before the selector switch and
+                // left in place with its target untouched.
+                let stray = root.join("artifact-dir/stray");
+                std::os::unix::fs::symlink(&victim, &stray).unwrap();
+                assert!(storage
+                    .activate_verified_item(
+                        item.clone(),
+                        Path::new("artifact-dir"),
+                        &activation_staged_data(&bytes, &item),
+                    )
+                    .is_err());
+                assert_eq!(fs::read_link(&stray).unwrap(), victim);
+                assert_eq!(
+                    storage.active_refs.read().unwrap()[&identity]
+                        .item
+                        .metadata
+                        .revision,
+                    1
+                );
+                fs::remove_file(&stray).unwrap();
+                assert_kinded_fixture(&root, regular);
+            }
+            storage
+                .activate_verified_item(
+                    item.clone(),
+                    Path::new("artifact-dir"),
+                    &activation_staged_data(&bytes, &item),
+                )
+                .unwrap();
+            assert_kinded_fixture(&root, entries);
+            assert_eq!(fs::read(&victim).unwrap(), b"keep");
+            let expected_schema = if entries == regular {
+                FS_ACTIVATION_ACTIVE_SCHEMA
+            } else {
+                FS_ACTIVATION_KINDED_ACTIVE_SCHEMA
+            };
+            assert_eq!(
+                activation_record_schema(&storage.active_ref_path(&identity)),
+                expected_schema
+            );
+            let active = storage.active_refs.read().unwrap()[&identity].clone();
+            let (schema, payload) = active.encode().unwrap();
+            assert_eq!(schema, expected_schema);
+            if schema == FS_ACTIVATION_ACTIVE_SCHEMA {
+                assert_eq!(payload, bitcode::serialize(active.as_ref()).unwrap());
+            }
+        }
+        drop(storage);
+        let restarted = FsStorage::new(root.clone()).unwrap();
+        assert_eq!(
+            restarted
+                .open_active_revision(Path::new("artifact-dir"))
+                .unwrap()
+                .unwrap()
+                .item()
+                .metadata
+                .revision,
+            3
+        );
+        assert_kinded_fixture(&root, regular);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn eager_resync_treats_the_unbacked_empty_chunk_as_present() {
+        let first_entries: &[(&str, EntryKind, &[u8])] = &[
+            ("l", link("tool"), b""),
+            ("tool", EntryKind::Executable, b"tool"),
+        ];
+        let second_entries: &[(&str, EntryKind, &[u8])] = &[
+            ("empty", EntryKind::Regular, b""),
+            ("l", link("tool"), b""),
+            ("tool", EntryKind::Executable, b"tool"),
+        ];
+        let root = temp_path();
+        let storage = Arc::new(FsStorage::new(root.clone()).unwrap());
+        let (first, first_bytes) = kinded_activation_fixture(first_entries, 1);
+        storage
+            .activate_verified_item(
+                first.clone(),
+                Path::new("artifact-dir"),
+                &activation_staged_data(&first_bytes, &first),
+            )
+            .unwrap();
+        assert!(!storage
+            .inner
+            .read()
+            .unwrap()
+            .data
+            .contains_key(&EMPTY_CHUNK_HASH));
+        drop(storage);
+
+        // Clients claim every chunk of the prior revision, including the link's empty chunk.
+        let storage = Arc::new(FsStorage::new(root.clone()).unwrap());
+        let (second, _) = kinded_activation_fixture(second_entries, 2);
+        let ingest = storage
+            .begin_sync_ingest(
+                second.metadata.name.clone(),
+                PathBuf::from("artifact-dir"),
+                2,
+                None,
+                second.manifest.clone(),
+                second.chunks.clone(),
+                first.chunks.iter().map(|chunk| chunk.hash).collect(),
+            )
+            .unwrap();
+        ingest.finish().unwrap();
+        assert_kinded_fixture(&root, second_entries);
+        assert_eq!(
+            storage
+                .get(&second.metadata.root.hash)
+                .unwrap()
+                .clone_data()
+                .unwrap(),
+            b"tool"
+        );
+        drop(storage);
+        FsStorage::new(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kinded_activation_records_reject_mismatched_schemas_and_tampered_links() {
+        let (regular, regular_bytes) =
+            kinded_activation_fixture(&[("a", EntryKind::Regular, b"aaaa")], 1);
+        let (kinded, kinded_bytes) = kinded_activation_fixture(
+            &[("a", EntryKind::Executable, b"aaaa"), ("l", link("a"), b"")],
+            2,
+        );
+        assert_ne!(
+            FsStorage::activation_revision_identity(&regular).unwrap(),
+            FsStorage::activation_revision_identity(&kinded).unwrap()
+        );
+        let mut retyped = kinded.clone();
+        retyped.manifest.entries[0].kind = EntryKind::Regular;
+        assert_ne!(
+            FsStorage::activation_revision_identity(&retyped).unwrap(),
+            FsStorage::activation_revision_identity(&kinded).unwrap()
+        );
+
+        let root = temp_path();
+        let storage = FsStorage::new(root.clone()).unwrap();
+        storage
+            .activate_verified_item(
+                regular.clone(),
+                Path::new("artifact-dir"),
+                &activation_staged_data(&regular_bytes, &regular),
+            )
+            .unwrap();
+        storage
+            .activate_verified_item(
+                kinded.clone(),
+                Path::new("artifact-dir"),
+                &activation_staged_data(&kinded_bytes, &kinded),
+            )
+            .unwrap();
+        let identity = storage
+            .activation_destination_identity(Path::new("artifact-dir"))
+            .unwrap();
+        let active = storage.active_refs.read().unwrap()[&identity].clone();
+        let (_, kinded_payload) = active.encode().unwrap();
+        assert!(
+            FsActivationActiveV1::decode(FS_ACTIVATION_ACTIVE_SCHEMA, &kinded_payload).is_err()
+        );
+        assert!(
+            FsActivationActiveV1::decode(FS_ACTIVATION_KINDED_ACTIVE_SCHEMA, &kinded_payload)
+                .is_ok()
+        );
+        let mut regular_active = active.as_ref().clone();
+        regular_active.item = regular.clone();
+        let regular_payload =
+            bitcode::serialize(&FsActivationActiveKindedV2::from(regular_active)).unwrap();
+        assert!(
+            FsActivationActiveV1::decode(FS_ACTIVATION_KINDED_ACTIVE_SCHEMA, &regular_payload)
+                .is_err()
+        );
+
+        // Retargeting the immutable link changes both its seal and its verified shape.
+        let link = storage
+            .activation_revision_root(&active.revision_identity)
+            .join("l");
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", &link).unwrap();
+        drop(storage);
+        assert!(FsStorage::new(root).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kinded_directory_operation_faults_recover_at_every_occurrence() {
+        let old_entries: &[(&str, EntryKind, &[u8])] = &[
+            ("bin/tool", EntryKind::Regular, b"tool"),
+            ("lib/link", link("../bin/tool"), b""),
+            ("nested/old", EntryKind::Regular, b"nest"),
+            ("swap", link("old-target"), b""),
+        ];
+        let new_entries: &[(&str, EntryKind, &[u8])] = &[
+            ("bin/tool", EntryKind::Executable, b"tool"),
+            ("lib/link", link("../bin/tool"), b""),
+            ("nested", link("bin"), b""),
+            ("swap", EntryKind::Regular, b"swap"),
+        ];
+        let operations = [
+            ActivationOperation::MaterializeDirectoryCreate,
+            ActivationOperation::MaterializeFileCreate,
+            ActivationOperation::MaterializeFileWrite,
+            ActivationOperation::MaterializeFileSync,
+            ActivationOperation::MaterializeDirectorySync,
+            ActivationOperation::RevisionRename,
+            ActivationOperation::RevisionParentSync,
+            ActivationOperation::MirrorDirectoryCreate,
+            ActivationOperation::MirrorEntryCreate,
+            ActivationOperation::MirrorEntryWrite,
+            ActivationOperation::MirrorEntrySync,
+            ActivationOperation::MirrorEntryRename,
+            ActivationOperation::MirrorEntryRemove,
+            ActivationOperation::MirrorDirectorySync,
+        ];
+        for operation in operations {
+            for occurrence in 0usize.. {
+                let root = temp_path();
+                let storage = FsStorage::new(root.clone()).unwrap();
+                let (old, old_bytes) = kinded_activation_fixture(old_entries, 1);
+                storage
+                    .activate_verified_item(
+                        old.clone(),
+                        Path::new("artifact-dir"),
+                        &activation_staged_data(&old_bytes, &old),
+                    )
+                    .unwrap();
+                let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let hook_seen = seen.clone();
+                storage.set_activation_fault_hook(move |stage| {
+                    if stage == ActivationFaultStage::Operation(operation)
+                        && hook_seen.fetch_add(1, std::sync::atomic::Ordering::AcqRel) == occurrence
+                    {
+                        return Err(std::io::Error::other("injected kinded operation fault"));
+                    }
+                    Ok(())
+                });
+                let (new, new_bytes) = kinded_activation_fixture(new_entries, 2);
+                let result = storage.activate_verified_item(
+                    new.clone(),
+                    Path::new("artifact-dir"),
+                    &activation_staged_data(&new_bytes, &new),
+                );
+                if seen.load(std::sync::atomic::Ordering::Acquire) <= occurrence {
+                    result.unwrap();
+                    assert_kinded_fixture(&root, new_entries);
+                    break;
+                }
+                assert!(result.is_err());
+                drop(storage);
+
+                for _ in 0..2 {
+                    let restarted = FsStorage::new(root.clone()).unwrap();
+                    let revision = restarted
+                        .open_active_revision(Path::new("artifact-dir"))
+                        .unwrap()
+                        .unwrap()
+                        .item()
+                        .metadata
+                        .revision;
+                    if revision == 1 {
+                        assert_kinded_fixture(&root, old_entries);
+                    } else {
+                        assert_eq!(revision, 2, "{operation:?} #{occurrence}");
+                        assert_kinded_fixture(&root, new_entries);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn directory_removed_between_revisions_is_not_synced_after_removal() {
+        let root = temp_path();
+        let storage = FsStorage::new(root.clone()).unwrap();
+        let old_entries: &[(&str, &[u8])] = &[("a/x", b"aaaa"), ("b", b"bbbb")];
+        let new_entries: &[(&str, &[u8])] = &[("b", b"bbbb")];
+        for (revision, entries) in [(1, old_entries), (2, new_entries)] {
+            let (item, bytes) = activation_directory_fixture(entries, revision);
+            storage
+                .activate_verified_item(
+                    item.clone(),
+                    Path::new("artifact-dir"),
+                    &activation_staged_data(&bytes, &item),
+                )
+                .unwrap();
+            assert_directory_fixture(&root, entries);
+        }
+        assert!(!root.join("artifact-dir/a").exists());
     }
 
     #[cfg(feature = "nightly-bench")]
