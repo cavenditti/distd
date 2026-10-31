@@ -5998,6 +5998,9 @@ impl FsStorage {
     }
 
     fn try_clone_file(source: &Path, destination: &Path) -> Result<bool, Error> {
+        // Other platforms use the copy fallback in clone_or_copy_file.
+        #[cfg(not(target_os = "macos"))]
+        let _ = (source, destination);
         #[cfg(target_os = "macos")]
         {
             use std::{ffi::CString, os::unix::ffi::OsStrExt};
