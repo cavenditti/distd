@@ -17,7 +17,10 @@ use crate::{
 };
 
 use distd_core::{
-    chunk_storage::{fs_storage::FsStorage, ChunkStorage},
+    chunk_storage::{
+        fs_storage::{FsStorage, LazyRevision},
+        ChunkStorage,
+    },
     hash::Hash,
     item::Item,
     metadata::Item as ItemMetadata,
@@ -356,6 +359,54 @@ impl Client<FsStorage> {
         Ok(item)
     }
 
+    /// Activate `target` at `path` from its verified manifest alone, without fetching payload.
+    ///
+    /// Publisher and rollback verification run exactly as for [`Self::get`]. The revision is
+    /// recorded and projected into a `composefs` EROFS image whose files redirect into the CAS
+    /// blob store, where contents are hydrated later on demand.
+    pub async fn get_lazy(&self, target: &Path, path: &Path) -> Result<LazyRevision, ClientError> {
+        let target_str = target.to_string_lossy().to_string();
+        let item_metadata = self
+            .server
+            .metadata_item(&target_str)
+            .await
+            .ok_or(ClientError::FileNotFound(target_str.clone()))?;
+        let activation = LocalActivationMetadata::from(&item_metadata);
+        let now = Instant::now();
+
+        let (manifest, chunks) = self
+            .server
+            .verify_manifest_only(target_str, item_metadata)
+            .await?;
+        let storage = Arc::clone(&self.storage);
+        let destination = path.to_path_buf();
+        let lazy = tokio::task::spawn_blocking(move || {
+            storage.activate_lazy_revision(
+                activation.name,
+                &destination,
+                activation.revision,
+                activation.description,
+                &manifest,
+                &chunks,
+            )
+        })
+        .await
+        .map_err(|_| ClientError::StorageWorker)?
+        .map_err(ClientError::Core)?;
+
+        tracing::info!(
+            "Lazily activated {} v{} ({} files, {} bytes) after {:.4}s; overlay lowerdir <erofs mount>:{}",
+            lazy.item.metadata.name,
+            lazy.item.metadata.revision,
+            lazy.image.files.len(),
+            lazy.item.size(),
+            now.elapsed().as_secs_f32(),
+            self.storage.cas_blobs_root().display(),
+        );
+
+        Ok(lazy)
+    }
+
     async fn update(
         &mut self,
         requested_artifact_id: &str,
@@ -519,15 +570,20 @@ pub mod cli {
     }
 
     async fn get(mut client: Client<FsStorage>, args: &[String]) -> Result<(), ClientError> {
-        let first = args
+        let (lazy, positional) = match args.split_first() {
+            Some((flag, rest)) if flag == "--lazy" => (true, rest),
+            _ => (false, args),
+        };
+        let first = positional
             .first()
             .ok_or(ClientError::InvalidArgs(args.to_owned()))?;
 
-        let (target, path) = match args.len() {
+        let (target, path) = match positional.len() {
             1 => (first, first),
             2 => (
                 first,
-                args.get(1)
+                positional
+                    .get(1)
                     .ok_or(ClientError::InvalidArgs(args.to_owned()))?,
             ),
             _ => return Err(ClientError::InvalidArgs(args.to_owned())),
@@ -536,7 +592,13 @@ pub mod cli {
         let Ok(path) = PathBuf::from_str(path);
         let Ok(target) = PathBuf::from_str(target.as_str());
 
-        client.get(&target, &path).await.map(|_| ())
+        if lazy {
+            let revision = client.get_lazy(&target, &path).await?;
+            println!("{}", revision.image_path.display());
+            Ok(())
+        } else {
+            client.get(&target, &path).await.map(|_| ())
+        }
     }
 }
 

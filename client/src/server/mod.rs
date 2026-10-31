@@ -788,6 +788,34 @@ impl Server {
         .await
     }
 
+    /// Authenticate an artifact revision's manifest without transferring any payload.
+    ///
+    /// Runs the catalog identity, publisher signature and rollback checks of a full sync,
+    /// then aborts the sync session before a possession bitfield is sent. The rollback state
+    /// records the accepted release exactly as a completed sync would. The sync memory budget
+    /// does not apply because no chunk is requested.
+    pub async fn verify_manifest_only(
+        &self,
+        requested_artifact_id: String,
+        expected: ItemMetadata,
+    ) -> Result<(Manifest, Vec<ChunkInfo>), ServerRequest> {
+        require_requested_catalog_identity(&requested_artifact_id, &expected)?;
+        let transport = self.shared.read().await.transport.clone();
+        let manifest_request = proto::ManifestRequest {
+            artifact_id: requested_artifact_id,
+            version: Some(u64::from(expected.revision)),
+        };
+        let pending = transport.open_sync(manifest_request).await?;
+        verify_pending_manifest_only(
+            pending,
+            expected,
+            self.publisher_policy.clone(),
+            self.rollback_state.clone(),
+            self.url.clone(),
+        )
+        .await
+    }
+
     /// Fetch a targeted subset of missing chunks on demand over QUIC for lazy range hydration.
     ///
     /// Authenticates the artifact's manifest and publisher signature, constructs a selective
@@ -836,19 +864,13 @@ impl Server {
                 missing_payload_bytes,
             ) = parts;
             enforce_sync_memory_budget(missing_payload_bytes, max_sync_payload_bytes)?;
-            if let Some(verified) = authorization.rollback() {
-                let receipt =
-                    rollback_state.authorize(&authority, &manifest.artifact_id, verified)?;
-                if !receipt.matches(
-                    &authority,
-                    &manifest.artifact_id,
-                    verified.sequence(),
-                    verified.statement_identity(),
-                ) {
-                    return Err(ServerRequest::PublisherVerificationWorker);
-                }
-            }
-            Ok((
+            authorize_rollback(
+                &rollback_state,
+                &authority,
+                &manifest.artifact_id,
+                authorization,
+            )?;
+            Ok::<_, ServerRequest>((
                 manifest,
                 chunks,
                 chunk_sizes,
@@ -970,18 +992,13 @@ where
             missing_payload_bytes,
         ) = parts;
         enforce_sync_memory_budget(missing_payload_bytes, max_sync_payload_bytes)?;
-        if let Some(verified) = authorization.rollback() {
-            let receipt = rollback_state.authorize(&authority, &manifest.artifact_id, verified)?;
-            if !receipt.matches(
-                &authority,
-                &manifest.artifact_id,
-                verified.sequence(),
-                verified.statement_identity(),
-            ) {
-                return Err(ServerRequest::PublisherVerificationWorker);
-            }
-        }
-        Ok((
+        authorize_rollback(
+            &rollback_state,
+            &authority,
+            &manifest.artifact_id,
+            authorization,
+        )?;
+        Ok::<_, ServerRequest>((
             manifest,
             chunks,
             chunk_sizes,
@@ -994,12 +1011,68 @@ where
     .await
 }
 
+async fn verify_pending_manifest_only(
+    pending: PendingSync,
+    expected: ItemMetadata,
+    policy: PublisherPolicy,
+    rollback_state: ClientRollbackState,
+    authority: CanonicalServerUrl,
+) -> Result<(Manifest, Vec<ChunkInfo>), ServerRequest> {
+    let verified = verify_pending_with(pending, move |response| {
+        let parts = verify_manifest_response_with_basis(
+            response,
+            &expected,
+            LocalChunkBasis::default(),
+            &policy,
+        )?;
+        authorize_rollback(&rollback_state, &authority, &parts.0.artifact_id, parts.4)?;
+        Ok::<_, ServerRequest>(parts)
+    })
+    .await?;
+    let VerifiedSync {
+        manifest,
+        chunks,
+        publisher_fingerprint,
+        continuation,
+        ..
+    } = verified;
+    continuation.abort();
+    if let Some(fingerprint) = publisher_fingerprint {
+        tracing::debug!(%fingerprint, "publisher manifest verified without payload transfer");
+    } else {
+        tracing::warn!("unsigned publisher manifest accepted by explicit insecure policy");
+    }
+    Ok((manifest, chunks))
+}
+
 async fn prepare_local_chunk_basis(
     local_hashes: Vec<Hash>,
 ) -> Result<LocalChunkBasis, ServerRequest> {
     tokio::task::spawn_blocking(move || LocalChunkBasis::new(local_hashes))
         .await
         .map_err(|_| ServerRequest::PublisherVerificationWorker)
+}
+
+/// Durably record an authenticated release in the rollback state before any
+/// payload is requested or any local state depends on it.
+fn authorize_rollback(
+    rollback_state: &ClientRollbackState,
+    authority: &CanonicalServerUrl,
+    artifact_id: &str,
+    authorization: PublisherAuthorization,
+) -> Result<(), ServerRequest> {
+    if let Some(verified) = authorization.rollback() {
+        let receipt = rollback_state.authorize(authority, artifact_id, verified)?;
+        if !receipt.matches(
+            authority,
+            artifact_id,
+            verified.sequence(),
+            verified.statement_identity(),
+        ) {
+            return Err(ServerRequest::PublisherVerificationWorker);
+        }
+    }
+    Ok(())
 }
 
 fn enforce_sync_memory_budget(required_bytes: u64, limit_bytes: u64) -> Result<(), ServerRequest> {
@@ -1400,9 +1473,9 @@ mod tests {
         assigned_uuid, enforce_sync_memory_budget, publisher_attestation_from_transport,
         receipt_matches_pending, redacted_token, require_requested_catalog_identity,
         require_same_prior_identity, verify_and_transfer_pending, verify_and_transfer_pending_with,
-        verify_manifest_response, verify_manifest_response_with_basis, LocalChunkBasis,
-        ObservedSyncContinuation, ObservedSyncSession, PendingManifest, PendingServer, PendingSync,
-        SyncContinuation,
+        verify_manifest_response, verify_manifest_response_with_basis,
+        verify_pending_manifest_only, LocalChunkBasis, ObservedSyncContinuation,
+        ObservedSyncSession, PendingManifest, PendingServer, PendingSync, SyncContinuation,
     };
     use crate::error::ServerRequest;
     use crate::{
@@ -2164,6 +2237,78 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn manifest_only_verification_aborts_without_possession_and_records_rollback() {
+        let (response, expected, policy) = signed_manifest_fixture();
+        let chunk_count = response.chunk_count as usize;
+
+        let rejected_observer = std::sync::Arc::new(ObservedSyncContinuation::default());
+        let (rejected_rollback, rejected_rollback_path) = test_rollback_state_and_path();
+        let mut forged = response.clone();
+        forged.publisher_signature[0] ^= 1;
+        let rejected = verify_pending_manifest_only(
+            PendingSync {
+                manifest: PendingManifest::Decoded(forged),
+                continuation: SyncContinuation::Observed(ObservedSyncSession::new(
+                    rejected_observer.clone(),
+                )),
+            },
+            expected.clone(),
+            policy.clone(),
+            rejected_rollback,
+            test_authority(),
+        )
+        .await;
+        assert!(matches!(
+            rejected,
+            Err(ServerRequest::PublisherAuthenticity(
+                PublisherAuthenticityError::InvalidSignature
+            ))
+        ));
+        assert_eq!(
+            rejected_observer
+                .possession_sends
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            rejected_observer
+                .aborts
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(!rejected_rollback_path.exists());
+
+        // No payload is requested, so even a revision larger than any sync budget is admitted.
+        let observer = std::sync::Arc::new(ObservedSyncContinuation::default());
+        let (rollback, rollback_path) = test_rollback_state_and_path();
+        let (manifest, chunks) = verify_pending_manifest_only(
+            PendingSync {
+                manifest: PendingManifest::Decoded(response),
+                continuation: SyncContinuation::Observed(ObservedSyncSession::new(
+                    observer.clone(),
+                )),
+            },
+            expected.clone(),
+            policy,
+            rollback,
+            test_authority(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(manifest.artifact_id, expected.artifact_id);
+        assert_eq!(manifest.root_hash, expected.root.hash);
+        assert_eq!(chunks.len(), chunk_count);
+        assert_eq!(
+            observer
+                .possession_sends
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(observer.aborts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(rollback_path.exists());
     }
 
     #[tokio::test]

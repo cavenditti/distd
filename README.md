@@ -92,6 +92,21 @@ cargo run -p distd_client -- get artifact-id local/path
 Remote metadata never selects the client destination. Absolute paths, `..`, and
 symbolic-link components are rejected by filesystem storage.
 
+`get --lazy` performs the same publisher and rollback verification but fetches
+no payload. It records the revision under `.distd-activation-v1/lazy/` and
+prints the path of a content-addressed composefs EROFS image in
+`.distd-activation-v1/composefs/`. Every file in the image redirects to its
+whole-file blob in `.distd-activation-v1/blobs`, which on-demand hydration
+fills in later:
+
+```bash
+cargo run -p distd_client -- get --lazy artifact-id local/path
+```
+
+A lazy activation is independent of an eager one for the same destination.
+Images currently carry fixed `0444` file and `0555` directory modes and no
+symbolic links.
+
 Publish through the authenticated HTTP endpoint:
 
 ```bash

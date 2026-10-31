@@ -33,6 +33,9 @@ use crate::{
 
 use super::{ChunkStorage, Node, ReceivedChunk};
 
+mod lazy;
+pub use lazy::LazyRevision;
+
 const DEFAULT_CHUNK_CACHE_BYTES: usize = 512 * 1024 * 1024;
 const DEFAULT_TREE_CACHE_ENTRIES: usize = 65_536;
 const DEFAULT_IMMUTABLE_READER_ENTRIES: usize = 32;
