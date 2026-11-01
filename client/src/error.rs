@@ -102,6 +102,14 @@ pub enum ServerRequest {
 
 #[derive(Error, Debug)]
 pub enum Client {
+    #[error("embedded session requires explicit TLS pinning, enrollment token and publisher keys")]
+    InsecureSession,
+
+    #[error("verified revision belongs to a different server authority or certificate")]
+    RevisionAuthorityMismatch,
+
+    #[error("cached revision differs from the authenticated manifest")]
+    CachedRevisionMismatch,
     #[error("server certificate is not pinned; configure server.certificate_fingerprint")]
     UnpinnedServer,
 

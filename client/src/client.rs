@@ -324,10 +324,6 @@ impl Client<FsStorage> {
 
     pub async fn get(&mut self, target: &Path, path: &Path) -> Result<Item, ClientError> {
         tracing::debug!("sync: {target:?} {path:?}");
-
-        let resolved_path = self.storage.path(path).map_err(ClientError::Core)?;
-        let (_, from) = self.local_diff_basis(resolved_path).await?;
-
         // Look up by artifact_id (target path string used as artifact_id)
         let target_str = target.to_string_lossy().to_string();
         let item_metadata = self
@@ -335,6 +331,49 @@ impl Client<FsStorage> {
             .metadata_item(&target_str)
             .await
             .ok_or(ClientError::FileNotFound(target_str.clone()))?;
+
+        self.get_expected(target_str, item_metadata, path).await
+    }
+
+    /// The expected catalog snapshot fixes the requested version before any
+    /// payload transfer. Used by authenticated embedded sessions as well.
+    pub(crate) async fn get_expected(
+        &mut self,
+        target_str: String,
+        item_metadata: ItemMetadata,
+        path: &Path,
+    ) -> Result<Item, ClientError> {
+        let resolved_path = self.storage.path(path).map_err(ClientError::Core)?;
+        let storage = Arc::clone(&self.storage);
+        let lookup_path = resolved_path.clone();
+        let cached = tokio::task::spawn_blocking(move || storage.item_for_path(&lookup_path))
+            .await
+            .map_err(|_| ClientError::StorageWorker)?;
+        if let Some(cached) = cached.filter(|item| {
+            item.metadata.artifact_id == item_metadata.artifact_id
+                && item.metadata.revision == item_metadata.revision
+        }) {
+            // Reuse is still a fresh authenticated operation: publisher policy
+            // and durable rollback checks must precede trusting local metadata.
+            let (manifest, chunks) = self
+                .server
+                .verify_manifest_only(target_str, item_metadata.clone())
+                .await?;
+            if cached.manifest != manifest
+                || cached.chunks != chunks
+                || cached.metadata.root != item_metadata.root
+            {
+                return Err(ClientError::CachedRevisionMismatch);
+            }
+            let storage = Arc::clone(&self.storage);
+            return tokio::task::spawn_blocking(move || {
+                storage.verify_committed_revision(&cached)?;
+                Ok(cached)
+            })
+            .await
+            .map_err(|_| ClientError::StorageWorker)?;
+        }
+        let (_, from) = self.local_diff_basis(resolved_path).await?;
 
         tracing::info!(
             "Fetching item '{}' at '{}' (local chunks: {})",

@@ -587,7 +587,8 @@ impl Drop for ClientPid {
 
 #[derive(Debug, Clone)]
 pub struct ClientState {
-    pub pid: ClientPid,
+    /// CLI-only process marker. Embedded sessions do not own a global PID file.
+    pub pid: Option<Arc<ClientPid>>,
     pub persistent: ClientPersistentState,
     pub rollback: crate::rollback::ClientRollbackState,
 }
@@ -595,9 +596,24 @@ pub struct ClientState {
 impl ClientState {
     pub fn load() -> Result<Self, PersistenceError> {
         Ok(Self {
-            pid: ClientPid::default(),
+            pid: Some(Arc::new(ClientPid::default())),
             persistent: ClientPersistentState::load()?,
             rollback: crate::rollback::ClientRollbackState::load()?,
+        })
+    }
+
+    /// Load isolated durable trust and rollback state without touching the CLI
+    /// PID file or process-wide cache environment. Call on a blocking worker.
+    pub fn load_in(directory: &Path) -> Result<Self, PersistenceError> {
+        Ok(Self {
+            pid: None,
+            persistent: ClientPersistentState::load_from_paths(
+                directory.join("trust.state"),
+                directory.join("legacy-trust.json"),
+            )?,
+            rollback: crate::rollback::ClientRollbackState::load_from_path(
+                directory.join("rollback.state"),
+            )?,
         })
     }
 }

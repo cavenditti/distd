@@ -671,7 +671,7 @@ impl Server {
     }
 
     /// Fetch metadata from server
-    async fn fetch(&self) -> Result<(), ServerRequest> {
+    pub(crate) async fn fetch(&self) -> Result<(), ServerRequest> {
         tracing::trace!("Starting `Fetch` request");
         assert!(self.client_uuid.is_some());
         let transport = self.shared.read().await.transport.clone();

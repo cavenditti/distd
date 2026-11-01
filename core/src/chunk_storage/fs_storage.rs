@@ -7429,6 +7429,16 @@ impl FsStorage {
         cache_config: FsStorageCacheConfig,
     ) -> Result<Self, Error> {
         let persistance_dir = cache_dir().join("chunk_storage").join("fs_storage");
+        Self::with_state_directory(requested_root, cache_config, persistance_dir)
+    }
+
+    /// Open storage with an explicitly scoped checkpoint directory. Embedded
+    /// clients can isolate state without changing process-wide environment.
+    pub fn with_state_directory(
+        requested_root: PathBuf,
+        cache_config: FsStorageCacheConfig,
+        persistance_dir: PathBuf,
+    ) -> Result<Self, Error> {
         let legacy_path =
             persistance_dir.join(requested_root.to_string_lossy().replace('/', "___"));
         create_dir_all(&persistance_dir)?;

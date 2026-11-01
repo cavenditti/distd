@@ -5,21 +5,13 @@ use distd_core::feed::Feed;
 use distd_core::signature::PublisherPublicKey;
 use std::{collections::HashSet, net::SocketAddr, time::Duration};
 
-use crate::client::Client;
-use crate::metadata_state::{MetadataPaths, MetadataStateStore};
-use crate::publication::PublisherPolicy;
-use crate::quic::QuicResourceSettings;
-use crate::server::{
+use distd_server::metadata_state::{MetadataPaths, MetadataStateStore};
+use distd_server::publication::PublisherPolicy;
+use distd_server::quic::QuicResourceSettings;
+use distd_server::rest_api;
+use distd_server::server::{
     InternalMetadata, Server, DEFAULT_MAX_REGISTERED_CLIENTS, HARD_MAX_REGISTERED_CLIENTS,
 };
-
-pub mod client;
-pub mod error;
-pub mod metadata_state;
-pub mod publication;
-pub mod quic;
-pub mod rest_api;
-pub mod server;
 
 const DEFAULT_HTTP_BIND: &str = "127.0.0.1:3000";
 const HTTP_BIND_ENV: &str = "DISTD_HTTP_BIND";
@@ -291,14 +283,12 @@ fn load_metadata<T>(
 where
     T: ChunkStorage,
 {
-    let (store, metadata) = MetadataStateStore::open_with_validator(paths, |metadata| {
-        metadata.verify_storage_after_metadata_validation(storage)?;
-        crate::metadata_state::validate_runtime_metadata_with_policy(metadata, publisher_policy)
-    })
-    .unwrap_or_else(|error| {
-        eprintln!("Cannot load server metadata: {error}");
-        std::process::exit(2);
-    });
+    let (store, metadata) =
+        MetadataStateStore::open_with_storage_and_policy(paths, storage, publisher_policy)
+            .unwrap_or_else(|error| {
+                eprintln!("Cannot load server metadata: {error}");
+                std::process::exit(2);
+            });
     storage
         .reconcile_published_revisions(&metadata.published_revisions())
         .unwrap_or_else(|error| {
@@ -563,7 +553,7 @@ mod tests {
         MAX_REGISTERED_CLIENTS_ENV, PUBLICATION_BODY_TIMEOUT_SECS_ENV, PUBLICATION_MEMORY_MIB_ENV,
         PUBLISHER_PUBLIC_KEYS_ENV,
     };
-    use crate::server::{DEFAULT_MAX_REGISTERED_CLIENTS, HARD_MAX_REGISTERED_CLIENTS};
+    use distd_server::server::{DEFAULT_MAX_REGISTERED_CLIENTS, HARD_MAX_REGISTERED_CLIENTS};
 
     fn publisher_key(index: usize) -> String {
         let mut bytes = [0u8; 32];

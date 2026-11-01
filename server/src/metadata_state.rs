@@ -144,6 +144,19 @@ impl DurableMetadataReceipt {
 }
 
 impl MetadataStateStore {
+    /// Load durable publication state, verify its retained payload and enforce
+    /// the configured publisher policy before any migration is committed.
+    pub fn open_with_storage_and_policy<T: distd_core::chunk_storage::ChunkStorage>(
+        paths: MetadataPaths,
+        storage: &T,
+        publisher_policy: &crate::publication::PublisherPolicy,
+    ) -> Result<(Arc<Self>, InternalMetadata), ServerError> {
+        Self::open_with_validator(paths, |metadata| {
+            metadata.verify_storage_after_metadata_validation(storage)?;
+            validate_runtime_metadata_with_policy(metadata, publisher_policy)
+        })
+    }
+
     pub fn open_with_validator<F>(
         paths: MetadataPaths,
         validate: F,

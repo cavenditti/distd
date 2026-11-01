@@ -45,8 +45,8 @@ use crate::publication::{
 use distd_core::feed::{Feed, Name as FeedName};
 use distd_core::version::Version;
 
-pub(crate) const DEFAULT_MAX_REGISTERED_CLIENTS: usize = 4_096;
-pub(crate) const HARD_MAX_REGISTERED_CLIENTS: usize = 65_536;
+pub const DEFAULT_MAX_REGISTERED_CLIENTS: usize = 4_096;
+pub const HARD_MAX_REGISTERED_CLIENTS: usize = 65_536;
 pub(crate) const MAX_CLIENT_NAME_BYTES: usize = 256;
 
 #[derive(Debug)]
@@ -490,7 +490,7 @@ where
     }
 
     #[must_use]
-    pub(crate) fn with_client_registry_limit(mut self, max_registered_clients: usize) -> Self {
+    pub fn with_client_registry_limit(mut self, max_registered_clients: usize) -> Self {
         assert!((1..=HARD_MAX_REGISTERED_CLIENTS).contains(&max_registered_clients));
         self.max_registered_clients = max_registered_clients;
         self

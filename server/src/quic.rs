@@ -1338,6 +1338,18 @@ where
         self.serve_quic_endpoint(endpoint, admission).await
     }
 
+    /// Serve an already-bound endpoint with the normal enrollment, publication
+    /// and resource policies. The caller owns TLS configuration and can close
+    /// its endpoint clone to stop this server; port 0 supports isolated tests.
+    pub async fn serve_quic_endpoint_with_settings(
+        self,
+        endpoint: Endpoint,
+        settings: QuicResourceSettings,
+    ) -> Result<(), ServerError> {
+        let admission = QuicAdmission::new(settings).map_err(ServerError::Quic)?;
+        self.serve_quic_endpoint(endpoint, admission).await
+    }
+
     pub async fn serve_quic(self, bind_addr: SocketAddr) -> Result<(), ServerError> {
         let settings = QuicResourceSettings::from_environment().map_err(ServerError::Quic)?;
         self.serve_quic_with_settings(bind_addr, settings).await
